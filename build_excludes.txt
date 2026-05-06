@@ -1,0 +1,13 @@
+dist_obf
+build
+dist
+.git
+tools
+__pycache__
+.pyc
+.spec
+build.bat
+build_excludes.txt
+creovcs.spec
+requirements.txt
+README

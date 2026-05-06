@@ -1,0 +1,7 @@
+# CreoVCS – runtime dependencies
+PyQt5>=5.15.9
+cryptography>=41.0.0
+
+# Build tools (not shipped with the EXE)
+pyinstaller>=6.0.0
+pyarmor>=8.0.0
