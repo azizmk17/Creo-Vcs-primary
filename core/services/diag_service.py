@@ -347,6 +347,76 @@ class DiagService:
         return results
     
 
+    def _sync_bom_record(self, working_dir, bom, files_in_dir=None, force_integrated_filenames=None):
+        """Check missing/outdated files for one BOM row and keep base names in sync."""
+        if not bom or not working_dir or not os.path.isdir(working_dir):
+            return []
+
+        if files_in_dir is None:
+            files_in_dir = os.listdir(working_dir)
+        if force_integrated_filenames is None:
+            try:
+                force_integrated_filenames = set(self.repo.get_forced_integrated_filenames(self.session.project_id) or [])
+            except Exception:
+                force_integrated_filenames = set()
+
+        result = []
+        base_file_name = None
+        base_drw_name = None
+
+        if bom.filename:
+            base_file_name = os.path.splitext(bom.filename)[0]
+            filename_path = os.path.join(working_dir, bom.filename)
+            if not os.path.exists(filename_path):
+                print(f' Filename {bom.filename} does not exist in working directory.')
+                result.append((bom.id, 'missing_file', bom.filename))
+            else:
+                matching_files = [f for f in files_in_dir if f.startswith(base_file_name + ".")]
+                if matching_files:
+                    versions = [f.split(".")[-1] for f in matching_files]
+                    last_version = sorted(versions)[-1]
+                    if bom.filename.split(".")[-1] < last_version and bom.filename not in force_integrated_filenames:
+                        print(f' Filename {bom.filename} is not the latest version in working directory.')
+                        result.append((bom.id, 'outdated_file', bom.filename))
+
+        if bom.drawing:
+            base_drw_name = os.path.splitext(bom.drawing)[0]
+            drawing_path = os.path.join(working_dir, bom.drawing)
+            if not os.path.exists(drawing_path):
+                print(f' Drawing {bom.drawing} does not exist in working directory.')
+                result.append((bom.id, 'missing_drawing', bom.drawing))
+
+        if getattr(bom, "pdf_path", None):
+            pdf_path = bom.pdf_path
+            pdf_full_path = pdf_path if os.path.isabs(pdf_path) else os.path.join(working_dir, pdf_path)
+            if not os.path.exists(pdf_full_path):
+                result.append((bom.id, 'missing_pdf', pdf_path))
+
+        if getattr(bom, "step_path", None):
+            step_path = bom.step_path
+            step_full_path = step_path if os.path.isabs(step_path) else os.path.join(working_dir, step_path)
+            if not os.path.exists(step_full_path):
+                result.append((bom.id, 'missing_step', step_path))
+
+        if base_file_name or base_drw_name:
+            self.bom_repo.update_bom_file_names(bom.id, base_file_name, base_drw_name, self.session.project_id)
+
+        return result
+
+    def sync_bom_part_files(self, working_dir, bom_id):
+        """Run the BOM file diagnostic for one part only."""
+        if not bom_id or not working_dir or not os.path.isdir(working_dir):
+            return []
+        bom = self.bom_repo.get_by_id(int(bom_id))
+        if not bom:
+            return []
+        files_in_dir = os.listdir(working_dir)
+        try:
+            force_integrated_filenames = set(self.repo.get_forced_integrated_filenames(self.session.project_id) or [])
+        except Exception:
+            force_integrated_filenames = set()
+        return self._sync_bom_record(working_dir, bom, files_in_dir, force_integrated_filenames)
+
     # everytime the app refreshed the bom page check if the filename and drawing exists in the working directory and check if the update the base_file_name and base_drw_name columns in the commit table regarding to the filename and drawing columns in the bom table
     def sync_bom_files(self, working_dir):
         try:
@@ -360,55 +430,7 @@ class DiagService:
         result = []
         boms = self.bom_repo.get_all(self.session.project_id)
         for bom in boms:
-            #print(f'Syncing BOM ID: {bom.id}, Filename: {bom.filename}, Drawing: {bom.drawing} in working dir: {working_dir}')
-            
-
-            base_file_name = None
-            base_drw_name = None
-            if bom.filename:
-                base_file_name = os.path.splitext(bom.filename)[0]
-                filename_path = os.path.join(working_dir, bom.filename)
-                if not os.path.exists(filename_path):
-                    print(f' Filename {bom.filename} does not exist in working directory.')
-                    result.append((bom.id, 'missing_file', bom.filename))
-                else:
-                    #check if this version is the last version in the working directory
-                    #get all files with the same base name 
-                    
-                    matching_files = [f for f in files_in_dir if f.startswith(base_file_name + ".")]
-                    if matching_files: 
-                        #get the last version
-                        versions = [f.split(".")[-1] for f in matching_files]
-                        last_version = sorted(versions)[-1]
-                        if bom.filename.split(".")[-1] < last_version and bom.filename not in force_integrated_filenames:
-                            print(f' Filename {bom.filename} is not the latest version in working directory.')
-                            result.append((bom.id, 'outdated_file', bom.filename))
-
-
-
-            if bom.drawing:
-                base_drw_name = os.path.splitext(bom.drawing)[0]
-                drawing_path = os.path.join(working_dir, bom.drawing)
-                if not os.path.exists(drawing_path):
-                    print(f' Drawing {bom.drawing} does not exist in working directory.')
-                    result.append((bom.id, 'missing_drawing', bom.drawing))
-
-            # PDF / STEP metadata (absolute path or relative-to-working-dir)
-            if getattr(bom, "pdf_path", None):
-                pdf_path = bom.pdf_path
-                pdf_full_path = pdf_path if os.path.isabs(pdf_path) else os.path.join(working_dir, pdf_path)
-                if not os.path.exists(pdf_full_path):
-                    result.append((bom.id, 'missing_pdf', pdf_path))
-
-            if getattr(bom, "step_path", None):
-                step_path = bom.step_path
-                step_full_path = step_path if os.path.isabs(step_path) else os.path.join(working_dir, step_path)
-                if not os.path.exists(step_full_path):
-                    result.append((bom.id, 'missing_step', step_path))
-
-            if base_file_name or base_drw_name:
-                #update the bom table base_file_name and base_drw_name
-                self.bom_repo.update_bom_file_names(bom.id, base_file_name, base_drw_name, self.session.project_id)
+            result.extend(self._sync_bom_record(working_dir, bom, files_in_dir, force_integrated_filenames))
 
         return result
 
