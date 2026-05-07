@@ -2989,6 +2989,26 @@ class BomPage(QWidget):
             self._apply_tree_item_data(item, info)
         return info
 
+    def refresh_parts_after_merge(self, part_ids) -> None:
+        """Refresh only BOM rows affected by a successful merge."""
+        refreshed = set()
+        for part_id in (part_ids or []):
+            try:
+                pid = int(part_id)
+            except Exception:
+                continue
+            if pid in refreshed:
+                continue
+            refreshed.add(pid)
+            self._refresh_part_in_tree(pid)
+
+        try:
+            current = getattr(self, "current_part_id", None)
+            if current is not None and int(current) in refreshed:
+                self.display_details(int(current))
+        except Exception:
+            pass
+
     def _remove_part_from_tree_widget(self, tree_widget: QTreeWidget, part_id: int, promote_children: bool = False) -> None:
         matches = self._find_tree_items(int(part_id), tree_widget)
         promoted = {}

@@ -1683,9 +1683,21 @@ class CommitPage(QWidget):
                 "Switch to that project to push/merge it.",
             )
             return
-        self.merge_service.excute_merge_by_commit_id(group["commit_id"])
+        affected_part_ids = self.merge_service.excute_merge_by_commit_id(group["commit_id"])
+        self._refresh_bom_rows_for_parts(affected_part_ids)
         self.load_pending_commits()
         self.load_commit_history()
+
+    def _refresh_bom_rows_for_parts(self, part_ids):
+        if not part_ids:
+            return
+        try:
+            main_window = self.window()
+            bom_page = getattr(main_window, "bom_page", None)
+            if bom_page and hasattr(bom_page, "refresh_parts_after_merge"):
+                bom_page.refresh_parts_after_merge(part_ids)
+        except Exception:
+            pass
 
     def revert_commit(self, group=None):
         if not group:
