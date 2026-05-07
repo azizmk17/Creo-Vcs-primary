@@ -370,6 +370,7 @@ class CommitRepository:
             'approved_version',
             'last_snapshot',
             'committed_at',
+            'merged_at',
             'signature',
             'username',
             'step_compare_enabled',

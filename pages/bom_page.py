@@ -1056,8 +1056,9 @@ class BomPage(QWidget):
         self._cached_missing_map = None
         self._in_search_mode = False     # True while _search_tree (index 2) is visible
         self.init_ui()
-        
+
         # Pre-render indicator icons (fast + consistent colors)
+        self._indicator_icon_cache = {}
         self._icon_pdf_ok = self._make_indicator_icon(pdf_ok=True, step_ok=False)
         self._icon_pdf_bad = self._make_indicator_icon(pdf_ok=False, step_ok=False)
         self._icon_step_ok = self._make_indicator_icon(pdf_ok=False, step_ok=True)
@@ -1069,6 +1070,7 @@ class BomPage(QWidget):
 
         self.missing_files = []
         self.missing_ids = set()
+        self._doc_indicator_cache = {}
 
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
@@ -1625,6 +1627,38 @@ class BomPage(QWidget):
             menu.addAction(add_child_action)
         menu.addAction(add_dwg_action)
 
+        try:
+            summary = self._indicator_summary_for_part(int(item_id), self._issues_for_part(int(item_id)))
+            ack_actions = []
+            for doc_key, doc_type in (("pdf", "PDF"), ("step", "STEP")):
+                doc = summary.get(doc_key) or {}
+                tip = str(doc.get("tooltip") or "").lower()
+                if doc.get("state") == "bad" and ("newer commit" in tip or "needs review" in tip):
+                    action = QAction(f"Acknowledge {doc_type} as safe", self)
+
+                    def _ack_doc(_checked=False, _doc_type=doc_type, _part_id=item_id):
+                        self.part_doc_ack_service.mark_up_to_date(
+                            int(_part_id),
+                            _doc_type,
+                            self._doc_ack_target(int(_part_id), _doc_type),
+                        )
+                        self._refresh_part_in_tree(int(_part_id))
+                        try:
+                            if getattr(self, "current_part_id", None) and int(self.current_part_id) == int(_part_id):
+                                self.display_details(int(_part_id))
+                        except Exception:
+                            pass
+
+                    action.triggered.connect(_ack_doc)
+                    ack_actions.append(action)
+
+            if ack_actions:
+                menu.addSeparator()
+                for action in ack_actions:
+                    menu.addAction(action)
+        except Exception:
+            pass
+
         # Allow removing a child relation when right-clicking a child node
         try:
             parent_item = item.parent()
@@ -2016,6 +2050,8 @@ class BomPage(QWidget):
                 self.bom_service.release_part(self.current_part_id)
             self.refresh_files_tab()
             self.on_attachment_selected()
+            if getattr(self, "current_part_id", None):
+                self._refresh_part_in_tree(int(self.current_part_id))
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to release version:\n{e}")
 
@@ -2075,6 +2111,7 @@ class BomPage(QWidget):
                 note=note or "",
             )
             self.refresh_files_tab()
+            self._refresh_part_in_tree(int(self.current_part_id))
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to add attachment:\n{e}")
 
@@ -2094,6 +2131,8 @@ class BomPage(QWidget):
             self.refresh_files_tab()
             # keep versions visible
             self.on_attachment_selected()
+            if getattr(self, "current_part_id", None):
+                self._refresh_part_in_tree(int(self.current_part_id))
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to add version:\n{e}")
 
@@ -2109,6 +2148,8 @@ class BomPage(QWidget):
             self.part_file_service.set_active_version(file_id, version_id)
             self.refresh_files_tab()
             self.on_attachment_selected()
+            if getattr(self, "current_part_id", None):
+                self._refresh_part_in_tree(int(self.current_part_id))
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to set active version:\n{e}")
 
@@ -2211,6 +2252,7 @@ class BomPage(QWidget):
 
         if added:
             self.refresh_files_tab()
+            self._refresh_part_in_tree(int(self.current_part_id))
         if failed:
             QMessageBox.warning(self, "Some files failed", "\n".join(failed[:15]))
 
@@ -2241,6 +2283,8 @@ class BomPage(QWidget):
             self.part_file_service.delete_version(file_id, version_id)
             self.refresh_files_tab()
             self.on_attachment_selected()
+            if getattr(self, "current_part_id", None):
+                self._refresh_part_in_tree(int(self.current_part_id))
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to delete version:\n{e}")
 
@@ -2257,6 +2301,8 @@ class BomPage(QWidget):
         try:
             self.part_file_service.delete_attachment(file_id)
             self.refresh_files_tab()
+            if getattr(self, "current_part_id", None):
+                self._refresh_part_in_tree(int(self.current_part_id))
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to remove attachment:\n{e}")
 
@@ -2811,7 +2857,17 @@ class BomPage(QWidget):
 
         return {str(row[1]) for row in new_rows}
 
+    def _invalidate_doc_indicator(self, part_id: int | None = None) -> None:
+        try:
+            if part_id is None:
+                self._doc_indicator_cache.clear()
+            else:
+                self._doc_indicator_cache.pop(int(part_id), None)
+        except Exception:
+            self._doc_indicator_cache = {}
+
     def _refresh_diagnostic_for_part(self, part_id: int) -> set:
+        self._invalidate_doc_indicator(int(part_id))
         rows = []
         try:
             if self.working_dir and os.path.isdir(self.working_dir):
@@ -2847,7 +2903,14 @@ class BomPage(QWidget):
         item.setData(0, Qt.UserRole, part_id)
 
         try:
+            summary = self._indicator_summary_for_part(part_id, issues)
             item.setIcon(0, self._pick_indicator_icon(issues, part_id=part_id))
+            tip = "\n".join([
+                str(summary["pdf"].get("tooltip", "PDF: unknown")),
+                str(summary["step"].get("tooltip", "STEP: unknown")),
+            ])
+            item.setToolTip(0, tip)
+            item.setToolTip(6, tip)
         except Exception:
             pass
 
@@ -3301,7 +3364,10 @@ class BomPage(QWidget):
         if not s:
             return None
         try:
-            return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+            if getattr(dt, "tzinfo", None) is not None:
+                dt = dt.replace(tzinfo=None)
+            return dt
         except Exception:
             return None
 
@@ -3314,130 +3380,194 @@ class BomPage(QWidget):
         except Exception:
             return None
 
-    def _is_committed_part(self, part_id: int) -> bool:
-        """Outdated rule: if the part has any Approved commit in the project family.
+    def _commit_effective_dt(self, commit):
+        try:
+            raw = getattr(commit, "merged_at", None) or getattr(commit, "committed_at", None)
+            return self._parse_dt(str(raw)) if raw else None
+        except Exception:
+            return None
 
-        NOTE: We treat 'Approved' as committed. Integrated/WIP do not count.
-        """
+    def _latest_change_commit_for_part(self, part_id: int):
+        """Latest real CAD/DRW change for this part across the project family."""
         try:
             proj = self.project_service.get_project_by_id(self.session.project_id) or {}
             root_id = proj.get("root_project_id")
-            commits = self.diag_service.repo.get_all_commits_for_root(int(root_id)) if root_id else self.diag_service.repo.get_all_commits(self.session.project_id)
-            for c in commits or []:
-                if int(getattr(c, "part_id", 0) or 0) == int(part_id) and str(getattr(c, "status", "") or "").lower() == "approved":
-                    return True
+            commits = (
+                self.diag_service.repo.get_all_commits_for_root(int(root_id))
+                if root_id else self.diag_service.repo.get_all_commits(self.session.project_id)
+            )
         except Exception:
-            pass
-        return False
+            commits = []
 
-    def _doc_outdated(self, part_id: int, doc_type: str) -> bool:
-        """Return True if document should be red per rules, unless acknowledged."""
-        doc_type = str(doc_type).upper()
-
-        # If user acknowledged against current modified timestamp, it's up-to-date.
-        part_mod = self._get_part_modified_dt(part_id)
-        try:
-            ack = self.part_doc_ack_service.get_ack(int(part_id), doc_type)
-        except Exception:
-            ack = None
-        if ack and part_mod:
-            ack_dt = self._parse_dt(ack.get("acknowledged_against"))
-            if ack_dt and ack_dt >= part_mod:
-                return False
-
-        # Rule 1: committed => outdated
-        if self._is_committed_part(part_id):
-            return True
-
-        # Rule 2: part modified after document creation
-        created_dt = None
-        try:
-            atts = self.part_file_service.list_attachments(int(part_id))
-        except Exception:
-            atts = []
-
-        for att in atts:
-            if (att.file_type or "").upper() != doc_type:
-                continue
-            ver = self.part_file_service.get_active_version(att.id)
-            if not ver:
-                continue
-            created_dt = self._parse_dt(getattr(ver, "created_at", None) or "")
-            if created_dt:
-                break
-
-        if part_mod and created_dt and part_mod > created_dt:
-            return True
-
-        return False
-
-    def _attachment_status_for_part(self, part_id: int) -> tuple[bool, bool]:
-        """Return (pdf_ok, step_ok) based on Files-tab attachments.
-
-        OK only if there is an attachment of that type AND its active version is Released AND the file exists on disk.
-        Also turns red if outdated per rules (unless acknowledged).
-        """
-        try:
-            atts = self.part_file_service.list_attachments(int(part_id))
-        except Exception:
-            atts = []
-
-        def _type_ok(file_type: str) -> bool:
-            ok = False
-            for att in atts:
-                try:
-                    if (att.file_type or "").upper() != file_type:
-                        continue
-                    ver = self.part_file_service.get_active_version(att.id)
-                    if not ver:
-                        continue
-                    #if str(getattr(ver, "lifecycle_state", "") or "").upper() != "RELEASED":
-                        #continue
-                    p = self.part_file_service.resolve_version_path(ver)
-                    if p and os.path.exists(p):
-                        ok = True
-                        break
-                except Exception:
-                    continue
-
-            if not ok:
-                return False
-
-            # apply outdated rules
+        latest = None
+        latest_key = (datetime.min, -1)
+        good_statuses = {"pending", "validated", "approved"}
+        for c in commits or []:
             try:
-                if self._doc_outdated(int(part_id), file_type):
-                    return False
+                if int(getattr(c, "part_id", 0) or 0) != int(part_id):
+                    continue
+                if str(getattr(c, "status", "") or "").lower() not in good_statuses:
+                    continue
+                dt = self._commit_effective_dt(c) or datetime.min
+                key = (dt, int(getattr(c, "id", 0) or 0))
+                if key > latest_key:
+                    latest = c
+                    latest_key = key
             except Exception:
-                pass
+                continue
+        return latest
 
+    def _commit_ack_token(self, commit) -> str:
+        if not commit:
+            return ""
+        dt = str(getattr(commit, "merged_at", None) or getattr(commit, "committed_at", None) or "")
+        cid = str(getattr(commit, "commit_id", "") or "")
+        row_id = str(getattr(commit, "id", "") or "")
+        return f"commit:{row_id}:{cid}:{dt}"
+
+    def _ack_covers_commit(self, ack: dict | None, commit) -> bool:
+        if not ack or not commit:
+            return False
+        value = str(ack.get("acknowledged_against") or "").strip()
+        if not value:
+            return False
+        if value == self._commit_ack_token(commit):
             return True
 
-        return _type_ok("PDF"), _type_ok("STEP")
+        # Backward compatibility: older acknowledgements stored a timestamp.
+        ack_dt = self._parse_dt(value)
+        commit_dt = self._commit_effective_dt(commit)
+        if ack_dt and commit_dt and ack_dt >= commit_dt:
+            return True
+        return False
+
+    def _doc_ack_target(self, part_id: int, doc_type: str) -> str:
+        latest_commit = self._latest_change_commit_for_part(int(part_id))
+        if latest_commit:
+            return self._commit_ack_token(latest_commit)
+        part_mod = self._get_part_modified_dt(int(part_id))
+        if part_mod:
+            return part_mod.isoformat(sep=" ")
+        return datetime.now().isoformat(sep=" ")
+
+    def _legacy_doc_path(self, part_id: int, doc_type: str) -> str:
+        try:
+            details = self.bom_service.get_part_details(int(part_id)) or {}
+        except Exception:
+            details = {}
+        key = "pdf_path" if str(doc_type).upper() == "PDF" else "step_path"
+        return str(details.get(key) or "").strip()
+
+    def _doc_indicator_state(self, part_id: int, doc_type: str, attachments: list | None = None, latest_commit=None) -> dict:
+        doc_type = str(doc_type).upper()
+        label = doc_type
+        latest_commit = latest_commit if latest_commit is not None else self._latest_change_commit_for_part(int(part_id))
+        commit_dt = self._commit_effective_dt(latest_commit) if latest_commit else None
+
+        if attachments is None:
+            try:
+                attachments = self.part_file_service.list_attachments(int(part_id))
+            except Exception:
+                attachments = []
+
+        candidates = []
+        for att in attachments or []:
+            try:
+                if str(getattr(att, "file_type", "") or "").upper() != doc_type:
+                    continue
+                ver = self.part_file_service.get_active_version(att.id)
+                created_dt = self._parse_dt(getattr(ver, "created_at", None) or "") if ver else None
+                sort_dt = created_dt or self._parse_dt(getattr(att, "created_at", None) or "") or datetime.min
+                candidates.append((sort_dt, att, ver))
+            except Exception:
+                continue
+
+        if candidates:
+            candidates.sort(key=lambda row: (row[0], int(getattr(row[1], "id", 0) or 0)), reverse=True)
+            _sort_dt, att, ver = candidates[0]
+            if not ver:
+                return {"state": "bad", "tooltip": f"{label}: attachment has no active version"}
+
+            created_dt = self._parse_dt(getattr(ver, "created_at", None) or "")
+            path = self.part_file_service.resolve_version_path(ver)
+            if not path or not os.path.exists(path):
+                return {"state": "bad", "tooltip": f"{label}: file missing on disk"}
+
+            if latest_commit and (not created_dt or (commit_dt and commit_dt > created_dt)):
+                try:
+                    ack = self.part_doc_ack_service.get_ack(int(part_id), doc_type)
+                except Exception:
+                    ack = None
+                if self._ack_covers_commit(ack, latest_commit):
+                    return {"state": "ack", "tooltip": f"{label}: safe by user acknowledgement"}
+                return {"state": "bad", "tooltip": f"{label}: newer commit needs review"}
+
+            return {"state": "ok", "tooltip": f"{label}: current"}
+
+        legacy_path = self._legacy_doc_path(int(part_id), doc_type)
+        if legacy_path:
+            resolved = self._resolve_file_path(legacy_path)
+            if not resolved or not os.path.exists(resolved):
+                return {"state": "bad", "tooltip": f"{label}: file missing on disk"}
+            if latest_commit:
+                try:
+                    ack = self.part_doc_ack_service.get_ack(int(part_id), doc_type)
+                except Exception:
+                    ack = None
+                if self._ack_covers_commit(ack, latest_commit):
+                    return {"state": "ack", "tooltip": f"{label}: legacy file safe by user acknowledgement"}
+                return {"state": "bad", "tooltip": f"{label}: legacy file needs review after newer commit"}
+            return {"state": "ok", "tooltip": f"{label}: legacy file exists"}
+
+        return {"state": "absent", "tooltip": f"{label}: no attachment"}
+
+    def _indicator_summary_for_part(self, part_id: int | None, issues: set | None = None) -> dict:
+        if part_id is None:
+            return {
+                "pdf": {"state": "absent", "tooltip": "PDF: no attachment"},
+                "step": {"state": "absent", "tooltip": "STEP: no attachment"},
+            }
+        try:
+            pid = int(part_id)
+        except Exception:
+            pid = None
+        if pid is None:
+            return {
+                "pdf": {"state": "absent", "tooltip": "PDF: no attachment"},
+                "step": {"state": "absent", "tooltip": "STEP: no attachment"},
+            }
+
+        cached = self._doc_indicator_cache.get(pid)
+        if cached is None:
+            try:
+                attachments = self.part_file_service.list_attachments(pid)
+            except Exception:
+                attachments = []
+            latest_commit = self._latest_change_commit_for_part(pid)
+            cached = {
+                "pdf": self._doc_indicator_state(pid, "PDF", attachments, latest_commit),
+                "step": self._doc_indicator_state(pid, "STEP", attachments, latest_commit),
+            }
+            self._doc_indicator_cache[pid] = cached
+
+        summary = {
+            "pdf": dict(cached.get("pdf") or {}),
+            "step": dict(cached.get("step") or {}),
+        }
+
+        issues = issues or set()
+        if ("missing_pdf" in issues) or ("outdated_pdf" in issues):
+            summary["pdf"] = {"state": "bad", "tooltip": "PDF: file missing or outdated on disk"}
+        if ("missing_step" in issues) or ("outdated_step" in issues):
+            summary["step"] = {"state": "bad", "tooltip": "STEP: file missing or outdated on disk"}
+        return summary
 
     def _pick_indicator_icon(self, issues: set, part_id: int | None = None) -> QIcon:
-        # Prefer real attachment status if we can
-        pdf_ok = True
-        step_ok = True
-        try:
-            if part_id is not None:
-                pdf_ok, step_ok = self._attachment_status_for_part(int(part_id))
-        except Exception:
-            pdf_ok = True
-            step_ok = True
-
-        # Apply diagnostics as additional "bad" flags
-        if ("missing_pdf" in issues) or ("outdated_pdf" in issues):
-            pdf_ok = False
-        if ("missing_step" in issues) or ("outdated_step" in issues):
-            step_ok = False
-
-        if pdf_ok and step_ok:
-            return self._icon_pdf_step_ok
-        if (not pdf_ok) and step_ok:
-            return self._icon_pdf_bad_step_ok
-        if pdf_ok and (not step_ok):
-            return self._icon_pdf_ok_step_bad
-        return self._icon_pdf_step_bad
+        summary = self._indicator_summary_for_part(part_id, issues)
+        return self._make_indicator_icon(
+            summary["pdf"].get("state", "absent"),
+            summary["step"].get("state", "absent"),
+        )
 
     def load_tree(self):
         # Show spinner immediately, then fetch tree data in a background thread.
@@ -3500,6 +3630,7 @@ class BomPage(QWidget):
         self._tree_build_seq = int(seq)
         self._tree_build_missing_map = missing_map or {}
         self._last_tree_node_count = 0
+        self._invalidate_doc_indicator()
 
         # cache for restore after search
         try:
@@ -4076,32 +4207,67 @@ class BomPage(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to export BOM: {str(e)}")
 
-    def _make_indicator_icon(self, pdf_ok: bool, step_ok: bool, step_present: bool = True) -> QIcon:
-        """Create a compact 2-dot icon: left=PDF, right=STEP. Red when missing/outdated."""
-        size = 14
-        pad = 1
-        dot = 6
+    def _make_indicator_icon(self, pdf_ok, step_ok, step_present: bool = True) -> QIcon:
+        """Create a compact 2-dot icon: left=PDF, right=STEP.
+
+        States: ok=green, ack=blue, bad=red, absent=gray.
+        Bool inputs are still accepted for older call sites.
+        """
+        def _state(value):
+            if isinstance(value, bool):
+                return "ok" if value else "bad"
+            value = str(value or "").lower()
+            return value if value in {"ok", "ack", "bad", "absent"} else "absent"
+
+        pdf_state = _state(pdf_ok)
+        step_state = _state(step_ok)
+        cache_key = (pdf_state, step_state, bool(step_present))
+        try:
+            icon = getattr(self, "_indicator_icon_cache", {}).get(cache_key)
+            if icon:
+                return icon
+        except Exception:
+            self._indicator_icon_cache = {}
+
+        size = 16
+        pad = 2
+        dot = 8
         pm = QPixmap(size * 2 + pad, size)
         pm.fill(Qt.transparent)
 
         painter = QPainter(pm)
         painter.setRenderHint(QPainter.Antialiasing, True)
 
-        def draw_dot(x: int, ok: bool):
-            color = QColor(34, 197, 94) if ok else QColor(239, 68, 68)  # green/red
+        def draw_dot(x: int, state: str):
+            colors = {
+                "ok": QColor(34, 197, 94),
+                "ack": QColor(14, 165, 233),
+                "bad": QColor(239, 68, 68),
+                "absent": QColor(156, 163, 175),
+            }
+            color = colors.get(state, colors["absent"])
             painter.setPen(Qt.NoPen)
             painter.setBrush(color)
             painter.drawEllipse(x, (size - dot) // 2, dot, dot)
+            if state == "ack":
+                painter.setBrush(QColor(255, 255, 255, 210))
+                inner = max(2, dot - 5)
+                painter.drawEllipse(x + (dot - inner) // 2, (size - inner) // 2, inner, inner)
 
         # PDF dot
-        draw_dot(pad, pdf_ok)
+        draw_dot(pad, pdf_state)
 
         # STEP dot (optionally not drawn if you ever want to hide it)
         if step_present:
-            draw_dot(size + pad, step_ok)
+            draw_dot(size + pad, step_state)
 
         painter.end()
-        return QIcon(pm)
+        icon = QIcon(pm)
+        try:
+            self._indicator_icon_cache[cache_key] = icon
+        except Exception:
+            self._indicator_icon_cache = {cache_key: icon}
+        return icon
 
     def _refresh_current_tree_item_indicator(self):
         """Fast refresh of just the selected tree item's PDF/STEP indicator."""
@@ -4113,16 +4279,7 @@ class BomPage(QWidget):
             if not part_id:
                 return
 
-            # Build issues set from current missing_map snapshot (from last sync_bom_files)
-            issues: set = set()
-            try:
-                for bom_id, issue_type, _fn in (self.missing_files or []):
-                    if int(bom_id) == int(part_id):
-                        issues.add(str(issue_type))
-            except Exception:
-                issues = set()
-
-            item.setIcon(0, self._pick_indicator_icon(issues, part_id=int(part_id)))
+            self._refresh_part_in_tree(int(part_id))
             # also refresh details warning banner (if open)
             try:
                 if getattr(self, "current_part_id", None) == part_id:
@@ -4147,14 +4304,12 @@ class BomPage(QWidget):
 
         menu = QMenu(self)
         if file_type in ("PDF", "STEP"):
-            act = QAction(f"Set {file_type} up to date", self)
+            act = QAction(f"Acknowledge {file_type} as safe", self)
 
             def _do():
-                part_mod = self._get_part_modified_dt(int(self.current_part_id))
-                if not part_mod:
-                    return QMessageBox.warning(self, "Up to date", "Part modified timestamp is not available.")
+                ack_target = self._doc_ack_target(int(self.current_part_id), file_type)
                 self.part_doc_ack_service.mark_up_to_date(
-                    int(self.current_part_id), file_type, part_mod.isoformat(sep=" ")
+                    int(self.current_part_id), file_type, ack_target
                 )
                 # fast refresh (avoid full tree rebuild)
                 self._refresh_current_tree_item_indicator()
@@ -4181,14 +4336,12 @@ class BomPage(QWidget):
         file_type = str(getattr(pf, "file_type", "") or "").upper()
         menu = QMenu(self)
         if file_type in ("PDF", "STEP"):
-            act = QAction(f"Set {file_type} up to date", self)
+            act = QAction(f"Acknowledge {file_type} as safe", self)
 
             def _do():
-                part_mod = self._get_part_modified_dt(int(self.current_part_id))
-                if not part_mod:
-                    return QMessageBox.warning(self, "Up to date", "Part modified timestamp is not available.")
+                ack_target = self._doc_ack_target(int(self.current_part_id), file_type)
                 self.part_doc_ack_service.mark_up_to_date(
-                    int(self.current_part_id), file_type, part_mod.isoformat(sep=" ")
+                    int(self.current_part_id), file_type, ack_target
                 )
                 # fast refresh (avoid full tree rebuild)
                 self._refresh_current_tree_item_indicator()

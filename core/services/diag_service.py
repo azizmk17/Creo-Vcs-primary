@@ -23,6 +23,8 @@ class DiagService:
 
     # --- Filesystem ---
     def list_commit_folders(self, commits_dir):
+        if not commits_dir or not os.path.isdir(commits_dir):
+            return []
         folders = []
         for user in os.listdir(commits_dir):
             user_dir = os.path.join(commits_dir, user)
@@ -48,6 +50,8 @@ class DiagService:
         return files
 
     def list_working_parts(self, working_dir):
+        if not working_dir or not os.path.isdir(working_dir):
+            return []
         return [f for f in os.listdir(working_dir) if os.path.isfile(os.path.join(working_dir, f)) and is_creo_file(os.path.join(working_dir, f)) ]
 
     def file_exists(self, path):
@@ -65,6 +69,22 @@ class DiagService:
 
         results = []
         synced, missing, extra = 0, 0, 0
+
+        if not commits_dir or not os.path.isdir(commits_dir):
+            for c in db_commits:
+                results.append((c.commit_id, "Missing", "Commit exists in DB but commits folder does not exist"))
+                missing += 1
+            if not db_commits:
+                results.append((commits_dir or "commits", "Missing", "Commits folder does not exist"))
+                missing += 1
+            return {
+                "rows": results,
+                "summary": {
+                    "synced": synced,
+                    "missing": missing,
+                    "extra": extra
+                }
+            }
 
         print(f"FS Folders: {[f['folder'] for f in fs_commits]}")
 
@@ -130,6 +150,8 @@ class DiagService:
 
 
     def check_working_directory(self, working_dir):
+        if not working_dir or not os.path.isdir(working_dir):
+            return []
         working_files = self.list_working_parts(working_dir)
         approved_commits = self.repo.get_by_status("Approved",self.session.project_id)
         
@@ -333,6 +355,8 @@ class DiagService:
         # return results
 
         #check all files in working directory if they are linked to any bom part with base_file_name or base_drw_name
+        if not working_dir or not os.path.isdir(working_dir):
+            return []
         all_files = os.listdir(working_dir)
         bom_parts = self.bom_repo.get_all(self.session.project_id)
         linked_files = set()
