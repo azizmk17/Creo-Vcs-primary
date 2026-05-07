@@ -22,6 +22,7 @@ class Commit:
     approved_version: Optional[str] = None
     last_snapshot: Optional[int] = None
     committed_at: Optional[str] = None
+    merged_at: Optional[str] = None
     signature: Optional[str] = None
     project_id: Optional[int] = None
     username: str = ""  # Designer username (when joined)
