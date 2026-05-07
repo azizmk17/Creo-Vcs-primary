@@ -185,7 +185,14 @@ class MergeService(BaseService):
                 }
                 result = self.merge_parts(commit_entry)
 
-                db_processing = {"item_id": commit.part_id, "new_filename" : result["new_filename"],  "new_version": result["new_version"], "pr_path" : result["pr_path"]} if result else None
+                db_processing = {
+                    "item_id": commit.part_id,
+                    "commit_id": commit.id,
+                    "part_type": commit.type,
+                    "new_filename": result["new_filename"],
+                    "new_version": result["new_version"],
+                    "pr_path": result["pr_path"],
+                } if result else None
                 if result:
                     merged_entries.append(db_processing)
             else:
@@ -194,9 +201,9 @@ class MergeService(BaseService):
         if merged_entries:
             self.finalize_merge(merged_entries, self.user_id, self.merge_id, message)
             print(f"Merged {len(merged_entries)} commits.")
-            return True
+            return sorted({int(item["item_id"]) for item in merged_entries if item.get("item_id") is not None})
 
-        return False
+        return []
     
 
     @require_permission("merge")
@@ -234,9 +241,9 @@ class MergeService(BaseService):
         if merged_entries:
             self.finalize_merge(merged_entries, self.user_id, self.merge_id, message)
             print(f"Merged {len(merged_entries)} commits.")
-            return True
+            return sorted({int(item["item_id"]) for item in merged_entries if item.get("item_id") is not None})
 
-        return False
+        return []
 
 
    
@@ -284,4 +291,3 @@ class MergeService(BaseService):
         print(f"Finalized merge for entries: {merged_entries}")
 
 
-   

@@ -2370,6 +2370,7 @@ class BomPage(QWidget):
             return
         try:
             self.bom_service.update_part(part_id, {"pdf_path": file_path})
+            self._refresh_part_in_tree(int(part_id))
             QMessageBox.information(self, "Success", "PDF associated with part successfully.")
             self.display_details(part_id)
         except Exception as e:
@@ -2381,6 +2382,7 @@ class BomPage(QWidget):
             return
         try:
             self.bom_service.update_part(part_id, {"step_path": file_path})
+            self._refresh_part_in_tree(int(part_id))
             QMessageBox.information(self, "Success", "STEP associated with part successfully.")
             self.display_details(part_id)
         except Exception as e:
@@ -2493,6 +2495,7 @@ class BomPage(QWidget):
             return
         try:
             self.bom_service.update_part(self.current_part_id, {"pdf_path": ""})
+            self._refresh_part_in_tree(int(self.current_part_id))
             self.display_details(self.current_part_id)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to clear PDF: {e}")
@@ -2502,6 +2505,7 @@ class BomPage(QWidget):
             return
         try:
             self.bom_service.update_part(self.current_part_id, {"step_path": ""})
+            self._refresh_part_in_tree(int(self.current_part_id))
             self.display_details(self.current_part_id)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to clear STEP: {e}")
@@ -2625,8 +2629,8 @@ class BomPage(QWidget):
 
         try:
             self.bom_service.update_part(parent_aes, update_payload)
+            self._refresh_part_in_tree(int(parent_aes))
             QMessageBox.information(self, "Success", "Drawing associated with part successfully.")
-            self.load_tree()
             self.display_details(parent_aes)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to attach drawing: {e}")
@@ -2721,22 +2725,7 @@ class BomPage(QWidget):
         try:
             while self._search_build_queue and processed < 200 and (time.perf_counter() - start) < 0.01:
                 part = self._search_build_queue.popleft()
-                locked_txt = ""
-                if part.get("locked"):
-                    who = (part.get("locked_by_username") or "").strip()
-                    locked_txt = f"In Work ({who})" if who else "In Work"
-                item = QTreeWidgetItem(
-                    [
-                        part.get("name", ""),
-                        locked_txt,
-                        part.get("aes_number", ""),
-                        part.get("type", ""),
-                        str(part.get("revision", "") or ""),
-                        part.get("status", ""),
-                        "",
-                    ]
-                )
-                item.setData(0, Qt.UserRole, part.get("id"))
+                item = self._make_tree_item(part)
                 self._search_tree.addTopLevelItem(item)
                 processed += 1
 
@@ -2759,6 +2748,310 @@ class BomPage(QWidget):
                 pass
             return
 
+    def _issues_for_part(self, part_id: int | None) -> set:
+        issues = set()
+        if part_id is None:
+            return issues
+        try:
+            pid = int(part_id)
+        except Exception:
+            return issues
+        for row in (self.missing_files or []):
+            try:
+                bom_id, issue_type, _filename = row
+                if int(bom_id) == pid:
+                    issues.add(str(issue_type))
+            except Exception:
+                continue
+        return issues
+
+    def _rebuild_missing_ids(self) -> None:
+        ids = set()
+        for row in (self.missing_files or []):
+            try:
+                ids.add(int(row[0]))
+            except Exception:
+                continue
+        self.missing_ids = ids
+
+    def _replace_missing_rows_for_part(self, part_id: int, rows: list | None) -> set:
+        try:
+            pid = int(part_id)
+        except Exception:
+            return set()
+
+        kept = []
+        for row in (self.missing_files or []):
+            try:
+                if int(row[0]) == pid:
+                    continue
+            except Exception:
+                pass
+            kept.append(row)
+
+        new_rows = []
+        for row in (rows or []):
+            try:
+                if int(row[0]) == pid:
+                    new_rows.append(row)
+            except Exception:
+                continue
+
+        self.missing_files = kept + new_rows
+        self._rebuild_missing_ids()
+
+        try:
+            if self._cached_missing_map is not None:
+                if new_rows:
+                    self._cached_missing_map[pid] = {str(row[1]) for row in new_rows}
+                else:
+                    self._cached_missing_map.pop(pid, None)
+        except Exception:
+            pass
+
+        return {str(row[1]) for row in new_rows}
+
+    def _refresh_diagnostic_for_part(self, part_id: int) -> set:
+        rows = []
+        try:
+            if self.working_dir and os.path.isdir(self.working_dir):
+                rows = self.diag_service.sync_bom_part_files(self.working_dir, int(part_id)) or []
+        except Exception:
+            rows = []
+        return self._replace_missing_rows_for_part(int(part_id), rows)
+
+    def _make_tree_item(self, info: dict) -> QTreeWidgetItem:
+        item = QTreeWidgetItem(["", "", "", "", "", "", ""])
+        self._apply_tree_item_data(item, info or {})
+        return item
+
+    def _apply_tree_item_data(self, item: QTreeWidgetItem, info: dict) -> None:
+        part_id = info.get("id")
+        issues = self._issues_for_part(part_id)
+        locked_txt = ""
+        if info.get("locked"):
+            who = str(info.get("locked_by_username") or "").strip()
+            locked_txt = f"In Work ({who})" if who else "In Work"
+
+        item.setText(0, str(info.get("name", "") or ""))
+        item.setText(1, locked_txt)
+        item.setText(2, str(info.get("aes_number", "") or ""))
+        item.setText(3, str(info.get("type", "") or ""))
+        item.setText(4, str(info.get("revision", "") or ""))
+        item.setText(5, str(info.get("status", "") or ""))
+        try:
+            has_issue = int(part_id) in self.missing_ids
+        except Exception:
+            has_issue = False
+        item.setText(6, "!" if has_issue else "")
+        item.setData(0, Qt.UserRole, part_id)
+
+        try:
+            item.setIcon(0, self._pick_indicator_icon(issues, part_id=part_id))
+        except Exception:
+            pass
+
+        try:
+            item.setForeground(1, QBrush())
+            item.setForeground(5, QBrush())
+            status = str(info.get("status", "") or "").lower()
+            if status == "released":
+                item.setForeground(5, QColor(0, 128, 0))
+            elif status == "obsolete":
+                item.setForeground(5, QColor(255, 0, 0))
+            if info.get("locked"):
+                item.setForeground(1, QColor(255, 0, 0))
+        except Exception:
+            pass
+
+    def _iter_tree_items(self, tree_widget: QTreeWidget):
+        stack = []
+        try:
+            for i in range(tree_widget.topLevelItemCount()):
+                stack.append(tree_widget.topLevelItem(i))
+        except Exception:
+            return
+        while stack:
+            item = stack.pop()
+            yield item
+            try:
+                for i in range(item.childCount() - 1, -1, -1):
+                    stack.append(item.child(i))
+            except Exception:
+                continue
+
+    def _find_tree_items(self, part_id: int, tree_widget: QTreeWidget | None = None) -> list:
+        try:
+            pid = int(part_id)
+        except Exception:
+            return []
+        widgets = [tree_widget] if tree_widget is not None else [getattr(self, "tree", None), getattr(self, "_search_tree", None)]
+        matches = []
+        for widget in widgets:
+            if widget is None:
+                continue
+            for item in self._iter_tree_items(widget):
+                try:
+                    if int(item.data(0, Qt.UserRole)) == pid:
+                        matches.append(item)
+                except Exception:
+                    continue
+        return matches
+
+    def _add_node_to_tree(self, tree_widget: QTreeWidget, info: dict, parent_item: QTreeWidgetItem | None = None) -> QTreeWidgetItem:
+        item = self._make_tree_item(info or {})
+        if parent_item is None:
+            tree_widget.addTopLevelItem(item)
+        else:
+            parent_item.addChild(item)
+        for child in (info or {}).get("children", []) or []:
+            self._add_node_to_tree(tree_widget, child, item)
+        return item
+
+    def _node_from_tree_item(self, item: QTreeWidgetItem) -> dict:
+        part_id = item.data(0, Qt.UserRole)
+        try:
+            node = self.bom_service.get_part_details(int(part_id)) or {}
+        except Exception:
+            node = {}
+        if not node:
+            node = {
+                "id": part_id,
+                "name": item.text(0),
+                "aes_number": item.text(2),
+                "type": item.text(3),
+                "revision": item.text(4),
+                "status": item.text(5),
+            }
+        node = dict(node)
+        node["children"] = []
+        for i in range(item.childCount()):
+            node["children"].append(self._node_from_tree_item(item.child(i)))
+        return node
+
+    def _part_matches_current_search(self, info: dict) -> bool:
+        try:
+            query = self.search_input.text().strip().lower()
+        except Exception:
+            query = ""
+        if not query:
+            return False
+        for key in ("aes_number", "name", "part_number"):
+            if query in str(info.get(key, "") or "").lower():
+                return True
+        return False
+
+    def _select_part_item(self, part_id: int) -> None:
+        target_tree = self._search_tree if getattr(self, "_in_search_mode", False) else self.tree
+        matches = self._find_tree_items(part_id, target_tree)
+        if not matches and target_tree is not self.tree:
+            matches = self._find_tree_items(part_id, self.tree)
+            target_tree = self.tree
+        if not matches:
+            return
+        item = matches[0]
+        try:
+            target_tree.setCurrentItem(item)
+            target_tree.scrollToItem(item)
+        except Exception:
+            pass
+
+    def _add_part_to_tree(self, part_id: int) -> dict:
+        self._refresh_diagnostic_for_part(int(part_id))
+        info = self.bom_service.get_part_details(int(part_id)) or {}
+        if not info:
+            return {}
+        info = dict(info)
+        info["children"] = []
+
+        try:
+            if not self._find_tree_items(int(part_id), self.tree):
+                self._add_node_to_tree(self.tree, info)
+        except Exception:
+            pass
+
+        try:
+            if getattr(self, "_in_search_mode", False) and self._part_matches_current_search(info):
+                if not self._find_tree_items(int(part_id), self._search_tree):
+                    self._add_node_to_tree(self._search_tree, info)
+        except Exception:
+            pass
+
+        self._select_part_item(int(part_id))
+        return info
+
+    def _refresh_part_in_tree(self, part_id: int) -> dict:
+        self._refresh_diagnostic_for_part(int(part_id))
+        info = self.bom_service.get_part_details(int(part_id)) or {}
+        if not info:
+            return {}
+        for item in self._find_tree_items(int(part_id)):
+            self._apply_tree_item_data(item, info)
+        return info
+
+    def refresh_parts_after_merge(self, part_ids) -> None:
+        """Refresh only BOM rows affected by a successful merge."""
+        refreshed = set()
+        for part_id in (part_ids or []):
+            try:
+                pid = int(part_id)
+            except Exception:
+                continue
+            if pid in refreshed:
+                continue
+            refreshed.add(pid)
+            self._refresh_part_in_tree(pid)
+
+        try:
+            current = getattr(self, "current_part_id", None)
+            if current is not None and int(current) in refreshed:
+                self.display_details(int(current))
+        except Exception:
+            pass
+
+    def _remove_part_from_tree_widget(self, tree_widget: QTreeWidget, part_id: int, promote_children: bool = False) -> None:
+        matches = self._find_tree_items(int(part_id), tree_widget)
+        promoted = {}
+        if promote_children:
+            for item in matches:
+                for i in range(item.childCount()):
+                    node = self._node_from_tree_item(item.child(i))
+                    try:
+                        child_id = int(node.get("id"))
+                    except Exception:
+                        continue
+                    if child_id != int(part_id):
+                        promoted.setdefault(child_id, node)
+
+        for item in list(matches):
+            parent = item.parent()
+            try:
+                if parent is not None:
+                    parent.removeChild(item)
+                else:
+                    index = tree_widget.indexOfTopLevelItem(item)
+                    if index >= 0:
+                        tree_widget.takeTopLevelItem(index)
+            except Exception:
+                continue
+
+        if promote_children:
+            for child_id, node in promoted.items():
+                if self._find_tree_items(child_id, tree_widget):
+                    continue
+                self._add_node_to_tree(tree_widget, node)
+
+    def _remove_part_from_trees(self, part_id: int) -> None:
+        self._replace_missing_rows_for_part(int(part_id), [])
+        try:
+            self._remove_part_from_tree_widget(self.tree, int(part_id), promote_children=True)
+        except Exception:
+            pass
+        try:
+            self._remove_part_from_tree_widget(self._search_tree, int(part_id), promote_children=False)
+        except Exception:
+            pass
+
     def add_part(self):
         if not self.perm.can("manage_parts"):
             return QMessageBox.warning(self, "Permission", "You do not have permission to add parts.")
@@ -2771,6 +3064,8 @@ class BomPage(QWidget):
             try:
                 added= self.bom_service.add_part(part_data)
                 if type(added) == int:
+                    self._add_part_to_tree(int(added))
+                    self.display_details(int(added))
                     QMessageBox.information(self, "Success", "Part added successfully.")
                     self.window().statusBar().showMessage("Part added successfully.")
                 elif added == "existing":
@@ -2779,9 +3074,6 @@ class BomPage(QWidget):
                 else:
                     QMessageBox.warning(self, "Error", "An unexpected error occurred while adding the part.")
                     self.window().statusBar().showMessage("Adding part failed.")
-                
-                
-                self.load_tree()
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to add part: {str(e)}")
 
@@ -2807,8 +3099,8 @@ class BomPage(QWidget):
                 return
             try:
                 self.bom_service.update_part(id, updated_data)
+                self._refresh_part_in_tree(int(id))
                 QMessageBox.information(self, "Success", "Part updated successfully.")
-                self.load_tree()
                 self.display_details(id)
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to update part: {str(e)}")
@@ -2831,8 +3123,8 @@ class BomPage(QWidget):
         if reply == QMessageBox.Yes:
             try:
                 self.bom_service.delete_part(id)
+                self._remove_part_from_trees(int(id))
                 QMessageBox.information(self, "Success", "Part deleted successfully.")
-                self.load_tree()
                 self.clear_details()
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to delete part: {str(e)}")
@@ -3418,6 +3710,8 @@ class BomPage(QWidget):
                 self.show_alert(" | ".join(missing_msgs), "warning", "details")
             else:
                 self.hide_alert("details")
+        else:
+            self.hide_alert("details")
 
         # Details table
         self.details_table.setRowCount(len(details))
@@ -3517,6 +3811,7 @@ class BomPage(QWidget):
             info_lbl.setStyleSheet("color: #4b5563; font-size: 12px; border: none; background: transparent;")
             h_lay.addWidget(info_lbl)
         commit_unique_id = str(ev_data.get("commit_unique_id", "") or "")
+        db_commit_info = None
         if commit_unique_id and commit_unique_id != "":
             try:
                 project_id = getattr(self.session, "project_id", None)
@@ -3526,8 +3821,6 @@ class BomPage(QWidget):
                         db_commit_info = db_commit
             except Exception:
                 db_commit_info = None
-        else:
-            db_commit_info = None
 
 
         # --- Add extra commit-related info ---

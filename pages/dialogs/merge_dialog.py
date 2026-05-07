@@ -87,8 +87,12 @@ class MergeDialog(QDialog):
             return
 
         # ✅ use IDs directly
-        if (self.merge_service.excute_merge(selected_ids, message)):
-            self.parent().refresh()
+        affected_part_ids = self.merge_service.excute_merge(selected_ids, message)
+        if affected_part_ids:
+            parent = self.parent()
+            if hasattr(parent, "_refresh_bom_rows_for_parts"):
+                parent._refresh_bom_rows_for_parts(affected_part_ids)
+            parent.refresh()
             QMessageBox.information(self, "Merge Complete", f"Merged {selected_ids} commits to Master.")
             self.accept()
 
