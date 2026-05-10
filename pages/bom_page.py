@@ -5,10 +5,10 @@ from PyQt5.QtWidgets import (
     QHeaderView, QAbstractItemView, QTextEdit, QComboBox, QSpinBox, QDateTimeEdit,
     QMessageBox, QInputDialog, QFileDialog, QMenu, QAction, QDialog, QDialogButtonBox, QFrame,
     QPlainTextEdit, QStackedWidget, QSizePolicy,
-    QGraphicsDropShadowEffect
+    QGraphicsDropShadowEffect, QToolTip, QStyledItemDelegate, QStyle, QStyleOptionViewItem,
 )
-from PyQt5.QtCore import Qt, QDateTime, pyqtSignal, QTimer, QObject, QThread, QSize
-from PyQt5.QtGui import QColor, QPen, QFont, QBrush
+from PyQt5.QtCore import Qt, QDateTime, pyqtSignal, QTimer, QObject, QThread, QSize, QRect, QEvent
+from PyQt5.QtGui import QColor, QPen, QFont, QBrush, QCursor, QPalette, QFontMetrics
 from datetime import datetime, timedelta
 from pages.part_dialog import PartDialog
 from collections import deque, Counter, defaultdict
@@ -102,6 +102,494 @@ class InlineSpinner(QWidget):
         start = int(self._angle * 16)
         span = int(120 * 16)
         painter.drawArc(r, start, span)
+
+
+# Role storing the optional "In Work" / "In Work (user)" suffix (painted beside name in column 0).
+BOM_TREE_INWORK_ROLE = Qt.UserRole + 33
+BOM_TREE_IS_ASSEMBLY_ROLE = Qt.UserRole + 35
+# Value: dict with "pdf" / "step" -> tuple (kind: str, tooltip: str); kind in ok|outdated|missing|na
+BOM_TREE_FILES_ROLE = Qt.UserRole + 36
+# Value: dict { "state": "ok"|"warn", "tooltip": str }
+BOM_TREE_INTEGRITY_ROLE = Qt.UserRole + 37
+
+# Inline "In Work" beside name (spec)
+_BOM_INWORK_COLOR = QColor("#BA7517")
+_BOM_INWORK_GAP_PX = 6
+_BOM_TREE_SEL_BG = "#e8eefc"
+_BOM_TREE_ROW_TEXT = "#111827"
+
+_FILE_BADGE_STYLES = {
+    "ok": {
+        "bg": "#EAF3DE", "fg": "#3B6D11", "dot": "#639922", "dash": False,
+    },
+    "outdated": {
+        "bg": "#FAEEDA", "fg": "#854F0B", "dot": "#BA7517", "dash": False,
+    },
+    "missing": {
+        "bg": "#FCEBEB", "fg": "#A32D2D", "dot": "#E24B4A", "dash": False,
+    },
+    "na": {
+        "bg": "#F0F0F0", "fg": "#888888", "dot": "#AAAAAA", "dash": True,
+    },
+}
+
+_STATUS_BADGE_STYLES = {
+    "released": {"bg": "#EAF3DE", "fg": "#3B6D11"},
+    "design": {"bg": "#E6F1FB", "fg": "#185FA5"},
+    "in work": {"bg": "#FAEEDA", "fg": "#854F0B"},
+    "obsolete": {"bg": "#F5F5F5", "fg": "#888888"},
+}
+# Modest corner radius — full pill (rx = half height) makes long labels look oblong.
+_STATUS_BADGE_CORNER_RADIUS = 6
+
+
+def _normalize_file_badge(doc_key: str, issues: set, doc_info: dict) -> tuple[str, str]:
+    """Map PDF/STEP indicator state + integrity issues to badge kind and tooltip."""
+    miss = f"missing_{doc_key}"
+    out = f"outdated_{doc_key}"
+    if miss in issues:
+        tip = str((doc_info or {}).get("tooltip") or f"{doc_key.upper()}: missing — no file attached to this revision")
+        return "missing", tip
+    if out in issues:
+        tip = str((doc_info or {}).get("tooltip") or f"{doc_key.upper()}: outdated — file is not the latest in working directory")
+        return "outdated", tip
+    state = str((doc_info or {}).get("state") or "absent").lower()
+    tip = str((doc_info or {}).get("tooltip") or f"{doc_key.upper()}: unknown")
+    tl = tip.lower()
+    if state == "ok":
+        return "ok", tip
+    if state == "ack":
+        return "ok", tip
+    if state == "absent":
+        return "na", tip
+    if state == "bad":
+        if "no attachment" in tl:
+            return "missing", tip
+        if "outdated" in tl or "newer" in tl or "review" in tl or "not the latest" in tl:
+            return "outdated", tip
+        if "missing" in tl:
+            return "missing", tip
+        return "outdated", tip
+    return "na", tip
+
+
+def _file_badges_payload(part_id, issues: set, summary: dict) -> dict:
+    pdf_i = (summary or {}).get("pdf") or {}
+    step_i = (summary or {}).get("step") or {}
+    pk, pt = _normalize_file_badge("pdf", issues, pdf_i)
+    sk, st = _normalize_file_badge("step", issues, step_i)
+    return {"pdf": (pk, pt), "step": (sk, st)}
+
+
+def _integrity_payload(part_id, missing_files, missing_ids: set) -> dict:
+    lines = []
+    try:
+        pid = int(part_id)
+    except Exception:
+        pid = None
+    if pid is not None:
+        for row in (missing_files or []):
+            try:
+                bom_id, issue_type, filename = row
+                if int(bom_id) != pid:
+                    continue
+                fn = str(filename or "")
+                it = str(issue_type or "")
+                if it == "missing_file":
+                    lines.append(f"Missing file: {fn}")
+                elif it == "outdated_file":
+                    lines.append(f"Outdated file: {fn} is not the latest version in working directory.")
+                elif it == "missing_drawing":
+                    lines.append(f"Missing drawing: {fn}")
+                elif it == "missing_pdf":
+                    lines.append(f"Missing PDF: {fn}")
+                elif it == "missing_step":
+                    lines.append(f"Missing STEP: {fn}")
+                else:
+                    lines.append(f"{it}: {fn}".strip(": "))
+            except Exception:
+                continue
+    warn = bool(lines) or (pid is not None and pid in (missing_ids or set()))
+    if not warn:
+        tip = "No integrity issues detected for this item."
+    elif lines:
+        tip = "\n".join(lines)
+    else:
+        tip = "BOM structure mismatch between PDF drawing and current assembly."
+    return {"state": "warn" if warn else "ok", "tooltip": tip}
+
+
+def _status_badge_key(raw: str) -> str | None:
+    s = (raw or "").strip().lower()
+    if not s:
+        return None
+    if "release" in s:
+        return "released"
+    if "obsolete" in s:
+        return "obsolete"
+    if "design" in s or "draft" in s:
+        return "design"
+    if "work" in s or "check" in s or "wip" in s:
+        return "in work"
+    return None
+
+
+def _paint_file_pill(painter: QPainter, rect: QRect, label: str, kind: str) -> int:
+    st = _FILE_BADGE_STYLES.get(kind, _FILE_BADGE_STYLES["na"])
+    bg = QColor(st["bg"])
+    fg = QColor(st["fg"])
+    dot_col = QColor(st["dot"])
+
+    f = QFont(painter.font())
+    f.setPixelSize(10)
+    f.setBold(True)
+    painter.setFont(f)
+    fm = QFontMetrics(f)
+    text = (label or "").upper()
+    dot_r = 5
+    gap_after_dot = 4
+    pad_h = 6
+    pad_v = 2
+    inner_w = dot_r + gap_after_dot + fm.horizontalAdvance(text)
+    w = inner_w + pad_h * 2
+    h = max(fm.height() + pad_v * 2, dot_r + pad_v * 2)
+    pill = QRect(rect.left(), rect.center().y() - h // 2, w, h)
+
+    painter.save()
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    if st.get("dash"):
+        pen = QPen(QColor("#CCCCCC"))
+        pen.setStyle(Qt.DashLine)
+        pen.setWidthF(0.5)
+        painter.setPen(pen)
+        painter.setBrush(QColor(st["bg"]))
+        painter.drawRoundedRect(pill, 4, 4)
+    else:
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(bg)
+        painter.drawRoundedRect(pill, 4, 4)
+
+    cx = pill.left() + pad_h + dot_r // 2
+    cy = pill.center().y()
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(dot_col)
+    painter.drawEllipse(QRect(cx - dot_r // 2, cy - dot_r // 2, dot_r, dot_r))
+
+    painter.setPen(fg)
+    painter.setFont(f)
+    text_rect = QRect(
+        pill.left() + pad_h + dot_r + gap_after_dot,
+        pill.top(),
+        pill.width() - (pad_h * 2 + dot_r + gap_after_dot),
+        pill.height(),
+    )
+    painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, text)
+    painter.restore()
+    return w
+
+
+def _files_delegate_pill_rects(option_rect: QRect, payload: dict) -> tuple[QRect | None, QRect | None]:
+    pdf = payload.get("pdf") or ("na", "")
+    step = payload.get("step") or ("na", "")
+    r = option_rect.adjusted(4, 0, -4, 0)
+    f = QFont()
+    f.setPixelSize(10)
+    f.setBold(True)
+    fm = QFontMetrics(f)
+
+    def _pill_w(kind: str, label: str) -> int:
+        text = label.upper()
+        dot_r = 5
+        gap_after_dot = 4
+        pad_h = 6
+        pad_v = 2
+        inner_w = dot_r + gap_after_dot + fm.horizontalAdvance(text)
+        return inner_w + pad_h * 2
+
+    w_pdf = _pill_w(pdf[0], "PDF")
+    w_step = _pill_w(step[0], "STEP")
+    gap = 4
+    h = max(20, fm.height() + 4)
+    y = r.center().y() - h // 2
+    x0 = r.left()
+    pdf_rect = QRect(x0, y, w_pdf, h)
+    step_rect = QRect(x0 + w_pdf + gap, y, w_step, h)
+    return pdf_rect, step_rect
+
+
+class _BomTreeNameDelegate(QStyledItemDelegate):
+    """Renders part name + optional inline 'In Work' label in column 0."""
+
+    def __init__(self, tree: QTreeWidget, parent=None):
+        super().__init__(parent)
+        self._tree = tree
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index):
+        if index.column() != 0:
+            return super().paint(painter, option, index)
+
+        item = self._tree.itemFromIndex(index)
+        if item is None:
+            return super().paint(painter, option, index)
+
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        name = item.text(0) or ""
+        suffix = item.data(0, BOM_TREE_INWORK_ROLE) or ""
+        widget = opt.widget or self._tree
+        style = widget.style()
+
+        opt.text = ""
+        painter.save()
+        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
+        painter.restore()
+
+        text_rect = style.subElementRect(QStyle.SE_ItemViewItemText, opt, widget)
+        if text_rect.width() <= 0:
+            text_rect = opt.rect
+
+        # Keep normal (dark) text on selection — do not use HighlightedText (often white on blue).
+        name_pen = QColor(_BOM_TREE_ROW_TEXT)
+
+        is_asm = bool(item.data(0, BOM_TREE_IS_ASSEMBLY_ROLE)) or item.childCount() > 0
+        name_font = QFont(opt.font)
+        name_font.setPixelSize(13)
+        name_font.setBold(bool(is_asm))
+        display_inwork = "In Work" if suffix else ""
+
+        painter.save()
+        painter.setFont(name_font)
+        painter.setPen(name_pen)
+
+        fm = QFontMetrics(name_font)
+        if display_inwork:
+            suf_font = QFont(opt.font)
+            suf_font.setPixelSize(10)
+            suf_font.setBold(False)
+            suf_font.setWeight(QFont.Normal)
+            suf_fm = QFontMetrics(suf_font)
+            half = max(48, text_rect.width() // 2)
+            suf_elided = suf_fm.elidedText(display_inwork, opt.textElideMode, half)
+            suf_w = suf_fm.horizontalAdvance(suf_elided)
+            name_max = max(24, text_rect.width() - _BOM_INWORK_GAP_PX - suf_w)
+            name_elided = fm.elidedText(name, opt.textElideMode, name_max)
+        else:
+            suf_font = None
+            suf_elided = ""
+            name_elided = fm.elidedText(name, opt.textElideMode, text_rect.width())
+
+        painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, name_elided)
+        name_w = fm.horizontalAdvance(name_elided)
+
+        if display_inwork and suf_font is not None:
+            painter.setFont(suf_font)
+            suf_rect = QRect(
+                text_rect.left() + name_w + _BOM_INWORK_GAP_PX,
+                text_rect.top(),
+                max(0, text_rect.right() - (text_rect.left() + name_w + _BOM_INWORK_GAP_PX)),
+                text_rect.height(),
+            )
+            painter.setPen(_BOM_INWORK_COLOR)
+            painter.drawText(suf_rect, Qt.AlignVCenter | Qt.AlignLeft, suf_elided)
+        painter.restore()
+
+    def sizeHint(self, option: QStyleOptionViewItem, index):
+        sh = super().sizeHint(option, index)
+        if index.column() != 0:
+            return sh
+        item = self._tree.itemFromIndex(index)
+        if not item:
+            return sh
+        suffix = item.data(0, BOM_TREE_INWORK_ROLE) or ""
+        if not suffix:
+            return sh
+        suf_font = QFont(option.font)
+        suf_font.setPixelSize(10)
+        extra = _BOM_INWORK_GAP_PX + QFontMetrics(suf_font).horizontalAdvance("In Work")
+        return QSize(sh.width() + extra, max(sh.height(), 28, QFontMetrics(suf_font).height()))
+
+
+class _BomTreeFilesDelegate(QStyledItemDelegate):
+    """PDF + STEP pill badges in column 1."""
+
+    def __init__(self, tree: QTreeWidget, parent=None):
+        super().__init__(parent)
+        self._tree = tree
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index):
+        if index.column() != 1:
+            return super().paint(painter, option, index)
+        item = self._tree.itemFromIndex(index)
+        if item is None:
+            return super().paint(painter, option, index)
+
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.text = ""
+        opt.icon = QIcon()
+        widget = opt.widget or self._tree
+        style = widget.style()
+        painter.save()
+        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
+        painter.restore()
+
+        payload = item.data(1, BOM_TREE_FILES_ROLE) or {}
+        pdf = payload.get("pdf") or ("na", "")
+        step = payload.get("step") or ("na", "")
+        r = opt.rect.adjusted(4, 0, -4, 0)
+        x = r.left()
+        x += _paint_file_pill(painter, QRect(x, r.top(), 0, r.height()), "PDF", pdf[0])
+        x += 4
+        _paint_file_pill(painter, QRect(x, r.top(), 0, r.height()), "STEP", step[0])
+
+    def helpEvent(self, event, view, option, index):
+        if event.type() != QEvent.ToolTip or index.column() != 1:
+            return super().helpEvent(event, view, option, index)
+        item = self._tree.itemFromIndex(index)
+        if not item:
+            return super().helpEvent(event, view, option, index)
+        payload = item.data(1, BOM_TREE_FILES_ROLE) or {}
+        pdf_rect, step_rect = _files_delegate_pill_rects(option.rect, payload)
+        try:
+            pos = view.viewport().mapFromGlobal(event.globalPos())
+        except Exception:
+            try:
+                pos = event.pos()
+            except Exception:
+                return super().helpEvent(event, view, option, index)
+        pdf = payload.get("pdf") or ("na", "PDF: unknown")
+        step = payload.get("step") or ("na", "STEP: unknown")
+        tip = ""
+        if pdf_rect.contains(pos):
+            tip = str(pdf[1] or "")
+        elif step_rect.contains(pos):
+            tip = str(step[1] or "")
+        if tip:
+            QToolTip.showText(event.globalPos(), tip, view)
+            return True
+        return super().helpEvent(event, view, option, index)
+
+
+class _BomTreeStatusDelegate(QStyledItemDelegate):
+    """Status column as a pill badge."""
+
+    def __init__(self, tree: QTreeWidget, parent=None):
+        super().__init__(parent)
+        self._tree = tree
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index):
+        if index.column() != 5:
+            return super().paint(painter, option, index)
+        item = self._tree.itemFromIndex(index)
+        if item is None:
+            return super().paint(painter, option, index)
+
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.text = ""
+        widget = opt.widget or self._tree
+        style = widget.style()
+        painter.save()
+        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
+        painter.restore()
+
+        raw = (item.text(5) or "").strip()
+        key = _status_badge_key(raw)
+        if not key:
+            painter.save()
+            painter.setPen(opt.palette.color(QPalette.Text))
+            f = QFont(opt.font)
+            f.setPixelSize(11)
+            painter.setFont(f)
+            painter.drawText(opt.rect.adjusted(6, 0, -6, 0), Qt.AlignVCenter | Qt.AlignLeft, raw)
+            painter.restore()
+            return
+
+        st = _STATUS_BADGE_STYLES[key]
+        bg = QColor(st["bg"])
+        fg = QColor(st["fg"])
+        f = QFont(opt.font)
+        f.setPixelSize(11)
+        painter.setFont(f)
+        fm = QFontMetrics(f)
+        label = raw or key.title()
+        pad_h, pad_v = 10, 2
+        w = fm.horizontalAdvance(label) + pad_h * 2
+        h = fm.height() + pad_v * 2
+        pill = QRect(
+            opt.rect.left() + 6,
+            opt.rect.center().y() - h // 2,
+            min(w, opt.rect.width() - 12),
+            h,
+        )
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(bg)
+        rr = min(_STATUS_BADGE_CORNER_RADIUS, max(2, pill.height() // 2))
+        painter.drawRoundedRect(pill, rr, rr)
+        painter.setPen(fg)
+        painter.setFont(f)
+        painter.drawText(pill, Qt.AlignCenter, label)
+        painter.restore()
+
+    def helpEvent(self, event, view, option, index):
+        if event.type() != QEvent.ToolTip or index.column() != 5:
+            return super().helpEvent(event, view, option, index)
+        item = self._tree.itemFromIndex(index)
+        if item and (item.text(5) or "").strip():
+            QToolTip.showText(event.globalPos(), item.text(5), view)
+            return True
+        return super().helpEvent(event, view, option, index)
+
+
+class _BomTreeIntegrityDelegate(QStyledItemDelegate):
+    """Integrity column: checkmark or warning."""
+
+    def __init__(self, tree: QTreeWidget, parent=None):
+        super().__init__(parent)
+        self._tree = tree
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index):
+        if index.column() != 6:
+            return super().paint(painter, option, index)
+        item = self._tree.itemFromIndex(index)
+        if item is None:
+            return super().paint(painter, option, index)
+
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.text = ""
+        widget = opt.widget or self._tree
+        style = widget.style()
+        painter.save()
+        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
+        painter.restore()
+
+        payload = item.data(6, BOM_TREE_INTEGRITY_ROLE) or {"state": "ok"}
+        state = str(payload.get("state") or "ok")
+        sym = "✓" if state == "ok" else "⚠"
+        col = QColor("#639922") if state == "ok" else QColor("#BA7517")
+        f = QFont(opt.font)
+        f.setPixelSize(14)
+        painter.save()
+        painter.setFont(f)
+        painter.setPen(col)
+        painter.drawText(opt.rect, Qt.AlignCenter, sym)
+        painter.restore()
+
+    def helpEvent(self, event, view, option, index):
+        if event.type() != QEvent.ToolTip or index.column() != 6:
+            return super().helpEvent(event, view, option, index)
+        item = self._tree.itemFromIndex(index)
+        if not item:
+            return super().helpEvent(event, view, option, index)
+        payload = item.data(6, BOM_TREE_INTEGRITY_ROLE) or {}
+        tip = str(payload.get("tooltip") or "")
+        if tip:
+            QToolTip.showText(event.globalPos(), tip, view)
+            return True
+        return super().helpEvent(event, view, option, index)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1284,19 +1772,53 @@ class BomPage(QWidget):
         # Add to your layout, e.g. at the top of your main layout
         left_layout.addWidget(filter_btn)
 
-        # Tree
-        tree_group = QGroupBox("BOM Structure")
+        # Tree (BOM structure)
+        tree_group = QFrame()
+        tree_group.setStyleSheet("QFrame { background-color: #F5F5F5; border: none; }")
         tree_layout = QVBoxLayout(tree_group)
+        tree_layout.setContentsMargins(8, 8, 8, 8)
+        tree_layout.setSpacing(6)
+        bom_header = QLabel("BOM STRUCTURE")
+        bom_header.setStyleSheet("""
+            QLabel {
+                font-size: 11px;
+                font-weight: 700;
+                color: #6b7280;
+                letter-spacing: 0.08em;
+                background: transparent;
+                border: none;
+                padding: 0px;
+            }
+        """)
+        tree_layout.addWidget(bom_header)
+
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Name", "", "AES Number", "Type", "Rev", "Status", "integrity"])
-        self.tree.setColumnWidth(0, 260)
-        self.tree.setColumnWidth(1, 70)
-        self.tree.setColumnWidth(2, 140)
-        self.tree.setColumnWidth(3, 70)
-        self.tree.setColumnWidth(4, 50)
+        try:
+            self.tree.setIconSize(QSize(16, 16))
+        except Exception:
+            pass
+        try:
+            self.tree.setIndentation(18)
+            self.tree.setAnimated(True)
+            self.tree.setAlternatingRowColors(True)
+            self.tree.setUniformRowHeights(True)
+            self.tree.setMouseTracking(True)
+            self.tree.itemEntered.connect(self._on_tree_item_entered)
+        except Exception:
+            pass
+        self.tree.setHeaderLabels(["Name", "Files", "AES Number", "Type", "Rev", "Status", "Integrity"])
+        self.tree.setColumnWidth(0, 280)
+        self.tree.setColumnWidth(1, 100)
+        self.tree.setColumnWidth(2, 90)
+        self.tree.setColumnWidth(3, 60)
+        self.tree.setColumnWidth(4, 40)
         self.tree.setColumnWidth(5, 90)
-        self.tree.setColumnWidth(6, 40)
+        self.tree.setColumnWidth(6, 55)
         self.tree.itemClicked.connect(self.on_tree_item_clicked)
+        try:
+            self.tree.itemDoubleClicked.connect(self._on_tree_item_double_clicked)
+        except Exception:
+            pass
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.show_tree_context_menu)
 
@@ -1313,54 +1835,122 @@ class BomPage(QWidget):
         # Search-results tree — shown instead of self.tree while a search is active.
         # self.tree is never cleared or rebuilt due to search; switching is a pure UI swap.
         self._search_tree = QTreeWidget()
-        self._search_tree.setHeaderLabels(["Name", "", "AES Number", "Type", "Rev", "Status", "integrity"])
-        self._search_tree.setColumnWidth(0, 260)
-        self._search_tree.setColumnWidth(1, 70)
-        self._search_tree.setColumnWidth(2, 140)
-        self._search_tree.setColumnWidth(3, 70)
-        self._search_tree.setColumnWidth(4, 50)
+        try:
+            self._search_tree.setIconSize(QSize(16, 16))
+        except Exception:
+            pass
+        try:
+            self._search_tree.setIndentation(18)
+            self._search_tree.setAnimated(True)
+            self._search_tree.setAlternatingRowColors(True)
+            self._search_tree.setUniformRowHeights(True)
+            self._search_tree.setMouseTracking(True)
+            self._search_tree.itemEntered.connect(self._on_tree_item_entered)
+        except Exception:
+            pass
+        self._search_tree.setHeaderLabels(["Name", "Files", "AES Number", "Type", "Rev", "Status", "Integrity"])
+        self._search_tree.setColumnWidth(0, 280)
+        self._search_tree.setColumnWidth(1, 100)
+        self._search_tree.setColumnWidth(2, 90)
+        self._search_tree.setColumnWidth(3, 60)
+        self._search_tree.setColumnWidth(4, 40)
         self._search_tree.setColumnWidth(5, 90)
-        self._search_tree.setColumnWidth(6, 40)
+        self._search_tree.setColumnWidth(6, 55)
         self._search_tree.itemClicked.connect(self.on_tree_item_clicked)
+        try:
+            self._search_tree.itemDoubleClicked.connect(self._on_tree_item_double_clicked)
+        except Exception:
+            pass
         self._search_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._search_tree.customContextMenuRequested.connect(self.show_tree_context_menu)
         self._tree_stack.addWidget(self._search_tree)          # index 2
+
+        _bom_tree_qss = f"""
+            QTreeWidget {{
+                background: #FFFFFF;
+                border: 1px solid #d1d5db;
+                border-radius: 6px;
+                font-size: 13px;
+                gridline-color: #e5e7eb;
+                font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", system-ui, sans-serif;
+                font-weight: 400;
+                letter-spacing: 0;
+                text-transform: none;
+                show-decoration-selected: 1;
+            }}
+            QHeaderView::section {{
+                background-color: #EEEEEE;
+                font-size: 11px;
+                color: #374151;
+                font-weight: 700;
+                text-transform: uppercase;
+                border-bottom: 0.5px solid #DDDDDD;
+                padding: 6px;
+                border-right: 1px solid #d1d5db;
+            }}
+            QTreeWidget::item {{
+                height: 28px;
+                border: none;
+                border-bottom: 1px solid #EEEEEE;
+                background: #FFFFFF;
+                color: {_BOM_TREE_ROW_TEXT};
+            }}
+            QTreeWidget::item:alternate {{
+                background: #FAFAFA;
+            }}
+            QTreeWidget::item:hover {{
+                background: #f3f4f6;
+            }}
+            QTreeWidget::item:selected {{
+                background: {_BOM_TREE_SEL_BG};
+                color: {_BOM_TREE_ROW_TEXT};
+            }}
+            QTreeWidget::item:selected:active {{
+                background: {_BOM_TREE_SEL_BG};
+                color: {_BOM_TREE_ROW_TEXT};
+            }}
+            QTreeWidget::branch:selected {{
+                background: {_BOM_TREE_SEL_BG};
+            }}
+            QTreeWidget::branch:selected:alternate {{
+                background: {_BOM_TREE_SEL_BG};
+            }}
+        """
+        self.tree.setStyleSheet(_bom_tree_qss)
+        self._search_tree.setStyleSheet(_bom_tree_qss)
+
+        def _bom_tree_sel_palette(w):
+            try:
+                pal = w.palette()
+                cbg = QColor(_BOM_TREE_SEL_BG)
+                cfg = QColor(_BOM_TREE_ROW_TEXT)
+                for cg in (QPalette.Active, QPalette.Inactive):
+                    pal.setColor(cg, QPalette.Highlight, cbg)
+                    pal.setColor(cg, QPalette.HighlightedText, cfg)
+                w.setPalette(pal)
+            except Exception:
+                pass
+
+        for _tw in (self.tree, self._search_tree):
+            try:
+                _tw.setShowDecorationSelected(True)
+            except Exception:
+                pass
+            _bom_tree_sel_palette(_tw)
+
+        self.tree.setItemDelegateForColumn(0, _BomTreeNameDelegate(self.tree, self.tree))
+        self.tree.setItemDelegateForColumn(1, _BomTreeFilesDelegate(self.tree, self.tree))
+        self.tree.setItemDelegateForColumn(5, _BomTreeStatusDelegate(self.tree, self.tree))
+        self.tree.setItemDelegateForColumn(6, _BomTreeIntegrityDelegate(self.tree, self.tree))
+        self._search_tree.setItemDelegateForColumn(0, _BomTreeNameDelegate(self._search_tree, self._search_tree))
+        self._search_tree.setItemDelegateForColumn(1, _BomTreeFilesDelegate(self._search_tree, self._search_tree))
+        self._search_tree.setItemDelegateForColumn(5, _BomTreeStatusDelegate(self._search_tree, self._search_tree))
+        self._search_tree.setItemDelegateForColumn(6, _BomTreeIntegrityDelegate(self._search_tree, self._search_tree))
 
         self._tree_stack.setCurrentIndex(1)
 
         tree_layout.addWidget(self._tree_stack)
         left_layout.addWidget(tree_group)
-
-        
-        # Apply style
-        self.tree.setStyleSheet("""
-            QTreeWidget {
-                background: #ffffff;
-                border: 1px solid #d1d5db;
-                border-radius: 6px;
-                font-size: 14px;
-                gridline-color: #e5e7eb;
-            }
-            QHeaderView::section {
-                background-color: #f3f4f6;
-                color: #374151;
-                font-weight: bold;
-                border: none;
-                padding: 6px;
-                border-right: 1px solid #d1d5db;
-            }
-            QTreeWidget::item {
-                padding: 6px;
-            }
-            QTreeWidget::item:hover {
-                background: #f3f4f6;
-            }
-            QTreeWidget::item:selected {
-                background: #2563eb;
-                color: white;
-                border-radius: 4px;
-            }
-        """)
 
         # Right panel
         right_widget = QWidget()
@@ -1600,14 +2190,31 @@ class BomPage(QWidget):
     # Context menu / tree actions
     # -------------------------
     def show_tree_context_menu(self, position):
-        item = self.tree.itemAt(position)
+        tree = self.sender()
+        if not isinstance(tree, QTreeWidget):
+            tree = self.tree
+        item = tree.itemAt(position)
         if not item:
             return
-        
+
         item_id = item.data(0, Qt.UserRole)
         menu = QMenu()
-        view_action = QAction("View Details", self)
+
+        open_pdf_act = QAction("Open PDF", self)
+        open_pdf_act.triggered.connect(lambda _=False, pid=item_id: self.open_part_pdf(int(pid)))
+        open_step_act = QAction("Open STEP", self)
+        open_step_act.triggered.connect(lambda _=False, pid=item_id: self.open_part_step(int(pid)))
+        view_action = QAction("View Item Details", self)
         view_action.triggered.connect(lambda: self.display_details(item_id))
+        refresh_files_act = QAction("Refresh Files", self)
+        refresh_files_act.triggered.connect(lambda _=False, pid=item_id: self._refresh_part_in_tree(int(pid)))
+
+        menu.addAction(open_pdf_act)
+        menu.addAction(open_step_act)
+        menu.addAction(view_action)
+        menu.addSeparator()
+        menu.addAction(refresh_files_act)
+        menu.addSeparator()
         edit_action = QAction("Edit Part", self)
         edit_action.triggered.connect(lambda: self.edit_part(item_id))
         delete_action = QAction("Delete Part", self)
@@ -1620,7 +2227,6 @@ class BomPage(QWidget):
         view_3d_action = QAction("🔬 View STEP in 3D Viewer", self)
         view_3d_action.triggered.connect(lambda: self._open_step_in_3d_viewer(item_id))
 
-        menu.addAction(view_action)
         if self.perm.can("manage_parts"):
             menu.addAction(edit_action)
             menu.addAction(delete_action)
@@ -1732,7 +2338,7 @@ class BomPage(QWidget):
         except Exception:
             pass
 
-        menu.exec_(self.tree.viewport().mapToGlobal(position))
+        menu.exec_(tree.viewport().mapToGlobal(position))
 
     
     def show_advanced_filter_dialog(self):
@@ -1786,8 +2392,8 @@ class BomPage(QWidget):
 
     def apply_bom_tree_filter(self, status: str, user_label: int | None):
         def filter_item(item):
-            # Status filter
-            locked_txt = item.text(1).lower()
+            # Status filter (inline lock label lives on column 0 / BOM_TREE_INWORK_ROLE)
+            locked_txt = ((item.data(0, BOM_TREE_INWORK_ROLE) or "") + " " + (item.text(0) or "")).lower()
             if status == "Checked In" and "in work" not in locked_txt:
                 return False
             # User filter
@@ -2890,40 +3496,32 @@ class BomPage(QWidget):
             locked_txt = f"In Work ({who})" if who else "In Work"
 
         item.setText(0, str(info.get("name", "") or ""))
-        item.setText(1, locked_txt)
+        item.setData(0, BOM_TREE_INWORK_ROLE, locked_txt)
+        is_asm = bool((info.get("children") or [])) or item.childCount() > 0
+        item.setData(0, BOM_TREE_IS_ASSEMBLY_ROLE, is_asm)
+        item.setText(1, "")
         item.setText(2, str(info.get("aes_number", "") or ""))
         item.setText(3, str(info.get("type", "") or ""))
         item.setText(4, str(info.get("revision", "") or ""))
         item.setText(5, str(info.get("status", "") or ""))
-        try:
-            has_issue = int(part_id) in self.missing_ids
-        except Exception:
-            has_issue = False
-        item.setText(6, "!" if has_issue else "")
+        item.setText(6, "")
         item.setData(0, Qt.UserRole, part_id)
 
         try:
             summary = self._indicator_summary_for_part(part_id, issues)
-            item.setIcon(0, self._pick_indicator_icon(issues, part_id=part_id))
-            tip = "\n".join([
+            item.setData(1, BOM_TREE_FILES_ROLE, _file_badges_payload(part_id, issues, summary))
+            item.setData(6, BOM_TREE_INTEGRITY_ROLE, _integrity_payload(part_id, self.missing_files, self.missing_ids))
+            item.setIcon(0, QIcon())
+            tips0 = []
+            if locked_txt:
+                tips0.append(locked_txt)
+            tips0.append(str(summary["pdf"].get("tooltip", "PDF: unknown")))
+            tips0.append(str(summary["step"].get("tooltip", "STEP: unknown")))
+            item.setToolTip(0, "\n".join(tips0))
+            item.setToolTip(1, "\n".join([
                 str(summary["pdf"].get("tooltip", "PDF: unknown")),
                 str(summary["step"].get("tooltip", "STEP: unknown")),
-            ])
-            item.setToolTip(0, tip)
-            item.setToolTip(6, tip)
-        except Exception:
-            pass
-
-        try:
-            item.setForeground(1, QBrush())
-            item.setForeground(5, QBrush())
-            status = str(info.get("status", "") or "").lower()
-            if status == "released":
-                item.setForeground(5, QColor(0, 128, 0))
-            elif status == "obsolete":
-                item.setForeground(5, QColor(255, 0, 0))
-            if info.get("locked"):
-                item.setForeground(1, QColor(255, 0, 0))
+            ]))
         except Exception:
             pass
 
@@ -2942,6 +3540,20 @@ class BomPage(QWidget):
                     stack.append(item.child(i))
             except Exception:
                 continue
+
+    def _on_tree_item_entered(self, item: QTreeWidgetItem, column: int) -> None:
+        """Show explicit tooltip when hovering a tree item (works around platform quirks)."""
+        try:
+            if item is None:
+                return
+            if column in (1, 5, 6):
+                return
+            tip = item.toolTip(column) or item.toolTip(0) or ""
+            if tip:
+                tw = item.treeWidget()
+                QToolTip.showText(QCursor.pos(), tip, tw or self.tree)
+        except Exception:
+            pass
 
     def _find_tree_items(self, part_id: int, tree_widget: QTreeWidget | None = None) -> list:
         try:
@@ -3193,9 +3805,9 @@ class BomPage(QWidget):
                 QMessageBox.critical(self, "Error", f"Failed to delete part: {str(e)}")
 
     def _refresh_current_tree_item_lock_state(self, part_id: int | None = None):
-        """Fast refresh of just the selected tree item's lock state ('In Work' column).
+        """Fast refresh of just the selected tree item's lock state (inline 'In Work' beside name).
 
-        Updates column 1 text + its foreground color based on latest DB state.
+        Updates BOM_TREE_INWORK_ROLE on column 0 based on latest DB state.
         """
         try:
             item = self.tree.currentItem()
@@ -3209,14 +3821,10 @@ class BomPage(QWidget):
             locked = bool(info.get("locked"))
             who = str(info.get("locked_by_username") or "").strip()
             if locked:
-                item.setText(1, f"In Work ({who})" if who else "In Work")
+                item.setData(0, BOM_TREE_INWORK_ROLE, f"In Work ({who})" if who else "In Work")
             else:
-                item.setText(1, "")
-            if locked:
-                item.setForeground(1, QColor(255, 0, 0))
-            else:
-                # reset to default (black)
-                item.setForeground(1, QColor(0, 0, 0))
+                item.setData(0, BOM_TREE_INWORK_ROLE, "")
+            item.setText(1, "")
         except Exception:
             pass
 
@@ -3685,11 +4293,6 @@ class BomPage(QWidget):
                 except Exception:
                     issues = set()
 
-                if info.get("id") in self.missing_ids:
-                    errorSymbole = "⚠️ "
-                else:
-                    errorSymbole = ""
-
                 locked_txt = ""
                 if info.get("locked"):
                     who = str(info.get("locked_by_username") or "").strip()
@@ -3698,30 +4301,34 @@ class BomPage(QWidget):
                 item = QTreeWidgetItem(
                     [
                         info.get("name", ""),
-                        locked_txt,
+                        "",
                         info.get("aes_number", ""),
                         info.get("type", ""),
                         str(info.get("revision", "") or ""),
                         info.get("status", ""),
-                        errorSymbole,
+                        "",
                     ]
                 )
-
+                item.setData(0, BOM_TREE_INWORK_ROLE, locked_txt)
+                item.setData(0, BOM_TREE_IS_ASSEMBLY_ROLE, bool((info.get("children") or [])))
                 try:
-                    item.setIcon(0, self._pick_indicator_icon(issues, part_id=part_id))
+                    summary = self._indicator_summary_for_part(part_id, issues)
+                    item.setData(1, BOM_TREE_FILES_ROLE, _file_badges_payload(part_id, issues, summary))
+                    item.setData(6, BOM_TREE_INTEGRITY_ROLE, _integrity_payload(part_id, self.missing_files, self.missing_ids))
+                    item.setIcon(0, QIcon())
+                    _tips0 = ([locked_txt] if locked_txt else []) + [
+                        str(summary["pdf"].get("tooltip", "PDF: unknown")),
+                        str(summary["step"].get("tooltip", "STEP: unknown")),
+                    ]
+                    item.setToolTip(0, "\n".join(_tips0))
+                    item.setToolTip(1, "\n".join([
+                        str(summary["pdf"].get("tooltip", "PDF: unknown")),
+                        str(summary["step"].get("tooltip", "STEP: unknown")),
+                    ]))
                 except Exception:
                     pass
 
                 item.setData(0, Qt.UserRole, info.get("id"))
-
-                status = info.get("status", "").lower()
-                if status == "released":
-                    item.setForeground(5, QColor(0, 128, 0))
-                elif status == "obsolete":
-                    item.setForeground(5, QColor(255, 0, 0))
-
-                if info.get("locked"):
-                    item.setForeground(1, QColor(255, 0, 0))
 
                 if parent_item is None:
                     self.tree.addTopLevelItem(item)
@@ -3812,6 +4419,16 @@ class BomPage(QWidget):
     def on_tree_item_clicked(self, item, column):
         item_id = item.data(0, Qt.UserRole)
         self.display_details(item_id)
+
+    def _on_tree_item_double_clicked(self, item, column):
+        item_id = item.data(0, Qt.UserRole)
+        if not item_id:
+            return
+        self.display_details(item_id)
+        try:
+            self.tabs.setCurrentIndex(0)
+        except Exception:
+            pass
 
     def display_details(self, item_id):
         self.current_part_id = item_id
@@ -4198,7 +4815,9 @@ class BomPage(QWidget):
                     f.write("AES,Name,Type,Status\n")
                     # iterate top level
                     def recurse(item):
-                        f.write(f'{item.text(0)},{item.text(1)},{item.text(2)},{item.text(3)}\n')
+                        f.write(
+                            f'{item.text(0)},{item.text(2)},{item.text(3)},{item.text(5)}\n'
+                        )
                         for i in range(item.childCount()):
                             recurse(item.child(i))
                     for i in range(self.tree.topLevelItemCount()):
@@ -4208,10 +4827,10 @@ class BomPage(QWidget):
             QMessageBox.critical(self, "Error", f"Failed to export BOM: {str(e)}")
 
     def _make_indicator_icon(self, pdf_ok, step_ok, step_present: bool = True) -> QIcon:
-        """Create a compact 2-dot icon: left=PDF, right=STEP.
+        """Create a clearer 2-part badge icon: left=PDF, right=STEP.
 
-        States: ok=green, ack=blue, bad=red, absent=gray.
-        Bool inputs are still accepted for older call sites.
+        Each side is a small rounded badge labeled with 'PDF' / 'STEP'.
+        Colors: ok=green, ack=blue, bad=red, absent=gray. Keeps cache for speed.
         """
         def _state(value):
             if isinstance(value, bool):
@@ -4229,37 +4848,56 @@ class BomPage(QWidget):
         except Exception:
             self._indicator_icon_cache = {}
 
-        size = 16
-        pad = 2
-        dot = 8
-        pm = QPixmap(size * 2 + pad, size)
+        # Badge dimensions (wide enough for short label)
+        h = 12
+        badge_w = 24
+        gap = 2
+        total_w = badge_w * 2 + gap if step_present else badge_w
+        pm = QPixmap(total_w, h)
         pm.fill(Qt.transparent)
 
         painter = QPainter(pm)
         painter.setRenderHint(QPainter.Antialiasing, True)
 
-        def draw_dot(x: int, state: str):
-            colors = {
-                "ok": QColor(34, 197, 94),
-                "ack": QColor(14, 165, 233),
-                "bad": QColor(239, 68, 68),
-                "absent": QColor(156, 163, 175),
-            }
-            color = colors.get(state, colors["absent"])
+        colors = {
+            "ok": QColor(34, 197, 94),    # green
+            "ack": QColor(14, 165, 233),  # blue
+            "bad": QColor(239, 68, 68),   # red
+            "absent": QColor(156, 163, 175),
+        }
+
+        def draw_badge(x: int, label: str, state: str):
+            bg = colors.get(state, colors["absent"])
             painter.setPen(Qt.NoPen)
-            painter.setBrush(color)
-            painter.drawEllipse(x, (size - dot) // 2, dot, dot)
+            painter.setBrush(bg)
+            rect = QRect(x, 0, badge_w, h)
+            painter.drawRoundedRect(rect, 3, 3)
+
+            # Text color: white for colored states, dark for absent
+            if state == "absent":
+                text_color = QColor(55, 65, 81)
+            else:
+                text_color = QColor(255, 255, 255)
+
+            f = painter.font()
+            f.setPointSize(6)
+            f.setBold(True)
+            painter.setFont(f)
+            painter.setPen(text_color)
+            painter.drawText(rect, Qt.AlignCenter, label)
+
+            # ACK state: small inner ring to indicate acknowledged
             if state == "ack":
-                painter.setBrush(QColor(255, 255, 255, 210))
-                inner = max(2, dot - 5)
-                painter.drawEllipse(x + (dot - inner) // 2, (size - inner) // 2, inner, inner)
+                painter.setPen(QColor(255, 255, 255, 200))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRoundedRect(rect.adjusted(3, 3, -3, -3), 4, 4)
 
-        # PDF dot
-        draw_dot(pad, pdf_state)
+        # Draw PDF badge (left)
+        draw_badge(0, "PDF", pdf_state)
 
-        # STEP dot (optionally not drawn if you ever want to hide it)
+        # Draw STEP badge (right) if present
         if step_present:
-            draw_dot(size + pad, step_state)
+            draw_badge(badge_w + gap, "STEP", step_state)
 
         painter.end()
         icon = QIcon(pm)
