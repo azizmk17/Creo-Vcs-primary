@@ -146,8 +146,8 @@ class PackageExportService:
 
             if pdf_path and os.path.exists(pdf_path):
                 # Build dst name: drawingNumber - aesNumber - name(with underscores) - note - YYYYMMDD
-                drawing_no = getattr(part, "drawing_number", None) or getattr(part, "drawing", None) or ""
-                aes = part_info.get("aes_number") or str(pid)
+                drawing_no = getattr(part, "drawing_number", None) or ""
+                aes = part_info.get("aes_number") or ""
                 pname = part_info.get("name") or ""
                 # normalize name and note to underscores between words
                 def _norm(s: Optional[str]) -> str:
@@ -178,8 +178,8 @@ class PackageExportService:
             
             if step_path and os.path.exists(step_path):
                 # Build dst name: drawingNumber - aesNumber - name(with underscores) - note - YYYYMMDD
-                drawing_no = getattr(part, "drawing_number", None) or getattr(part, "drawing", None) or ""
-                aes = part_info.get("aes_number") or str(pid)
+                drawing_no = getattr(part, "drawing_number", None) or ""
+                aes = part_info.get("aes_number") or ""
                 pname = part_info.get("name") or ""
                 # normalize name and note to underscores between words
                 def _norm(s: Optional[str]) -> str:
