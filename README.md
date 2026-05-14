@@ -222,3 +222,11 @@ Schema (high-level tables):
 ## Notes
 
 This project is evolving toward “PLM-lite”: controlled releases, revision discipline, auditable baselines, and reproducible delivery packages—without the overhead of a full PLM system.
+
+
+---
+
+## To do
+
++ fix export package file naming
++ add issues tab and flag in the bom tree
