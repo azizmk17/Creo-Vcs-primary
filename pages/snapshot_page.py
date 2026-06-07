@@ -278,6 +278,10 @@ class SnapshotPage(QWidget):
         text_html += format_section("🟥 Removed Files", diff["removed"], "red")
         text_html += format_section("🟨 Modified Files", diff["modified"], "orange")
 
+        text_html += format_section("Issues Added", diff.get("issue_added", []), "#b91c1c")
+        text_html += format_section("Issues Removed", diff.get("issue_removed", []), "#2e7d32")
+        text_html += format_section("Issue State Changed", diff.get("issue_changed", []), "#a16207")
+
         # Create dialog
         dlg = QDialog(self)
         dlg.setWindowTitle("Snapshot Comparison Result")

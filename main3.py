@@ -33,6 +33,7 @@ def _run_migrations_safely():
 #import pages
 from pages.bom_page import BomPage
 from pages.commit_page import CommitPage
+from pages.issue_page import EngineeringIssuePage
 from pages.diag_page import DiagPage
 from pages.admin_page import AdminPage
 from pages.snapshot_page import SnapshotPage
@@ -360,14 +361,20 @@ class BomGUI(QMainWindow):
         # Add pages
         self.bom_page = BomPage(self.bom_service)
         self.commit_page = CommitPage(self.bom_service)
+        self.issue_page = EngineeringIssuePage()
         self.diag_page = DiagPage()
         self.admin_page = AdminPage()
         self.snap_page = SnapshotPage()
         self.pages.addWidget(self.bom_page)
         self.pages.addWidget(self.commit_page)
+        self.pages.addWidget(self.issue_page)
         self.pages.addWidget(self.diag_page)
         self.pages.addWidget(self.admin_page)
         self.pages.addWidget(self.snap_page)
+        self.bom_page.issue_requested.connect(self.open_issues_for_part)
+        self.bom_page.create_issue_requested.connect(self.create_issue_for_part)
+        self.issue_page.issue_changed.connect(self.bom_page.load_tree)
+        self.issue_page.issue_changed.connect(self.commit_page._refresh_resolved_issues)
 
         
 
@@ -438,6 +445,10 @@ class BomGUI(QMainWindow):
         commit_action.triggered.connect(lambda: self.switch_page(1))
         toolbar.addAction(commit_action)
 
+        issue_action = QAction("Issue Center", self)
+        issue_action.triggered.connect(lambda: self.switch_page(2))
+        toolbar.addAction(issue_action)
+
         toolbar.addSeparator()
 
         # Refresh button
@@ -455,18 +466,18 @@ class BomGUI(QMainWindow):
         toolbar.addSeparator()
 
         diag_action = QAction("Diagnostic", self)
-        diag_action.triggered.connect(lambda: self.switch_page(2))
+        diag_action.triggered.connect(lambda: self.switch_page(3))
         toolbar.addAction(diag_action)
 
         snap_action = QAction("Snapshots", self)
-        snap_action.triggered.connect(lambda: self.switch_page(4))
+        snap_action.triggered.connect(lambda: self.switch_page(5))
         toolbar.addAction(snap_action)
 
         # Admin page button — only visible to admin-level users
         # Uses UIPermissionHelper so it covers both is_admin DB flag and "admin" role name
         if UIPermissionHelper().can("admin_panel"):
             admin_action = QAction("Admin", self)
-            admin_action.triggered.connect(lambda: self.switch_page(3))
+            admin_action.triggered.connect(lambda: self.switch_page(4))
             toolbar.addAction(admin_action)
 
         toolbar.addSeparator()
@@ -721,8 +732,16 @@ class BomGUI(QMainWindow):
 
     def switch_page(self, index):
         self.pages.setCurrentIndex(index)
-        page_names = ["BOM", "Commit","Diagnostic", "Admin", "Snapshot"]
+        page_names = ["BOM", "Commit", "Issue Center", "Diagnostic", "Admin", "Snapshot"]
         self.statusBar().showMessage(f"Switched to {page_names[index]} page")
+
+    def open_issues_for_part(self, part_id):
+        self.issue_page.open_for_part(int(part_id))
+        self.switch_page(2)
+
+    def create_issue_for_part(self, part_id):
+        self.issue_page.create_for_part(int(part_id))
+        self.switch_page(2)
 
     def _launch_cad_viewer(self):
         """Open the Advanced CAD Viewer as a standalone subprocess (pyoccenv)."""
@@ -751,6 +770,9 @@ class BomGUI(QMainWindow):
             self.statusBar().showMessage("BOM refreshed")
         elif current_index == 1:
             self.statusBar().showMessage("Commit page refreshed")
+        elif current_index == 2:
+            self.issue_page.refresh()
+            self.statusBar().showMessage("Issue Center refreshed")
 
         self.reload_main_window()
 

@@ -63,7 +63,11 @@ def _table_columns(conn, table_name: str) -> list:
 def _ensure_column(conn, table_name: str, column_name: str, column_def_sql: str):
     cols = _table_columns(conn, table_name)
     if column_name not in cols:
-        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_def_sql}")
+        try:
+            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_def_sql}")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
 
 
 def _migration_5(conn):
@@ -349,6 +353,144 @@ def _migration_10(conn):
             pass
 
 
+def _migration_13(conn):
+    """Upgrade legacy engineering-issue tables without deleting existing issue data."""
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "issues" not in tables:
+        return
+
+    original_issue_cols = set(_table_columns(conn, "issues"))
+    for name, definition in (
+        ("issue_number", "issue_number TEXT"),
+        ("priority", "priority TEXT"),
+        ("closed_by", "closed_by INTEGER"),
+        ("closed_at", "closed_at TEXT"),
+        ("archived", "archived INTEGER NOT NULL DEFAULT 0"),
+        ("archive_reason", "archive_reason TEXT"),
+        ("source_type", "source_type TEXT"),
+        ("source_key", "source_key TEXT"),
+    ):
+        _ensure_column(conn, "issues", name, definition)
+
+    issue_cols = set(_table_columns(conn, "issues"))
+    if "issue_key" in issue_cols:
+        conn.execute(
+            """
+            UPDATE issues SET issue_number=COALESCE(
+                NULLIF(TRIM(issue_number), ''), NULLIF(TRIM(issue_key), ''),
+                printf('ISS-%06d', id)
+            )
+            WHERE issue_number IS NULL OR TRIM(issue_number)=''
+            """
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE issues SET issue_number=COALESCE(
+                NULLIF(TRIM(issue_number), ''), printf('ISS-%06d', id)
+            )
+            WHERE issue_number IS NULL OR TRIM(issue_number)=''
+            """
+        )
+
+    if "severity" in issue_cols and "priority" not in original_issue_cols:
+        conn.execute(
+            """
+            UPDATE issues SET priority=CASE UPPER(COALESCE(severity, ''))
+                WHEN 'CRITICAL' THEN 'Critical'
+                WHEN 'HIGH' THEN 'High'
+                WHEN 'MEDIUM' THEN 'Medium'
+                WHEN 'LOW' THEN 'Low'
+                WHEN 'INFO' THEN 'Low'
+                ELSE COALESCE(NULLIF(priority, ''), 'Medium')
+            END
+            """
+        )
+    conn.execute("UPDATE issues SET priority='Medium' WHERE priority IS NULL OR TRIM(priority)=''")
+    conn.execute(
+        """
+        UPDATE issues SET status=CASE UPPER(REPLACE(COALESCE(status, ''), ' ', '_'))
+            WHEN 'OPEN' THEN 'Open'
+            WHEN 'IN_PROGRESS' THEN 'In Progress'
+            WHEN 'WAITING_VALIDATION' THEN 'Ready For Validation'
+            WHEN 'READY_FOR_VALIDATION' THEN 'Ready For Validation'
+            WHEN 'VALIDATED' THEN 'Ready For Validation'
+            WHEN 'CLOSED' THEN 'Closed'
+            WHEN 'REJECTED' THEN 'Rejected'
+            ELSE COALESCE(NULLIF(status, ''), 'Open')
+        END
+        WHERE status IS NULL OR TRIM(status)='' OR status IN (
+            'OPEN', 'IN_PROGRESS', 'WAITING_VALIDATION', 'READY_FOR_VALIDATION',
+            'VALIDATED', 'CLOSED', 'REJECTED'
+        )
+        """
+    )
+    if "fixed_by" in issue_cols:
+        conn.execute(
+            "UPDATE issues SET closed_by=fixed_by "
+            "WHERE status='Closed' AND closed_by IS NULL AND fixed_by IS NOT NULL"
+        )
+    if "resolved_at" in issue_cols:
+        conn.execute(
+            "UPDATE issues SET closed_at=resolved_at "
+            "WHERE status='Closed' AND closed_at IS NULL AND resolved_at IS NOT NULL"
+        )
+    elif "fixed_at" in issue_cols:
+        conn.execute(
+            "UPDATE issues SET closed_at=fixed_at "
+            "WHERE status='Closed' AND closed_at IS NULL AND fixed_at IS NOT NULL"
+        )
+
+    if "part_id" in issue_cols and "issue_parts" in tables:
+        conn.execute(
+            """
+            INSERT INTO issue_parts(issue_id, part_id, linked_by, linked_at)
+            SELECT i.id, i.part_id, i.created_by, COALESCE(i.created_at, datetime('now'))
+            FROM issues i
+            WHERE i.part_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM issue_parts ip
+                  WHERE ip.issue_id=i.id AND ip.part_id=i.part_id
+              )
+            """
+        )
+
+    if "issue_comments" in tables:
+        _ensure_column(conn, "issue_comments", "comment", "comment TEXT")
+        _ensure_column(conn, "issue_comments", "user_id", "user_id INTEGER")
+        comment_cols = set(_table_columns(conn, "issue_comments"))
+        if "body" in comment_cols:
+            conn.execute("UPDATE issue_comments SET comment=body WHERE comment IS NULL")
+        if "created_by" in comment_cols:
+            conn.execute("UPDATE issue_comments SET user_id=created_by WHERE user_id IS NULL")
+
+    if "issue_attachments" in tables:
+        _ensure_column(conn, "issue_attachments", "created_at", "created_at TEXT")
+        if "uploaded_at" in set(_table_columns(conn, "issue_attachments")):
+            conn.execute("UPDATE issue_attachments SET created_at=uploaded_at WHERE created_at IS NULL")
+
+    if "issue_history" in tables:
+        _ensure_column(conn, "issue_history", "user_id", "user_id INTEGER")
+        if "actor_id" in set(_table_columns(conn, "issue_history")):
+            conn.execute("UPDATE issue_history SET user_id=actor_id WHERE user_id IS NULL")
+
+    conn.executescript(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_issues_issue_number ON issues(issue_number);
+        CREATE INDEX IF NOT EXISTS idx_issues_project_status ON issues(project_id, status, archived);
+        CREATE INDEX IF NOT EXISTS idx_issues_project_priority ON issues(project_id, priority, archived);
+        CREATE INDEX IF NOT EXISTS idx_issues_assigned_to ON issues(assigned_to, status, archived);
+        CREATE INDEX IF NOT EXISTS idx_issues_due_date ON issues(due_date, status, archived);
+        CREATE INDEX IF NOT EXISTS idx_issue_parts_part ON issue_parts(part_id, issue_id);
+        CREATE INDEX IF NOT EXISTS idx_issue_history_issue ON issue_history(issue_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_issue_commit_links_commit ON issue_commit_links(commit_id);
+        CREATE INDEX IF NOT EXISTS idx_issue_comments_issue ON issue_comments(issue_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_issue_attachments_issue ON issue_attachments(issue_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_issue_notifications_user ON issue_notifications(user_id, is_read, created_at);
+        """
+    )
+
+
 MIGRATIONS = {
     1: """
     CREATE TABLE IF NOT EXISTS users (
@@ -571,6 +713,119 @@ CREATE TABLE IF NOT EXISTS app_metadata (
     value TEXT NOT NULL
 );
 """,
+
+    12: """
+CREATE TABLE IF NOT EXISTS issues (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_number TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'Open',
+    priority TEXT NOT NULL DEFAULT 'Medium',
+    category TEXT NOT NULL DEFAULT 'Design',
+    created_by INTEGER,
+    assigned_to INTEGER,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    due_date TEXT,
+    project_id INTEGER NOT NULL,
+    closed_by INTEGER,
+    closed_at TEXT,
+    archived INTEGER NOT NULL DEFAULT 0,
+    archive_reason TEXT,
+    source_type TEXT,
+    source_key TEXT,
+    FOREIGN KEY (created_by) REFERENCES users(id),
+    FOREIGN KEY (assigned_to) REFERENCES users(id),
+    FOREIGN KEY (project_id) REFERENCES projects(id),
+    FOREIGN KEY (closed_by) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS issue_parts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id INTEGER NOT NULL,
+    part_id INTEGER NOT NULL,
+    linked_by INTEGER,
+    linked_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(issue_id, part_id),
+    FOREIGN KEY (issue_id) REFERENCES issues(id),
+    FOREIGN KEY (part_id) REFERENCES bom(id),
+    FOREIGN KEY (linked_by) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS issue_comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id INTEGER NOT NULL,
+    user_id INTEGER,
+    comment TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (issue_id) REFERENCES issues(id),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS issue_commit_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id INTEGER NOT NULL,
+    commit_id TEXT NOT NULL,
+    resolution_comment TEXT DEFAULT '',
+    linked_by INTEGER,
+    linked_at TEXT NOT NULL DEFAULT (datetime('now')),
+    validation_status TEXT NOT NULL DEFAULT 'Pending',
+    validated_by INTEGER,
+    validated_at TEXT,
+    validation_comment TEXT DEFAULT '',
+    UNIQUE(issue_id, commit_id),
+    FOREIGN KEY (issue_id) REFERENCES issues(id),
+    FOREIGN KEY (linked_by) REFERENCES users(id),
+    FOREIGN KEY (validated_by) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS issue_attachments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id INTEGER NOT NULL,
+    file_name TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    uploaded_by INTEGER,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (issue_id) REFERENCES issues(id),
+    FOREIGN KEY (uploaded_by) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS issue_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    field_name TEXT,
+    old_value TEXT,
+    new_value TEXT,
+    user_id INTEGER,
+    details_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (issue_id) REFERENCES issues(id),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS issue_notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    message TEXT NOT NULL,
+    is_read INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    read_at TEXT,
+    FOREIGN KEY (issue_id) REFERENCES issues(id),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+INSERT OR IGNORE INTO permissions(name) VALUES ('manage_issues');
+INSERT OR IGNORE INTO permissions(name) VALUES ('validate_issues');
+INSERT OR IGNORE INTO permissions(name) VALUES ('archive_issues');
+INSERT OR IGNORE INTO role_permissions(role_id, permission_id)
+SELECT r.id, p.id FROM roles r, permissions p
+WHERE r.name IN ('admin','master') AND p.name IN ('manage_issues','validate_issues','archive_issues');
+INSERT OR IGNORE INTO role_permissions(role_id, permission_id)
+SELECT r.id, p.id FROM roles r, permissions p
+WHERE r.name = 'checker' AND p.name IN ('manage_issues','validate_issues');
+INSERT OR IGNORE INTO role_permissions(role_id, permission_id)
+SELECT r.id, p.id FROM roles r, permissions p
+WHERE r.name = 'designer' AND p.name = 'manage_issues';
+""",
+
+    13: _migration_13,
 
 }
 
