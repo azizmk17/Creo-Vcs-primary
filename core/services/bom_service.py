@@ -732,6 +732,8 @@ class BomService(BaseService):
         self.bom_repo.set_revision(part_id, revision)
 
     def release_part(self, part_id: int):
+        from core.services.issue_service import IssueService
+        IssueService().assert_no_critical_issues([int(part_id)], operation="release", include_children=True)
         self.bom_repo.release_part(part_id, released_by=self.user_id)
 
     # -------------------------------

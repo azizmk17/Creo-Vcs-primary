@@ -9,6 +9,7 @@ Desktop (PyQt5) application for managing a Creo-based BOM with a lightweight, PL
 - Release controls + alphabetic revisions
 - Baselines (freeze exact released deliverables for reproducible exports)
 - Delivery package export (PDF/STEP) with a `manifest.json` (+ optional ZIP)
+- BOM-integrated engineering issues, commit resolution claims, validation, risk propagation, and release gates
 
 This repository is intentionally “DB-first”: most features are backed by SQLite tables and surfaced in the UI.
 
@@ -62,6 +63,7 @@ Pages (stacked navigation):
 - `pages/bom_page.py`: BOM browser/editor + Files tab (attachments, versions, baselines, exports)
 - `pages/commit_page.py`: commit queue and validation/merge flow
 - `pages/snapshot_page.py`: project snapshots
+- `pages/issue_page.py`: engineering Issue Center
 - `pages/admin_page.py`: users/roles/permissions and project administration
 - `pages/diag_page.py`: diagnostics
 - `pages/login_page.py`: authentication
@@ -195,6 +197,9 @@ Schema (high-level tables):
 - PLM-lite: `roles`, `permissions`, `user_roles`, `role_permissions`
 - Baselines: `baselines`, `baseline_files`
 - Snapshots: `snapshots`
+- Engineering issues: `issues`, `issue_parts`, `issue_comments`, `issue_commit_links`, `issue_attachments`, `issue_history`
+
+Detailed issue architecture and workflows: [`docs/issue_management.md`](docs/issue_management.md).
 
 ---
 

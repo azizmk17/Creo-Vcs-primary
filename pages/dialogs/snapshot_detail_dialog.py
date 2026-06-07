@@ -83,11 +83,29 @@ class SnapshotDetailDialog(QDialog):
 
         working_dir = snapshot_data.get("working_dir", "(unknown directory)")
         files = snapshot_data.get("files", [])
+        issue_state = snapshot_data.get("issue_state") or {}
+        issue_summary = issue_state.get("summary") or {}
 
         # Add working directory info
         dir_item = QTreeWidgetItem(["Working Directory:", working_dir])
         self.tree.addTopLevelItem(dir_item)
         self.tree.addTopLevelItem(QTreeWidgetItem([""]))  # spacer
+
+        issues_item = QTreeWidgetItem([
+            "Engineering Issues",
+            f"Open: {int(issue_summary.get('open_count') or 0)}",
+            f"Critical: {int(issue_summary.get('critical_count') or 0)}",
+            f"Closed: {int(issue_summary.get('closed_count') or 0)}",
+        ])
+        self.tree.addTopLevelItem(issues_item)
+        for issue in issue_state.get("issues", []):
+            issues_item.addChild(QTreeWidgetItem([
+                issue.get("issue_number", ""),
+                issue.get("priority", ""),
+                issue.get("status", ""),
+                issue.get("title", ""),
+            ]))
+        self.tree.addTopLevelItem(QTreeWidgetItem([""]))
 
         # Add header
         header_item = QTreeWidgetItem(["Filename", "Size (KB)", "Modified", "Checksum"])

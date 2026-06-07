@@ -87,7 +87,11 @@ class MergeDialog(QDialog):
             return
 
         # ✅ use IDs directly
-        affected_part_ids = self.merge_service.excute_merge(selected_ids, message)
+        try:
+            affected_part_ids = self.merge_service.excute_merge(selected_ids, message)
+        except Exception as exc:
+            QMessageBox.warning(self, "Merge Blocked", str(exc))
+            return
         if affected_part_ids:
             parent = self.parent()
             if hasattr(parent, "_refresh_bom_rows_for_parts"):

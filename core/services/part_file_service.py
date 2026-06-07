@@ -212,6 +212,14 @@ class PartFileService:
         return self.repo.get_version_by_id(pf.active_version_id)
 
     def release_version(self, version_id: int):
+        version = self.repo.get_version_by_id(version_id)
+        if version:
+            part_file = self.repo.get_file_by_id(version.file_id)
+            if part_file:
+                from core.services.issue_service import IssueService
+                IssueService().assert_no_critical_issues(
+                    [int(part_file.part_id)], operation="release file", include_children=True
+                )
         self.repo.release_version(version_id, released_by=self.session.user_id)
 
     def delete_version(self, file_id: int, version_id: int):

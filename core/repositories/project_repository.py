@@ -512,6 +512,9 @@ class ProjectRepository:
                             except Exception:
                                 pass
 
+                # Preserve issue identity and traceability across the new project revision.
+                self._duplicate_issue_part_links(conn, bom_id_map)
+
                 # Duplicate vault metadata (attachments) so the new revision keeps file history.
                 tables = set(self._list_tables(conn))
                 if bom_id_map and "part_files" in tables and "part_file_versions" in tables:
@@ -620,6 +623,32 @@ class ProjectRepository:
     def _list_tables(self, conn):
         rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         return [r[0] for r in rows]
+
+    def _duplicate_issue_part_links(self, conn, bom_id_map):
+        """Carry issue identity across project revisions by linking it to remapped BOM rows."""
+        if not bom_id_map or "issue_parts" not in set(self._list_tables(conn)):
+            return
+        placeholders = ",".join("?" for _ in bom_id_map)
+        rows = conn.execute(
+            f"SELECT * FROM issue_parts WHERE part_id IN ({placeholders})",
+            tuple(int(x) for x in bom_id_map.keys()),
+        ).fetchall()
+        cols = set(self._table_columns(conn, "issue_parts"))
+        for row in rows:
+            data = dict(row)
+            mapped_part_id = bom_id_map.get(int(data["part_id"]))
+            if mapped_part_id is None:
+                continue
+            names = ["issue_id", "part_id"]
+            values = [int(data["issue_id"]), int(mapped_part_id)]
+            for optional in ("linked_by", "linked_at"):
+                if optional in cols:
+                    names.append(optional)
+                    values.append(data.get(optional))
+            conn.execute(
+                f"INSERT OR IGNORE INTO issue_parts({','.join(names)}) VALUES({','.join('?' for _ in names)})",
+                values,
+            )
 
     def _table_columns(self, conn, table_name):
         # basic identifier safety
@@ -756,6 +785,9 @@ class ProjectRepository:
                                 self._insert_row_from_row(
                                     conn, rel_table, rel_cols, rrd, overrides=overrides, id_col="id"
                                 )
+
+                # Preserve issue identity on duplicated BOM rows.
+                self._duplicate_issue_part_links(conn, bom_id_map)
 
                 # 5) Duplicate commits (remap part_id if present)
                 if commit_tables:

@@ -31,6 +31,7 @@ from core.services.ui_permission import UIPermissionHelper
 from core.services.role_service import RoleService
 from core.services.project_service import ProjectService
 from core.session_manager import SessionManager
+from core.services.issue_service import IssueService
 
 from utils import is_creo_file, ensure_dir_exists
 
@@ -515,6 +516,7 @@ class CommitPage(QWidget):
         self.commit_service = CommitService()
         self.bom_service = bom_service
         self.project_service = ProjectService()
+        self.issue_service = IssueService()
 
         self.merge_repo = MergeRepository()
         self.uncommitted_parts = []
@@ -740,6 +742,14 @@ class CommitPage(QWidget):
         step_lay.addLayout(step_file_row)
 
         meta_lay.addRow("STEP:", step_frame)
+
+        self.resolved_issues_list = QListWidget()
+        self.resolved_issues_list.setMaximumHeight(115)
+        self.resolved_issues_list.setAlternatingRowColors(True)
+        self.resolved_issues_list.setToolTip(
+            "Select active engineering issues addressed by this commit."
+        )
+        meta_lay.addRow("Resolved Issues:", self.resolved_issues_list)
         left_splitter.addWidget(meta_group)
 
         top_layout.addWidget(left_splitter, 2)
@@ -933,6 +943,30 @@ class CommitPage(QWidget):
         n = len(self.uncommitted_parts)
         self._staged_count_lbl.setText(f"{n} file{'s' if n != 1 else ''} staged")
         self._stat_staged.set_value(str(n))
+        self._refresh_resolved_issues()
+
+    def _refresh_resolved_issues(self):
+        if not hasattr(self, "resolved_issues_list"):
+            return
+        checked = {
+            int(self.resolved_issues_list.item(i).data(Qt.UserRole))
+            for i in range(self.resolved_issues_list.count())
+            if self.resolved_issues_list.item(i).checkState() == Qt.Checked
+        }
+        self.resolved_issues_list.clear()
+        try:
+            paths = [p["path"] for p in self.uncommitted_parts]
+            issues = self.issue_service.active_issues_for_paths(paths)
+        except Exception:
+            issues = []
+        for issue in issues:
+            item = QListWidgetItem(
+                f"{issue['issue_number']}  {issue['title']}  [{issue['priority']}]"
+            )
+            item.setData(Qt.UserRole, int(issue["id"]))
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if int(issue["id"]) in checked else Qt.Unchecked)
+            self.resolved_issues_list.addItem(item)
 
     def _update_dashboard_stats(self):
         cache = getattr(self, "_history_cache", []) or []
@@ -1369,6 +1403,21 @@ class CommitPage(QWidget):
             parts_list.addItem(item)
         main.addWidget(parts_list)
 
+        related_issues = group.get("related_issues") or []
+        issue_checks = QListWidget()
+        if related_issues:
+            main.addWidget(QLabel("<b style='font-size: 11px; color: #374151;'>Issues claimed as resolved</b>"))
+            issue_checks.setMaximumHeight(160)
+            for issue in related_issues:
+                item = QListWidgetItem(
+                    f"{issue['issue_number']}  {issue['title']}  [{issue['priority']}]"
+                )
+                item.setData(Qt.UserRole, int(issue["id"]))
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Checked)
+                issue_checks.addItem(item)
+            main.addWidget(issue_checks)
+
         # ── Action row ────────────────────────────────────────────────
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(8)
@@ -1382,7 +1431,13 @@ class CommitPage(QWidget):
             QTimer.singleShot(3000, lambda: warning_label.setVisible(False))
 
         def handle_validate():
-            success = self.validate_commit(group)
+            confirmed = []
+            rejected = []
+            for index in range(issue_checks.count()):
+                item = issue_checks.item(index)
+                target = confirmed if item.checkState() == Qt.Checked else rejected
+                target.append(int(item.data(Qt.UserRole)))
+            success = self.validate_commit(group, confirmed, rejected)
             if success:
                 group['status'] = 'Validated'
                 new_sty = _status_style('Validated')
@@ -1587,6 +1642,11 @@ class CommitPage(QWidget):
             return
 
         uncommitted_filenames = [p['path'] for p in self.uncommitted_parts]
+        resolved_issue_ids = [
+            int(self.resolved_issues_list.item(i).data(Qt.UserRole))
+            for i in range(self.resolved_issues_list.count())
+            if self.resolved_issues_list.item(i).checkState() == Qt.Checked
+        ]
 
         if self.commit_service:
             try:
@@ -1598,6 +1658,7 @@ class CommitPage(QWidget):
                     title,
                     step_compare_enabled=step_compare_enabled,
                     step_file_path=step_file_path,
+                    resolved_issue_ids=resolved_issue_ids,
                 )
                 QMessageBox.information(self, "Success",
                     "✅ Changes committed successfully!")
@@ -1611,6 +1672,7 @@ class CommitPage(QWidget):
                 self.uncommitted_parts.clear()
                 self.changes_list.clear()
                 self._update_staged_count()
+                self._refresh_issue_views()
                 self.refresh()
             except ValueError as e:
                 error_str = str(e)
@@ -1661,13 +1723,16 @@ class CommitPage(QWidget):
     #  WORKFLOW ACTIONS
     # ═══════════════════════════════════════════════════════════════════
 
-    def validate_commit(self, group):
+    def validate_commit(self, group, confirmed_issue_ids=None, rejected_issue_ids=None):
         try:
             self.commit_service.validate_commit(
                 group["commit_id"],
                 project_id=group.get("project_id"),
+                confirmed_issue_ids=confirmed_issue_ids,
+                rejected_issue_ids=rejected_issue_ids,
             )
             self.load_pending_commits()
+            self._refresh_issue_views()
             return True
         except Exception as e:
             QMessageBox.critical(self, "Error",
@@ -1683,10 +1748,13 @@ class CommitPage(QWidget):
                 "Switch to that project to push/merge it.",
             )
             return
-        affected_part_ids = self.merge_service.excute_merge_by_commit_id(group["commit_id"])
-        self._refresh_bom_rows_for_parts(affected_part_ids)
-        self.load_pending_commits()
-        self.load_commit_history()
+        try:
+            affected_part_ids = self.merge_service.excute_merge_by_commit_id(group["commit_id"])
+            self._refresh_bom_rows_for_parts(affected_part_ids)
+            self.load_pending_commits()
+            self.load_commit_history()
+        except Exception as exc:
+            QMessageBox.warning(self, "Merge Blocked", str(exc))
 
     def _refresh_bom_rows_for_parts(self, part_ids):
         if not part_ids:
@@ -1696,6 +1764,18 @@ class CommitPage(QWidget):
             bom_page = getattr(main_window, "bom_page", None)
             if bom_page and hasattr(bom_page, "refresh_parts_after_merge"):
                 bom_page.refresh_parts_after_merge(part_ids)
+        except Exception:
+            pass
+
+    def _refresh_issue_views(self):
+        try:
+            main_window = self.window()
+            issue_page = getattr(main_window, "issue_page", None)
+            bom_page = getattr(main_window, "bom_page", None)
+            if issue_page:
+                issue_page.refresh()
+            if bom_page:
+                bom_page.load_tree()
         except Exception:
             pass
 

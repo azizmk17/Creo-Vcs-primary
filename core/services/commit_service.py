@@ -15,6 +15,7 @@ from core.services.base_service import BaseService
 from core.services.project_service import ProjectService
 from core.session_manager import SessionManager
 from core.services.permission_decorators import require_permission
+from core.services.issue_service import IssueService
 
 from utils import (
     is_creo_file,
@@ -29,6 +30,7 @@ class CommitService(BaseService):
         self.signature_repo = SignatureRepository()
         self.user_service = UserService(UserRepository())
         self.project_service = ProjectService()
+        self.issue_service = IssueService()
 
         self.session = SessionManager()
 
@@ -169,6 +171,7 @@ class CommitService(BaseService):
         title,
         step_compare_enabled: bool = False,
         step_file_path: str | None = None,
+        resolved_issue_ids=None,
     ):
 
         #base filename list
@@ -340,7 +343,9 @@ class CommitService(BaseService):
                     
                 except Exception as e:
                     raise ValueError(f"Commit failed: {str(e)}")
-                
+        if resolved_issue_ids:
+            self.issue_service.link_to_commit(resolved_issue_ids, commit_id, message)
+        return commit_id
 
 
     def get_commit_history (self):
@@ -438,6 +443,7 @@ class CommitService(BaseService):
                     "title": c.title,
                     "date": c.committed_at,
                     "parts": [],
+                    "related_issues": self.issue_service.issues_for_commit(c.commit_id),
                 }
             grouped[key]["parts"].append(c.filename)
         return list(grouped.values())
@@ -450,9 +456,14 @@ class CommitService(BaseService):
         )
     
     @require_permission("validate")
-    def validate_commit(self, commit_id: int, project_id: int = None):
-        return self.commit_repository.validate(
+    def validate_commit(self, commit_id: int, project_id: int = None,
+                        confirmed_issue_ids=None, rejected_issue_ids=None, validation_comment=""):
+        result = self.commit_repository.validate(
             commit_id,
             self.session.user_id,
             int(project_id) if project_id is not None else self.session.project_id,
         )
+        self.issue_service.validate_commit_issues(
+            str(commit_id), confirmed_issue_ids or [], rejected_issue_ids or [], validation_comment
+        )
+        return result

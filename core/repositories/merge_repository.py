@@ -50,13 +50,15 @@ class MergeRepository:
                 return self._row_to_merge(row)
             return None
         
-    def get_commit_ids_by_commitid(self, commit_id: int) -> Merge:
+    def get_commit_ids_by_commitid(self, commit_id: str) -> list[Merge]:
         with self.get_conn() as conn:
             cur = conn.cursor()
             cur.execute("""
-                SELECT id
-                FROM commits 
-                WHERE status = 'Validated' AND commit_id=?
+                SELECT c.id, c.type, c.part_id, c.status, c.filename, c.title,
+                       c.commit_id, u.username AS designer_username
+                FROM commits c
+                JOIN users u ON u.id = c.designer
+                WHERE c.status = 'Validated' AND c.commit_id=?
             """, (commit_id,))
             rows = cur.fetchall()
             return [self._row_to_merge(r) for r in rows]

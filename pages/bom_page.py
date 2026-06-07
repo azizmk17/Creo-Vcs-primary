@@ -29,6 +29,7 @@ from core.services.package_export_service import PackageExportService
 from core.services.ui_permission import UIPermissionHelper
 from core.services.baseline_service import BaselineService
 from core.services.part_doc_ack_service import PartDocAckService
+from core.services.issue_service import IssueService
 from core.repositories.commit_repository import CommitRepository
 from pages.dialogs.package_parts_dialog import PackagePartsDialog
 from pages.dialogs.addChild_dialog import AddChildDialog
@@ -111,6 +112,8 @@ BOM_TREE_IS_ASSEMBLY_ROLE = Qt.UserRole + 35
 BOM_TREE_FILES_ROLE = Qt.UserRole + 36
 # Value: dict { "state": "ok"|"warn", "tooltip": str }
 BOM_TREE_INTEGRITY_ROLE = Qt.UserRole + 37
+# Value: dict {active_count, total_count, critical_count}
+BOM_TREE_ISSUE_ROLE = Qt.UserRole + 38
 
 # Inline "In Work" beside name (spec)
 _BOM_INWORK_COLOR = QColor("#BA7517")
@@ -336,6 +339,9 @@ class _BomTreeNameDelegate(QStyledItemDelegate):
         self.initStyleOption(opt, index)
         name = item.text(0) or ""
         suffix = item.data(0, BOM_TREE_INWORK_ROLE) or ""
+        issue_summary = item.data(0, BOM_TREE_ISSUE_ROLE) or {}
+        active_count = int(issue_summary.get("active_count") or 0)
+        total_count = int(issue_summary.get("total_count") or 0)
         widget = opt.widget or self._tree
         style = widget.style()
 
@@ -356,12 +362,20 @@ class _BomTreeNameDelegate(QStyledItemDelegate):
         name_font.setPixelSize(13)
         name_font.setBold(bool(is_asm))
         display_inwork = "In Work" if suffix else ""
+        issue_label = f"!{active_count}" if active_count else ("●" if total_count else "")
+        issue_color = QColor("#c62828") if active_count else QColor("#2e7d32")
 
         painter.save()
         painter.setFont(name_font)
         painter.setPen(name_pen)
 
         fm = QFontMetrics(name_font)
+        issue_font = QFont(opt.font)
+        issue_font.setPixelSize(11)
+        issue_font.setBold(True)
+        issue_fm = QFontMetrics(issue_font)
+        issue_w = issue_fm.horizontalAdvance(issue_label) if issue_label else 0
+
         if display_inwork:
             suf_font = QFont(opt.font)
             suf_font.setPixelSize(10)
@@ -371,12 +385,15 @@ class _BomTreeNameDelegate(QStyledItemDelegate):
             half = max(48, text_rect.width() // 2)
             suf_elided = suf_fm.elidedText(display_inwork, opt.textElideMode, half)
             suf_w = suf_fm.horizontalAdvance(suf_elided)
-            name_max = max(24, text_rect.width() - _BOM_INWORK_GAP_PX - suf_w)
+            name_max = max(24, text_rect.width() - _BOM_INWORK_GAP_PX - suf_w - (_BOM_INWORK_GAP_PX + issue_w if issue_label else 0))
             name_elided = fm.elidedText(name, opt.textElideMode, name_max)
         else:
             suf_font = None
             suf_elided = ""
-            name_elided = fm.elidedText(name, opt.textElideMode, text_rect.width())
+            name_elided = fm.elidedText(
+                name, opt.textElideMode,
+                max(24, text_rect.width() - (_BOM_INWORK_GAP_PX + issue_w if issue_label else 0)),
+            )
 
         painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, name_elided)
         name_w = fm.horizontalAdvance(name_elided)
@@ -391,6 +408,17 @@ class _BomTreeNameDelegate(QStyledItemDelegate):
             )
             painter.setPen(_BOM_INWORK_COLOR)
             painter.drawText(suf_rect, Qt.AlignVCenter | Qt.AlignLeft, suf_elided)
+            name_w += _BOM_INWORK_GAP_PX + QFontMetrics(suf_font).horizontalAdvance(suf_elided)
+        if issue_label:
+            painter.setFont(issue_font)
+            painter.setPen(issue_color)
+            issue_rect = QRect(
+                text_rect.left() + name_w + _BOM_INWORK_GAP_PX,
+                text_rect.top(),
+                issue_w + 4,
+                text_rect.height(),
+            )
+            painter.drawText(issue_rect, Qt.AlignVCenter | Qt.AlignLeft, issue_label)
         painter.restore()
 
     def sizeHint(self, option: QStyleOptionViewItem, index):
@@ -1491,6 +1519,8 @@ class BomPage(QWidget):
     """Full-featured BOM Management Page (restored features)"""
 
     initial_tree_ready = pyqtSignal()
+    issue_requested = pyqtSignal(int)
+    create_issue_requested = pyqtSignal(int)
 
     def __init__(self, bom_service):
         super().__init__()
@@ -1504,6 +1534,8 @@ class BomPage(QWidget):
         self.package_export_service = PackageExportService()
         self.baseline_service = BaselineService()
         self.commit_repo = CommitRepository()
+        self.issue_service = IssueService()
+        self._issue_summary_cache = {}
 
         self.working_dir = None
         self.commits_dir = None
@@ -1790,7 +1822,15 @@ class BomPage(QWidget):
                 padding: 0px;
             }
         """)
-        tree_layout.addWidget(bom_header)
+        bom_header_row = QHBoxLayout()
+        bom_header_row.addWidget(bom_header)
+        bom_header_row.addStretch()
+        self.bom_health_label = QLabel("Health: --")
+        self.bom_health_label.setStyleSheet(
+            "font-size:11px;font-weight:700;color:#475569;background:transparent;border:none;"
+        )
+        bom_header_row.addWidget(self.bom_health_label)
+        tree_layout.addLayout(bom_header_row)
 
         self.tree = QTreeWidget()
         try:
@@ -2016,6 +2056,29 @@ class BomPage(QWidget):
         notes_layout.addWidget(QLabel("Notes:"))
         notes_layout.addWidget(self.notes_view)
         self.tabs.addTab(notes_tab, "Notes")
+
+        # Engineering issues tab
+        issues_tab = QWidget()
+        issues_layout = QVBoxLayout(issues_tab)
+        self.part_issues_table = QTableWidget()
+        self.part_issues_table.setColumnCount(4)
+        self.part_issues_table.setHorizontalHeaderLabels(["Issue", "Title", "Status", "Priority"])
+        self.part_issues_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.part_issues_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.part_issues_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.part_issues_table.itemDoubleClicked.connect(lambda *_: self._open_current_part_issues())
+        issue_actions = QHBoxLayout()
+        open_issues_btn = QPushButton("Open Issue List")
+        open_issues_btn.clicked.connect(self._open_current_part_issues)
+        create_issue_btn = QPushButton("Create Issue")
+        create_issue_btn.setObjectName("primary")
+        create_issue_btn.clicked.connect(self._create_issue_for_current_part)
+        issue_actions.addWidget(open_issues_btn)
+        issue_actions.addWidget(create_issue_btn)
+        issue_actions.addStretch()
+        issues_layout.addWidget(self.part_issues_table)
+        issues_layout.addLayout(issue_actions)
+        self.tabs.addTab(issues_tab, "Issues")
 
         # Files tab (Vault attachments + version history)
         files_tab = QWidget()
@@ -3499,6 +3562,8 @@ class BomPage(QWidget):
         item.setData(0, BOM_TREE_INWORK_ROLE, locked_txt)
         is_asm = bool((info.get("children") or [])) or item.childCount() > 0
         item.setData(0, BOM_TREE_IS_ASSEMBLY_ROLE, is_asm)
+        issue_summary = self._issue_summary_cache.get(int(part_id), {}) if part_id is not None else {}
+        item.setData(0, BOM_TREE_ISSUE_ROLE, issue_summary)
         item.setText(1, "")
         item.setText(2, str(info.get("aes_number", "") or ""))
         item.setText(3, str(info.get("type", "") or ""))
@@ -3515,6 +3580,10 @@ class BomPage(QWidget):
             tips0 = []
             if locked_txt:
                 tips0.append(locked_txt)
+            if int(issue_summary.get("active_count") or 0):
+                tips0.append(f"{int(issue_summary['active_count'])} active issues linked to this part")
+            elif int(issue_summary.get("total_count") or 0):
+                tips0.append("All issues linked to this part are resolved")
             tips0.append(str(summary["pdf"].get("tooltip", "PDF: unknown")))
             tips0.append(str(summary["step"].get("tooltip", "STEP: unknown")))
             item.setToolTip(0, "\n".join(tips0))
@@ -4193,6 +4262,16 @@ class BomPage(QWidget):
                 pass
             self._set_tree_loading(False)
             return
+        try:
+            self._issue_summary_cache = self.issue_service.part_summary()
+            score = max(0, self.issue_service.health_score() - len(getattr(self, "missing_ids", set()) or set()))
+            color = "#2e7d32" if score >= 85 else ("#a16207" if score >= 65 else "#b91c1c")
+            self.bom_health_label.setText(f"Health: {score}/100")
+            self.bom_health_label.setStyleSheet(
+                f"font-size:11px;font-weight:700;color:{color};background:transparent;border:none;"
+            )
+        except Exception:
+            self._issue_summary_cache = {}
 
         self._set_tree_loading(True)
 
@@ -4311,6 +4390,8 @@ class BomPage(QWidget):
                 )
                 item.setData(0, BOM_TREE_INWORK_ROLE, locked_txt)
                 item.setData(0, BOM_TREE_IS_ASSEMBLY_ROLE, bool((info.get("children") or [])))
+                issue_summary = self._issue_summary_cache.get(int(part_id), {}) if part_id is not None else {}
+                item.setData(0, BOM_TREE_ISSUE_ROLE, issue_summary)
                 try:
                     summary = self._indicator_summary_for_part(part_id, issues)
                     item.setData(1, BOM_TREE_FILES_ROLE, _file_badges_payload(part_id, issues, summary))
@@ -4320,6 +4401,10 @@ class BomPage(QWidget):
                         str(summary["pdf"].get("tooltip", "PDF: unknown")),
                         str(summary["step"].get("tooltip", "STEP: unknown")),
                     ]
+                    if int(issue_summary.get("active_count") or 0):
+                        _tips0.insert(0, f"{int(issue_summary['active_count'])} active issues linked to this part")
+                    elif int(issue_summary.get("total_count") or 0):
+                        _tips0.insert(0, "All issues linked to this part are resolved")
                     item.setToolTip(0, "\n".join(_tips0))
                     item.setToolTip(1, "\n".join([
                         str(summary["pdf"].get("tooltip", "PDF: unknown")),
@@ -4424,11 +4509,7 @@ class BomPage(QWidget):
         item_id = item.data(0, Qt.UserRole)
         if not item_id:
             return
-        self.display_details(item_id)
-        try:
-            self.tabs.setCurrentIndex(0)
-        except Exception:
-            pass
+        self.issue_requested.emit(int(item_id))
 
     def display_details(self, item_id):
         self.current_part_id = item_id
@@ -4480,6 +4561,7 @@ class BomPage(QWidget):
         self.history_panel.set_data(history, analytics)
 
         self.notes_view.setText(details.get("notes", ""))
+        self.refresh_issues_tab()
 
     def clear_details(self):
         self.current_part_id = None
@@ -4487,11 +4569,41 @@ class BomPage(QWidget):
         self.children_table.setRowCount(0)
         self.notes_view.clear()
         try:
+            self.part_issues_table.setRowCount(0)
+        except Exception:
+            pass
+        try:
             self.history_panel.clear()
             self._history_rows = []
         except Exception:
             pass
         self.refresh_files_tab()
+
+    def refresh_issues_tab(self):
+        if not getattr(self, "current_part_id", None):
+            self.part_issues_table.setRowCount(0)
+            return
+        try:
+            issues = self.issue_service.issues_for_part(int(self.current_part_id))
+        except Exception:
+            issues = []
+        self.part_issues_table.setRowCount(len(issues))
+        for row, issue in enumerate(issues):
+            values = [issue["issue_number"], issue["title"], issue["status"], issue["priority"]]
+            for col, value in enumerate(values):
+                cell = QTableWidgetItem(str(value))
+                cell.setData(Qt.UserRole, int(issue["id"]))
+                if col == 3:
+                    cell.setForeground(QBrush(QColor("#b91c1c" if issue["priority"] == "Critical" else "#374151")))
+                self.part_issues_table.setItem(row, col, cell)
+
+    def _open_current_part_issues(self):
+        if getattr(self, "current_part_id", None):
+            self.issue_requested.emit(int(self.current_part_id))
+
+    def _create_issue_for_current_part(self):
+        if getattr(self, "current_part_id", None):
+            self.create_issue_requested.emit(int(self.current_part_id))
 
     # ═══════════════════════════════════════════════════════════════════════
     #  History Panel Callbacks

@@ -14,6 +14,7 @@ from core.repositories.bom_children_repository import BomChildrenRepository
 from core.services.user_service import UserService
 from core.services.bom_service import BomService
 from core.services.base_service import BaseService
+from core.services.issue_service import IssueService
 from utils import (
     is_creo_file,
     ensure_dir_exists,
@@ -31,6 +32,7 @@ class MergeService(BaseService):
         self.signature_repo = SignatureRepository()
         self.user_service = UserService(UserRepository())
         self.bom_service = BomService(BomRepository(), BomChildrenRepository(), LockRepository(), SignatureRepository())
+        self.issue_service = IssueService()
 
         self.working_dir = working_dir
         self.commits_dir = commits_dir
@@ -166,9 +168,31 @@ class MergeService(BaseService):
             return result
 
         return None
+
+    @staticmethod
+    def _part_ids_for_issue_gate(commits):
+        part_ids = []
+        for commit in commits:
+            if commit.part_id is None:
+                label = commit.commit_id or commit.id
+                raise ValueError(
+                    f"Cannot merge commit {label}. It is not linked to a BOM part."
+                )
+            part_ids.append(int(commit.part_id))
+        return part_ids
+
     @require_permission("merge")
     def excute_merge(self, selected_ids, message):
         merged_entries = []
+        selected_commits = []
+        for selected_id in selected_ids:
+            commit = self.merge_repository.get_ready_to_merge_by_id(selected_id)
+            if commit:
+                selected_commits.append(commit)
+        if not selected_commits:
+            raise ValueError("No validated commits were found for the selected merge items.")
+        candidate_parts = self._part_ids_for_issue_gate(selected_commits)
+        self.issue_service.assert_no_critical_issues(candidate_parts, operation="merge", include_children=True)
 
         for commit_id in selected_ids:
             commit = self.merge_repository.get_ready_to_merge_by_id(commit_id)
@@ -213,6 +237,11 @@ class MergeService(BaseService):
 
         #get the ids of the commit from the commit_id
         commit_data = self.merge_repository.get_commit_ids_by_commitid(commit_id)
+        if not commit_data:
+            raise ValueError(f"No validated commit found for {commit_id}.")
+        self.issue_service.assert_no_critical_issues(
+            self._part_ids_for_issue_gate(commit_data), operation="merge", include_children=True
+        )
         
         #store them
         selected_ids = [c.id for c in commit_data] 

@@ -3,6 +3,7 @@ from datetime import datetime
 import json
 from core.repositories.snapshot_repository import SnapshotRepository
 from core.repositories.commit_repository import CommitRepository
+from core.repositories.issue_repository import IssueRepository
 from utils import (
     is_creo_file
 )
@@ -11,6 +12,7 @@ class SnapshotService:
     def __init__(self):
         self.repo = SnapshotRepository()
         self.commit_rep = CommitRepository()
+        self.issue_repo = IssueRepository()
 
     def generate_snapshot_data(self, working_dir, project_id):
         """Scans ONLY the main working directory and builds file list with metadata."""
@@ -41,7 +43,11 @@ class SnapshotService:
                 "status": "Old" if committed else "New"
             })
 
-        return {"working_dir": working_dir, "files": files}
+        return {
+            "working_dir": working_dir,
+            "files": files,
+            "issue_state": self.issue_repo.snapshot_state(int(project_id)),
+        }
 
     def create_snapshot(self, project_id, name, description, working_dir, user):
         data = self.generate_snapshot_data(working_dir, project_id)
@@ -70,7 +76,28 @@ class SnapshotService:
         removed = [f for f in files1.keys() if f not in files2]
         modified = [f for f in files1.keys() if f in files2 and files1[f]["checksum"] != files2[f]["checksum"]]
 
-        return {"added": added, "removed": removed, "modified": modified}
+        issues1 = {
+            i["issue_number"]: i for i in (data1.get("issue_state") or {}).get("issues", [])
+        }
+        issues2 = {
+            i["issue_number"]: i for i in (data2.get("issue_state") or {}).get("issues", [])
+        }
+        issue_added = [key for key in issues2 if key not in issues1]
+        issue_removed = [key for key in issues1 if key not in issues2]
+        issue_changed = [
+            key for key in issues1
+            if key in issues2 and (
+                issues1[key].get("status"), issues1[key].get("priority")
+            ) != (
+                issues2[key].get("status"), issues2[key].get("priority")
+            )
+        ]
+
+        return {
+            "added": added, "removed": removed, "modified": modified,
+            "issue_added": issue_added, "issue_removed": issue_removed,
+            "issue_changed": issue_changed,
+        }
 
 
     def update_last_snapshot_in_commit(self, data, snapshot_id, project_id):
