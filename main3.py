@@ -373,8 +373,8 @@ class BomGUI(QMainWindow):
         self.pages.addWidget(self.snap_page)
         self.bom_page.issue_requested.connect(self.open_issues_for_part)
         self.bom_page.create_issue_requested.connect(self.create_issue_for_part)
-        self.issue_page.issue_changed.connect(self.bom_page.load_tree)
-        self.issue_page.issue_changed.connect(self.commit_page._refresh_resolved_issues)
+        self.issue_page.issue_changed.connect(self.bom_page.refresh_issue_indicators)
+        self.issue_page.issue_changed.connect(lambda _part_ids: self.commit_page._refresh_resolved_issues())
 
         
 

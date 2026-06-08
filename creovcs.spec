@@ -43,6 +43,11 @@ if os.path.isfile(QSS):
 for rt_dir in pyarmor_runtime_dirs:
     datas.append((rt_dir, os.path.basename(rt_dir)))
 
+# PyMuPDF ships native libraries and support data needed by the embedded viewer.
+fitz_datas, fitz_binaries, fitz_hidden = collect_all('fitz')
+pymupdf_datas, pymupdf_binaries, pymupdf_hidden = collect_all('pymupdf')
+datas += fitz_datas + pymupdf_datas
+
 # ---------------------------------------------------------------------------
 # Hidden imports
 # PyInstaller cannot detect modules loaded via dynamic imports, string-based
@@ -167,6 +172,7 @@ hidden = [
     'PyQt5.sip',
     'PyQt5.QtPrintSupport',   # needed by some print/export flows
 ]
+hidden += fitz_hidden + pymupdf_hidden
 
 # ---------------------------------------------------------------------------
 # Analysis
@@ -174,7 +180,7 @@ hidden = [
 a = Analysis(
     [os.path.join(OBFDIR, 'main3.py')],
     pathex=[OBFDIR, ROOT],
-    binaries=[],
+    binaries=fitz_binaries + pymupdf_binaries,
     datas=datas,
     hiddenimports=hidden,
     hookspath=[],
