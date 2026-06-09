@@ -20,6 +20,15 @@ import sys
 from typing import Optional
 
 
+def _is_frozen() -> bool:
+    """Return True for PyInstaller, Nuitka, and similar packaged builds."""
+    return bool(
+        getattr(sys, "frozen", False)
+        or "__compiled__" in globals()
+        or hasattr(sys, "_MEIPASS")
+    )
+
+
 def _repo_root() -> str:
     """Return the working directory for the CAD viewer subprocess.
 
@@ -30,7 +39,7 @@ def _repo_root() -> str:
       ``python -m tools.CAD.step_viewer`` resolves via site-packages,
       not via cwd.
     """
-    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+    if _is_frozen():
         # Running inside a PyInstaller bundle — use the EXE's own directory.
         return os.path.dirname(sys.executable)
     here = os.path.dirname(os.path.abspath(__file__))
@@ -55,10 +64,15 @@ def _build_cmd(module_args: list[str]) -> list[str]:
     2. Dev / source fallback: conda run -n pyoccenv python -m tools.CAD.step_viewer
     3. Last resort: sys.executable (only works if pythonocc is in the active venv)
     """
-    if getattr(sys, "frozen", False):
-        viewer_exe = os.path.join(os.path.dirname(sys.executable), "CADViewer.exe")
-        if os.path.isfile(viewer_exe):
-            return [viewer_exe] + module_args
+    if _is_frozen():
+        exe_dir = os.path.dirname(sys.executable)
+        viewer_candidates = (
+            os.path.join(exe_dir, "CADViewer.exe"),
+            os.path.join(exe_dir, "CADViewer", "CADViewer.exe"),
+        )
+        for viewer_exe in viewer_candidates:
+            if os.path.isfile(viewer_exe):
+                return [viewer_exe] + module_args
 
     conda = _conda_bat()
     if conda:

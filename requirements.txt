@@ -6,3 +6,6 @@ PyMuPDF>=1.23.0
 # Build tools (not shipped with the EXE)
 pyinstaller>=6.0.0
 pyarmor>=8.0.0
+nuitka>=4.1.0
+ordered-set>=4.1.0
+zstandard>=0.23.0
