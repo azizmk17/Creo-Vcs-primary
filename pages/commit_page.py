@@ -1647,6 +1647,15 @@ class CommitPage(QWidget):
             for i in range(self.resolved_issues_list.count())
             if self.resolved_issues_list.item(i).checkState() == Qt.Checked
         ]
+        resolved_issue_part_ids = set()
+        for issue_id in resolved_issue_ids:
+            try:
+                issue = self.issue_service.get_issue(issue_id) or {}
+                resolved_issue_part_ids.update(
+                    int(part["id"]) for part in issue.get("parts", []) if part.get("id") is not None
+                )
+            except Exception:
+                continue
 
         if self.commit_service:
             try:
@@ -1672,7 +1681,7 @@ class CommitPage(QWidget):
                 self.uncommitted_parts.clear()
                 self.changes_list.clear()
                 self._update_staged_count()
-                self._refresh_issue_views()
+                self._refresh_issue_views(resolved_issue_part_ids)
                 self.refresh()
             except ValueError as e:
                 error_str = str(e)
@@ -1767,15 +1776,15 @@ class CommitPage(QWidget):
         except Exception:
             pass
 
-    def _refresh_issue_views(self):
+    def _refresh_issue_views(self, affected_part_ids=None):
         try:
             main_window = self.window()
             issue_page = getattr(main_window, "issue_page", None)
             bom_page = getattr(main_window, "bom_page", None)
             if issue_page:
                 issue_page.refresh()
-            if bom_page:
-                bom_page.load_tree()
+            if bom_page and hasattr(bom_page, "refresh_issue_indicators"):
+                bom_page.refresh_issue_indicators(affected_part_ids)
         except Exception:
             pass
 

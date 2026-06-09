@@ -176,7 +176,7 @@ class MetricCard(QFrame):
 
 
 class EngineeringIssuePage(QWidget):
-    issue_changed = pyqtSignal()
+    issue_changed = pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -362,6 +362,7 @@ class EngineeringIssuePage(QWidget):
     def refresh(self, *_):
         if not self.service.project_id:
             return
+        selected_issue_id = self.current_issue_id
         metrics = self.service.metrics()
         analytics = self.service.analytics()
         for key, card in self.cards.items():
@@ -375,22 +376,34 @@ class EngineeringIssuePage(QWidget):
         ) or "None"
         self.analytics_label.setText(f"Risk hotspots: {hotspots}    |    Active workload: {workload}")
         issues = self.service.list_issues(self._filters())
-        self.issue_table.setRowCount(len(issues))
-        for row, issue in enumerate(issues):
-            values = [
-                issue["issue_number"], issue["title"], issue["status"], issue["priority"],
-                issue["category"], issue.get("assigned_to_name") or "Unassigned",
-                issue.get("due_date") or "", issue.get("affected_parts") or "",
-            ]
-            for col, value in enumerate(values):
-                item = QTableWidgetItem(str(value))
-                item.setData(Qt.UserRole, int(issue["id"]))
-                if col == 3:
-                    item.setForeground(QBrush(QColor(PRIORITY_COLORS.get(issue["priority"], "#374151"))))
-                self.issue_table.setItem(row, col, item)
+        selected_row = None
+        signals_were_blocked = self.issue_table.blockSignals(True)
+        try:
+            self.issue_table.setRowCount(len(issues))
+            for row, issue in enumerate(issues):
+                issue_id = int(issue["id"])
+                if selected_issue_id is not None and issue_id == int(selected_issue_id):
+                    selected_row = row
+                values = [
+                    issue["issue_number"], issue["title"], issue["status"], issue["priority"],
+                    issue["category"], issue.get("assigned_to_name") or "Unassigned",
+                    issue.get("due_date") or "", issue.get("affected_parts") or "",
+                ]
+                for col, value in enumerate(values):
+                    item = QTableWidgetItem(str(value))
+                    item.setData(Qt.UserRole, issue_id)
+                    if col == 3:
+                        item.setForeground(QBrush(QColor(PRIORITY_COLORS.get(issue["priority"], "#374151"))))
+                    self.issue_table.setItem(row, col, item)
+            if selected_row is not None:
+                self.issue_table.selectRow(selected_row)
+        finally:
+            self.issue_table.blockSignals(signals_were_blocked)
         self.issue_table.resizeColumnsToContents()
         self.issue_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.issue_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
+        if selected_issue_id is not None:
+            self.refresh_current_issue_details()
 
     def open_for_part(self, part_id: int):
         index = self.part_filter.findData(int(part_id))
@@ -418,6 +431,10 @@ class EngineeringIssuePage(QWidget):
         if dialog.exec_() != QDialog.Accepted:
             return
         values = dialog.values()
+        affected_part_ids = {
+            int(part["id"]) for part in (issue or {}).get("parts", []) if part.get("id") is not None
+        }
+        affected_part_ids.update(int(part_id) for part_id in values["part_ids"])
         try:
             if issue:
                 saved = self.service.update_issue(issue["id"], values["data"], values["part_ids"])
@@ -426,7 +443,7 @@ class EngineeringIssuePage(QWidget):
             for path in values["attachments"]:
                 self.service.add_attachment(saved["id"], path, self._working_dir())
             self.refresh()
-            self.issue_changed.emit()
+            self.issue_changed.emit(sorted(affected_part_ids))
         except Exception as exc:
             QMessageBox.critical(self, "Issue", str(exc))
 
@@ -435,7 +452,15 @@ class EngineeringIssuePage(QWidget):
         if not selected:
             return
         self.current_issue_id = int(selected[0].data(Qt.UserRole))
+        self.refresh_current_issue_details()
+
+    def refresh_current_issue_details(self):
+        """Reload the selected issue header, commits, audit trail, and related tabs."""
+        if not self.current_issue_id:
+            return
         issue = self.service.get_issue(self.current_issue_id)
+        if not issue:
+            return
         self.detail_title.setText(f"{issue['issue_number']}  {issue['title']}")
         part_names = ", ".join(x["name"] for x in issue.get("parts", [])) or "No affected parts"
         self.detail_meta.setText(
@@ -502,9 +527,9 @@ class EngineeringIssuePage(QWidget):
         if not self.current_issue_id:
             return
         try:
-            self.service.transition(self.current_issue_id, self.transition_combo.currentText())
+            issue = self.service.transition(self.current_issue_id, self.transition_combo.currentText())
             self.refresh()
-            self.issue_changed.emit()
+            self.issue_changed.emit([int(part["id"]) for part in issue.get("parts", [])])
         except Exception as exc:
             QMessageBox.warning(self, "Issue Workflow", str(exc))
 
@@ -516,7 +541,7 @@ class EngineeringIssuePage(QWidget):
             self.comment_edit.clear()
             self._load_comments()
             self._load_history()
-            self.issue_changed.emit()
+            self.issue_changed.emit([])
         except Exception as exc:
             QMessageBox.warning(self, "Comment", str(exc))
 
@@ -529,9 +554,11 @@ class EngineeringIssuePage(QWidget):
         if not accepted:
             return
         try:
+            issue = self.service.get_issue(self.current_issue_id) or {}
+            affected_part_ids = [int(part["id"]) for part in issue.get("parts", [])]
             self.service.archive(self.current_issue_id, reason)
             self.current_issue_id = None
             self.refresh()
-            self.issue_changed.emit()
+            self.issue_changed.emit(affected_part_ids)
         except Exception as exc:
             QMessageBox.warning(self, "Archive Issue", str(exc))

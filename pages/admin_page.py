@@ -1,9 +1,10 @@
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QListWidget,
     QComboBox, QFrame, QGroupBox, QTabWidget, QTableWidget, QTableWidgetItem,
-    QMessageBox, QHeaderView, QInputDialog, QFileDialog, QLineEdit
+    QMessageBox, QHeaderView, QInputDialog, QFileDialog, QLineEdit,
+    QSizePolicy, QSplitter, QAbstractItemView
 )
-from PyQt5.QtGui import QFont, QIcon
+from PyQt5.QtGui import QFont
 from PyQt5.QtCore import Qt
 
 from core.services.admin_service import AdminService
@@ -12,6 +13,30 @@ from core.services.permission_service import PermissionService
 from core.services.user_service import UserService
 from core.services.project_service import ProjectService
 from core.repositories.user_repository import UserRepository
+
+
+class AdminMetricCard(QFrame):
+    def __init__(self, label, accent, parent=None):
+        super().__init__(parent)
+        self.setObjectName("adminMetricCard")
+        self.setProperty("accent", accent)
+        self.setMinimumWidth(130)
+        self.setFixedHeight(72)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(0)
+        self.value_label = QLabel("-")
+        self.value_label.setObjectName("adminMetricValue")
+        self.value_label.setStyleSheet(f"color: {accent};")
+        label_widget = QLabel(label)
+        label_widget.setObjectName("adminMetricLabel")
+        layout.addWidget(self.value_label)
+        layout.addWidget(label_widget)
+
+    def set_value(self, value):
+        self.value_label.setText(str(value))
 
 
 class AdminPage(QWidget):
@@ -27,36 +52,57 @@ class AdminPage(QWidget):
 
     # ----------------------------- UI SETUP -----------------------------
     def init_ui(self):
-        layout = QVBoxLayout()
-        layout.setContentsMargins(20, 15, 20, 15)
-        layout.setSpacing(15)
+        self.setObjectName("adminPage")
+        self.setStyleSheet(self._page_stylesheet())
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
 
-        # Header
         layout.addWidget(self.create_header())
 
-        # Tabs
-        tabs = QTabWidget()
-        tabs.addTab(self.create_user_role_tab(), "Users & Roles")
-        tabs.addTab(self.create_role_perm_tab(), "Roles & Permissions")
-        tabs.addTab(self.create_project_tab(), "Projects")
+        metrics = QHBoxLayout()
+        metrics.setSpacing(10)
+        self.user_metric = AdminMetricCard("User accounts", "#2563eb")
+        self.role_metric = AdminMetricCard("Security roles", "#7c3aed")
+        self.permission_metric = AdminMetricCard("Permissions", "#0891b2")
+        self.project_metric = AdminMetricCard("Projects", "#16a34a")
+        for card in (self.user_metric, self.role_metric, self.permission_metric, self.project_metric):
+            metrics.addWidget(card)
+        layout.addLayout(metrics)
 
-        layout.addWidget(tabs)
-        self.setLayout(layout)
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("adminTabs")
+        self.tabs.addTab(self.create_user_role_tab(), "Users")
+        self.tabs.addTab(self.create_role_perm_tab(), "Access Control")
+        self.tabs.addTab(self.create_project_tab(), "Projects")
+        layout.addWidget(self.tabs, 1)
+        self.refresh_stats()
 
     def create_header(self):
         frame = QFrame()
-        frame.setObjectName("header")
-        hbox = QHBoxLayout()
-        title = QLabel("Admin")
-        title.setFont(QFont("Segoe UI", 16, QFont.Bold))
+        frame.setObjectName("adminHeader")
+        hbox = QHBoxLayout(frame)
+        hbox.setContentsMargins(16, 12, 16, 12)
+        hbox.setSpacing(12)
 
-        self.stats_label = QLabel("")
+        text = QVBoxLayout()
+        text.setSpacing(1)
+        title = QLabel("Administration")
+        title.setObjectName("adminTitle")
+        subtitle = QLabel("Workspace access, project membership, and security policy")
+        subtitle.setObjectName("adminSubtitle")
+        text.addWidget(title)
+        text.addWidget(subtitle)
+        hbox.addLayout(text)
+        hbox.addStretch()
+
+        self.stats_label = QLabel("System configuration")
+        self.stats_label.setObjectName("adminStatus")
         self.stats_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.refresh_stats()
-
-        hbox.addWidget(title)
         hbox.addWidget(self.stats_label)
-        frame.setLayout(hbox)
+        refresh = self.create_button("Refresh", "neutral", self.refresh_all)
+        refresh.setToolTip("Reload administration data")
+        hbox.addWidget(refresh)
         return frame
 
     def refresh_stats(self):
@@ -64,53 +110,168 @@ class AdminPage(QWidget):
             users = len(self.user_service.get_all_users())
             roles = len(self.role_service.get_all_roles())
             perms = len(self.permission_service.get_all_permissions())
-            self.stats_label.setText(f"Users: {users}   Roles: {roles}   Permissions: {perms}")
+            projects = len(self.project_service.get_all_projects())
+            self.user_metric.set_value(users)
+            self.role_metric.set_value(roles)
+            self.permission_metric.set_value(perms)
+            self.project_metric.set_value(projects)
+            self.stats_label.setText("Configuration up to date")
         except Exception:
-            self.stats_label.setText("Users: -   Roles: -   Permissions: -")
+            for card in (
+                getattr(self, "user_metric", None),
+                getattr(self, "role_metric", None),
+                getattr(self, "permission_metric", None),
+                getattr(self, "project_metric", None),
+            ):
+                if card:
+                    card.set_value("-")
+            self.stats_label.setText("Unable to load summary")
+
+    def refresh_all(self):
+        self.reload_users()
+        self._reload_roles()
+        self._reload_permissions()
+        self.load_projects()
+        self.load_user_roles()
+        self.load_role_permissions()
+        self.load_project_members()
+        self.refresh_stats()
+
+    def _page_stylesheet(self):
+        return """
+        QWidget#adminPage { background: #f4f6f8; }
+        QFrame#adminHeader {
+            background: #ffffff; border: 1px solid #dfe3e8; border-radius: 6px;
+        }
+        QLabel#adminTitle { color: #172033; font-size: 20px; font-weight: 700; }
+        QLabel#adminSubtitle { color: #687386; font-size: 11px; font-weight: 400; }
+        QLabel#adminStatus { color: #526071; font-size: 10px; font-weight: 600; }
+        QFrame#adminMetricCard {
+            background: #ffffff; border: 1px solid #dfe3e8; border-radius: 6px;
+        }
+        QLabel#adminMetricValue { font-size: 21px; font-weight: 700; background: transparent; }
+        QLabel#adminMetricLabel { color: #687386; font-size: 10px; font-weight: 600; background: transparent; }
+        QTabWidget#adminTabs::pane {
+            background: #ffffff; border: 1px solid #dfe3e8; border-radius: 0 6px 6px 6px;
+        }
+        QTabWidget#adminTabs QTabBar::tab {
+            min-width: 112px; padding: 9px 16px; margin-right: 2px;
+            background: #e9edf2; color: #526071; border: 1px solid #dfe3e8;
+            border-bottom: none; border-radius: 5px 5px 0 0; font-weight: 600;
+        }
+        QTabWidget#adminTabs QTabBar::tab:selected { background: #ffffff; color: #1d4ed8; }
+        QFrame#adminPanel {
+            background: #ffffff; border: 1px solid #dfe3e8; border-radius: 6px;
+        }
+        QLabel#sectionTitle { color: #172033; font-size: 13px; font-weight: 700; }
+        QLabel#sectionCaption { color: #738094; font-size: 10px; font-weight: 400; }
+        QLabel#fieldLabel { color: #526071; font-size: 10px; font-weight: 600; }
+        QComboBox, QLineEdit {
+            min-height: 24px; background: #ffffff; border: 1px solid #cfd6df;
+            border-radius: 4px; padding: 3px 7px; color: #172033;
+        }
+        QComboBox:focus, QLineEdit:focus { border-color: #2563eb; }
+        QListWidget, QTableWidget {
+            background: #ffffff; border: 1px solid #dfe3e8; border-radius: 4px;
+            alternate-background-color: #f8fafc; selection-background-color: #e5efff;
+            selection-color: #172033; outline: none;
+        }
+        QListWidget::item { min-height: 24px; padding: 3px 7px; }
+        QListWidget::item:selected { border-left: 3px solid #2563eb; }
+        QTableWidget::item { padding: 5px 7px; border-bottom: 1px solid #edf0f3; }
+        QHeaderView::section {
+            background: #f3f5f7; color: #526071; border: none;
+            border-bottom: 1px solid #dfe3e8; padding: 7px; font-size: 10px; font-weight: 700;
+        }
+        QPushButton { min-height: 26px; padding: 3px 10px; border-radius: 4px; font-weight: 600; }
+        QPushButton#primary { background: #2563eb; color: #ffffff; border: 1px solid #2563eb; }
+        QPushButton#primary:hover { background: #1d4ed8; }
+        QPushButton#neutral { background: #ffffff; color: #334155; border: 1px solid #cfd6df; }
+        QPushButton#neutral:hover { background: #f3f5f7; }
+        QPushButton#danger { background: #ffffff; color: #b42318; border: 1px solid #e6b8b3; }
+        QPushButton#danger:hover { background: #fff1f0; }
+        QSplitter::handle { background: #edf0f3; }
+        """
+
+    def _section_header(self, title, caption, actions=None):
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        text = QVBoxLayout()
+        text.setSpacing(1)
+        title_label = QLabel(title)
+        title_label.setObjectName("sectionTitle")
+        caption_label = QLabel(caption)
+        caption_label.setObjectName("sectionCaption")
+        text.addWidget(title_label)
+        text.addWidget(caption_label)
+        row.addLayout(text)
+        row.addStretch()
+        for action in actions or []:
+            row.addWidget(action)
+        return row
+
+    def _panel(self):
+        panel = QFrame()
+        panel.setObjectName("adminPanel")
+        return panel
+
+    def _field_label(self, text):
+        label = QLabel(text)
+        label.setObjectName("fieldLabel")
+        return label
 
     # -------------------- TAB 1: USER ROLE MANAGEMENT --------------------
     def create_user_role_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
 
-        # Toolbar
-        toolbar = QHBoxLayout()
-        toolbar.addWidget(QLabel("User Management"))
-        toolbar.addStretch()
         btn_new_user = self.create_button("New User", "primary", self.create_user)
         btn_edit_user = self.create_button("Edit User", "neutral", self.edit_user)
         btn_delete_user = self.create_button("Delete User", "danger", self.delete_user)
-        toolbar.addWidget(btn_new_user)
-        toolbar.addWidget(btn_edit_user)
-        toolbar.addWidget(btn_delete_user)
-        layout.addLayout(toolbar)
+        layout.addLayout(self._section_header(
+            "User access",
+            "Manage accounts and role membership",
+            [btn_new_user, btn_edit_user, btn_delete_user],
+        ))
 
-        # Combo and lists
-        top = QHBoxLayout()
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        assigned_panel = self._panel()
+        assigned_layout = QVBoxLayout(assigned_panel)
+        assigned_layout.setContentsMargins(12, 12, 12, 12)
+        assigned_layout.setSpacing(8)
+        assigned_layout.addWidget(self._field_label("Selected user"))
         self.user_combo = QComboBox()
+        self.user_combo.setMinimumWidth(220)
         for u in self.user_service.get_all_users():
             self.user_combo.addItem(u.username, u.id)
-        top.addWidget(QLabel("Select User:"))
-        top.addWidget(self.user_combo)
-        layout.addLayout(top)
-
-        lists = QHBoxLayout()
+        assigned_layout.addWidget(self.user_combo)
+        assigned_layout.addWidget(self._field_label("Assigned roles"))
         self.user_roles_list = QListWidget()
+        self.user_roles_list.setAlternatingRowColors(True)
+        assigned_layout.addWidget(self.user_roles_list, 1)
+        remove = self.create_button("Remove Selected Role", "danger", self.remove_role_from_user)
+        assigned_layout.addWidget(remove, 0, Qt.AlignRight)
+        splitter.addWidget(assigned_panel)
+
+        available_panel = self._panel()
+        available_layout = QVBoxLayout(available_panel)
+        available_layout.setContentsMargins(12, 12, 12, 12)
+        available_layout.setSpacing(8)
+        available_layout.addWidget(self._field_label("Available role"))
         self.role_combo = QComboBox()
         for r in self.role_service.get_all_roles():
             self.role_combo.addItem(r["name"], r["id"])
-
-        lists.addWidget(self.create_list_group("Assigned Roles", self.user_roles_list))
-        lists.addWidget(self.create_list_group("Available Roles", self.role_combo, False))
-        layout.addLayout(lists)
-
-        # Buttons
-        btns = QHBoxLayout()
+        available_layout.addWidget(self.role_combo)
         assign = self.create_button("Assign Role", "primary", self.assign_role_to_user)
-        remove = self.create_button("Remove Role", "danger", self.remove_role_from_user)
-        btns.addWidget(assign)
-        btns.addWidget(remove)
-        layout.addLayout(btns)
+        available_layout.addWidget(assign, 0, Qt.AlignLeft)
+        available_layout.addStretch()
+        splitter.addWidget(available_panel)
+        splitter.setSizes([620, 360])
+        layout.addWidget(splitter, 1)
 
         self.user_combo.currentIndexChanged.connect(self.load_user_roles)
         self.load_user_roles()
@@ -240,51 +401,59 @@ class AdminPage(QWidget):
     def create_role_perm_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
 
-        # Toolbar
-        toolbar = QHBoxLayout()
-        toolbar.addWidget(QLabel("Role & Permission Management"))
-        toolbar.addStretch()
         btn_new_role = self.create_button("New Role", "primary", self.create_role)
         btn_rename_role = self.create_button("Rename Role", "neutral", self.rename_role)
         btn_delete_role = self.create_button("Delete Role", "danger", self.delete_role)
-        toolbar.addWidget(btn_new_role)
-        toolbar.addWidget(btn_rename_role)
-        toolbar.addWidget(btn_delete_role)
-        layout.addLayout(toolbar)
+        layout.addLayout(self._section_header(
+            "Access control",
+            "Configure roles and their permission sets",
+            [btn_new_role, btn_rename_role, btn_delete_role],
+        ))
 
-        # Role combo
-        top = QHBoxLayout()
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        assigned_panel = self._panel()
+        assigned_layout = QVBoxLayout(assigned_panel)
+        assigned_layout.setContentsMargins(12, 12, 12, 12)
+        assigned_layout.setSpacing(8)
+        assigned_layout.addWidget(self._field_label("Selected role"))
         self.role_perm_combo = QComboBox()
         for r in self.role_service.get_all_roles():
             self.role_perm_combo.addItem(r["name"], r["id"])
-        top.addWidget(QLabel("Select Role:"))
-        top.addWidget(self.role_perm_combo)
-        layout.addLayout(top)
-
-        # Lists
-        lists = QHBoxLayout()
+        assigned_layout.addWidget(self.role_perm_combo)
+        assigned_layout.addWidget(self._field_label("Assigned permissions"))
         self.role_permissions_list = QListWidget()
+        self.role_permissions_list.setAlternatingRowColors(True)
+        assigned_layout.addWidget(self.role_permissions_list, 1)
+        rem = self.create_button("Remove Selected Permission", "danger", self.remove_permission_from_role)
+        assigned_layout.addWidget(rem, 0, Qt.AlignRight)
+        splitter.addWidget(assigned_panel)
+
+        available_panel = self._panel()
+        available_layout = QVBoxLayout(available_panel)
+        available_layout.setContentsMargins(12, 12, 12, 12)
+        available_layout.setSpacing(8)
+        available_layout.addWidget(self._field_label("Available permission"))
         self.permission_combo = QComboBox()
         for p in self.permission_service.get_all_permissions():
             self.permission_combo.addItem(p["name"], p["id"])
-
-        lists.addWidget(self.create_list_group("Assigned Permissions", self.role_permissions_list))
-        lists.addWidget(self.create_list_group("Available Permissions", self.permission_combo, False))
-        layout.addLayout(lists)
-
-        # Buttons
-        btns = QHBoxLayout()
+        available_layout.addWidget(self.permission_combo)
         add = self.create_button("Add Permission", "primary", self.add_permission_to_role)
-        rem = self.create_button("Remove Permission", "danger", self.remove_permission_from_role)
         btn_new_perm = self.create_button("New Permission", "neutral", self.create_permission)
         btn_del_perm = self.create_button("Delete Permission", "danger", self.delete_permission)
-        btns.addWidget(add)
-        btns.addWidget(rem)
-        btns.addStretch()
-        btns.addWidget(btn_new_perm)
-        btns.addWidget(btn_del_perm)
-        layout.addLayout(btns)
+        available_layout.addWidget(add, 0, Qt.AlignLeft)
+        available_layout.addStretch()
+        permission_actions = QHBoxLayout()
+        permission_actions.addWidget(btn_new_perm)
+        permission_actions.addWidget(btn_del_perm)
+        available_layout.addLayout(permission_actions)
+        splitter.addWidget(available_panel)
+        splitter.setSizes([620, 360])
+        layout.addWidget(splitter, 1)
 
         self.role_perm_combo.currentIndexChanged.connect(self.load_role_permissions)
         self.load_role_permissions()
@@ -386,45 +555,66 @@ class AdminPage(QWidget):
     def create_project_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
 
-        # Toolbar
-        toolbar = QHBoxLayout()
-        title = QLabel("Manage Projects")
-        title.setFont(QFont("Segoe UI", 12, QFont.Bold))
         btn_add = self.create_button("New Project", "primary", self.create_project)
-        btn_edit = self.create_button("Edit", "neutral", self.edit_project)
-        btn_del = self.create_button("Delete", "danger", self.delete_project)
-        toolbar.addWidget(title)
-        toolbar.addStretch()
-        toolbar.addWidget(btn_add)
-        toolbar.addWidget(btn_edit)
-        toolbar.addWidget(btn_del)
-        layout.addLayout(toolbar)
+        btn_edit = self.create_button("Edit Project", "neutral", self.edit_project)
+        btn_del = self.create_button("Delete Project", "danger", self.delete_project)
+        layout.addLayout(self._section_header(
+            "Project registry",
+            "Manage workspaces and project membership",
+            [btn_add, btn_edit, btn_del],
+        ))
 
-        # Project Table
+        splitter = QSplitter(Qt.Vertical)
+        splitter.setChildrenCollapsible(False)
+        project_panel = self._panel()
+        project_layout = QVBoxLayout(project_panel)
+        project_layout.setContentsMargins(10, 10, 10, 10)
+        project_layout.setSpacing(8)
+        self.project_search = QLineEdit()
+        self.project_search.setPlaceholderText("Search projects")
+        self.project_search.setClearButtonEnabled(True)
+        self.project_search.textChanged.connect(self._filter_projects)
+        project_layout.addWidget(self.project_search)
+
         self.table = QTableWidget()
         self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels(["ID", "Name", "Version", "State", "Working Dir", "Created At"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setAlternatingRowColors(True)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
         self.table.verticalHeader().setVisible(False)
-        layout.addWidget(self.table)
+        self.table.verticalHeader().setDefaultSectionSize(32)
+        self.table.setSortingEnabled(True)
+        project_layout.addWidget(self.table)
+        splitter.addWidget(project_panel)
 
-        # Project Members
-        members_box = QGroupBox("Project Members")
-        members_box.setFont(QFont("Segoe UI", 10, QFont.Bold))
-        members_layout = QVBoxLayout(members_box)
+        members_panel = self._panel()
+        members_layout = QVBoxLayout(members_panel)
+        members_layout.setContentsMargins(10, 10, 10, 10)
+        members_layout.setSpacing(8)
+        members_layout.addLayout(self._section_header("Project members", "Membership for the selected project"))
         members_top = QHBoxLayout()
         self.project_user_combo = QComboBox()
-        members_top.addWidget(QLabel("User:"))
+        members_top.addWidget(self._field_label("User"))
         members_top.addWidget(self.project_user_combo)
-        btn_add_user = self.create_button("Add", "primary", self.add_user_to_project)
-        btn_remove_user = self.create_button("Remove", "danger", self.remove_user_from_project)
+        btn_add_user = self.create_button("Add Member", "primary", self.add_user_to_project)
+        btn_remove_user = self.create_button("Remove Member", "danger", self.remove_user_from_project)
         members_top.addWidget(btn_add_user)
         members_top.addWidget(btn_remove_user)
         members_layout.addLayout(members_top)
         self.project_members_list = QListWidget()
+        self.project_members_list.setAlternatingRowColors(True)
         members_layout.addWidget(self.project_members_list)
-        layout.addWidget(members_box)
+        splitter.addWidget(members_panel)
+        splitter.setSizes([430, 220])
+        layout.addWidget(splitter, 1)
 
         self.table.itemSelectionChanged.connect(self.load_project_members)
         self.reload_users()
@@ -481,6 +671,7 @@ class AdminPage(QWidget):
             self.project_user_combo.addItem(u.username, u.id)
 
     def load_projects(self):
+        self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         projects = self.project_service.get_all_projects()
         for p in projects:
@@ -492,6 +683,18 @@ class AdminPage(QWidget):
             self.table.setItem(row, 3, QTableWidgetItem(str(p.get("version_state") or "")))
             self.table.setItem(row, 4, QTableWidgetItem(p.get("working_directory") or ""))
             self.table.setItem(row, 5, QTableWidgetItem(p.get("created_at") or ""))
+        self.table.setSortingEnabled(True)
+        self._filter_projects(self.project_search.text() if hasattr(self, "project_search") else "")
+
+    def _filter_projects(self, text):
+        query = str(text or "").strip().lower()
+        for row in range(self.table.rowCount()):
+            searchable = " ".join(
+                self.table.item(row, column).text()
+                for column in range(self.table.columnCount())
+                if self.table.item(row, column)
+            ).lower()
+            self.table.setRowHidden(row, bool(query and query not in searchable))
 
     # -------------------- ACTIONS --------------------
     def assign_role_to_user(self):
@@ -559,6 +762,7 @@ class AdminPage(QWidget):
         except Exception as e:
             return QMessageBox.warning(self, "Failed", str(e))
         self.load_projects()
+        self.refresh_stats()
 
     def edit_project(self):
         pid = self._selected_project_id()
@@ -596,6 +800,7 @@ class AdminPage(QWidget):
 
         QMessageBox.information(self, "Updated", "Project updated.")
         self.load_projects()
+        self.refresh_stats()
 
     def delete_project(self):
         row = self.table.currentRow()
@@ -664,3 +869,8 @@ class AdminPage(QWidget):
         except Exception as e:
             return QMessageBox.warning(self, "Failed", str(e))
         self.load_project_members()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if hasattr(self, "tabs"):
+            self.refresh_all()

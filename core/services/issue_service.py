@@ -221,7 +221,7 @@ class IssueService(BaseService):
         return max(0, min(100, score))
 
     def sync_validation_findings(self, findings: Iterable[tuple]):
-        """Create/reopen validation issues and close findings no longer reported."""
+        """Explicitly sync diagnostics into issues when an operator requests it."""
         definitions = {
             "missing_file": ("Missing CAD file", "High", "Restore or relink the expected Creo file."),
             "outdated_file": ("Outdated CAD export", "Medium", "Update the BOM link to the latest approved file."),

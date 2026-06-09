@@ -2082,6 +2082,7 @@ class BomPage(QWidget):
 
         # Files tab (Vault attachments + version history)
         files_tab = QWidget()
+        self.files_tab = files_tab
         files_layout = QVBoxLayout(files_tab)
 
         files_layout.addWidget(QLabel("Attachments:"))
@@ -2265,6 +2266,8 @@ class BomPage(QWidget):
 
         open_pdf_act = QAction("Open PDF", self)
         open_pdf_act.triggered.connect(lambda _=False, pid=item_id: self.open_part_pdf(int(pid)))
+        preview_pdf_act = QAction("Preview PDF", self)
+        preview_pdf_act.triggered.connect(lambda _=False, pid=item_id: self.preview_part_pdf(int(pid)))
         open_step_act = QAction("Open STEP", self)
         open_step_act.triggered.connect(lambda _=False, pid=item_id: self.open_part_step(int(pid)))
         view_action = QAction("View Item Details", self)
@@ -2272,6 +2275,7 @@ class BomPage(QWidget):
         refresh_files_act = QAction("Refresh Files", self)
         refresh_files_act.triggered.connect(lambda _=False, pid=item_id: self._refresh_part_in_tree(int(pid)))
 
+        menu.addAction(preview_pdf_act)
         menu.addAction(open_pdf_act)
         menu.addAction(open_step_act)
         menu.addAction(view_action)
@@ -2601,6 +2605,7 @@ class BomPage(QWidget):
         attachments = self.part_file_service.list_attachments(self.current_part_id)
 
         self.files_table.setRowCount(len(attachments))
+        first_pdf_row = None
         for i, f in enumerate(attachments):
             versions = self.part_file_service.list_versions(f.id)
             active_version = None
@@ -2618,9 +2623,21 @@ class BomPage(QWidget):
             self.files_table.setItem(i, 2, QTableWidgetItem(str(active_version.version_no) if active_version else ""))
             self.files_table.setItem(i, 3, QTableWidgetItem(str(active_version.original_filename) if active_version else ""))
             self.files_table.setItem(i, 4, QTableWidgetItem(str(active_version.created_at) if active_version else str(f.created_at or "")))
+            if first_pdf_row is None and str(f.file_type or "").upper() == "PDF":
+                first_pdf_row = i
 
         # Clear versions view until an attachment is selected
         self.versions_table.setRowCount(0)
+        if first_pdf_row is not None:
+            self.files_table.selectRow(first_pdf_row)
+            self.on_attachment_selected()
+        elif hasattr(self, "pdf_viewer"):
+            details = self.bom_service.get_part_details(int(self.current_part_id)) or {}
+            legacy_pdf = self._resolve_file_path(details.get("pdf_path", ""))
+            if legacy_pdf:
+                self.pdf_viewer.load_pdf(legacy_pdf)
+            else:
+                self.pdf_viewer.close_preview()
 
     def _selected_attachment_id(self):
         items = getattr(self, "files_table", None).selectedItems() if hasattr(self, "files_table") else []
@@ -2673,12 +2690,12 @@ class BomPage(QWidget):
                 return
             path = self.part_file_service.resolve_active_path(file_id)
             resolved = self._resolve_file_path(path)
-            if resolved and os.path.isfile(resolved) and resolved.lower().endswith(".pdf"):
+            if resolved:
                 self.pdf_viewer.load_pdf(resolved)
             else:
-                self.pdf_viewer.close_preview()
-        except Exception:
-            self.pdf_viewer.close_preview()
+                self.pdf_viewer.show_error("The selected PDF attachment has no active version.")
+        except Exception as exc:
+            self.pdf_viewer.show_error(f"Unable to preview the active PDF:\n{exc}")
 
     def _on_version_selection_changed(self):
         """When a specific version row is selected, preview it if it is a PDF."""
@@ -2697,12 +2714,12 @@ class BomPage(QWidget):
                 return
             path = self.part_file_service.resolve_version_path(ver)
             resolved = self._resolve_file_path(path)
-            if resolved and os.path.isfile(resolved):
+            if resolved:
                 self.pdf_viewer.load_pdf(resolved)
             else:
-                self.pdf_viewer.close_preview()
-        except Exception:
-            self.pdf_viewer.close_preview()
+                self.pdf_viewer.show_error("Unable to resolve the selected PDF version path.")
+        except Exception as exc:
+            self.pdf_viewer.show_error(f"Unable to preview the selected PDF version:\n{exc}")
 
     def release_selected_version(self):
         if not self.perm.can("release_files"):
@@ -3104,8 +3121,34 @@ class BomPage(QWidget):
             QMessageBox.critical(self, "Error", f"Failed to attach STEP: {e}")
 
     def open_part_pdf(self, part_id: int):
-        details = self.bom_service.get_part_details(part_id) or {}
-        self._open_file(details.get("pdf_path", ""), "PDF")
+        path = ""
+        try:
+            for attachment in self.part_file_service.list_attachments(int(part_id)):
+                if str(attachment.file_type or "").upper() == "PDF":
+                    path = self.part_file_service.resolve_active_path(attachment.id)
+                    if path:
+                        break
+        except Exception:
+            path = ""
+        if not path:
+            details = self.bom_service.get_part_details(part_id) or {}
+            path = details.get("pdf_path", "")
+        self._open_file(path, "PDF")
+
+    def preview_part_pdf(self, part_id: int):
+        """Select a BOM item, open its Files tab, and preview its active PDF."""
+        self.display_details(int(part_id))
+        try:
+            self.tabs.setCurrentWidget(self.files_tab)
+        except Exception:
+            pass
+        if not self.pdf_viewer.is_loaded():
+            details = self.bom_service.get_part_details(int(part_id)) or {}
+            path = self._resolve_file_path(details.get("pdf_path", ""))
+            if path:
+                self.pdf_viewer.load_pdf(path)
+            else:
+                self.pdf_viewer.show_error("No PDF attachment is available for this BOM item.")
 
     def open_part_step(self, part_id: int):
         details = self.bom_service.get_part_details(part_id) or {}
@@ -3750,6 +3793,56 @@ class BomPage(QWidget):
             current = getattr(self, "current_part_id", None)
             if current is not None and int(current) in refreshed:
                 self.display_details(int(current))
+        except Exception:
+            pass
+
+    def refresh_issue_indicators(self, affected_part_ids=None) -> None:
+        """Repaint only BOM nodes whose propagated issue summary changed."""
+        try:
+            previous = dict(self._issue_summary_cache or {})
+            current = self.issue_service.part_summary()
+        except Exception:
+            return
+
+        candidate_ids = set(previous) | set(current)
+        candidate_ids.update(
+            int(part_id) for part_id in (affected_part_ids or []) if part_id is not None
+        )
+        changed_ids = {
+            int(part_id)
+            for part_id in candidate_ids
+            if previous.get(int(part_id), {}) != current.get(int(part_id), {})
+        }
+        self._issue_summary_cache = current
+
+        for part_id in changed_ids:
+            try:
+                info = self.bom_service.get_part_details(int(part_id)) or {}
+                if not info:
+                    continue
+                for item in self._find_tree_items(int(part_id)):
+                    self._apply_tree_item_data(item, info)
+            except Exception:
+                continue
+
+        try:
+            score = max(
+                0,
+                self.issue_service.health_score()
+                - len(getattr(self, "missing_ids", set()) or set()),
+            )
+            color = "#2e7d32" if score >= 85 else ("#a16207" if score >= 65 else "#b91c1c")
+            self.bom_health_label.setText(f"Health: {score}/100")
+            self.bom_health_label.setStyleSheet(
+                f"font-size:11px;font-weight:700;color:{color};background:transparent;border:none;"
+            )
+        except Exception:
+            pass
+
+        try:
+            current_part_id = getattr(self, "current_part_id", None)
+            if current_part_id is not None and int(current_part_id) in changed_ids:
+                self.refresh_issues_tab()
         except Exception:
             pass
 
@@ -4508,6 +4601,23 @@ class BomPage(QWidget):
     def _on_tree_item_double_clicked(self, item, column):
         item_id = item.data(0, Qt.UserRole)
         if not item_id:
+            return
+        if int(column) == 1:
+            tree = item.treeWidget() or self.tree
+            payload = item.data(1, BOM_TREE_FILES_ROLE) or {}
+            row_rect = tree.visualItemRect(item)
+            column_rect = QRect(
+                tree.header().sectionViewportPosition(1),
+                row_rect.top(),
+                tree.header().sectionSize(1),
+                row_rect.height(),
+            )
+            pdf_rect, step_rect = _files_delegate_pill_rects(column_rect, payload)
+            cursor_pos = tree.viewport().mapFromGlobal(QCursor.pos())
+            if step_rect and step_rect.contains(cursor_pos):
+                self.open_part_step(int(item_id))
+            else:
+                self.preview_part_pdf(int(item_id))
             return
         self.issue_requested.emit(int(item_id))
 

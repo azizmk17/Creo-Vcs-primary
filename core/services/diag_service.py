@@ -456,13 +456,6 @@ class DiagService:
         for bom in boms:
             result.extend(self._sync_bom_record(working_dir, bom, files_in_dir, force_integrated_filenames))
 
-        try:
-            from core.services.issue_service import IssueService
-            IssueService().sync_validation_findings(result)
-        except Exception:
-            # Diagnostics must remain usable even if issue synchronization fails.
-            pass
-
         return result
 
 
