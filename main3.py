@@ -1,10 +1,9 @@
 import sys
-from PyQt5.QtWidgets import QLabel, QDialog , QInputDialog, QApplication, QMainWindow, QSystemTrayIcon, QStackedWidget, QAction, QToolBar, QMessageBox, QComboBox, QGraphicsBlurEffect, QFileDialog
-from PyQt5.QtCore import Qt, QTimer, QPropertyAnimation, pyqtSignal, QObject, QThread
+from PyQt5.QtWidgets import QLabel, QInputDialog, QApplication, QMainWindow, QSystemTrayIcon, QStackedWidget, QAction, QToolBar, QMessageBox, QComboBox, QFileDialog, QProgressBar
+from PyQt5.QtCore import Qt, QTimer, QPropertyAnimation, pyqtSignal, QObject, QThread, QEventLoop
 from PyQt5.QtGui import QPainter, QColor, QPen, QPixmap, QFont, QIcon
 from PyQt5.QtWidgets import QWidget, QVBoxLayout
 import math
-import random
 import os
 
 
@@ -30,13 +29,7 @@ def _run_migrations_safely():
 
 
 
-#import pages
-from pages.bom_page import BomPage
-from pages.commit_page import CommitPage
-from pages.issue_page import EngineeringIssuePage
-from pages.diag_page import DiagPage
-from pages.admin_page import AdminPage
-from pages.snapshot_page import SnapshotPage
+# Import the startup screen eagerly; heavy application pages are loaded after login.
 from pages.login_page import LoginPage
 from pages.dialogs.progress_dialog import ProgressDialog
 
@@ -57,198 +50,93 @@ from core.session_manager import SessionManager
 class AdvancedSpinner(QWidget):
     def __init__(self, logo_path=None, parent=None):
         super().__init__(parent)
-        self.setFixedSize(300, 300)  # bigger spinner
+        self.setFixedSize(180, 180)
         self.angle = 0
-        self.timer = QTimer()
+        self.timer = QTimer(self)
         self.timer.timeout.connect(self.rotate)
-        self.timer.start(16)  # ~60fps
+        self.timer.start(33)
 
-        # Load logo
-        self.logo = QPixmap(logo_path).scaled(120, 120, Qt.KeepAspectRatio, Qt.SmoothTransformation) if logo_path else None
-
-        # Floating particles
-        self.particles = []
-        for _ in range(30):  # more particles for bigger size
-            self.particles.append({
-                "angle": random.uniform(0, 360),
-                "radius": random.uniform(120, 150),
-                "size": random.uniform(3, 6),
-                "speed": random.uniform(0.5, 1.2)
-            })
+        self.logo = QPixmap(logo_path).scaled(
+            82, 82, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        ) if logo_path else None
 
     def rotate(self):
-        self.angle = (self.angle + 4) % 360
-        for p in self.particles:
-            p["angle"] = (p["angle"] + p["speed"]) % 360
+        self.angle = (self.angle + 7) % 360
         self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         center = self.rect().center()
-        radius = min(self.width(), self.height()) / 2 - 30
+        radius = min(self.width(), self.height()) / 2 - 18
 
-        # Gradient rotating trail
-        for i in range(15):  # more points
-            color = QColor.fromHsv((self.angle + i*15) % 360, 200, 255)
-            color.setAlphaF(i / 15)
-            painter.setPen(QPen(color, 8, Qt.SolidLine, Qt.RoundCap))
-            angle_rad = math.radians((self.angle + i * 24) % 360)
+        for i in range(10):
+            color = QColor(37, 99, 235)
+            color.setAlpha(35 + i * 20)
+            painter.setPen(QPen(color, 6, Qt.SolidLine, Qt.RoundCap))
+            angle_rad = math.radians((self.angle + i * 28) % 360)
             x = center.x() + math.cos(angle_rad) * radius
             y = center.y() + math.sin(angle_rad) * radius
             painter.drawPoint(int(x), int(y))
 
-        # Floating particles
-        for p in self.particles:
-            angle_rad = math.radians(p["angle"])
-            x = center.x() + math.cos(angle_rad) * p["radius"]
-            y = center.y() + math.sin(angle_rad) * p["radius"]
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(100, 200, 255, 150))
-            painter.drawEllipse(int(x), int(y), int(p["size"]), int(p["size"]))
-
-        # Pulsing and glowing logo (slower pulse)
         if self.logo:
-            scale = 1 + 0.03 * math.sin(math.radians(self.angle*1.5))
-            w, h = self.logo.width() * scale, self.logo.height() * scale
-            logo_scaled = self.logo.scaled(int(w), int(h), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            logo_rect = logo_scaled.rect()
-            logo_rect.moveCenter(center)
-
-            glow_color = QColor(50, 150, 255, 100)
             painter.setPen(Qt.NoPen)
-            painter.setBrush(glow_color)
-            painter.drawEllipse(logo_rect.center(), int(w/1.5), int(h/1.5))
-
-            painter.drawPixmap(logo_rect, logo_scaled)
-
+            painter.setBrush(QColor(22, 38, 61))
+            painter.drawEllipse(center, 51, 51)
+            logo_rect = self.logo.rect()
+            logo_rect.moveCenter(center)
+            painter.drawPixmap(logo_rect, self.logo)
 
 class AdvancedLoader(QWidget):
-    def __init__(self, logo_path=None):
-        super().__init__()
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setFixedSize(480, 480)  # bigger window
+    def __init__(self, logo_path=None, parent=None):
+        super().__init__(parent)
+        self.setObjectName("startupLoader")
 
-        # Frosted glass background
-        self.background = QWidget(self)
-        self.background.setStyleSheet("""
-            background-color: rgba(30, 30, 30, 180);
-            border-radius: 30px;
-        """)
-        self.background.setGeometry(0, 0, 480, 480)
-        blur = QGraphicsBlurEffect()
-        blur.setBlurRadius(20)
-        self.background.setGraphicsEffect(blur)
-
-        layout = QVBoxLayout()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(40, 40, 40, 40)
         layout.setAlignment(Qt.AlignCenter)
-        layout.setSpacing(20)
+        layout.setSpacing(14)
 
-        # Spinner
         self.spinner = AdvancedSpinner(logo_path)
-        layout.addWidget(self.spinner)
+        layout.addWidget(self.spinner, 0, Qt.AlignCenter)
 
-        # Animated loading text with dots
-        self.loading_label = QLabel("Loading VCS", self)
+        self.loading_label = QLabel("Preparing CreoVCS", self)
         self.loading_label.setAlignment(Qt.AlignCenter)
-        self.loading_label.setStyleSheet("color: white; font: bold 18px;")
-        self.loading_label.setFont(QFont("Segoe UI", 16))
+        self.loading_label.setObjectName("loaderTitle")
+        self.loading_label.setFont(QFont("Segoe UI", 18, QFont.Bold))
         layout.addWidget(self.loading_label)
 
-        self.setLayout(layout)
+        self.detail_label = QLabel("Checking application data...", self)
+        self.detail_label.setAlignment(Qt.AlignCenter)
+        self.detail_label.setObjectName("loaderDetail")
+        layout.addWidget(self.detail_label)
 
-        # Fade-in animation
-        self.fade_in = QPropertyAnimation(self, b"windowOpacity")
-        self.fade_in.setDuration(500)
-        self.fade_in.setStartValue(0)
-        self.fade_in.setEndValue(1)
-        self.fade_in.start()
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedWidth(320)
+        self.progress.setFixedHeight(5)
+        layout.addWidget(self.progress, 0, Qt.AlignCenter)
 
-        # Animate loading dots
-        self.dot_count = 0
-        self.dot_timer = QTimer()
-        self.dot_timer.timeout.connect(self.animate_dots)
-        self.dot_timer.start(500)  # slower dot animation
+        self.setStyleSheet(
+            """
+            QWidget#startupLoader { background: #f3f6fa; }
+            QLabel#loaderTitle { color: #16263d; }
+            QLabel#loaderDetail { color: #66758a; font-size: 13px; }
+            QProgressBar {
+                border: none;
+                border-radius: 2px;
+                background: #dbe4ef;
+            }
+            QProgressBar::chunk {
+                border-radius: 2px;
+                background: #2563eb;
+            }
+            """
+        )
 
-        # Minimum splash duration (show loader first, then UI).
-        self._min_splash_ms = 2000
-
-        # Run migrations in background; don't delay UI.
-        QTimer.singleShot(0, self._start_migrations)
-
-        # Show UI after a minimum delay.
-        QTimer.singleShot(self._min_splash_ms, self.open_main)
-
-        self._closing = False
-        self._migrate_thread = None
-        self._migrate_worker = None
-
-    def _start_migrations(self):
-        try:
-            if self._migrate_thread is not None:
-                return
-        except Exception:
-            pass
-
-        self._migrate_thread = QThread(self)
-        self._migrate_worker = _MigrateWorker()
-        self._migrate_worker.moveToThread(self._migrate_thread)
-        self._migrate_thread.started.connect(self._migrate_worker.run)
-        self._migrate_worker.finished.connect(self._migrate_thread.quit)
-        self._migrate_worker.finished.connect(self._migrate_worker.deleteLater)
-        self._migrate_thread.finished.connect(self._migrate_thread.deleteLater)
-        self._migrate_thread.start()
-
-    def animate_dots(self):
-        self.dot_count = (self.dot_count + 1) % 4
-        self.loading_label.setText("Loading VCS" + "." * self.dot_count)
-
-    def finish_loading(self):
-        if getattr(self, "_closing", False):
-            return
-        self._closing = True
-        self.fade_out = QPropertyAnimation(self, b"windowOpacity")
-        self.fade_out.setDuration(500)
-        self.fade_out.setStartValue(1)
-        self.fade_out.setEndValue(0)
-        self.fade_out.finished.connect(self.close)
-        self.fade_out.start()
-
-    def open_main(self):
-        # Create/show the main window while the loader remains visible.
-        try:
-            self.main_page = BomGUI()
-            self.main_page.show()
-        except Exception:
-            # If something goes wrong, still close the loader.
-            try:
-                self.close()
-            except Exception:
-                pass
-            raise
-
-        should_wait_for_bom = False
-        try:
-            session = getattr(self.main_page, "session", None)
-            should_wait_for_bom = bool(session and getattr(session, "project_id", None))
-        except Exception:
-            should_wait_for_bom = False
-
-        if should_wait_for_bom:
-            # Keep loader until the BOM tree finishes its initial load.
-            try:
-                bom_page = getattr(self.main_page, "bom_page", None)
-                if bom_page is not None and hasattr(bom_page, "initial_tree_ready"):
-                    bom_page.initial_tree_ready.connect(self.finish_loading)
-            except Exception:
-                pass
-
-            # Fallback: never block forever.
-            QTimer.singleShot(8000, self.finish_loading)
-        else:
-            # No project loaded (or login needed): don't block the UI.
-            QTimer.singleShot(0, self.finish_loading)
+    def set_status(self, message):
+        self.detail_label.setText(message)
 
 
 class _MigrateWorker(QObject):
@@ -257,6 +145,80 @@ class _MigrateWorker(QObject):
     def run(self):
         _run_migrations_safely()
         self.finished.emit()
+
+
+class StartupWindow(QMainWindow):
+    """Hosts login and startup progress in one stable, full-size window."""
+
+    def __init__(self, logo_path=None):
+        super().__init__()
+        self.setWindowTitle("CreoVCS")
+        self.resize(1400, 900)
+        self.setWindowIcon(QIcon(_resource_path("assets/pictures/creovcs_logo-main.ico")))
+
+        self.pages = QStackedWidget()
+        self.setCentralWidget(self.pages)
+        self.login_page = LoginPage()
+        self.loader_page = AdvancedLoader(logo_path)
+        self.pages.addWidget(self.login_page)
+        self.pages.addWidget(self.loader_page)
+        self.pages.setCurrentWidget(self.login_page)
+
+        self.main_page = None
+        self._migrate_thread = None
+        self._migrate_worker = None
+        self._main_shown = False
+        self.login_page.login_succeeded.connect(self.begin_loading)
+
+    def begin_loading(self):
+        self.pages.setCurrentWidget(self.loader_page)
+        self.loader_page.set_status("Checking database migrations...")
+        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+
+        self._migrate_thread = QThread(self)
+        self._migrate_worker = _MigrateWorker()
+        self._migrate_worker.moveToThread(self._migrate_thread)
+        self._migrate_thread.started.connect(self._migrate_worker.run)
+        self._migrate_worker.finished.connect(self._migrate_thread.quit)
+        self._migrate_worker.finished.connect(self._migrate_worker.deleteLater)
+        self._migrate_thread.finished.connect(self._migrate_thread.deleteLater)
+        self._migrate_thread.finished.connect(self._build_main_window)
+        self._migrate_thread.start()
+
+    def _set_loading_status(self, message):
+        self.loader_page.set_status(message)
+        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+
+    def _build_main_window(self):
+        self._set_loading_status("Preparing application services...")
+        try:
+            self.main_page = BomGUI(startup_progress=self._set_loading_status)
+        except Exception as exc:
+            QMessageBox.critical(self, "Startup Error", f"CreoVCS could not start:\n\n{exc}")
+            self.pages.setCurrentWidget(self.login_page)
+            self.login_page._set_busy(False)
+            raise
+
+        self._set_loading_status("Loading the initial BOM...")
+        try:
+            if getattr(self.main_page.session, "project_id", None):
+                self.main_page.bom_page.initial_tree_ready.connect(self.show_main_window)
+                QTimer.singleShot(8000, self.show_main_window)
+                return
+        except Exception:
+            pass
+        QTimer.singleShot(0, self.show_main_window)
+
+    def show_main_window(self):
+        if self._main_shown or self.main_page is None:
+            return
+        self._main_shown = True
+        self.main_page.setGeometry(self.geometry())
+        if self.isMaximized():
+            self.main_page.showMaximized()
+        else:
+            self.main_page.show()
+        self.close()
 
 
 class Notifier(QObject):
@@ -276,7 +238,7 @@ _PRODUCTION_PUBLIC_KEY = "fc941ecde885df70bfdcd71498d80fa8cfa7fe340c40c2292bbfc2
 class BomGUI(QMainWindow):
     """Modern BOM Management Application with Toolbar Navigation"""
 
-    def __init__(self):
+    def __init__(self, startup_progress=None):
         super().__init__()
         self.setWindowTitle("BOM Manager - CreoVCS")
         self.resize(1400, 900)
@@ -297,7 +259,7 @@ class BomGUI(QMainWindow):
         # Status bar
         self.statusBar().showMessage("Ready")
 
-        self._build_ui()
+        self._build_ui(startup_progress=startup_progress)
 
     def _ensure_valid_current_project(self):
         """If the session points to a missing project directory, clear it and continue startup."""
@@ -353,18 +315,35 @@ class BomGUI(QMainWindow):
         # --- 4️⃣ Refresh display ---
         self.update()
 
-    def _build_ui(self):
+    def _build_ui(self, startup_progress=None):
          # Central stacked pages
         self.pages = QStackedWidget()
         self.setCentralWidget(self.pages)
 
+        def startup_stage(message):
+            if startup_progress:
+                startup_progress(message)
+
         # Add pages
+        startup_stage("Loading BOM workspace...")
+        from pages.bom_page import BomPage
         self.bom_page = BomPage(self.bom_service)
+        startup_stage("Loading commit workspace...")
+        from pages.commit_page import CommitPage
         self.commit_page = CommitPage(self.bom_service)
+        startup_stage("Loading engineering issues...")
+        from pages.issue_page import EngineeringIssuePage
         self.issue_page = EngineeringIssuePage()
+        startup_stage("Loading diagnostics...")
+        from pages.diag_page import DiagPage
         self.diag_page = DiagPage()
+        startup_stage("Loading administration tools...")
+        from pages.admin_page import AdminPage
         self.admin_page = AdminPage()
+        startup_stage("Loading snapshots and baselines...")
+        from pages.snapshot_page import SnapshotPage
         self.snap_page = SnapshotPage()
+        startup_stage("Connecting application modules...")
         self.pages.addWidget(self.bom_page)
         self.pages.addWidget(self.commit_page)
         self.pages.addWidget(self.issue_page)
@@ -1053,19 +1032,9 @@ if __name__ == "__main__":
         sys.exit(1)
     # ------------------------------------------------------------------
 
-    session = SessionManager()
-
-
-    login_dialog = LoginPage()
-    if login_dialog.exec_() == QDialog.Accepted:  # waits until dialog is closed
-        loader = AdvancedLoader(logo_path)
-        loader.show()
-        sys.exit(app.exec_())
-        # window = BomGUI()
-        # window.show()
-        # sys.exit(app.exec_())
-    else:
-        sys.exit(0) 
+    startup_window = StartupWindow(logo_path)
+    startup_window.showMaximized()
+    sys.exit(app.exec_())
 
 
     
