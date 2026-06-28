@@ -88,6 +88,22 @@ def get_latest_version(public_key_bytes: bytes) -> Optional[str]:
         return None
 
 
+def get_minimum_app_version() -> Optional[str]:
+    """Read the minimum app version required by the current database schema."""
+    try:
+        db_path = Path(DB_NAME)
+        if not db_path.exists():
+            return None
+        with sqlite3.connect(str(db_path)) as conn:
+            row = conn.execute(
+                "SELECT value FROM app_metadata WHERE key=?",
+                ("minimum_app_version",),
+            ).fetchone()
+        return str(row[0]).strip() if row and row[0] else None
+    except Exception:
+        return None
+
+
 def is_outdated(current: str, latest: str) -> bool:
     """Return ``True`` if *current* is strictly older than *latest*.
 
@@ -135,6 +151,14 @@ def check_version_notification(public_key_bytes: bytes) -> Optional[str]:
         return None
 
     latest = get_latest_version(public_key_bytes)
+    minimum = get_minimum_app_version()
+    if minimum and is_outdated(APP_VERSION, minimum):
+        return (
+            f"This database requires CreoVCS {minimum} or newer. "
+            f"You are running version {APP_VERSION}. "
+            "Please update before continuing to avoid incompatible database behavior."
+        )
+
     if latest is None:
         return None
 

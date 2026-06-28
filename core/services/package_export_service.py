@@ -135,6 +135,7 @@ class PackageExportService:
                             "file_type": att.file_type,
                             "active_version_id": att.active_version_id,
                             "active_version_note": getattr(active_ver, "note", None),
+                            "active_version_revision": getattr(active_ver, "revision", None),
                             "active_original_filename": getattr(active_ver, "original_filename", None),
                         }
                 return None, None
@@ -145,23 +146,23 @@ class PackageExportService:
             row = {**part_info, "pdf": None, "step": None}
 
             if pdf_path and os.path.exists(pdf_path):
-                # Build dst name: drawingNumber - aesNumber - name(with underscores) - note - YYYYMMDD
+                # Build dst name: drawingNumber - aesNumber - name - revision - YYYYMMDD
                 drawing_no = getattr(part, "drawing_number", None) or ""
                 aes = part_info.get("aes_number") or ""
                 pname = part_info.get("name") or ""
-                # normalize name and note to underscores between words
+                # normalize name and revision to underscores between words
                 def _norm(s: Optional[str]) -> str:
                     if s is None:
                         return ""
                     return "_".join(str(s).split())
 
                 name_us = _norm(pname)
-                note_us = _norm((pdf_meta or {}).get("active_version_note") or "")
+                revision_us = _norm((pdf_meta or {}).get("active_version_revision") or getattr(part, "revision", None) or "")
                 date_str = datetime.now().strftime("%Y%m%d")
 
                 parts = [drawing_no, aes, name_us]
-                if note_us:
-                    parts.append(note_us)
+                if revision_us:
+                    parts.append(revision_us)
                 parts.append(date_str)
 
                 # sanitize each part and join
@@ -177,20 +178,22 @@ class PackageExportService:
 
             
             if step_path and os.path.exists(step_path):
-                # Build dst name: drawingNumber - aesNumber - name(with underscores) - note - YYYYMMDD
+                # Build dst name: drawingNumber - aesNumber - name - revision - YYYYMMDD
                 drawing_no = getattr(part, "drawing_number", None) or ""
                 aes = part_info.get("aes_number") or ""
                 pname = part_info.get("name") or ""
-                # normalize name and note to underscores between words
+                # normalize name and revision to underscores between words
                 def _norm(s: Optional[str]) -> str:
                     if s is None:
                         return ""
                     return "_".join(str(s).split())
 
                 name_us = _norm(pname)
+                revision_us = _norm((step_meta or {}).get("active_version_revision") or getattr(part, "revision", None) or "")
                 date_str = datetime.now().strftime("%Y%m%d")
                 parts = [drawing_no, aes, name_us]
-          
+                if revision_us:
+                    parts.append(revision_us)
                 parts.append(date_str)
 
                 # sanitize each part and join

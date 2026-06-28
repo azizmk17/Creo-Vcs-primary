@@ -1,13 +1,15 @@
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QHBoxLayout, QListWidget, QTextEdit,
     QPushButton, QMessageBox, QGroupBox, QFileDialog, QComboBox, QFormLayout,
-    QDialog, QLineEdit, QGraphicsDropShadowEffect,
+    QDialog, QLineEdit, QGraphicsDropShadowEffect, QTabWidget,
     QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QMenu, QAction,
     QListWidgetItem, QScrollArea, QFrame, QSizePolicy, QSplitter,
+    QTreeWidget, QTreeWidgetItem,
     QApplication, QAbstractItemView,
 )
 from PyQt5.QtCore import (
-    Qt, QPropertyAnimation, QEasingCurve, pyqtProperty, pyqtSignal, QTimer, QSize,
+    Qt, QPropertyAnimation, QEasingCurve, pyqtProperty, pyqtSignal, QTimer, QSize, QRect,
+    QObject, QThread,
 )
 from PyQt5.QtGui import (
     QColor, QPainter, QPen, QFont, QCursor, QBrush, QTransform,
@@ -32,6 +34,7 @@ from core.services.role_service import RoleService
 from core.services.project_service import ProjectService
 from core.session_manager import SessionManager
 from core.services.issue_service import IssueService
+from pages.rich_text_image_editor import RichTextImageEditor, html_to_plain_text, looks_like_html
 
 from utils import is_creo_file, ensure_dir_exists
 
@@ -202,6 +205,105 @@ class DropListWidget(QListWidget):
 #  STAT CARD WIDGET
 # ═══════════════════════════════════════════════════════════════════════════
 
+class _PageProcessingOverlay(QWidget):
+    """Full-page busy veil used while commit/merge operations run."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._angle = 0
+        self._message = "Processing..."
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        self.setCursor(Qt.WaitCursor)
+        self._timer = QTimer(self)
+        self._timer.setInterval(45)
+        self._timer.timeout.connect(self._tick)
+        self.hide()
+
+    def show_overlay(self, message: str):
+        self._message = message or "Processing..."
+        if self.parent():
+            self.setGeometry(self.parent().rect())
+        self.raise_()
+        self.show()
+        self._timer.start()
+        self.update()
+
+    def hide_overlay(self):
+        self._timer.stop()
+        self.hide()
+
+    def _tick(self):
+        self._angle = (self._angle + 18) % 360
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # "Voile" overlay: soft translucent layer above the whole page.
+        painter.fillRect(self.rect(), QColor(248, 250, 252, 190))
+
+        card_w = min(380, max(280, self.width() - 48))
+        card_h = 156
+        card_x = (self.width() - card_w) // 2
+        card_y = (self.height() - card_h) // 2
+        card = QRect(card_x, card_y, card_w, card_h)
+
+        painter.setPen(QPen(QColor("#bfdbfe"), 1))
+        painter.setBrush(QBrush(QColor(255, 255, 255, 238)))
+        painter.drawRoundedRect(card, 10, 10)
+
+        spinner_size = 50
+        spinner_x = card_x + (card_w - spinner_size) // 2
+        spinner_y = card_y + 30
+        spinner_rect = QRect(spinner_x, spinner_y, spinner_size, spinner_size)
+        arc_rect = spinner_rect.adjusted(5, 5, -5, -5)
+        painter.setPen(QPen(QColor("#dbeafe"), 5, Qt.SolidLine, Qt.RoundCap))
+        painter.drawArc(arc_rect, 0, 360 * 16)
+        painter.setPen(QPen(QColor("#2563eb"), 5, Qt.SolidLine, Qt.RoundCap))
+        painter.drawArc(arc_rect, int(self._angle * 16), int(110 * 16))
+
+        painter.setPen(QColor("#111827"))
+        title_font = QFont()
+        title_font.setPointSize(11)
+        title_font.setBold(True)
+        painter.setFont(title_font)
+        text_rect = QRect(card_x + 20, spinner_y + spinner_size + 18, card_w - 40, 28)
+        painter.drawText(text_rect, Qt.AlignCenter, self._message)
+
+        painter.setPen(QColor("#64748b"))
+        hint_font = QFont()
+        hint_font.setPointSize(9)
+        painter.setFont(hint_font)
+        hint_rect = QRect(card_x + 20, text_rect.bottom() + 4, card_w - 40, 24)
+        painter.drawText(hint_rect, Qt.AlignCenter, "Please wait. The commit page is locked while this finishes.")
+
+    def mousePressEvent(self, event):
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        event.accept()
+
+    def keyPressEvent(self, event):
+        event.accept()
+
+
+class _ProcessingWorker(QObject):
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(object)
+
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def run(self):
+        try:
+            self.finished.emit(self._fn())
+        except Exception as exc:
+            self.failed.emit(exc)
+
+
 class _StatCard(QFrame):
     """Mini KPI card for the dashboard row."""
 
@@ -254,11 +356,13 @@ class _StatCard(QFrame):
 class _HistoryTable(QTableWidget):
     """Rich commit-history table with coloured badges, relative times, STEP markers."""
 
+    restore_requested = pyqtSignal(object)
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setColumnCount(7)
+        self.setColumnCount(8)
         self.setHorizontalHeaderLabels([
-            "", "Status", "File", "Designer", "Date", "STEP", "Message",
+            "", "Action", "Status", "File / Commit", "Designer", "Date", "STEP", "Message",
         ])
         self.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -273,10 +377,11 @@ class _HistoryTable(QTableWidget):
         hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(5, QHeaderView.Fixed)
-        hh.setSectionResizeMode(6, QHeaderView.Stretch)
+        hh.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(6, QHeaderView.Fixed)
+        hh.setSectionResizeMode(7, QHeaderView.Stretch)
         self.setColumnWidth(0, 8)
-        self.setColumnWidth(5, 50)
+        self.setColumnWidth(6, 50)
         self.setStyleSheet("""
             QTableWidget {
                 border: 1px solid #e5e7eb; border-radius: 8px;
@@ -295,6 +400,8 @@ class _HistoryTable(QTableWidget):
         self.setRowCount(0)
         self.setRowCount(len(rows))
         for i, c in enumerate(rows):
+            if i and i % 20 == 0:
+                QApplication.processEvents()
             sty = _status_style(c.get("status", ""))
 
             # col 0 — colour dot
@@ -302,6 +409,28 @@ class _HistoryTable(QTableWidget):
             dot_item.setData(Qt.UserRole, dict(c))
             dot_item.setBackground(QBrush(QColor(sty["color"])))
             self.setItem(i, 0, dot_item)
+
+            if c.get("is_commit_group"):
+                action = QPushButton("Restore")
+                action.setCursor(Qt.PointingHandCursor)
+                action.setEnabled(bool(c.get("can_restore")))
+                action.setToolTip(
+                    "Restore this approved commit group"
+                    if c.get("can_restore")
+                    else "Restore is available only for commits pushed to master"
+                )
+                action.setStyleSheet("""
+                    QPushButton {
+                        background: #ffffff; border: 1px solid #d1d5db; border-radius: 6px;
+                        padding: 3px 8px; font-size: 10px; color: #374151;
+                    }
+                    QPushButton:hover:enabled { background: #eff6ff; border-color: #93c5fd; color: #1d4ed8; }
+                    QPushButton:disabled { color: #9ca3af; background: #f3f4f6; }
+                """)
+                action.clicked.connect(lambda _checked=False, d=dict(c): self.restore_requested.emit(d))
+                self.setCellWidget(i, 1, action)
+            else:
+                self.setItem(i, 1, QTableWidgetItem(""))
 
             # col 1 — status badge
             badge = QLabel(f' {sty["icon"]} {sty["label"]} ')
@@ -316,7 +445,7 @@ class _HistoryTable(QTableWidget):
             cl.setContentsMargins(2, 2, 2, 2)
             cl.addWidget(badge)
             cl.addStretch()
-            self.setCellWidget(i, 1, container)
+            self.setCellWidget(i, 2, container)
 
             # col 2 — file
             fname = str(c.get("filename", "") or "")
@@ -326,10 +455,10 @@ class _HistoryTable(QTableWidget):
             fnt = fi.font()
             fnt.setBold(True)
             fi.setFont(fnt)
-            self.setItem(i, 2, fi)
+            self.setItem(i, 3, fi)
 
             # col 3 — designer
-            self.setItem(i, 3, QTableWidgetItem(str(c.get("designed_by", "") or "")))
+            self.setItem(i, 4, QTableWidgetItem(str(c.get("designed_by", "") or "")))
 
             # col 4 — date + relative
             raw_ts = str(c.get("date", "") or "")
@@ -345,7 +474,7 @@ class _HistoryTable(QTableWidget):
                 d2 = QLabel(rel)
                 d2.setStyleSheet("font-size: 8px; color: #9ca3af; background: transparent; border: none;")
                 wl.addWidget(d2)
-            self.setCellWidget(i, 4, w)
+            self.setCellWidget(i, 5, w)
 
             # col 5 — STEP indicator
             step_status = str(c.get("step_diff_status", "") or "").strip().upper()
@@ -359,14 +488,14 @@ class _HistoryTable(QTableWidget):
             si = QTableWidgetItem(step_txt)
             si.setTextAlignment(Qt.AlignCenter)
             si.setToolTip(f"STEP: {step_status}" if step_status else "No STEP")
-            self.setItem(i, 5, si)
+            self.setItem(i, 6, si)
 
             # col 6 — message
-            msg = str(c.get("message", "") or "")
+            msg = html_to_plain_text(str(c.get("message", "") or ""))
             mi = QTableWidgetItem(msg)
             mi.setToolTip(msg)
             mi.setForeground(QBrush(QColor("#4b5563")))
-            self.setItem(i, 6, mi)
+            self.setItem(i, 7, mi)
 
             self.setRowHeight(i, 44)
 
@@ -528,6 +657,9 @@ class CommitPage(QWidget):
         self.commits_dir = None
         self.pr_dir = None
         self.merge_service = None
+        self._processing_action = False
+        self._processing_thread = None
+        self._processing_worker = None
 
         if self.session.project_id:
             self.working_dir = self.get_working_dir()
@@ -568,8 +700,8 @@ class CommitPage(QWidget):
         self.revert_btn.setEnabled(project_loaded)
 
         if self.session.project_id:
-            self.load_commit_history()
-            self.load_pending_commits()
+            QTimer.singleShot(0, self.load_commit_history)
+            QTimer.singleShot(75, self.load_pending_commits)
 
     # ═══════════════════════════════════════════════════════════════════
     #  UI BUILD
@@ -702,14 +834,15 @@ class CommitPage(QWidget):
             self.designed_by.addItems(self.usernames)
         meta_lay.addRow("Designer:", self.designed_by)
 
-        self.commit_message = QTextEdit()
+        self.commit_message = RichTextImageEditor()
         self.commit_message.setPlaceholderText(
             "Describe your changes in detail…\n\n"
             "• What was modified?\n"
             "• Why was it changed?\n"
             "• Any related part numbers?"
         )
-        self.commit_message.setMaximumHeight(90)
+        self.commit_message.setMinimumHeight(150)
+        self.commit_message.setMaximumHeight(260)
         self.commit_message.setStyleSheet("""
             QTextEdit { border: 1px solid #d1d5db; border-radius: 6px; padding: 6px; font-size: 11px; }
             QTextEdit:focus { border-color: #0078d7; }
@@ -750,6 +883,24 @@ class CommitPage(QWidget):
             "Select active engineering issues addressed by this commit."
         )
         meta_lay.addRow("Resolved Issues:", self.resolved_issues_list)
+
+        self.issue_relation_combo = QComboBox()
+        self.issue_relation_combo.addItems(["solves", "partial_fix", "related", "regression"])
+        self.issue_relation_combo.setToolTip("Relation applied to all selected linked issues.")
+        meta_lay.addRow("Issue Relation:", self.issue_relation_combo)
+
+        self.commit_jira_key = QLineEdit()
+        self.commit_jira_key.setPlaceholderText("Optional Jira key, e.g. ENG-123")
+        meta_lay.addRow("Jira Key:", self.commit_jira_key)
+
+        self.commit_jira_url = QLineEdit()
+        self.commit_jira_url.setPlaceholderText("Optional Jira URL")
+        meta_lay.addRow("Jira URL:", self.commit_jira_url)
+
+        create_issue_btn = QPushButton("Create Issue from Commit")
+        create_issue_btn.setObjectName("neutral")
+        create_issue_btn.clicked.connect(self._create_issue_from_commit)
+        meta_lay.addRow("", create_issue_btn)
         left_splitter.addWidget(meta_group)
 
         top_layout.addWidget(left_splitter, 2)
@@ -873,6 +1024,12 @@ class CommitPage(QWidget):
         self.history_status_filter.setFixedWidth(110)
         filter_row.addWidget(self.history_status_filter)
 
+        self.history_view_filter = QComboBox()
+        self.history_view_filter.addItems(["Items", "Commit Groups"])
+        self.history_view_filter.setToolTip("Switch between file-row history and logical commit groups")
+        self.history_view_filter.setFixedWidth(135)
+        filter_row.addWidget(self.history_view_filter)
+
         self.history_clear_btn = QPushButton("✖")
         self.history_clear_btn.setFixedSize(28, 28)
         self.history_clear_btn.setToolTip("Clear filters")
@@ -892,6 +1049,7 @@ class CommitPage(QWidget):
         # Table
         self.history_table = _HistoryTable()
         self.history_table.itemDoubleClicked.connect(self._on_history_double_click)
+        self.history_table.restore_requested.connect(self._restore_commit_group_from_history)
         self.history_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.history_table.customContextMenuRequested.connect(self._show_history_context_menu)
         history_lay.addWidget(self.history_table)
@@ -909,16 +1067,29 @@ class CommitPage(QWidget):
         self.history_search.textChanged.connect(lambda _: self._history_search_timer.start())
         self._history_search_timer.timeout.connect(self._apply_history_filter)
         self.history_status_filter.currentTextChanged.connect(lambda _: self._apply_history_filter())
+        self.history_view_filter.currentTextChanged.connect(lambda _: self._apply_history_filter())
         self.history_clear_btn.clicked.connect(self._clear_history_filter)
 
         # Track selected pending card
         self.selected_card = None
         self.selected_group = None
         self._pending_cards = []
+        self.processing_overlay = _PageProcessingOverlay(self)
+        self.processing_overlay.setGeometry(self.rect())
+        self.processing_overlay.hide()
 
     # ═══════════════════════════════════════════════════════════════════
     #  HELPERS
     # ═══════════════════════════════════════════════════════════════════
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        try:
+            self.processing_overlay.setGeometry(self.rect())
+            if self.processing_overlay.isVisible():
+                self.processing_overlay.raise_()
+        except Exception:
+            pass
 
     def _toggle_step_controls(self, enabled):
         self.step_file_input.setEnabled(bool(enabled))
@@ -988,7 +1159,9 @@ class CommitPage(QWidget):
         commits = self.commit_service.get_pending_commits_grouped(
             self.session.project_id, self.session.user_id, self.is_designer
         )
+        self._set_pending_commit_groups(commits)
 
+    def _set_pending_commit_groups(self, commits):
         # Clear old cards
         for i in reversed(range(self.pending_container_layout.count())):
             w = self.pending_container_layout.itemAt(i).widget()
@@ -999,7 +1172,9 @@ class CommitPage(QWidget):
         self.selected_group = None
         self._pending_cards = []
 
-        for group in commits:
+        for idx, group in enumerate(commits):
+            if idx and idx % 10 == 0:
+                QApplication.processEvents()
             card = _PendingCard(group)
             card.clicked.connect(self._on_pending_card_clicked)
             card.view_requested.connect(self.show_commit_details)
@@ -1030,6 +1205,9 @@ class CommitPage(QWidget):
             return
 
         commits = self.commit_service.get_commit_history() or []
+        self._set_commit_history_rows(commits)
+
+    def _set_commit_history_rows(self, commits):
         self._history_cache = commits
         self._apply_history_filter()
         self._update_dashboard_stats()
@@ -1043,31 +1221,109 @@ class CommitPage(QWidget):
             status_filter = (self.history_status_filter.currentText() or "All").strip().lower()
         except Exception:
             status_filter = "all"
+        try:
+            grouped_view = (self.history_view_filter.currentText() == "Commit Groups")
+        except Exception:
+            grouped_view = False
 
         filtered = []
-        for c in self._history_cache:
+        for idx, c in enumerate(self._history_cache):
+            if idx and idx % 250 == 0:
+                QApplication.processEvents()
             st = (c.get("status") or "").strip().lower()
             if status_filter != "all" and st != status_filter:
                 continue
             if q:
                 hay = " ".join(str(c.get(k, "")) for k in
                                ("status", "filename", "date", "designed_by",
-                                "checked_by", "message", "commit_id")).lower()
+                                "checked_by", "message", "commit_id", "title")).lower()
                 if q not in hay:
                     continue
             filtered.append(c)
 
-        self.history_table.populate(filtered)
+        visible_rows = self._group_history_rows(filtered) if grouped_view else filtered
+        self.history_table.populate(visible_rows)
         total = len(self._history_cache)
-        shown = len(filtered)
-        if total == shown:
+        shown = len(visible_rows)
+        if grouped_view:
+            self._hist_count_lbl.setText(f"{shown} groups / {len(filtered)} items")
+        elif total == shown:
             self._hist_count_lbl.setText(f"{total} commits")
         else:
             self._hist_count_lbl.setText(f"{shown} / {total}")
 
+    def _group_history_rows(self, rows):
+        status_rank = {
+            "reverted": 90,
+            "released": 80,
+            "pushed": 70,
+            "approved": 70,
+            "validated": 60,
+            "pending": 50,
+            "integrated": 40,
+            "wip": 30,
+        }
+        grouped = {}
+        for row in rows:
+            commit_id = str(row.get("commit_id") or row.get("id") or "")
+            project_id = row.get("project_id")
+            key = (project_id, commit_id)
+            group = grouped.setdefault(key, {
+                "is_commit_group": True,
+                "commit_id": commit_id,
+                "project_id": project_id,
+                "title": row.get("title") or "",
+                "filename": row.get("title") or f"Commit {commit_id[:12]}",
+                "date": row.get("date") or "",
+                "designed_by": row.get("designed_by") or "",
+                "checked_by": row.get("checked_by") or "",
+                "message": "",
+                "status": row.get("status") or "",
+                "files": [],
+                "step_diff_status": "",
+            })
+            group["files"].append(row)
+            if not group.get("title") and row.get("title"):
+                group["title"] = row.get("title")
+                group["filename"] = row.get("title")
+            if row.get("date") and str(row.get("date")) > str(group.get("date") or ""):
+                group["date"] = row.get("date")
+            current_rank = status_rank.get(str(group.get("status") or "").lower(), 0)
+            row_rank = status_rank.get(str(row.get("status") or "").lower(), 0)
+            if row_rank > current_rank:
+                group["status"] = row.get("status") or ""
+            if row.get("step_diff_status"):
+                group["step_diff_status"] = row.get("step_diff_status")
+
+        result = []
+        for group in grouped.values():
+            files = group.get("files") or []
+            filenames = [str(f.get("filename") or "") for f in files if f.get("filename")]
+            messages = [html_to_plain_text(str(f.get("message") or "")) for f in files if f.get("message")]
+            title = group.get("title") or f"Commit {str(group.get('commit_id') or '')[:12]}"
+            group["filename"] = title
+            group["message"] = (
+                f"{group.get('commit_id', '')} | {len(files)} file(s): "
+                + ", ".join(filenames[:5])
+                + ("..." if len(filenames) > 5 else "")
+            )
+            if messages:
+                group["message"] += f"\n{messages[0]}"
+            all_group_rows = [
+                row for row in self._history_cache
+                if str(row.get("commit_id") or row.get("id") or "") == str(group.get("commit_id") or "")
+                and row.get("project_id") == group.get("project_id")
+            ]
+            statuses = {str(f.get("status") or "").lower() for f in all_group_rows}
+            group["can_restore"] = bool(statuses) and statuses.issubset({"approved", "pushed", "released"})
+            result.append(group)
+        result.sort(key=lambda g: str(g.get("date") or ""), reverse=True)
+        return result
+
     def _clear_history_filter(self):
         self.history_search.setText("")
         self.history_status_filter.setCurrentText("All")
+        self.history_view_filter.setCurrentText("Items")
         self._apply_history_filter()
 
     # ═══════════════════════════════════════════════════════════════════
@@ -1081,6 +1337,20 @@ class CommitPage(QWidget):
             self._show_history_details_dialog(data)
 
     def _show_history_details_dialog(self, data: dict):
+        group_details = self.commit_service.get_commit_group_details(
+            data.get("commit_id") or "",
+            data.get("project_id"),
+        )
+        files = group_details.get("files") or []
+        selected_file = None
+        if not data.get("is_commit_group"):
+            selected_id = data.get("id")
+            for item in files:
+                if str(item.get("id")) == str(selected_id):
+                    selected_file = item
+                    break
+        if selected_file is None and files and not data.get("is_commit_group"):
+            selected_file = files[0]
         sty = _status_style(data.get("status", ""))
         dlg = QDialog(self)
         dlg.setWindowTitle(f"{sty['icon']}  Commit Details — {data.get('filename', '')}")
@@ -1128,6 +1398,18 @@ class CommitPage(QWidget):
             hl.addWidget(m)
 
         layout.addWidget(header)
+
+        message_value = group_details.get("message") or data.get("message") or ""
+        if message_value:
+            msg_view = QTextEdit()
+            msg_view.setReadOnly(True)
+            msg_view.setMinimumHeight(120)
+            msg_view.setMaximumHeight(260)
+            if looks_like_html(message_value):
+                msg_view.setHtml(message_value)
+            else:
+                msg_view.setPlainText(str(message_value))
+            layout.addWidget(msg_view)
 
         # Details grid
         grid = QTableWidget()
@@ -1179,7 +1461,125 @@ class CommitPage(QWidget):
             if v:
                 add_row(k, v)
 
+        approved_version_value = ""
+        if selected_file:
+            approved_version_value = selected_file.get("approved_version") or ""
+        elif data.get("is_commit_group"):
+            versions = []
+            for item in files:
+                label = item.get("filename") or item.get("id")
+                version = item.get("approved_version")
+                if version:
+                    versions.append(f"{label}: {version}")
+            approved_version_value = "\n".join(versions)
+
+        for k, v in (
+            ("Commit Title", group_details.get("title")),
+            ("Commit Group Status", group_details.get("status")),
+            ("Project", group_details.get("project_name")),
+            ("Project Version", group_details.get("project_version_label")),
+            ("Author", group_details.get("author")),
+            ("Merged By", group_details.get("merged_by")),
+            ("Merged At", group_details.get("merged_at")),
+            ("Merge ID", group_details.get("merge_id")),
+            ("Merge Message", group_details.get("merge_message")),
+            ("Approved Version", approved_version_value),
+            ("PR Path", (selected_file or {}).get("pr_path") or group_details.get("pr_path")),
+            ("Signature", group_details.get("signature")),
+            ("Last Snapshot", group_details.get("last_snapshot")),
+            ("Snapshotted In", group_details.get("snapshotted_in")),
+        ):
+            if v:
+                add_row(k, v)
+
         layout.addWidget(grid)
+
+        files_label = QLabel(f"<b>Files in this commit ({len(files)})</b>")
+        files_label.setStyleSheet("font-size:12px;color:#111827;")
+        layout.addWidget(files_label)
+
+        files_tree = QTreeWidget()
+        files_tree.setColumnCount(2)
+        files_tree.setHeaderLabels(["File / Field", "Value"])
+        files_tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        files_tree.header().setSectionResizeMode(1, QHeaderView.Stretch)
+        files_tree.setAlternatingRowColors(True)
+        selected_id = str((selected_file or {}).get("id") or "")
+
+        def add_child(parent, label, value):
+            if value is None or value == "":
+                return
+            child = QTreeWidgetItem([str(label), str(value)])
+            child.setToolTip(1, str(value))
+            parent.addChild(child)
+
+        for item in files:
+            filename = str(item.get("filename") or "")
+            top_label = f"{_file_icon(filename)} {filename}"
+            top_value = (
+                f"Status: {item.get('status') or ''}"
+                f" | Approved version: {item.get('approved_version') or ''}"
+            )
+            top = QTreeWidgetItem([top_label, top_value])
+            top.setToolTip(0, filename)
+            top.setToolTip(1, top_value)
+            font = top.font(0)
+            font.setBold(True)
+            top.setFont(0, font)
+            files_tree.addTopLevelItem(top)
+            for label, value in (
+                ("Row ID", item.get("id")),
+                ("Commit ID", item.get("commit_id")),
+                ("Status", item.get("status")),
+                ("Type", item.get("type")),
+                ("Part", item.get("part_name") or item.get("part_id")),
+                ("Part ID", item.get("part_id")),
+                ("AES", item.get("aes_number")),
+                ("Part Number", item.get("part_number")),
+                ("Drawing Number", item.get("drawing_number")),
+                ("Revision", item.get("part_revision")),
+                ("Lifecycle", item.get("part_lifecycle_state")),
+                ("Source Path", item.get("file_path")),
+                ("PR Path", item.get("pr_path")),
+                ("Approved Version", item.get("approved_version")),
+                ("Merged At", item.get("merged_at")),
+                ("Merged By", item.get("merged_by_name")),
+                ("STEP Status", item.get("step_diff_status")),
+                ("STEP File", item.get("step_file_path")),
+                ("Previous STEP", item.get("step_prev_file_path")),
+                ("STEP Diff", item.get("step_diff_path")),
+                ("STEP Error", item.get("step_error")),
+            ):
+                add_child(top, label, value)
+            top.setExpanded((not data.get("is_commit_group")) and str(item.get("id")) == selected_id)
+        layout.addWidget(files_tree, 1)
+
+        issues = group_details.get("issues") or []
+        if issues:
+            issues_label = QLabel(f"<b>Linked Issues ({len(issues)})</b>")
+            issues_label.setStyleSheet("font-size:12px;color:#111827;")
+            layout.addWidget(issues_label)
+            issues_table = QTableWidget()
+            issues_table.setColumnCount(7)
+            issues_table.setHorizontalHeaderLabels([
+                "Issue", "Title", "Status", "Priority", "Relation", "Validation", "Resolution"
+            ])
+            issues_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+            issues_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            issues_table.setRowCount(len(issues))
+            for r, issue in enumerate(issues):
+                values = [
+                    issue.get("issue_number"),
+                    issue.get("title"),
+                    issue.get("status"),
+                    issue.get("priority"),
+                    issue.get("relation_type"),
+                    issue.get("validation_status"),
+                    issue.get("resolution_comment"),
+                ]
+                for c, value in enumerate(values):
+                    issues_table.setItem(r, c, QTableWidgetItem(str(value or "")))
+            layout.addWidget(issues_table)
 
         # Action buttons
         btn_row = QHBoxLayout()
@@ -1240,6 +1640,11 @@ class CommitPage(QWidget):
 
         det = menu.addAction("📋  View Full Details")
         det.triggered.connect(lambda _c, d=data: self._show_history_details_dialog(d))
+
+        if data.get("is_commit_group"):
+            rst = menu.addAction("Restore Commit Group")
+            rst.setEnabled(bool(data.get("can_restore")))
+            rst.triggered.connect(lambda _c, d=data: self._restore_commit_group_from_history(d))
 
         cpy = menu.addAction("📝  Copy Info to Clipboard")
         cpy.triggered.connect(lambda _c, d=data: self._copy_commit_to_clipboard(d))
@@ -1410,7 +1815,7 @@ class CommitPage(QWidget):
             issue_checks.setMaximumHeight(160)
             for issue in related_issues:
                 item = QListWidgetItem(
-                    f"{issue['issue_number']}  {issue['title']}  [{issue['priority']}]"
+                    f"{issue['issue_number']}  {issue['title']}  [{issue.get('relation_type') or 'solves'}]"
                 )
                 item.setData(Qt.UserRole, int(issue["id"]))
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
@@ -1615,18 +2020,146 @@ class CommitPage(QWidget):
     #  COMMIT ACTION
     # ═══════════════════════════════════════════════════════════════════
 
+    def _set_processing_state(self, busy: bool, message: str = "Processing..."):
+        self._processing_action = bool(busy)
+        try:
+            if busy:
+                self._close_active_modal_before_processing()
+                self.processing_overlay.show_overlay(message)
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+            else:
+                self.processing_overlay.hide_overlay()
+                QApplication.restoreOverrideCursor()
+        except Exception:
+            pass
+
+        project_loaded = bool(self.session.project_id)
+        can_commit = project_loaded and self.perm.can("commit")
+        can_merge = project_loaded and self.perm.can("merge")
+        for widget, enabled in (
+            (getattr(self, "commit_btn", None), can_commit),
+            (getattr(self, "add_file_btn", None), can_commit),
+            (getattr(self, "remove_part_btn", None), can_commit),
+            (getattr(self, "push_dev_btn", None), can_merge),
+            (getattr(self, "merge_master_btn", None), can_merge),
+            (getattr(self, "revert_btn", None), project_loaded),
+            (getattr(self, "snapshot_btn", None), project_loaded),
+        ):
+            try:
+                if widget is not None:
+                    widget.setEnabled((not busy) and enabled)
+            except Exception:
+                pass
+
+        try:
+            QApplication.processEvents()
+        except Exception:
+            pass
+
+    def _close_active_modal_before_processing(self):
+        try:
+            modal = QApplication.activeModalWidget()
+            if modal is not None and modal is not self and modal.window() is not self.window():
+                if hasattr(modal, "reject"):
+                    modal.reject()
+                else:
+                    modal.close()
+        except Exception:
+            pass
+
+    def _run_processing_task(self, message: str, work_fn, success_fn=None, error_fn=None):
+        if getattr(self, "_processing_action", False):
+            return
+        self._set_processing_state(True, message)
+        thread = QThread(self)
+        worker = _ProcessingWorker(work_fn)
+        worker.moveToThread(thread)
+
+        def cleanup():
+            self._set_processing_state(False)
+            self._processing_worker = None
+            self._processing_thread = None
+
+        def handle_success(result):
+            post_popup = None
+            try:
+                if success_fn:
+                    post_popup = success_fn(result)
+            except Exception as exc:
+                cleanup()
+                QMessageBox.critical(self, "Error", str(exc))
+                return
+            if isinstance(post_popup, dict):
+                self._run_processing_finish_steps(
+                    list(post_popup.get("steps") or []),
+                    post_popup.get("popup"),
+                    cleanup,
+                )
+                return
+            cleanup()
+            if callable(post_popup):
+                post_popup()
+
+        def handle_error(exc):
+            cleanup()
+            if error_fn:
+                error_fn(exc)
+            else:
+                QMessageBox.critical(self, "Error", str(exc))
+
+        thread.started.connect(worker.run)
+        worker.finished.connect(handle_success)
+        worker.failed.connect(handle_error)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._processing_thread = thread
+        self._processing_worker = worker
+        thread.start()
+
+    def _run_processing_finish_steps(self, steps, popup_fn, cleanup_fn):
+        steps = list(steps or [])
+
+        def run_next():
+            if not steps:
+                cleanup_fn()
+                if callable(popup_fn):
+                    popup_fn()
+                return
+            step = steps.pop(0)
+            try:
+                if isinstance(step, tuple) and step and step[0] == "async":
+                    step[1](run_next)
+                    return
+                step()
+            except Exception as exc:
+                cleanup_fn()
+                QMessageBox.critical(self, "Error", str(exc))
+                return
+            QApplication.processEvents()
+            QTimer.singleShot(35, run_next)
+
+        QTimer.singleShot(0, run_next)
+
     def commit_changes(self):
+        if getattr(self, "_processing_action", False):
+            return
+
         title = self.commit_title.text().strip()
-        message = self.commit_message.toPlainText().strip()
+        message = self.commit_message.content()
         designer = self.designed_by.currentText()
         step_compare_enabled = bool(self.step_compare_checkbox.isChecked())
         step_file_path = (self.step_file_input.text() or "").strip()
+        issue_relation = self.issue_relation_combo.currentText() if hasattr(self, "issue_relation_combo") else "solves"
+        jira_key = self.commit_jira_key.text().strip() if hasattr(self, "commit_jira_key") else ""
+        jira_url = self.commit_jira_url.text().strip() if hasattr(self, "commit_jira_url") else ""
 
         if not title:
             QMessageBox.warning(self, "Validation", "Commit title is required.")
             self.commit_title.setFocus()
             return
-        if not message:
+        if not self.commit_message.has_content():
             QMessageBox.warning(self, "Validation", "Commit message is required.")
             self.commit_message.setFocus()
             return
@@ -1658,7 +2191,7 @@ class CommitPage(QWidget):
                 continue
 
         if self.commit_service:
-            try:
+            def do_commit():
                 self.commit_service.commit_file(
                     self.commits_dir,
                     uncommitted_filenames,
@@ -1668,23 +2201,49 @@ class CommitPage(QWidget):
                     step_compare_enabled=step_compare_enabled,
                     step_file_path=step_file_path,
                     resolved_issue_ids=resolved_issue_ids,
+                    resolved_issue_relation_type=issue_relation,
+                    jira_key=jira_key,
+                    jira_url=jira_url,
                 )
-                QMessageBox.information(self, "Success",
+                return {
+                    "history": self.commit_service.get_commit_history() or [],
+                    "pending": self.commit_service.get_pending_commits_grouped(
+                        self.session.project_id, self.session.user_id, self.is_designer
+                    ) or [],
+                }
+
+            def after_commit(result):
+                if False: QMessageBox.information(self, "Success",
                     "✅ Changes committed successfully!")
-                parent_window = self.window()
-                parent_window.statusBar().showMessage(
-                    "Changes committed successfully.")
-                self.commit_title.clear()
-                self.commit_message.clear()
-                self.step_compare_checkbox.setChecked(False)
-                self.step_file_input.clear()
-                self.uncommitted_parts.clear()
-                self.changes_list.clear()
-                self._update_staged_count()
-                self._refresh_issue_views(resolved_issue_part_ids)
-                self.refresh()
-            except ValueError as e:
-                error_str = str(e)
+                def update_status():
+                    self.window().statusBar().showMessage("Changes committed successfully.")
+
+                def clear_commit_form():
+                    self.commit_title.clear()
+                    self.commit_message.clear()
+                    self.step_compare_checkbox.setChecked(False)
+                    self.step_file_input.clear()
+                    self.commit_jira_key.clear()
+                    self.commit_jira_url.clear()
+                    self.uncommitted_parts.clear()
+                    self.changes_list.clear()
+                    self._update_staged_count()
+
+                return {
+                    "steps": [
+                        update_status,
+                        clear_commit_form,
+                        lambda: self._refresh_issue_views(resolved_issue_part_ids),
+                        lambda: self._set_commit_history_rows((result or {}).get("history") or []),
+                        lambda: self._set_pending_commit_groups((result or {}).get("pending") or []),
+                    ],
+                    "popup": lambda: QMessageBox.information(
+                        self, "Success", "Changes committed successfully!"
+                    ),
+                }
+
+            def on_commit_error(exc):
+                error_str = str(exc)
                 if error_str.startswith("cad404:"):
                     missing_file = error_str.split(":", 1)[1]
                     self.ask_new_part_action(missing_file)
@@ -1692,10 +2251,23 @@ class CommitPage(QWidget):
                     missing_file = error_str.split(":", 1)[1]
                     QMessageBox.warning(self, "Commit Failed",
                         f"Drawing file {missing_file} is not associated to any part.")
+                elif error_str.startswith(("Commit blocked:", "Error:", "STEP compare failed")):
+                    QMessageBox.warning(self, "Commit Blocked", error_str)
                 else:
-                    QMessageBox.warning(self, "Commit Failed", error_str)
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Commit Failed: {str(e)}")
+                    QMessageBox.critical(self, "Error", f"Commit Failed: {error_str}")
+
+            self._run_processing_task("Committing changes...", do_commit, after_commit, on_commit_error)
+
+    def _create_issue_from_commit(self):
+        try:
+            main_window = self.window()
+            issue_page = getattr(main_window, "issue_page", None)
+            if issue_page and hasattr(issue_page, "create_issue"):
+                issue_page.create_issue()
+                return
+        except Exception:
+            pass
+        QMessageBox.information(self, "Issue", "Open Issue Center to create a new issue.")
 
     def ask_new_part_action(self, base_file_name: str):
         msg = QMessageBox(self)
@@ -1749,6 +2321,8 @@ class CommitPage(QWidget):
             return False
 
     def push_to_master(self, group):
+        if getattr(self, "_processing_action", False):
+            return
         if (group.get("project_id") and self.session.project_id and
                 int(group.get("project_id")) != int(self.session.project_id)):
             QMessageBox.warning(
@@ -1757,13 +2331,121 @@ class CommitPage(QWidget):
                 "Switch to that project to push/merge it.",
             )
             return
-        try:
+        def do_push():
             affected_part_ids = self.merge_service.excute_merge_by_commit_id(group["commit_id"])
-            self._refresh_bom_rows_for_parts(affected_part_ids)
-            self.load_pending_commits()
-            self.load_commit_history()
-        except Exception as exc:
+            return {
+                "affected_part_ids": affected_part_ids,
+                "history": self.commit_service.get_commit_history() or [],
+                "pending": self.commit_service.get_pending_commits_grouped(
+                    self.session.project_id, self.session.user_id, self.is_designer
+                ) or [],
+            }
+
+        def after_push(result):
+            result = result or {}
+            return {
+                "steps": [
+                    lambda: self._refresh_bom_rows_for_parts(result.get("affected_part_ids")),
+                    lambda: self._set_pending_commit_groups(result.get("pending") or []),
+                    lambda: self._set_commit_history_rows(result.get("history") or []),
+                ],
+                "popup": None,
+            }
+
+        def on_push_error(exc):
             QMessageBox.warning(self, "Merge Blocked", str(exc))
+
+        self._run_processing_task("Pushing commit to master...", do_push, after_push, on_push_error)
+
+    def _restore_commit_group_from_history(self, group):
+        if getattr(self, "_processing_action", False):
+            return
+        if not group or not group.get("commit_id"):
+            QMessageBox.warning(self, "Restore Commit", "Invalid commit group.")
+            return
+        if not group.get("can_restore"):
+            QMessageBox.information(
+                self,
+                "Restore Commit",
+                "Restore is available only for commit groups already pushed to master.",
+            )
+            return
+
+        commit_id = str(group.get("commit_id") or "")
+        project_id = group.get("project_id")
+        title = group.get("title") or group.get("filename") or commit_id
+        details = self.commit_service.get_commit_group_details(commit_id, project_id)
+        linked_issues = details.get("issues") or []
+
+        issue_warning = ""
+        if linked_issues:
+            issue_lines = [
+                f"- {i.get('issue_number') or i.get('id')}: {i.get('title') or ''} ({i.get('status') or ''})"
+                for i in linked_issues[:8]
+            ]
+            if len(linked_issues) > 8:
+                issue_lines.append(f"- ... and {len(linked_issues) - 8} more")
+            issue_warning = (
+                "\n\nThis commit is linked to issues. Closed linked issues will be reopened "
+                "and every linked issue will receive a history entry:\n"
+                + "\n".join(issue_lines)
+            )
+
+        confirm = QMessageBox.warning(
+            self,
+            "Restore Commit",
+            f"Restore this commit group?\n\n{title}\nID: {commit_id}\n\n"
+            "The app will return each affected BOM file to the previous approved version."
+            f"{issue_warning}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        def do_restore():
+            result = self.merge_service.restore_commit_group(
+                commit_id,
+                int(project_id) if project_id is not None else None,
+                "Restored from Commit History.",
+            )
+            return {
+                "restore": result,
+                "history": self.commit_service.get_commit_history() or [],
+                "pending": self.commit_service.get_pending_commits_grouped(
+                    self.session.project_id, self.session.user_id, self.is_designer
+                ) or [],
+            }
+
+        def after_restore(result):
+            result = result or {}
+            restore = result.get("restore") or {}
+            restored_files = restore.get("restored_files") or []
+            reopened = restore.get("reopened_issues") or []
+
+            def popup():
+                QMessageBox.information(
+                    self,
+                    "Commit Restored",
+                    f"Commit {commit_id} was restored.\n\n"
+                    f"Files restored: {len(restored_files)}\n"
+                    f"Issues reopened: {len(reopened)}",
+                )
+
+            return {
+                "steps": [
+                    lambda: self._refresh_bom_rows_for_parts(restore.get("affected_part_ids")),
+                    lambda: self._set_pending_commit_groups(result.get("pending") or []),
+                    lambda: self._set_commit_history_rows(result.get("history") or []),
+                    lambda: self._refresh_issue_views(restore.get("affected_part_ids")),
+                ],
+                "popup": popup,
+            }
+
+        def on_restore_error(exc):
+            QMessageBox.warning(self, "Restore Blocked", str(exc))
+
+        self._run_processing_task("Restoring commit group...", do_restore, after_restore, on_restore_error)
 
     def _refresh_bom_rows_for_parts(self, part_ids):
         if not part_ids:
@@ -1796,7 +2478,7 @@ class CommitPage(QWidget):
                 return False
             group = self.selected_group
 
-        commit_id = group.get("id") or group.get("commit_id")
+        commit_id = group.get("commit_id") or group.get("id")
         title = group.get("title", "Untitled")
 
         if not commit_id:
@@ -1828,7 +2510,16 @@ class CommitPage(QWidget):
         QMessageBox.critical(self, "Error", "Failed to create snapshot")
 
     def push_to_dev(self):
-        QMessageBox.critical(self, "Error", "Push failed")
+        if getattr(self, "_processing_action", False):
+            return
+
+        def do_push_dev():
+            return None
+
+        def after_push_dev(_result):
+            return lambda: QMessageBox.critical(self, "Error", "Push failed")
+
+        self._run_processing_task("Pushing to dev...", do_push_dev, after_push_dev)
 
     def merge_to_master(self):
         self.open_merge_dialog()

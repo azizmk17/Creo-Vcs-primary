@@ -15,6 +15,7 @@ from core.services.user_service import UserService
 from core.services.bom_service import BomService
 from core.services.base_service import BaseService
 from core.services.issue_service import IssueService
+from core.services.traceability_service import TraceabilityService
 from utils import (
     is_creo_file,
     ensure_dir_exists,
@@ -33,6 +34,7 @@ class MergeService(BaseService):
         self.user_service = UserService(UserRepository())
         self.bom_service = BomService(BomRepository(), BomChildrenRepository(), LockRepository(), SignatureRepository())
         self.issue_service = IssueService()
+        self.traceability_service = TraceabilityService()
 
         self.working_dir = working_dir
         self.commits_dir = commits_dir
@@ -318,5 +320,180 @@ class MergeService(BaseService):
 
         
         print(f"Finalized merge for entries: {merged_entries}")
+
+    def _previous_working_filename(self, base_name: str, approved_version: int) -> str | None:
+        previous_version = None
+        try:
+            names = os.listdir(self.working_dir)
+        except OSError:
+            names = []
+        for name in names:
+            if not name.startswith(base_name + ".") or not is_creo_file(name):
+                continue
+            version = get_version_number(name)
+            if version is None or version >= approved_version:
+                continue
+            if previous_version is None or version > previous_version:
+                previous_version = version
+        if previous_version is None:
+            return None
+        return f"{base_name}.{previous_version}"
+
+    def _commit_restore_plan(self, commit_id: str, project_id: int | None = None) -> list[dict]:
+        rows = self.commit_repository.get_rows_by_commit_id(str(commit_id), project_id)
+        if not rows and project_id is not None:
+            rows = self.commit_repository.get_rows_by_commit_id(str(commit_id))
+        if not rows:
+            raise ValueError(f"Commit {commit_id} was not found.")
+
+        invalid = sorted({str(r.get("status") or "") for r in rows
+                          if str(r.get("status") or "").lower() not in {"approved", "pushed", "released"}})
+        if invalid:
+            raise ValueError(
+                "Restore is only available for commits already pushed to master. "
+                f"Current status: {', '.join(invalid)}."
+            )
+
+        plan = []
+        for row in rows:
+            filename = os.path.basename(str(row.get("filename") or ""))
+            base_name = get_base_name(filename)
+            if not base_name:
+                raise ValueError(f"Cannot restore {filename}: invalid Creo filename.")
+            try:
+                approved_version = int(row.get("approved_version") or 0)
+            except Exception:
+                approved_version = 0
+            if approved_version <= 0:
+                raise ValueError(f"Cannot restore {filename}: approved version is missing.")
+
+            approved_filename = f"{base_name}.{approved_version}"
+            approved_path = os.path.join(self.working_dir, approved_filename)
+            if not os.path.exists(approved_path):
+                raise ValueError(f"Cannot restore {filename}: approved file is missing:\n{approved_path}")
+
+            previous_filename = self._previous_working_filename(base_name, approved_version)
+            if not previous_filename:
+                raise ValueError(f"Cannot restore {filename}: no previous working version was found.")
+            previous_path = os.path.join(self.working_dir, previous_filename)
+            if not os.path.exists(previous_path):
+                raise ValueError(f"Cannot restore {filename}: previous file is missing:\n{previous_path}")
+
+            part_id = row.get("part_id")
+            if part_id is None:
+                raise ValueError(f"Cannot restore {filename}: commit row is not linked to a BOM part.")
+            part = self.bom_repo.get_by_id(int(part_id))
+            if not part:
+                raise ValueError(f"Cannot restore {filename}: BOM part {part_id} was not found.")
+
+            part_type = str(row.get("type") or "").lower()
+            attr = "drawing" if part_type == "drw" or ".drw." in filename.lower() else "filename"
+            current_filename = getattr(part, attr, None)
+            if current_filename != approved_filename:
+                raise ValueError(
+                    f"Cannot restore {filename}: {approved_filename} is no longer the current BOM file. "
+                    "Restore the newest related commit first."
+                )
+
+            plan.append({
+                "row": row,
+                "part": part,
+                "attr": attr,
+                "approved_filename": approved_filename,
+                "approved_path": approved_path,
+                "previous_filename": previous_filename,
+                "previous_path": previous_path,
+            })
+        return plan
+
+    @require_permission("merge")
+    def restore_commit_group(self, commit_id: str, project_id: int | None = None, note: str = "") -> dict:
+        """Return the working BOM/files to the state immediately before an approved commit."""
+        commit_id = str(commit_id or "").strip()
+        if not commit_id:
+            raise ValueError("Commit ID is required.")
+
+        plan = self._commit_restore_plan(
+            commit_id,
+            int(project_id) if project_id is not None else None,
+        )
+
+        archive_dir = os.path.join(
+            self.working_dir,
+            ".creo_vcs",
+            "restored_commits",
+            commit_id,
+            datetime.now().strftime("%Y%m%d_%H%M%S"),
+        )
+        ensure_dir_exists(archive_dir)
+
+        moved_files = []
+        updated_parts = []
+        try:
+            for item in plan:
+                archived_path = os.path.join(archive_dir, item["approved_filename"])
+                shutil.move(item["approved_path"], archived_path)
+                moved_files.append((archived_path, item["approved_path"]))
+
+            part_updates = {}
+            for item in plan:
+                part_id = int(item["row"]["part_id"])
+                update = part_updates.setdefault(part_id, {"values": {}, "original": {}})
+                update["values"][item["attr"]] = item["previous_filename"]
+                update["original"].setdefault(item["attr"], getattr(item["part"], item["attr"], None))
+
+            for part_id, update in part_updates.items():
+                part = self.bom_repo.get_by_id(part_id)
+                if not part:
+                    raise ValueError(f"Cannot restore commit: BOM part {part_id} was not found.")
+                original_values = {attr: getattr(part, attr, None) for attr in update["values"]}
+                for attr, value in update["values"].items():
+                    setattr(part, attr, value)
+                self.bom_repo.update(part)
+                updated_parts.append((part_id, original_values))
+
+            self.traceability_service.mark_commit_reverted(
+                commit_id,
+                int(project_id) if project_id is not None else None,
+                note or "Commit restored from master.",
+            )
+            reopened = self.issue_service.repo.reopen_for_restored_commit(
+                commit_id,
+                self.user_id,
+                note or "Commit restored from master.",
+            )
+        except Exception:
+            for part_id, original_values in reversed(updated_parts):
+                try:
+                    part = self.bom_repo.get_by_id(part_id)
+                    if not part:
+                        continue
+                    for attr, original_value in original_values.items():
+                        setattr(part, attr, original_value)
+                    self.bom_repo.update(part)
+                except Exception:
+                    pass
+            for archived_path, original_path in reversed(moved_files):
+                try:
+                    if os.path.exists(archived_path) and not os.path.exists(original_path):
+                        shutil.move(archived_path, original_path)
+                except Exception:
+                    pass
+            raise
+
+        return {
+            "commit_id": commit_id,
+            "restored_files": [
+                {
+                    "part_id": item["row"].get("part_id"),
+                    "from": item["approved_filename"],
+                    "to": item["previous_filename"],
+                }
+                for item in plan
+            ],
+            "affected_part_ids": sorted({int(item["row"]["part_id"]) for item in plan if item["row"].get("part_id") is not None}),
+            "reopened_issues": reopened,
+            "archive_dir": archive_dir,
+        }
 
 

@@ -3,6 +3,7 @@ import os
 import shutil
 from typing import List, Optional, Tuple
 
+from core.repositories.bom_repository import BomRepository
 from core.repositories.part_file_repository import PartFileRepository
 from core.session_manager import SessionManager
 from core.services.project_service import ProjectService
@@ -13,6 +14,7 @@ from core.models.part_file_version_model import PartFileVersion
 class PartFileService:
     def __init__(self, repo: Optional[PartFileRepository] = None):
         self.repo = repo or PartFileRepository()
+        self.bom_repo = BomRepository()
         self.session = SessionManager()
         self.project_service = ProjectService()
 
@@ -49,6 +51,13 @@ class PartFileService:
             return None, None
         project = self.project_service.get_project_by_id(project_id) or {}
         return project.get("root_project_id"), project.get("version_label")
+
+    def _part_revision(self, part_id: int) -> str:
+        try:
+            part = self.bom_repo.get_by_id(int(part_id))
+            return str(getattr(part, "revision", "") or "").strip().upper()
+        except Exception:
+            return ""
 
     def _working_dir_for_root_label(self, root_project_id: Optional[int], version_label: Optional[str]) -> str:
         try:
@@ -100,6 +109,7 @@ class PartFileService:
 
         created_by = self.session.user_id
         root_project_id, project_version_label = self._project_version_context()
+        revision = self._part_revision(part_id)
         file_id = self.repo.create_file(part_id, file_type, display_name, description, created_by=created_by)
 
         version_no = 1
@@ -119,6 +129,7 @@ class PartFileService:
             sha256=sha256,
             size_bytes=size_bytes,
             note=note,
+            revision=revision,
             created_by=created_by,
             root_project_id=root_project_id,
             project_version_label=project_version_label,
@@ -138,6 +149,7 @@ class PartFileService:
 
         created_by = self.session.user_id
         root_project_id, project_version_label = self._project_version_context()
+        revision = self._part_revision(pf.part_id)
         version_no = self.repo.get_next_version_no(file_id)
 
         rel_path = self._version_dest_relpath(pf.part_id, file_id, version_no, source_path)
@@ -156,6 +168,7 @@ class PartFileService:
             sha256=sha256,
             size_bytes=size_bytes,
             note=note,
+            revision=revision,
             created_by=created_by,
             root_project_id=root_project_id,
             project_version_label=project_version_label,

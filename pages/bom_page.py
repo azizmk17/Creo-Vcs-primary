@@ -4,7 +4,7 @@ from PyQt5.QtWidgets import (
     QTreeWidgetItem, QSplitter, QTabWidget, QLabel, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QTextEdit, QComboBox, QSpinBox, QDateTimeEdit,
     QMessageBox, QInputDialog, QFileDialog, QMenu, QAction, QDialog, QDialogButtonBox, QFrame,
-    QPlainTextEdit, QStackedWidget, QSizePolicy,
+    QPlainTextEdit, QStackedWidget, QSizePolicy, QCheckBox, QGridLayout,
     QGraphicsDropShadowEffect, QToolTip, QStyledItemDelegate, QStyle, QStyleOptionViewItem,
 )
 from PyQt5.QtCore import Qt, QDateTime, pyqtSignal, QTimer, QObject, QThread, QSize, QRect, QEvent
@@ -30,6 +30,7 @@ from core.services.ui_permission import UIPermissionHelper
 from core.services.baseline_service import BaselineService
 from core.services.part_doc_ack_service import PartDocAckService
 from core.services.issue_service import IssueService
+from core.services.traceability_service import TraceabilityService
 from core.repositories.commit_repository import CommitRepository
 from pages.dialogs.package_parts_dialog import PackagePartsDialog
 from pages.dialogs.addChild_dialog import AddChildDialog
@@ -1535,6 +1536,7 @@ class BomPage(QWidget):
         self.baseline_service = BaselineService()
         self.commit_repo = CommitRepository()
         self.issue_service = IssueService()
+        self.traceability_service = TraceabilityService()
         self._issue_summary_cache = {}
 
         self.working_dir = None
@@ -1575,6 +1577,7 @@ class BomPage(QWidget):
         self._cached_tree_data = None
         self._cached_missing_map = None
         self._in_search_mode = False     # True while _search_tree (index 2) is visible
+        self._bom_advanced_filters = self._default_bom_advanced_filters()
         self.init_ui()
 
         # Pre-render indicator icons (fast + consistent colors)
@@ -1799,10 +1802,15 @@ class BomPage(QWidget):
         search_layout.addWidget(self.search_btn)
         left_layout.addWidget(search_group)
 
-        filter_btn = QPushButton("Advanced Filter")
-        filter_btn.clicked.connect(self.show_advanced_filter_dialog)
-        # Add to your layout, e.g. at the top of your main layout
-        left_layout.addWidget(filter_btn)
+        filter_row = QHBoxLayout()
+        self.advanced_filter_btn = QPushButton("Advanced Filter")
+        self.advanced_filter_btn.clicked.connect(self.show_advanced_filter_dialog)
+        self.clear_filter_btn = QPushButton("Clear")
+        self.clear_filter_btn.clicked.connect(self.clear_bom_tree_filter)
+        self.clear_filter_btn.setEnabled(False)
+        filter_row.addWidget(self.advanced_filter_btn)
+        filter_row.addWidget(self.clear_filter_btn)
+        left_layout.addLayout(filter_row)
 
         # Tree (BOM structure)
         tree_group = QFrame()
@@ -2130,12 +2138,16 @@ class BomPage(QWidget):
         self.export_baseline_btn = QPushButton("Export Baseline")
         self.export_baseline_btn.setObjectName("neutral")
         self.export_baseline_btn.clicked.connect(self.export_baseline)
+        self.link_file_issue_btn = QPushButton("Link to Issue")
+        self.link_file_issue_btn.setObjectName("neutral")
+        self.link_file_issue_btn.clicked.connect(self.link_selected_file_to_issue)
         files_actions.addWidget(self.add_attachment_btn)
         files_actions.addWidget(self.add_version_btn)
         files_actions.addWidget(self.set_active_btn)
         files_actions.addWidget(self.open_active_btn)
         files_actions.addWidget(self.open_folder_btn)
         files_actions.addWidget(self.remove_attachment_btn)
+        files_actions.addWidget(self.link_file_issue_btn)
         files_actions.addWidget(self.export_package_btn)
         files_actions.addWidget(self.create_baseline_btn)
         files_actions.addWidget(self.export_baseline_btn)
@@ -2143,8 +2155,8 @@ class BomPage(QWidget):
 
         files_layout.addWidget(QLabel("Versions:"))
         self.versions_table = QTableWidget()
-        self.versions_table.setColumnCount(6)
-        self.versions_table.setHorizontalHeaderLabels(["Version", "State", "Filename", "Created", "Released", "Note"])
+        self.versions_table.setColumnCount(7)
+        self.versions_table.setHorizontalHeaderLabels(["Version", "State", "Filename", "Created", "Released", "Revision", "Note"])
         self.versions_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.versions_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.versions_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -2153,6 +2165,14 @@ class BomPage(QWidget):
         self.versions_table.customContextMenuRequested.connect(self.show_versions_context_menu)
         self.versions_table.itemSelectionChanged.connect(self._on_version_selection_changed)
         files_layout.addWidget(self.versions_table)
+
+        files_layout.addWidget(QLabel("Related Issues:"))
+        self.file_related_issues_table = QTableWidget()
+        self.file_related_issues_table.setColumnCount(5)
+        self.file_related_issues_table.setHorizontalHeaderLabels(["Issue", "Title", "Status", "Role", "Linked"])
+        self.file_related_issues_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.file_related_issues_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        files_layout.addWidget(self.file_related_issues_table)
 
         versions_actions = QHBoxLayout()
         self.open_version_btn = QPushButton("Open Version")
@@ -2407,79 +2427,326 @@ class BomPage(QWidget):
 
         menu.exec_(tree.viewport().mapToGlobal(position))
 
-    
-    def show_advanced_filter_dialog(self):
-        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton
+    def _default_bom_advanced_filters(self) -> dict:
+        return {
+            "text": "",
+            "work_state": "Any",
+            "work_owner": "All",
+            "status": "All",
+            "type": "All",
+            "revision": "",
+            "structure": "Any",
+            "pdf": "Any",
+            "step": "Any",
+            "integrity": "Any",
+            "issues": "Any",
+            "expand_matches": True,
+        }
 
+    def _is_default_bom_advanced_filter(self, filters: dict | None = None) -> bool:
+        filters = filters or getattr(self, "_bom_advanced_filters", {}) or {}
+        defaults = self._default_bom_advanced_filters()
+        return all(filters.get(k, v) == v for k, v in defaults.items())
+
+    def _collect_tree_column_values(self, column: int) -> list[str]:
+        values = set()
+        for tree in (getattr(self, "tree", None), getattr(self, "_search_tree", None)):
+            if tree is None:
+                continue
+            try:
+                for item in self._iter_tree_items(tree):
+                    value = str(item.text(column) or "").strip()
+                    if value:
+                        values.add(value)
+            except Exception:
+                continue
+        return sorted(values, key=lambda s: s.lower())
+
+    def _current_tree_for_filtering(self) -> QTreeWidget:
+        if getattr(self, "_in_search_mode", False):
+            return getattr(self, "_search_tree", self.tree)
+        return self.tree
+
+    def _file_badge_kind(self, item: QTreeWidgetItem, doc_key: str) -> str:
+        payload = item.data(1, BOM_TREE_FILES_ROLE) or {}
+        value = payload.get(doc_key)
+        if isinstance(value, (tuple, list)) and value:
+            return str(value[0] or "na").lower()
+        return "na"
+
+    def _bom_tree_item_matches_advanced_filter(self, item: QTreeWidgetItem, filters: dict) -> bool:
+        text = str(filters.get("text") or "").strip().lower()
+        if text:
+            haystack = " ".join([
+                str(item.text(col) or "") for col in range(0, 6)
+            ] + [
+                str(item.data(0, BOM_TREE_INWORK_ROLE) or ""),
+                str(item.toolTip(0) or ""),
+                str(item.toolTip(1) or ""),
+            ]).lower()
+            if text not in haystack:
+                return False
+
+        locked_txt = str(item.data(0, BOM_TREE_INWORK_ROLE) or "")
+        locked_l = locked_txt.lower()
+        work_state = str(filters.get("work_state") or "Any")
+        if work_state == "In Work" and "in work" not in locked_l:
+            return False
+        if work_state == "Checked In" and "in work" in locked_l:
+            return False
+
+        owner = str(filters.get("work_owner") or "All").strip()
+        if owner and owner != "All" and owner.lower() not in locked_l:
+            return False
+
+        status = str(filters.get("status") or "All").strip()
+        if status and status != "All" and str(item.text(5) or "").strip().lower() != status.lower():
+            return False
+
+        part_type = str(filters.get("type") or "All").strip()
+        if part_type and part_type != "All" and str(item.text(3) or "").strip().lower() != part_type.lower():
+            return False
+
+        revision = str(filters.get("revision") or "").strip().lower()
+        if revision and revision not in str(item.text(4) or "").strip().lower():
+            return False
+
+        structure = str(filters.get("structure") or "Any")
+        is_assembly = bool(item.data(0, BOM_TREE_IS_ASSEMBLY_ROLE)) or item.childCount() > 0
+        if structure == "Assemblies only" and not is_assembly:
+            return False
+        if structure == "Leaf parts only" and is_assembly:
+            return False
+
+        doc_map = {
+            "OK": "ok",
+            "Outdated": "outdated",
+            "Missing": "missing",
+            "Not attached": "na",
+        }
+        for doc_key in ("pdf", "step"):
+            desired = str(filters.get(doc_key) or "Any")
+            if desired != "Any" and self._file_badge_kind(item, doc_key) != doc_map.get(desired, desired.lower()):
+                return False
+
+        integrity = str(filters.get("integrity") or "Any")
+        integrity_state = str((item.data(6, BOM_TREE_INTEGRITY_ROLE) or {}).get("state") or "ok").lower()
+        if integrity == "Healthy only" and integrity_state != "ok":
+            return False
+        if integrity == "Has integrity issues" and integrity_state != "warn":
+            return False
+
+        issues = str(filters.get("issues") or "Any")
+        issue_summary = item.data(0, BOM_TREE_ISSUE_ROLE) or {}
+        active_count = int(issue_summary.get("active_count") or 0)
+        total_count = int(issue_summary.get("total_count") or 0)
+        if issues == "Active issues" and active_count <= 0:
+            return False
+        if issues == "Any linked issue" and total_count <= 0:
+            return False
+        if issues == "No linked issues" and total_count > 0:
+            return False
+
+        return True
+
+    def show_advanced_filter_dialog(self):
         dialog = QDialog(self)
         dialog.setWindowTitle("Advanced BOM Filter")
+        dialog.resize(560, 360)
         layout = QVBoxLayout(dialog)
+        layout.setSpacing(10)
 
-        # Status filter
-        status_label = QLabel("Status:")
-        status_combo = QComboBox()
-        status_combo.addItem("All")
-        status_combo.addItem("Checked In")
-        layout.addWidget(status_label)
-        layout.addWidget(status_combo)
+        intro = QLabel("Filter the visible BOM by lifecycle state, owner, document health, issues, and integrity.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color:#475569;")
+        layout.addWidget(intro)
 
-        # User filter
-        user_label = QLabel("User:")
-        user_combo = QComboBox()
-        user_combo.addItem("All")
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(8)
+        current = dict(getattr(self, "_bom_advanced_filters", {}) or self._default_bom_advanced_filters())
+
+        text_input = QLineEdit(str(current.get("text") or ""))
+        text_input.setPlaceholderText("Name, AES, part number, tooltip, file state...")
+        grid.addWidget(QLabel("Contains"), 0, 0)
+        grid.addWidget(text_input, 0, 1, 1, 3)
+
+        work_combo = QComboBox()
+        work_combo.addItems(["Any", "In Work", "Checked In"])
+        work_combo.setCurrentText(str(current.get("work_state") or "Any"))
+        grid.addWidget(QLabel("Work state"), 1, 0)
+        grid.addWidget(work_combo, 1, 1)
+
+        owner_combo = QComboBox()
+        owner_combo.addItem("All")
         users = self.project_service.get_users_for_project(self.session.project_id) or []
-        user_map = {"All": None}
         for u in users:
             label = str(u.get("username") or "").strip()
             if not label:
                 continue
-            user_combo.addItem(label)
-            user_map[label] = int(u.get("id"))
-        layout.addWidget(user_label)
-        layout.addWidget(user_combo)
+            owner_combo.addItem(label)
+        if owner_combo.findText(str(current.get("work_owner") or "All")) >= 0:
+            owner_combo.setCurrentText(str(current.get("work_owner") or "All"))
+        grid.addWidget(QLabel("Owner"), 1, 2)
+        grid.addWidget(owner_combo, 1, 3)
 
-        # Buttons
-        btns = QHBoxLayout()
-        ok_btn = QPushButton("Apply")
-        cancel_btn = QPushButton("Cancel")
-        btns.addWidget(ok_btn)
-        btns.addWidget(cancel_btn)
-        layout.addLayout(btns)
+        status_combo = QComboBox()
+        status_combo.addItem("All")
+        status_combo.addItems(self._collect_tree_column_values(5))
+        if status_combo.findText(str(current.get("status") or "All")) >= 0:
+            status_combo.setCurrentText(str(current.get("status") or "All"))
+        grid.addWidget(QLabel("Status"), 2, 0)
+        grid.addWidget(status_combo, 2, 1)
+
+        type_combo = QComboBox()
+        type_combo.addItem("All")
+        type_combo.addItems(self._collect_tree_column_values(3))
+        if type_combo.findText(str(current.get("type") or "All")) >= 0:
+            type_combo.setCurrentText(str(current.get("type") or "All"))
+        grid.addWidget(QLabel("Type"), 2, 2)
+        grid.addWidget(type_combo, 2, 3)
+
+        revision_input = QLineEdit(str(current.get("revision") or ""))
+        revision_input.setPlaceholderText("Revision contains...")
+        grid.addWidget(QLabel("Revision"), 3, 0)
+        grid.addWidget(revision_input, 3, 1)
+
+        structure_combo = QComboBox()
+        structure_combo.addItems(["Any", "Assemblies only", "Leaf parts only"])
+        structure_combo.setCurrentText(str(current.get("structure") or "Any"))
+        grid.addWidget(QLabel("Structure"), 3, 2)
+        grid.addWidget(structure_combo, 3, 3)
+
+        pdf_combo = QComboBox()
+        pdf_combo.addItems(["Any", "OK", "Outdated", "Missing", "Not attached"])
+        pdf_combo.setCurrentText(str(current.get("pdf") or "Any"))
+        grid.addWidget(QLabel("PDF"), 4, 0)
+        grid.addWidget(pdf_combo, 4, 1)
+
+        step_combo = QComboBox()
+        step_combo.addItems(["Any", "OK", "Outdated", "Missing", "Not attached"])
+        step_combo.setCurrentText(str(current.get("step") or "Any"))
+        grid.addWidget(QLabel("STEP"), 4, 2)
+        grid.addWidget(step_combo, 4, 3)
+
+        integrity_combo = QComboBox()
+        integrity_combo.addItems(["Any", "Healthy only", "Has integrity issues"])
+        integrity_combo.setCurrentText(str(current.get("integrity") or "Any"))
+        grid.addWidget(QLabel("Integrity"), 5, 0)
+        grid.addWidget(integrity_combo, 5, 1)
+
+        issue_combo = QComboBox()
+        issue_combo.addItems(["Any", "Active issues", "Any linked issue", "No linked issues"])
+        issue_combo.setCurrentText(str(current.get("issues") or "Any"))
+        grid.addWidget(QLabel("Issues"), 5, 2)
+        grid.addWidget(issue_combo, 5, 3)
+
+        layout.addLayout(grid)
+
+        expand_check = QCheckBox("Expand matching branches after applying")
+        expand_check.setChecked(bool(current.get("expand_matches", True)))
+        layout.addWidget(expand_check)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        clear_btn = buttons.addButton("Clear Filter", QDialogButtonBox.ResetRole)
+        layout.addWidget(buttons)
 
         def on_apply():
-            status = status_combo.currentText()
-            user_label = user_combo.currentText()
-            user_id = user_map.get(user_label)
+            filters = {
+                "text": text_input.text().strip(),
+                "work_state": work_combo.currentText(),
+                "work_owner": owner_combo.currentText(),
+                "status": status_combo.currentText(),
+                "type": type_combo.currentText(),
+                "revision": revision_input.text().strip(),
+                "structure": structure_combo.currentText(),
+                "pdf": pdf_combo.currentText(),
+                "step": step_combo.currentText(),
+                "integrity": integrity_combo.currentText(),
+                "issues": issue_combo.currentText(),
+                "expand_matches": expand_check.isChecked(),
+            }
             dialog.accept()
-            self.apply_bom_tree_filter(status, user_label)
+            self.apply_bom_tree_filter(filters)
 
-        ok_btn.clicked.connect(on_apply)
-        cancel_btn.clicked.connect(dialog.reject)
+        buttons.accepted.connect(on_apply)
+        buttons.rejected.connect(dialog.reject)
+        clear_btn.clicked.connect(lambda: (dialog.accept(), self.clear_bom_tree_filter()))
         dialog.exec_()
 
-    def apply_bom_tree_filter(self, status: str, user_label: int | None):
-        def filter_item(item):
-            # Status filter (inline lock label lives on column 0 / BOM_TREE_INWORK_ROLE)
-            locked_txt = ((item.data(0, BOM_TREE_INWORK_ROLE) or "") + " " + (item.text(0) or "")).lower()
-            if status == "Checked In" and "in work" not in locked_txt:
-                return False
-            # User filter
-            if user_label is not None and user_label != "All":
-                if str(user_label).lower() not in locked_txt:
-                    return False
-            return True
+    def clear_bom_tree_filter(self):
+        self._bom_advanced_filters = self._default_bom_advanced_filters()
+        for tree in (getattr(self, "tree", None), getattr(self, "_search_tree", None)):
+            if tree is None:
+                continue
+            try:
+                for item in self._iter_tree_items(tree):
+                    item.setHidden(False)
+            except Exception:
+                pass
+        self._update_advanced_filter_button_state(visible_count=None)
+
+    def _update_advanced_filter_button_state(self, visible_count: int | None = None):
+        active = not self._is_default_bom_advanced_filter()
+        try:
+            self.clear_filter_btn.setEnabled(active)
+        except Exception:
+            pass
+        try:
+            if active:
+                suffix = f" ({visible_count} shown)" if visible_count is not None else ""
+                self.advanced_filter_btn.setText(f"Advanced Filter Active{suffix}")
+            else:
+                self.advanced_filter_btn.setText("Advanced Filter")
+        except Exception:
+            pass
+
+    def _apply_bom_tree_filter_to_tree(self, tree: QTreeWidget, filters: dict) -> int:
+        visible_count = 0
 
         def recurse(item):
-            show = filter_item(item)
+            nonlocal visible_count
+            show_self = self._bom_tree_item_matches_advanced_filter(item, filters)
+            show = show_self
             for i in range(item.childCount()):
                 child = item.child(i)
                 child_show = recurse(child)
                 show = show or child_show
             item.setHidden(not show)
+            if show_self:
+                visible_count += 1
+                if filters.get("expand_matches", True):
+                    try:
+                        item.setExpanded(True)
+                    except Exception:
+                        pass
             return show
 
-        for i in range(self.tree.topLevelItemCount()):
-            recurse(self.tree.topLevelItem(i))
+        try:
+            tree.setUpdatesEnabled(False)
+            for i in range(tree.topLevelItemCount()):
+                recurse(tree.topLevelItem(i))
+        finally:
+            try:
+                tree.setUpdatesEnabled(True)
+            except Exception:
+                pass
+        return visible_count
+
+    def apply_bom_tree_filter(self, filters: dict | None = None):
+        self._bom_advanced_filters = dict(filters or self._bom_advanced_filters or self._default_bom_advanced_filters())
+        if self._is_default_bom_advanced_filter():
+            self.clear_bom_tree_filter()
+            return
+        total_visible = 0
+        for tree in (getattr(self, "tree", None), getattr(self, "_search_tree", None)):
+            if tree is None:
+                continue
+            try:
+                total_visible += self._apply_bom_tree_filter_to_tree(tree, self._bom_advanced_filters)
+            except Exception:
+                pass
+        self._update_advanced_filter_button_state(total_visible)
 
     # -------------------------
     # Files (Vault / PLM-like)
@@ -2596,6 +2863,8 @@ class BomPage(QWidget):
                 self.files_table.setRowCount(0)
             if hasattr(self, "versions_table"):
                 self.versions_table.setRowCount(0)
+            if hasattr(self, "file_related_issues_table"):
+                self.file_related_issues_table.setRowCount(0)
             if hasattr(self, "pdf_viewer"):
                 self.pdf_viewer.close_preview()
             self._set_files_tab_enabled(False)
@@ -2628,6 +2897,8 @@ class BomPage(QWidget):
 
         # Clear versions view until an attachment is selected
         self.versions_table.setRowCount(0)
+        if hasattr(self, "file_related_issues_table"):
+            self.file_related_issues_table.setRowCount(0)
         if first_pdf_row is not None:
             self.files_table.selectRow(first_pdf_row)
             self.on_attachment_selected()
@@ -2656,11 +2927,19 @@ class BomPage(QWidget):
         file_id = self._selected_attachment_id()
         if not file_id:
             self.versions_table.setRowCount(0)
+            if hasattr(self, "file_related_issues_table"):
+                self.file_related_issues_table.setRowCount(0)
             if hasattr(self, "pdf_viewer"):
                 self.pdf_viewer.close_preview()
             return
         versions = self.part_file_service.list_versions(file_id)
         self.versions_table.setRowCount(len(versions))
+        current_revision = ""
+        try:
+            details = self.bom_service.get_part_details(int(self.current_part_id)) or {}
+            current_revision = str(details.get("revision") or "").strip().upper()
+        except Exception:
+            current_revision = ""
         for i, v in enumerate(versions):
             ver_item = QTableWidgetItem(str(v.version_no))
             ver_item.setData(Qt.UserRole, v.id)
@@ -2669,10 +2948,34 @@ class BomPage(QWidget):
             self.versions_table.setItem(i, 2, QTableWidgetItem(str(v.original_filename)))
             self.versions_table.setItem(i, 3, QTableWidgetItem(str(v.created_at or "")))
             self.versions_table.setItem(i, 4, QTableWidgetItem(str(v.released_at or "")))
-            self.versions_table.setItem(i, 5, QTableWidgetItem(str(v.note or "")))
+            self.versions_table.setItem(i, 5, QTableWidgetItem(str(getattr(v, "revision", None) or current_revision or "")))
+            self.versions_table.setItem(i, 6, QTableWidgetItem(str(v.note or "")))
 
         # Auto-preview the active version if it is a PDF
         self._try_pdf_preview_for_active(file_id)
+        self._load_related_issues_for_file(file_id)
+
+    def _load_related_issues_for_file(self, file_id):
+        if not hasattr(self, "file_related_issues_table"):
+            return
+        try:
+            issues = self.traceability_service.issues_for_engineering_file(int(file_id))
+        except Exception:
+            issues = []
+        self.file_related_issues_table.setRowCount(len(issues))
+        for row, issue in enumerate(issues):
+            values = [
+                issue.get("issue_number"),
+                issue.get("title"),
+                issue.get("status"),
+                issue.get("file_role"),
+                issue.get("linked_at"),
+            ]
+            for col, value in enumerate(values):
+                cell = QTableWidgetItem(str(value or ""))
+                if col == 0 and issue.get("id") is not None:
+                    cell.setData(Qt.UserRole, int(issue["id"]))
+                self.file_related_issues_table.setItem(row, col, cell)
 
     # ── PDF preview helpers ─────────────────────────────────────────
     def _try_pdf_preview_for_active(self, file_id):
@@ -2800,6 +3103,93 @@ class BomPage(QWidget):
             self._refresh_part_in_tree(int(self.current_part_id))
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to add attachment:\n{e}")
+
+    def link_selected_file_to_issue(self):
+        file_id = self._selected_attachment_id()
+        if not file_id:
+            return QMessageBox.warning(self, "Select", "Select a vaulted file first.")
+        try:
+            issues = self.issue_service.list_issues({"include_archived": False})
+        except Exception:
+            issues = []
+        if not issues:
+            return QMessageBox.information(self, "Issues", "No issues are available to link.")
+
+        labels = [
+            f"{issue['issue_number']} - {issue['title']} [{issue['status']}]"
+            for issue in issues
+        ]
+        selected, ok = QInputDialog.getItem(
+            self,
+            "Link File to Issue",
+            "Select issue:",
+            labels,
+            0,
+            False,
+        )
+        if not ok or not selected:
+            return
+        issue = issues[labels.index(selected)]
+
+        file_type_item = self.files_table.item(self.files_table.currentRow(), 1)
+        file_type = (file_type_item.text() if file_type_item else "").strip().upper()
+        default_role = {
+            "PDF": "exported_pdf",
+            "STEP": "exported_step",
+            "STP": "exported_step",
+        }.get(file_type, "other")
+        roles = [
+            "exported_pdf",
+            "exported_step",
+            "validation_doc",
+            "inspection_report",
+            "screenshot",
+            "supporting_doc",
+            "other",
+        ]
+        role, ok = QInputDialog.getItem(
+            self,
+            "File Role",
+            "Traceability role:",
+            roles,
+            max(0, roles.index(default_role) if default_role in roles else 0),
+            False,
+        )
+        if not ok:
+            return
+        note, _ = QInputDialog.getText(self, "Link Note", "Note (optional):")
+        version_id = self._selected_version_id()
+        try:
+            self.traceability_service.link_issue_to_engineering_file(
+                int(issue["id"]),
+                int(file_id),
+                int(version_id) if version_id else None,
+                role,
+                note or "",
+            )
+            self._load_related_issues_for_file(file_id)
+            self._refresh_linked_issue_traceability(int(issue["id"]))
+            QMessageBox.information(self, "Linked", "Engineering file linked to issue.")
+        except Exception as e:
+            QMessageBox.critical(self, "Link File", str(e))
+
+    def _refresh_linked_issue_traceability(self, issue_id: int):
+        try:
+            issue_page = getattr(self.window(), "issue_page", None)
+            if not issue_page:
+                return
+            if getattr(issue_page, "current_issue_id", None) == int(issue_id):
+                if hasattr(issue_page, "_load_engineering_files"):
+                    issue_page._load_engineering_files()
+                if hasattr(issue_page, "_load_history"):
+                    issue_page._load_history()
+                if hasattr(issue_page, "_load_commits"):
+                    issue_page._load_commits()
+            elif hasattr(issue_page, "refresh"):
+                # Keep the issue list counts/current cache fresh without rebuilding the whole app.
+                issue_page.refresh()
+        except Exception:
+            pass
 
     def add_attachment_version(self):
         if not self.perm.can("release_files"):
@@ -3496,6 +3886,11 @@ class BomPage(QWidget):
                 try:
                     # Search results are flat; no need to expand deeply.
                     self._search_tree.expandToDepth(1)
+                except Exception:
+                    pass
+                try:
+                    if not self._is_default_bom_advanced_filter():
+                        self.apply_bom_tree_filter(self._bom_advanced_filters)
                 except Exception:
                     pass
                 self._set_tree_loading(False)
@@ -4541,6 +4936,11 @@ class BomPage(QWidget):
                     pass
 
                 self._set_tree_loading(False)
+                try:
+                    if not self._is_default_bom_advanced_filter():
+                        self.apply_bom_tree_filter(self._bom_advanced_filters)
+                except Exception:
+                    pass
 
                 # Fire once when the very first tree load finishes.
                 try:

@@ -16,6 +16,7 @@ from core.services.project_service import ProjectService
 from core.session_manager import SessionManager
 from core.services.permission_decorators import require_permission
 from core.services.issue_service import IssueService
+from core.services.traceability_service import TraceabilityService
 
 from utils import (
     is_creo_file,
@@ -31,6 +32,7 @@ class CommitService(BaseService):
         self.user_service = UserService(UserRepository())
         self.project_service = ProjectService()
         self.issue_service = IssueService()
+        self.traceability_service = TraceabilityService()
 
         self.session = SessionManager()
 
@@ -172,10 +174,10 @@ class CommitService(BaseService):
         step_compare_enabled: bool = False,
         step_file_path: str | None = None,
         resolved_issue_ids=None,
+        resolved_issue_relation_type: str = "solves",
+        jira_key: str | None = None,
+        jira_url: str | None = None,
     ):
-
-        #base filename list
-        base_uncommitted = [os.path.basename(f) for f in uncommitted_parts]
 
         commit_id = f"commit_{uuid.uuid4().hex[:8]}"
 
@@ -194,38 +196,40 @@ class CommitService(BaseService):
         except Exception:
             project_version_label = None
 
+        if not uncommitted_parts:
+            raise ValueError("No files staged for commit.")
+
+        user_dir = os.path.join(commit_dir, designer)
+        commit_user_dir = os.path.join(user_dir, f"{title}_{commit_id}")
+        uncommitted_bases = [".".join(os.path.basename(f).split(".")[:-1]) for f in uncommitted_parts]
+        commit_plan = []
+
+        # Phase 1: preflight every file before creating commit artifacts.
         for filepath in uncommitted_parts:
             print(f"Processing file: {filepath}")
             filename = os.path.basename(filepath)
 
+            if not os.path.exists(filepath):
+                raise ValueError(f"Commit blocked: source file is missing: {filename}")
+
             if not is_creo_file(filename):
                 raise ValueError(f"Error: {filename} is not a valid Creo file")
-            
 
-            user_dir = os.path.join(commit_dir, designer)
-            commit_user_dir = os.path.join(user_dir, f"{title}_{commit_id}")
-            ensure_dir_exists(commit_user_dir)
-            dest_path = os.path.join(commit_user_dir, filename)
-
-            # Check for duplicate (regardless of user)
             base_f_name = ".".join(filename.split(".")[:-1])
             file_extension = ".".join(base_f_name.split(".")[1:])
             print(f"Base file name: {base_f_name}, Extension: {file_extension}")
             if self.commit_repository.is_duplicate_commit(base_f_name, self.session.project_id):
                 raise ValueError(f"Commit already exists for {base_f_name}. Use --force to overwrite.")
-                
+
             if file_extension.lower() == "drw":
-                #get related part from bom
                 bom_entry = self.bom_repo.get_by_drawing_file_name_for_commit(
                     base_f_name,
                     self.session.project_id,
                     designer_id,
                 )
-                # check if the cad of the drawing is in the uncomiitted list
                 if bom_entry:
                     cad_file = bom_entry.base_file_name
                     print(f"Related CAD file for drawing {filename} is {cad_file}")
-                    uncommitted_bases = [".".join(os.path.basename(f).split(".")[:-1]) for f in uncommitted_parts]
                     print(f"Uncommitted parts: {uncommitted_bases}")
                     if cad_file not in uncommitted_bases:
                         raise ValueError(f"Error: Cannot Commit drawing without its related CAD,\n Please provide the CAD file {cad_file} related to drawing {filename} in the uncommitted parts.")
@@ -239,112 +243,141 @@ class CommitService(BaseService):
                     designer_id,
                 )
 
-
-
-
             if not bom_entry:
                 if part_type == "Cad":
-                    # raise ValueError(f"Error: No BOM item found for {base_f_name}")
                     raise ValueError(f"cad404:{filename}")
                 elif part_type == "Drw":
-                    # raise ValueError(f"Error: No BOM item found for {base_f_name}")
                     raise ValueError(f"drw404:{filename}")
-            else:
-                part_id = bom_entry.id
-                # Check if part is locked by designer
-                locked = self.lock_repo.get_by_part(part_id)
-                if not locked:
-                    raise ValueError("Part is not checked in.")
-                elif locked.user_id != designer_id: 
-                    print(locked.user_id)
-                    raise ValueError("Part is checked in by another user.")
-                
-                try:
-                    
-                        #perform commit
-                        # Copy file to commits directory
-                        shutil.copy2(filepath, dest_path)
-                        
-                        print(f"Committed {filename} for approval.")
-                        print(f"File copied to {dest_path}")
-                        signature = self.signature_repo.add_signature("commit", designer_id, message)
-                        step_meta = {
-                            "step_compare_enabled": 0,
-                            "step_file_path": None,
-                            "step_prev_file_path": None,
-                            "step_diff_path": None,
-                            "step_diff_summary": None,
-                            "step_diff_status": None,
-                            "step_error": None,
-                        }
 
-                        if bool(step_compare_enabled) and part_type == "Cad" and step_file_path:
-                            try:
-                                previous_step_commit = self.commit_repository.get_latest_step_commit_for_base_name_family(
-                                    str(base_f_name),
-                                    int(self.session.project_id),
-                                    exclude_commit_id=str(commit_id),
-                                )
-                                previous_commit_hint = (
-                                    getattr(previous_step_commit, "commit_id", None) or "prev"
-                                )
-                                previous_step_path = getattr(previous_step_commit, "step_file_path", None)
+            part_id = bom_entry.id
+            locked = self.lock_repo.get_by_part(part_id)
+            if not locked:
+                raise ValueError(f"Commit blocked: {filename} is not checked in.")
+            elif locked.user_id != designer_id:
+                print(locked.user_id)
+                raise ValueError(f"Commit blocked: {filename} is checked in by another user.")
 
-                                step_meta = self._process_step_compare(
-                                    commit_dir=commit_dir,
-                                    part_id=int(part_id),
-                                    commit_id=str(commit_id),
-                                    current_step_source_path=step_file_path,
-                                    current_commit_label=str(commit_id),
-                                    previous_commit_hint=previous_commit_hint,
-                                    previous_step_path=previous_step_path,
-                                    metadata={
-                                        "project_id": self.session.project_id,
-                                        "part_id": int(part_id),
-                                        "base_file_name": base_f_name,
-                                        "filename": filename,
-                                        "commit_id": str(commit_id),
-                                        "title": title,
-                                        "designer_id": designer_id,
-                                    },
-                                )
-                            except Exception as e:
-                                raise ValueError(f"STEP compare failed for {filename}: {str(e)}")
+            commit_plan.append({
+                "filepath": filepath,
+                "filename": filename,
+                "dest_path": os.path.join(commit_user_dir, filename),
+                "base_f_name": base_f_name,
+                "part_type": part_type,
+                "part_id": part_id,
+            })
 
-                        self.commit_repository.insert(
-                            part_id,
-                            part_type,
-                            filename,
-                            filepath,
-                            base_f_name,
-                            designer_id,
-                            self.user_id,
-                            message,
-                            signature,
-                            self.session.project_id,
-                            title,
-                            commit_id,
-                            step_compare_enabled=step_meta.get("step_compare_enabled", 0),
-                            step_file_path=step_meta.get("step_file_path"),
-                            step_prev_file_path=step_meta.get("step_prev_file_path"),
-                            step_diff_path=step_meta.get("step_diff_path"),
-                            step_diff_summary=step_meta.get("step_diff_summary"),
-                            step_diff_status=step_meta.get("step_diff_status"),
-                            step_error=step_meta.get("step_error"),
-                            step_face_map_path=step_meta.get("step_face_map_path"),
+        inserted_any = False
+        try:
+            ensure_dir_exists(commit_user_dir)
+
+            # Phase 2: copy/process all files. No DB rows are visible until every staged file succeeds.
+            for item in commit_plan:
+                shutil.copy2(item["filepath"], item["dest_path"])
+                print(f"Committed {item['filename']} for approval.")
+                print(f"File copied to {item['dest_path']}")
+
+                step_meta = {
+                    "step_compare_enabled": 0,
+                    "step_file_path": None,
+                    "step_prev_file_path": None,
+                    "step_diff_path": None,
+                    "step_diff_summary": None,
+                    "step_diff_status": None,
+                    "step_error": None,
+                    "step_face_map_path": None,
+                }
+                if bool(step_compare_enabled) and item["part_type"] == "Cad" and step_file_path:
+                    try:
+                        previous_step_commit = self.commit_repository.get_latest_step_commit_for_base_name_family(
+                            str(item["base_f_name"]),
+                            int(self.session.project_id),
+                            exclude_commit_id=str(commit_id),
                         )
+                        previous_commit_hint = getattr(previous_step_commit, "commit_id", None) or "prev"
+                        previous_step_path = getattr(previous_step_commit, "step_file_path", None)
+                        step_meta = self._process_step_compare(
+                            commit_dir=commit_dir,
+                            part_id=int(item["part_id"]),
+                            commit_id=str(commit_id),
+                            current_step_source_path=step_file_path,
+                            current_commit_label=str(commit_id),
+                            previous_commit_hint=previous_commit_hint,
+                            previous_step_path=previous_step_path,
+                            metadata={
+                                "project_id": self.session.project_id,
+                                "part_id": int(item["part_id"]),
+                                "base_file_name": item["base_f_name"],
+                                "filename": item["filename"],
+                                "commit_id": str(commit_id),
+                                "title": title,
+                                "designer_id": designer_id,
+                            },
+                        )
+                    except Exception as e:
+                        raise ValueError(f"STEP compare failed for {item['filename']}: {str(e)}")
+                item["step_meta"] = step_meta
 
-                        # PLM-lite: part revision follows project version only when the part is committed.
-                        if project_version_label:
-                            try:
-                                self.bom_repo.set_revision(part_id, project_version_label)
-                            except Exception:
-                                pass
-                    
-                except Exception as e:
-                    raise ValueError(f"Commit failed: {str(e)}")
-        if resolved_issue_ids:
-            self.issue_service.link_to_commit(resolved_issue_ids, commit_id, message)
+            # Phase 3: persist all rows and traceability links.
+            for item in commit_plan:
+                signature = self.signature_repo.add_signature("commit", designer_id, message)
+                step_meta = item.get("step_meta") or {}
+                self.commit_repository.insert(
+                    item["part_id"],
+                    item["part_type"],
+                    item["filename"],
+                    item["filepath"],
+                    item["base_f_name"],
+                    designer_id,
+                    self.user_id,
+                    message,
+                    signature,
+                    self.session.project_id,
+                    title,
+                    commit_id,
+                    step_compare_enabled=step_meta.get("step_compare_enabled", 0),
+                    step_file_path=step_meta.get("step_file_path"),
+                    step_prev_file_path=step_meta.get("step_prev_file_path"),
+                    step_diff_path=step_meta.get("step_diff_path"),
+                    step_diff_summary=step_meta.get("step_diff_summary"),
+                    step_diff_status=step_meta.get("step_diff_status"),
+                    step_error=step_meta.get("step_error"),
+                    step_face_map_path=step_meta.get("step_face_map_path"),
+                )
+                inserted_any = True
+
+            if project_version_label:
+                for item in commit_plan:
+                    try:
+                        self.bom_repo.set_revision(item["part_id"], project_version_label)
+                    except Exception:
+                        pass
+
+            self.traceability_service.repo.backfill_commit_groups()
+            if resolved_issue_ids:
+                self.issue_service.link_to_commit_with_relation(
+                    resolved_issue_ids,
+                    commit_id,
+                    relation_type=resolved_issue_relation_type,
+                    note=message,
+                )
+                if (jira_key or jira_url):
+                    for issue_id in resolved_issue_ids:
+                        self.traceability_service.link_jira(issue_id, jira_key or "", jira_url or "")
+        except Exception as e:
+            if inserted_any:
+                try:
+                    self.commit_repository.hard_delete_by_commit_id(commit_id, self.session.project_id)
+                except Exception:
+                    pass
+            try:
+                if os.path.isdir(commit_user_dir):
+                    shutil.rmtree(commit_user_dir)
+            except Exception:
+                pass
+            msg = str(e)
+            if msg.startswith(("cad404:", "drw404:", "Error:", "Commit blocked:", "STEP compare failed")):
+                raise ValueError(msg)
+            raise ValueError(f"Commit failed: {msg}")
         return commit_id
 
 
@@ -377,6 +410,10 @@ class CommitService(BaseService):
                 "id": c.id,
                 "status": c.status,
                 "filename": c.filename,
+                "title": c.title,
+                "project_id": c.project_id,
+                "part_id": c.part_id,
+                "type": c.type,
                 "date": c.committed_at,
                 "designed_by": designer.username if designer else "Unknown",
                 "checked_by": checker.username if checker else "Unknown",
@@ -448,11 +485,53 @@ class CommitService(BaseService):
             grouped[key]["parts"].append(c.filename)
         return list(grouped.values())
 
+    def get_commit_group_details(self, commit_id: str, project_id: int | None = None) -> dict:
+        rows = self.commit_repository.get_rows_by_commit_id(
+            str(commit_id),
+            int(project_id) if project_id is not None else None,
+        )
+        if not rows and project_id is not None:
+            rows = self.commit_repository.get_rows_by_commit_id(str(commit_id))
+        if not rows:
+            return {"commit_id": str(commit_id), "files": [], "issues": []}
+
+        first = rows[0]
+        status_order = {"Reverted": 5, "Approved": 4, "Validated": 3, "Pending": 2, "Integrated": 1}
+        statuses = [str(r.get("status") or "") for r in rows]
+        group_status = max(statuses, key=lambda s: status_order.get(s, 0)) if statuses else ""
+        issues = self.issue_service.issues_for_commit(str(commit_id))
+        return {
+            "commit_id": str(commit_id),
+            "title": first.get("title") or "",
+            "message": first.get("message") or "",
+            "status": group_status,
+            "project_id": first.get("project_id"),
+            "project_name": first.get("project_name") or "",
+            "project_version_label": first.get("project_version_label") or "",
+            "root_project_id": first.get("root_project_id"),
+            "author": first.get("committed_by_name") or first.get("designer_name") or "",
+            "designer": first.get("designer_name") or "",
+            "checker": first.get("checked_by_name") or "",
+            "committed_at": first.get("committed_at") or "",
+            "merged_by": first.get("merged_by_name") or "",
+            "merged_at": first.get("merged_at") or "",
+            "merge_id": first.get("merge_id") or "",
+            "merge_message": first.get("merge_message") or "",
+            "approved_version": first.get("approved_version") or "",
+            "pr_path": first.get("pr_path") or "",
+            "signature": first.get("signature") or "",
+            "last_snapshot": first.get("last_snapshot"),
+            "snapshotted_in": first.get("snapshotted_in") or "",
+            "files": rows,
+            "issues": issues,
+        }
+
     
     def revert_commit(self, commit_id: int, project_id: int = None):
-        return self.commit_repository.delete(
-            commit_id,
+        return self.traceability_service.mark_commit_reverted(
+            str(commit_id),
             int(project_id) if project_id is not None else self.session.project_id,
+            "Reverted from Commit page",
         )
     
     @require_permission("validate")

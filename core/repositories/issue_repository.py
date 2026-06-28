@@ -459,7 +459,8 @@ class IssueRepository:
             return [
                 dict(r) for r in conn.execute(
                     """
-                    SELECT b.id, b.name, b.filename, b.type, b.revision, b.lifecycle_state
+                    SELECT b.id, b.name, b.type, b.filename, b.drawing,
+                           b.base_file_name, b.base_drw_name, b.revision, b.lifecycle_state
                     FROM issue_parts ip JOIN bom b ON b.id=ip.part_id
                     WHERE ip.issue_id=? ORDER BY b.name
                     """,
@@ -675,7 +676,8 @@ class IssueRepository:
             return [
                 dict(r) for r in conn.execute(
                     """
-                    SELECT i.*, l.validation_status, l.resolution_comment, l.validation_comment
+                    SELECT i.*, l.validation_status, l.resolution_comment, l.validation_comment,
+                           l.relation_type, l.note
                     FROM issue_commit_links l JOIN issues i ON i.id=l.issue_id
                     WHERE l.commit_id=? ORDER BY i.issue_number
                     """,
@@ -703,8 +705,17 @@ class IssueRepository:
     def validate_commit_issue(self, issue_id: int, commit_id: str, solved: bool,
                               actor_id: Optional[int], comment=""):
         state = "Confirmed" if solved else "Rejected"
-        target = "Closed" if solved else "In Progress"
         with self.get_conn() as conn:
+            link = conn.execute(
+                "SELECT relation_type FROM issue_commit_links WHERE issue_id=? AND commit_id=?",
+                (int(issue_id), commit_id),
+            ).fetchone()
+            relation_type = (link["relation_type"] if link else "solves") or "solves"
+            old = conn.execute("SELECT status FROM issues WHERE id=?", (int(issue_id),)).fetchone()
+            if relation_type in {"solves", "partial_fix"}:
+                target = "Closed" if solved else "In Progress"
+            else:
+                target = old["status"] if old else "Open"
             conn.execute(
                 """
                 UPDATE issue_commit_links SET validation_status=?, validated_by=?,
@@ -713,7 +724,6 @@ class IssueRepository:
                 """,
                 (state, actor_id, comment, int(issue_id), commit_id),
             )
-            old = conn.execute("SELECT status FROM issues WHERE id=?", (int(issue_id),)).fetchone()
             conn.execute(
                 """
                 UPDATE issues SET status=?, updated_at=datetime('now'), closed_by=?,
@@ -725,6 +735,58 @@ class IssueRepository:
             self._history(conn, issue_id, f"Commit resolution {state}", actor_id,
                           "status", old["status"] if old else None, target,
                           {"commit_id": commit_id, "comment": comment})
+
+    def reopen_for_restored_commit(self, commit_id: str, actor_id: Optional[int],
+                                   note: str = "") -> list[dict]:
+        """Reopen linked closed issues and write history for every affected issue."""
+        reopened = []
+        with self.get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT i.*
+                FROM issue_commit_links l
+                JOIN issues i ON i.id=l.issue_id
+                WHERE l.commit_id=? AND COALESCE(i.archived, 0)=0
+                ORDER BY i.issue_number
+                """,
+                (str(commit_id),),
+            ).fetchall()
+            for row in rows:
+                issue = dict(row)
+                old_status = issue.get("status") or "Open"
+                details = {"commit_id": str(commit_id), "note": note or ""}
+                if old_status == "Closed":
+                    conn.execute(
+                        """
+                        UPDATE issues
+                        SET status='Open', updated_at=datetime('now'),
+                            closed_by=NULL, closed_at=NULL
+                        WHERE id=?
+                        """,
+                        (int(issue["id"]),),
+                    )
+                    self._history(
+                        conn,
+                        int(issue["id"]),
+                        "Issue reopened after commit restore",
+                        actor_id,
+                        "status",
+                        old_status,
+                        "Open",
+                        details,
+                    )
+                    issue["previous_status"] = old_status
+                    issue["status"] = "Open"
+                    reopened.append(issue)
+                else:
+                    self._history(
+                        conn,
+                        int(issue["id"]),
+                        "Linked commit restored",
+                        actor_id,
+                        details=details,
+                    )
+        return reopened
 
     def summary_by_part(self, project_id: int) -> dict[int, dict]:
         with self.get_conn() as conn:

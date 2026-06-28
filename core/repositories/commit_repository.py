@@ -314,6 +314,45 @@ class CommitRepository:
             )
             rows = cur.fetchall()
             return [self._row_to_commit(r) for r in rows]
+
+    def get_rows_by_commit_id(self, commit_id: str, project_id: int | None = None) -> list[dict]:
+        """Return all file rows for a logical commit id with manager-facing joins."""
+        with self.get_conn() as conn:
+            params = [str(commit_id)]
+            project_clause = ""
+            if project_id is not None:
+                project_clause = " AND c.project_id = ?"
+                params.append(int(project_id))
+            rows = conn.execute(
+                f"""
+                SELECT
+                    c.*,
+                    designer.username AS designer_name,
+                    committer.username AS committed_by_name,
+                    checker.username AS checked_by_name,
+                    merger.username AS merged_by_name,
+                    b.name AS part_name,
+                    b.aes_number,
+                    b.part_number,
+                    b.drawing_number,
+                    b.revision AS part_revision,
+                    b.lifecycle_state AS part_lifecycle_state,
+                    p.name AS project_name,
+                    p.version_label AS project_version_label,
+                    p.root_project_id
+                FROM commits c
+                LEFT JOIN users designer ON designer.id=c.designer
+                LEFT JOIN users committer ON committer.id=c.committed_by
+                LEFT JOIN users checker ON checker.id=c.checked_by
+                LEFT JOIN users merger ON merger.id=c.merged_by
+                LEFT JOIN bom b ON b.id=c.part_id
+                LEFT JOIN projects p ON p.id=c.project_id
+                WHERE c.commit_id = ? {project_clause}
+                ORDER BY c.id
+                """,
+                tuple(params),
+            ).fetchall()
+            return [dict(r) for r in rows]
     
     #retur true if the filename exists in the commit table
     def is_filename_exist(self, filename, project_id):
@@ -386,15 +425,34 @@ class CommitRepository:
         return Commit(**filtered)
     
     def delete(self, commit_id: int, project_id: int):
-        """Delete a commit by ID and project. Returns True if deleted, False otherwise."""
+        """Mark a commit group as reverted. Kept for legacy callers."""
         with self.get_conn() as conn:
             cur = conn.cursor()
             cur.execute(
-                "DELETE FROM commits WHERE commit_id = ? AND project_id = ?",
+                "UPDATE commits SET status = 'Reverted' WHERE commit_id = ? AND project_id = ?",
                 (commit_id, project_id)
             )
             conn.commit()
-            return cur.rowcount > 0  # True if at least one row was deleted
+            return cur.rowcount > 0
+
+    def hard_delete_by_commit_id(self, commit_id: str, project_id: int):
+        with self.get_conn() as conn:
+            cur = conn.cursor()
+            for sql, params in (
+                ("DELETE FROM issue_commit_links WHERE commit_id = ?", (str(commit_id),)),
+                ("DELETE FROM commit_file_links WHERE commit_group_id IN (SELECT id FROM commit_groups WHERE commit_id = ? AND project_id = ?)", (str(commit_id), int(project_id))),
+                ("DELETE FROM commit_groups WHERE commit_id = ? AND project_id = ?", (str(commit_id), int(project_id))),
+            ):
+                try:
+                    cur.execute(sql, params)
+                except Exception:
+                    pass
+            cur.execute(
+                "DELETE FROM commits WHERE commit_id = ? AND project_id = ?",
+                (str(commit_id), int(project_id)),
+            )
+            conn.commit()
+            return cur.rowcount
 
 
     def update_snapshot(self, filename, last_snapshot_id, project_id):

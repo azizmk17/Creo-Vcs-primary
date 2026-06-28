@@ -12,6 +12,7 @@ class PartFileVersion:
     sha256: Optional[str] = None
     size_bytes: Optional[int] = None
     note: Optional[str] = None
+    revision: Optional[str] = None
     created_by: Optional[int] = None
     created_at: Optional[str] = None
     lifecycle_state: Optional[str] = None  # WIP | Released | Obsolete

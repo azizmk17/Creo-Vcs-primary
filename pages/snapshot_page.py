@@ -2,7 +2,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QPushButton, QLabel, QTableWidget,
     QTableWidgetItem, QMessageBox, QHeaderView, QHBoxLayout, QFileDialog, QComboBox, QSizePolicy, QTextEdit, QDialog, QProgressDialog
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from core.services.snapshot_service import SnapshotService
 from core.session_manager import SessionManager
 from core.services.project_service import ProjectService
@@ -90,7 +90,7 @@ class SnapshotPage(QWidget):
         layout.addLayout(compare_layout)
 
         self.setLayout(layout)
-        self.load_snapshots()
+        QTimer.singleShot(0, self.load_snapshots)
 
         # Initial state
         self._update_action_state()

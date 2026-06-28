@@ -334,15 +334,10 @@ class BomGUI(QMainWindow):
         startup_stage("Loading engineering issues...")
         from pages.issue_page import EngineeringIssuePage
         self.issue_page = EngineeringIssuePage()
-        startup_stage("Loading diagnostics...")
-        from pages.diag_page import DiagPage
-        self.diag_page = DiagPage()
-        startup_stage("Loading administration tools...")
-        from pages.admin_page import AdminPage
-        self.admin_page = AdminPage()
-        startup_stage("Loading snapshots and baselines...")
-        from pages.snapshot_page import SnapshotPage
-        self.snap_page = SnapshotPage()
+        startup_stage("Preparing secondary tools...")
+        self.diag_page = self._lazy_page_placeholder("Diagnostic")
+        self.admin_page = self._lazy_page_placeholder("Admin")
+        self.snap_page = self._lazy_page_placeholder("Snapshots")
         startup_stage("Connecting application modules...")
         self.pages.addWidget(self.bom_page)
         self.pages.addWidget(self.commit_page)
@@ -386,6 +381,15 @@ class BomGUI(QMainWindow):
 
         # Version update notification — runs after the window is fully visible.
         QTimer.singleShot(500, self._check_version_notification)
+
+    def _lazy_page_placeholder(self, label):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setAlignment(Qt.AlignCenter)
+        msg = QLabel(f"{label} will load when opened.")
+        msg.setStyleSheet("font-size: 14px; color: #66758a;")
+        layout.addWidget(msg)
+        return page
 
     def _check_version_notification(self):
         """Show a popup dialog if a newer CreoVCS version is available in the DB."""
@@ -710,9 +714,42 @@ class BomGUI(QMainWindow):
             self.project_label.setText(f"  Current Project: {name}  ")
 
     def switch_page(self, index):
+        self._ensure_lazy_page(index)
         self.pages.setCurrentIndex(index)
         page_names = ["BOM", "Commit", "Issue Center", "Diagnostic", "Admin", "Snapshot"]
         self.statusBar().showMessage(f"Switched to {page_names[index]} page")
+
+    def _ensure_lazy_page(self, index):
+        if index == 3 and not getattr(self, "_diag_loaded", False):
+            self.statusBar().showMessage("Loading Diagnostic page...")
+            QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+            from pages.diag_page import DiagPage
+            page = DiagPage()
+            self.pages.removeWidget(self.diag_page)
+            self.diag_page.deleteLater()
+            self.diag_page = page
+            self.pages.insertWidget(3, self.diag_page)
+            self._diag_loaded = True
+        elif index == 4 and not getattr(self, "_admin_loaded", False):
+            self.statusBar().showMessage("Loading Admin page...")
+            QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+            from pages.admin_page import AdminPage
+            page = AdminPage()
+            self.pages.removeWidget(self.admin_page)
+            self.admin_page.deleteLater()
+            self.admin_page = page
+            self.pages.insertWidget(4, self.admin_page)
+            self._admin_loaded = True
+        elif index == 5 and not getattr(self, "_snap_loaded", False):
+            self.statusBar().showMessage("Loading Snapshot page...")
+            QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+            from pages.snapshot_page import SnapshotPage
+            page = SnapshotPage()
+            self.pages.removeWidget(self.snap_page)
+            self.snap_page.deleteLater()
+            self.snap_page = page
+            self.pages.insertWidget(5, self.snap_page)
+            self._snap_loaded = True
 
     def open_issues_for_part(self, part_id):
         self.issue_page.open_for_part(int(part_id))
