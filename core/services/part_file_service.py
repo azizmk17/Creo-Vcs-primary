@@ -357,3 +357,17 @@ class PartFileService:
                 pass
 
         self.repo.delete_file(file_id)
+
+    def update_version_revision(self, version_id: int, revision: str):
+        self.repo.update_version_metadata(
+            int(version_id),
+            revision=str(revision or "").strip().upper(),
+            update_revision=True,
+        )
+
+    def update_version_note(self, version_id: int, note: str):
+        self.repo.update_version_metadata(
+            int(version_id),
+            note=str(note or "").strip(),
+            update_note=True,
+        )

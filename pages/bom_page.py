@@ -343,6 +343,10 @@ class _BomTreeNameDelegate(QStyledItemDelegate):
         issue_summary = item.data(0, BOM_TREE_ISSUE_ROLE) or {}
         active_count = int(issue_summary.get("active_count") or 0)
         total_count = int(issue_summary.get("total_count") or 0)
+        direct_active_count = int(issue_summary.get("direct_active_count", active_count) or 0)
+        inherited_active_count = int(issue_summary.get("inherited_active_count") or 0)
+        direct_total_count = int(issue_summary.get("direct_total_count", total_count) or 0)
+        inherited_total_count = int(issue_summary.get("inherited_total_count") or 0)
         widget = opt.widget or self._tree
         style = widget.style()
 
@@ -363,8 +367,16 @@ class _BomTreeNameDelegate(QStyledItemDelegate):
         name_font.setPixelSize(13)
         name_font.setBold(bool(is_asm))
         display_inwork = "In Work" if suffix else ""
-        issue_label = f"!{active_count}" if active_count else ("●" if total_count else "")
-        issue_color = QColor("#c62828") if active_count else QColor("#2e7d32")
+        issue_badges = []
+        if direct_active_count:
+            issue_badges.append((f"!{direct_active_count}", QColor("#c62828")))
+        if inherited_active_count:
+            issue_badges.append((f"+{inherited_active_count}", QColor("#2563eb")))
+        if not issue_badges and total_count:
+            if direct_total_count:
+                issue_badges.append(("●", QColor("#2e7d32")))
+            elif inherited_total_count:
+                issue_badges.append(("+", QColor("#2563eb")))
 
         painter.save()
         painter.setFont(name_font)
@@ -375,7 +387,9 @@ class _BomTreeNameDelegate(QStyledItemDelegate):
         issue_font.setPixelSize(11)
         issue_font.setBold(True)
         issue_fm = QFontMetrics(issue_font)
-        issue_w = issue_fm.horizontalAdvance(issue_label) if issue_label else 0
+        issue_w = sum(issue_fm.horizontalAdvance(label) + 4 for label, _color in issue_badges)
+        if len(issue_badges) > 1:
+            issue_w += _BOM_INWORK_GAP_PX * (len(issue_badges) - 1)
 
         if display_inwork:
             suf_font = QFont(opt.font)
@@ -386,14 +400,14 @@ class _BomTreeNameDelegate(QStyledItemDelegate):
             half = max(48, text_rect.width() // 2)
             suf_elided = suf_fm.elidedText(display_inwork, opt.textElideMode, half)
             suf_w = suf_fm.horizontalAdvance(suf_elided)
-            name_max = max(24, text_rect.width() - _BOM_INWORK_GAP_PX - suf_w - (_BOM_INWORK_GAP_PX + issue_w if issue_label else 0))
+            name_max = max(24, text_rect.width() - _BOM_INWORK_GAP_PX - suf_w - (_BOM_INWORK_GAP_PX + issue_w if issue_badges else 0))
             name_elided = fm.elidedText(name, opt.textElideMode, name_max)
         else:
             suf_font = None
             suf_elided = ""
             name_elided = fm.elidedText(
                 name, opt.textElideMode,
-                max(24, text_rect.width() - (_BOM_INWORK_GAP_PX + issue_w if issue_label else 0)),
+                max(24, text_rect.width() - (_BOM_INWORK_GAP_PX + issue_w if issue_badges else 0)),
             )
 
         painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, name_elided)
@@ -410,16 +424,15 @@ class _BomTreeNameDelegate(QStyledItemDelegate):
             painter.setPen(_BOM_INWORK_COLOR)
             painter.drawText(suf_rect, Qt.AlignVCenter | Qt.AlignLeft, suf_elided)
             name_w += _BOM_INWORK_GAP_PX + QFontMetrics(suf_font).horizontalAdvance(suf_elided)
-        if issue_label:
+        if issue_badges:
             painter.setFont(issue_font)
-            painter.setPen(issue_color)
-            issue_rect = QRect(
-                text_rect.left() + name_w + _BOM_INWORK_GAP_PX,
-                text_rect.top(),
-                issue_w + 4,
-                text_rect.height(),
-            )
-            painter.drawText(issue_rect, Qt.AlignVCenter | Qt.AlignLeft, issue_label)
+            x = text_rect.left() + name_w + _BOM_INWORK_GAP_PX
+            for label, color in issue_badges:
+                label_w = issue_fm.horizontalAdvance(label) + 4
+                painter.setPen(color)
+                issue_rect = QRect(x, text_rect.top(), label_w, text_rect.height())
+                painter.drawText(issue_rect, Qt.AlignVCenter | Qt.AlignLeft, label)
+                x += label_w + _BOM_INWORK_GAP_PX
         painter.restore()
 
     def sizeHint(self, option: QStyleOptionViewItem, index):
@@ -3201,12 +3214,23 @@ class BomPage(QWidget):
         if not file_id:
             QMessageBox.warning(self, "Select", "Select an attachment first.")
             return
-        note, _ = QInputDialog.getText(self, "Version Note", "Version note (optional):")
+        revision, ok = QInputDialog.getText(self, "Version Revision", "Revision (optional, e.g. A010):")
+        if not ok:
+            return
+        revision = (revision or "").strip().upper()
+        note, ok = QInputDialog.getText(self, "Version Note", "Version note (optional):")
+        if not ok:
+            return
         source_path, _ = QFileDialog.getOpenFileName(self, "Select new version file")
         if not source_path:
             return
         try:
-            self.part_file_service.add_new_version(file_id, source_path, note=note or "")
+            self.part_file_service.add_new_version_with_revision(
+                file_id,
+                source_path,
+                note=note or "",
+                revision=revision,
+            )
             self.refresh_files_tab()
             # keep versions visible
             self.on_attachment_selected()
@@ -3272,7 +3296,13 @@ class BomPage(QWidget):
         if not getattr(self, "current_part_id", None):
             QMessageBox.warning(self, "Select", "Select a part first.")
             return
-        note, _ = QInputDialog.getText(self, "Version Note", "Version note for dropped files (optional):")
+        revision, ok = QInputDialog.getText(self, "Version Revision", "Revision for dropped files (optional, e.g. A010):")
+        if not ok:
+            return
+        revision = (revision or "").strip().upper()
+        note, ok = QInputDialog.getText(self, "Version Note", "Version note for dropped files (optional):")
+        if not ok:
+            return
 
         added = 0
         failed = []
@@ -3309,7 +3339,12 @@ class BomPage(QWidget):
 
                 if existing:
                     # add new version to existing attachment
-                    self.part_file_service.add_new_version(existing.id, p, note=note or "")
+                    self.part_file_service.add_new_version_with_revision(
+                        existing.id,
+                        p,
+                        note=note or "",
+                        revision=revision,
+                    )
                 else:
                     display_name = os.path.splitext(os.path.basename(p))[0]
                     self.part_file_service.create_attachment(
@@ -3319,6 +3354,7 @@ class BomPage(QWidget):
                         description="",
                         source_path=p,
                         note=note or "",
+                        revision_override=revision,
                     )
                     # refresh cached attachments so subsequent dropped files see the new attachment
                     try:
@@ -4021,8 +4057,14 @@ class BomPage(QWidget):
             tips0 = []
             if locked_txt:
                 tips0.append(locked_txt)
-            if int(issue_summary.get("active_count") or 0):
-                tips0.append(f"{int(issue_summary['active_count'])} active issues linked to this part")
+            direct_active = int(issue_summary.get("direct_active_count", issue_summary.get("active_count") or 0) or 0)
+            inherited_active = int(issue_summary.get("inherited_active_count") or 0)
+            if direct_active and inherited_active:
+                tips0.append(f"{direct_active} direct active issue(s); {inherited_active} inherited active issue(s) from children")
+            elif direct_active:
+                tips0.append(f"{direct_active} direct active issue(s) linked to this part")
+            elif inherited_active:
+                tips0.append(f"{inherited_active} inherited active issue(s) from child parts")
             elif int(issue_summary.get("total_count") or 0):
                 tips0.append("All issues linked to this part are resolved")
             tips0.append(str(summary["pdf"].get("tooltip", "PDF: unknown")))
@@ -5607,6 +5649,50 @@ class BomPage(QWidget):
 
         file_type = str(getattr(pf, "file_type", "") or "").upper()
         menu = QMenu(self)
+        edit_revision_act = QAction("Edit Revision", self)
+        edit_note_act = QAction("Edit Note", self)
+
+        def _edit_revision():
+            current = str(getattr(ver, "revision", "") or "").strip()
+            revision, ok = QInputDialog.getText(
+                self,
+                "Edit Version Revision",
+                "Revision (blank allowed, e.g. A010):",
+                text=current,
+            )
+            if not ok:
+                return
+            try:
+                self.part_file_service.update_version_revision(int(version_id), revision)
+                self.on_attachment_selected()
+            except Exception as exc:
+                QMessageBox.critical(self, "Edit Revision", f"Failed to update revision:\n{exc}")
+
+        def _edit_note():
+            current = str(getattr(ver, "note", "") or "")
+            note, ok = QInputDialog.getText(
+                self,
+                "Edit Version Note",
+                "Note:",
+                text=current,
+            )
+            if not ok:
+                return
+            try:
+                self.part_file_service.update_version_note(int(version_id), note)
+                self.on_attachment_selected()
+            except Exception as exc:
+                QMessageBox.critical(self, "Edit Note", f"Failed to update note:\n{exc}")
+
+        edit_revision_act.triggered.connect(_edit_revision)
+        edit_note_act.triggered.connect(_edit_note)
+        can_edit = self.perm.can("release_files")
+        edit_revision_act.setEnabled(can_edit)
+        edit_note_act.setEnabled(can_edit)
+        menu.addAction(edit_revision_act)
+        menu.addAction(edit_note_act)
+        menu.addSeparator()
+
         if file_type in ("PDF", "STEP"):
             act = QAction(f"Acknowledge {file_type} as safe", self)
 

@@ -131,6 +131,12 @@ class IssueService(BaseService):
                 "active_count": len(values["active"]),
                 "total_count": len(values["all"]),
                 "critical_count": len(values["critical"]),
+                "direct_active_count": len(direct.get(part_id, {}).get("active", set())),
+                "direct_total_count": len(direct.get(part_id, {}).get("all", set())),
+                "direct_critical_count": len(direct.get(part_id, {}).get("critical", set())),
+                "inherited_active_count": len(values["active"] - direct.get(part_id, {}).get("active", set())),
+                "inherited_total_count": len(values["all"] - direct.get(part_id, {}).get("all", set())),
+                "inherited_critical_count": len(values["critical"] - direct.get(part_id, {}).get("critical", set())),
             }
             for part_id, values in issue_sets.items()
         }

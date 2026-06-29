@@ -293,3 +293,30 @@ class PartFileRepository:
                 (file_id, version_id),
             )
             conn.commit()
+
+    def update_version_metadata(
+        self,
+        version_id: int,
+        *,
+        revision: Optional[str] = None,
+        note: Optional[str] = None,
+        update_revision: bool = False,
+        update_note: bool = False,
+    ):
+        assignments = []
+        params = []
+        if update_revision:
+            assignments.append("revision = ?")
+            params.append(revision if revision is not None else "")
+        if update_note:
+            assignments.append("note = ?")
+            params.append(note if note is not None else "")
+        if not assignments:
+            return
+        params.append(int(version_id))
+        with self.get_conn() as conn:
+            conn.execute(
+                f"UPDATE part_file_versions SET {', '.join(assignments)} WHERE id = ?",
+                tuple(params),
+            )
+            conn.commit()
