@@ -2,7 +2,7 @@ import sys
 from PyQt5.QtWidgets import QLabel, QInputDialog, QApplication, QMainWindow, QSystemTrayIcon, QStackedWidget, QAction, QToolBar, QMessageBox, QComboBox, QFileDialog, QProgressBar
 from PyQt5.QtCore import Qt, QTimer, QPropertyAnimation, pyqtSignal, QObject, QThread, QEventLoop
 from PyQt5.QtGui import QPainter, QColor, QPen, QPixmap, QFont, QIcon
-from PyQt5.QtWidgets import QWidget, QVBoxLayout
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QPushButton
 import math
 import os
 
@@ -510,8 +510,14 @@ class BomGUI(QMainWindow):
                     pass
 
         self.project_combo.currentIndexChanged.connect(self.save_current_project)
-        toolbar.addWidget(QLabel("  Project: "))
+        self.project_combo.setMinimumWidth(210)
+        self.project_combo.setMaximumWidth(270)
+
+        project_caption = QLabel("Project")
+        project_caption.setStyleSheet("color: #e5e7eb; font-weight: 700; padding-left: 6px;")
+        toolbar.addWidget(project_caption)
         toolbar.addWidget(self.project_combo)
+        toolbar.addSeparator()
 
         
         # Create and store the project label
@@ -519,14 +525,34 @@ class BomGUI(QMainWindow):
         if self.session.project_id:
             p = self.project_service.get_project_by_id(self.session.project_id) or {}
             current_project_name = p.get("name") or str(self.session.project_id)
+            version_label = p.get("version_label")
+            if version_label:
+                current_project_name = f"{current_project_name} ({version_label})"
 
-        self.project_label = QLabel(f"  Current Project: {current_project_name}  ")
+        self.project_label = QLabel(f"Current: {current_project_name}")
+        self.project_label.setMinimumWidth(260)
+        self.project_label.setMaximumWidth(430)
+        self.project_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.project_label.setStyleSheet("color: #ffffff; font-weight: 700; padding: 0 8px;")
         toolbar.addWidget(self.project_label)
 
         # Add button to toolbar
-        new_version_action = QAction("New Version", self)
-        new_version_action.triggered.connect(self.show_new_version_dialog)
-        toolbar.addAction(new_version_action)
+        new_version_button = QPushButton("New Version")
+        new_version_button.setCursor(Qt.PointingHandCursor)
+        new_version_button.setStyleSheet("""
+            QPushButton {
+                min-height: 26px;
+                padding: 3px 10px;
+                border-radius: 5px;
+                background: #ffffff;
+                border: 1px solid #cfd6df;
+                color: #111827;
+                font-weight: 700;
+            }
+            QPushButton:hover { background: #f3f5f7; }
+        """)
+        new_version_button.clicked.connect(self.show_new_version_dialog)
+        toolbar.addWidget(new_version_button)
 
     def show_new_version_dialog(self):
         if not self.session.project_id:
@@ -708,10 +734,10 @@ class BomGUI(QMainWindow):
         p = self.project_service.get_project_by_id(self.session.project_id) or {}
         name = p.get("name") or str(self.session.project_id)
         ver = p.get("version_label")
+        label = str(name or "None")
         if ver:
-            self.project_label.setText(f"  Current Project: {name} ({ver})  ")
-        else:
-            self.project_label.setText(f"  Current Project: {name}  ")
+            label = f"{label} ({ver})"
+        self.project_label.setText(f"Current: {label}")
 
     def switch_page(self, index):
         self._ensure_lazy_page(index)
@@ -853,7 +879,8 @@ class BomGUI(QMainWindow):
             QToolBar {
                 background: #1f2937;  /* dark slate */
                 border: none;
-                padding: 6px;
+                padding: 7px 10px;
+                spacing: 8px;
             }
 
             QToolButton {

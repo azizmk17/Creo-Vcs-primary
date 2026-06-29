@@ -17,6 +17,7 @@ from core.session_manager import SessionManager
 from core.services.permission_decorators import require_permission
 from core.services.issue_service import IssueService
 from core.services.traceability_service import TraceabilityService
+from core.services.part_file_service import PartFileService
 
 from utils import (
     is_creo_file,
@@ -33,6 +34,7 @@ class CommitService(BaseService):
         self.project_service = ProjectService()
         self.issue_service = IssueService()
         self.traceability_service = TraceabilityService()
+        self.part_file_service = PartFileService()
 
         self.session = SessionManager()
 
@@ -267,6 +269,8 @@ class CommitService(BaseService):
             })
 
         inserted_any = False
+        vault_versions_created = []
+        vault_files_created = []
         try:
             ensure_dir_exists(commit_user_dir)
 
@@ -316,6 +320,34 @@ class CommitService(BaseService):
                     except Exception as e:
                         raise ValueError(f"STEP compare failed for {item['filename']}: {str(e)}")
                 item["step_meta"] = step_meta
+
+            for item in commit_plan:
+                step_meta = item.get("step_meta") or {}
+                step_path = step_meta.get("step_file_path")
+                if (
+                    step_meta.get("step_compare_enabled")
+                    and item["part_type"] == "Cad"
+                    and step_path
+                    and os.path.exists(step_path)
+                ):
+                    before_ids = {
+                        int(f.id)
+                        for f in self.part_file_service.list_attachments(int(item["part_id"]))
+                        if str(f.file_type or "").strip().upper() == "STEP"
+                    }
+                    file_id, version_id = self.part_file_service.upsert_part_file_version(
+                        part_id=int(item["part_id"]),
+                        file_type="STEP",
+                        source_path=step_path,
+                        note="compared",
+                        revision="",
+                        display_name=f"{item['base_f_name']} STEP",
+                        description=f"STEP captured during commit {commit_id}",
+                    )
+                    if version_id:
+                        vault_versions_created.append((int(file_id), int(version_id)))
+                    if int(file_id) not in before_ids:
+                        vault_files_created.append(int(file_id))
 
             # Phase 3: persist all rows and traceability links.
             for item in commit_plan:
@@ -369,6 +401,17 @@ class CommitService(BaseService):
                     self.commit_repository.hard_delete_by_commit_id(commit_id, self.session.project_id)
                 except Exception:
                     pass
+            for file_id, version_id in reversed(vault_versions_created):
+                try:
+                    if int(file_id) not in vault_files_created:
+                        self.part_file_service.delete_version(int(file_id), int(version_id))
+                except Exception:
+                    pass
+            for file_id in reversed(vault_files_created):
+                try:
+                    self.part_file_service.delete_attachment(int(file_id))
+                except Exception:
+                    pass
             try:
                 if os.path.isdir(commit_user_dir):
                     shutil.rmtree(commit_user_dir)
@@ -378,7 +421,14 @@ class CommitService(BaseService):
             if msg.startswith(("cad404:", "drw404:", "Error:", "Commit blocked:", "STEP compare failed")):
                 raise ValueError(msg)
             raise ValueError(f"Commit failed: {msg}")
-        return commit_id
+        return {
+            "commit_id": commit_id,
+            "affected_part_ids": sorted({
+                int(item["part_id"])
+                for item in commit_plan
+                if item.get("part_id") is not None
+            }),
+        }
 
 
     def get_commit_history (self):

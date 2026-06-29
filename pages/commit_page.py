@@ -2192,7 +2192,7 @@ class CommitPage(QWidget):
 
         if self.commit_service:
             def do_commit():
-                self.commit_service.commit_file(
+                commit_result = self.commit_service.commit_file(
                     self.commits_dir,
                     uncommitted_filenames,
                     designer,
@@ -2205,7 +2205,10 @@ class CommitPage(QWidget):
                     jira_key=jira_key,
                     jira_url=jira_url,
                 )
+                affected_part_ids = set((commit_result or {}).get("affected_part_ids") or [])
+                affected_part_ids.update(resolved_issue_part_ids)
                 return {
+                    "affected_part_ids": sorted(int(pid) for pid in affected_part_ids if pid is not None),
                     "history": self.commit_service.get_commit_history() or [],
                     "pending": self.commit_service.get_pending_commits_grouped(
                         self.session.project_id, self.session.user_id, self.is_designer
@@ -2233,6 +2236,7 @@ class CommitPage(QWidget):
                     "steps": [
                         update_status,
                         clear_commit_form,
+                        lambda: self._refresh_bom_rows_for_parts((result or {}).get("affected_part_ids")),
                         lambda: self._refresh_issue_views(resolved_issue_part_ids),
                         lambda: self._set_commit_history_rows((result or {}).get("history") or []),
                         lambda: self._set_pending_commit_groups((result or {}).get("pending") or []),

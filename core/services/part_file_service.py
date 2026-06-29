@@ -98,6 +98,7 @@ class PartFileService:
         description: str,
         source_path: str,
         note: str = "",
+        revision_override: Optional[str] = None,
     ) -> int:
         if not part_id:
             raise ValueError("part_id is required")
@@ -109,7 +110,7 @@ class PartFileService:
 
         created_by = self.session.user_id
         root_project_id, project_version_label = self._project_version_context()
-        revision = self._part_revision(part_id)
+        revision = self._part_revision(part_id) if revision_override is None else str(revision_override or "")
         file_id = self.repo.create_file(part_id, file_type, display_name, description, created_by=created_by)
 
         version_no = 1
@@ -175,6 +176,91 @@ class PartFileService:
         )
         self.repo.set_active_version(file_id, version_id)
         return version_id
+
+    def add_new_version_with_revision(
+        self,
+        file_id: int,
+        source_path: str,
+        note: str = "",
+        revision: Optional[str] = None,
+    ) -> int:
+        pf = self.repo.get_file_by_id(file_id)
+        if not pf:
+            raise ValueError("Attachment not found")
+        wd = self._working_dir()
+        if not wd:
+            raise ValueError("Project working directory is not set")
+        if not source_path or not os.path.exists(source_path):
+            raise ValueError("Source file does not exist")
+
+        created_by = self.session.user_id
+        root_project_id, project_version_label = self._project_version_context()
+        version_no = self.repo.get_next_version_no(file_id)
+
+        rel_path = self._version_dest_relpath(pf.part_id, file_id, version_no, source_path)
+        abs_path = os.path.join(wd, rel_path)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+
+        shutil.copy2(source_path, abs_path)
+        sha256 = self._hash_file_sha256(abs_path)
+        size_bytes = os.path.getsize(abs_path)
+
+        version_id = self.repo.add_version(
+            file_id=file_id,
+            version_no=version_no,
+            original_filename=os.path.basename(source_path),
+            vault_rel_path=rel_path,
+            sha256=sha256,
+            size_bytes=size_bytes,
+            note=note,
+            revision=str(revision or ""),
+            created_by=created_by,
+            root_project_id=root_project_id,
+            project_version_label=project_version_label,
+        )
+        self.repo.set_active_version(file_id, version_id)
+        return version_id
+
+    def upsert_part_file_version(
+        self,
+        part_id: int,
+        file_type: str,
+        source_path: str,
+        note: str = "",
+        revision: Optional[str] = None,
+        display_name: Optional[str] = None,
+        description: str = "",
+    ) -> tuple[int, int]:
+        normalized_type = str(file_type or "").strip().upper()
+        if not normalized_type:
+            raise ValueError("file_type is required")
+
+        existing = None
+        for attachment in self.list_attachments(part_id):
+            if str(attachment.file_type or "").strip().upper() == normalized_type:
+                existing = attachment
+                break
+
+        if existing:
+            version_id = self.add_new_version_with_revision(
+                existing.id,
+                source_path,
+                note=note,
+                revision=revision,
+            )
+            return existing.id, version_id
+
+        file_id = self.create_attachment(
+            part_id=part_id,
+            file_type=normalized_type,
+            display_name=display_name or os.path.splitext(os.path.basename(source_path))[0],
+            description=description,
+            source_path=source_path,
+            note=note,
+            revision_override=revision,
+        )
+        active = self.get_active_version(file_id)
+        return file_id, int(active.id) if active else 0
 
     def list_attachments(self, part_id: int) -> List[PartFile]:
         return self.repo.get_files_for_part(part_id)

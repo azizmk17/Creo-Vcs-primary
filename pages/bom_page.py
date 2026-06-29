@@ -2948,7 +2948,10 @@ class BomPage(QWidget):
             self.versions_table.setItem(i, 2, QTableWidgetItem(str(v.original_filename)))
             self.versions_table.setItem(i, 3, QTableWidgetItem(str(v.created_at or "")))
             self.versions_table.setItem(i, 4, QTableWidgetItem(str(v.released_at or "")))
-            self.versions_table.setItem(i, 5, QTableWidgetItem(str(getattr(v, "revision", None) or current_revision or "")))
+            version_revision = getattr(v, "revision", None)
+            if version_revision is None:
+                version_revision = current_revision or ""
+            self.versions_table.setItem(i, 5, QTableWidgetItem(str(version_revision)))
             self.versions_table.setItem(i, 6, QTableWidgetItem(str(v.note or "")))
 
         # Auto-preview the active version if it is a PDF
@@ -4658,6 +4661,13 @@ class BomPage(QWidget):
             if not path or not os.path.exists(path):
                 return {"state": "bad", "tooltip": f"{label}: file missing on disk"}
 
+            if doc_type == "STEP" and latest_commit:
+                latest_step_path = str(getattr(latest_commit, "step_file_path", "") or "").strip()
+                latest_step_name = os.path.basename(latest_step_path)
+                version_name = str(getattr(ver, "original_filename", "") or "").strip()
+                if latest_step_name and version_name and latest_step_name == version_name:
+                    return {"state": "ok", "tooltip": f"{label}: current from compared commit STEP"}
+
             if latest_commit and (not created_dt or (commit_dt and commit_dt > created_dt)):
                 try:
                     ack = self.part_doc_ack_service.get_ack(int(part_id), doc_type)
@@ -4721,9 +4731,11 @@ class BomPage(QWidget):
         }
 
         issues = issues or set()
-        if ("missing_pdf" in issues) or ("outdated_pdf" in issues):
+        pdf_state = str(summary["pdf"].get("state") or "").lower()
+        step_state = str(summary["step"].get("state") or "").lower()
+        if ("missing_pdf" in issues or "outdated_pdf" in issues) and pdf_state not in ("ok", "ack"):
             summary["pdf"] = {"state": "bad", "tooltip": "PDF: file missing or outdated on disk"}
-        if ("missing_step" in issues) or ("outdated_step" in issues):
+        if ("missing_step" in issues or "outdated_step" in issues) and step_state not in ("ok", "ack"):
             summary["step"] = {"state": "bad", "tooltip": "STEP: file missing or outdated on disk"}
         return summary
 

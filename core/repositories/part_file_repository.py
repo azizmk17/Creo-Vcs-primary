@@ -242,7 +242,7 @@ class PartFileRepository:
                         "WIP",
                         root_project_id,
                         project_version_label,
-                    ] + ([revision or None] if "revision" in cols else [])),
+                    ] + ([revision if revision is not None else None] if "revision" in cols else [])),
                 )
             else:
                 revision_sql = ", revision" if "revision" in cols else ""
@@ -263,7 +263,7 @@ class PartFileRepository:
                         note or None,
                         created_by,
                         "WIP",
-                    ] + ([revision or None] if "revision" in cols else [])),
+                    ] + ([revision if revision is not None else None] if "revision" in cols else [])),
                 )
 
             conn.commit()
