@@ -614,6 +614,7 @@ class EngineeringIssuePage(QWidget):
         tabs = QTabWidget()
         tabs.addTab(self._commit_summary_tab(commit, issue), "Summary")
         tabs.addTab(self._commit_files_tab(commit), "Files Changed")
+        tabs.addTab(self._commit_engineering_docs_tab(commit), "Validation Docs")
         tabs.addTab(self._commit_validation_tab(commit), "Validation")
         tabs.addTab(self._commit_step_tab(commit), "STEP")
         root.addWidget(tabs, 1)
@@ -704,6 +705,67 @@ class EngineeringIssuePage(QWidget):
         self._fill_key_value_table(table, rows)
         layout.addWidget(table)
         return tab
+
+    def _commit_engineering_docs_tab(self, commit: dict):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        files = commit.get("validation_docs") or []
+        table = QTableWidget()
+        table.setColumnCount(8)
+        table.setHorizontalHeaderLabels([
+            "Role", "Type", "Filename", "Part", "Version", "Revision", "Exists", "Path"
+        ])
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setRowCount(len(files))
+        for row, doc in enumerate(files):
+            path = ""
+            try:
+                path = doc.get("stored_path") or doc.get("source_path") or ""
+            except Exception:
+                path = doc.get("source_path") or ""
+            exists = bool(path and os.path.exists(path))
+            values = [
+                doc.get("doc_role") or doc.get("file_role"),
+                doc.get("file_type"),
+                doc.get("original_filename") or doc.get("display_name") or doc.get("filename"),
+                doc.get("part_name") or doc.get("part_id"),
+                doc.get("version_no") or "",
+                doc.get("revision") or "",
+                "Yes" if exists else "Missing",
+                path,
+            ]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(str(value or ""))
+                item.setToolTip(str(value or ""))
+                item.setData(Qt.UserRole, path)
+                table.setItem(row, col, item)
+        layout.addWidget(table)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        open_btn = QPushButton("Open Selected Doc")
+        open_btn.clicked.connect(lambda _c=False, t=table: self._open_selected_commit_doc(t))
+        row.addWidget(open_btn)
+        layout.addLayout(row)
+        return tab
+
+    def _open_selected_commit_doc(self, table):
+        row = table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "Open Document", "Select a document first.")
+            return
+        item = table.item(row, table.columnCount() - 1)
+        path = item.data(Qt.UserRole) if item else ""
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(self, "Open Document", f"File not found:\n{path}")
+            return
+        try:
+            os.startfile(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Open Document", f"Failed to open file:\n{exc}")
 
     def _commit_step_tab(self, commit: dict):
         tab = QWidget()
@@ -858,7 +920,8 @@ class EngineeringIssuePage(QWidget):
                 "Issue package exported successfully:\n"
                 f"{manifest.get('package_dir')}\n\n"
                 f"Input files: {len(manifest.get('input_files') or [])}\n"
-                f"Engineering output files: {len(manifest.get('output_files') or [])}",
+                f"Engineering output files: {len(manifest.get('output_files') or [])}\n"
+                f"Validation docs: {len(manifest.get('validation_docs') or [])}",
             )
         except Exception as exc:
             QMessageBox.critical(self, "Export", str(exc))

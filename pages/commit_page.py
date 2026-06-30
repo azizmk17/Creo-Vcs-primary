@@ -5,7 +5,7 @@ from PyQt5.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QMenu, QAction,
     QListWidgetItem, QScrollArea, QFrame, QSizePolicy, QSplitter,
     QTreeWidget, QTreeWidgetItem,
-    QApplication, QAbstractItemView,
+    QApplication, QAbstractItemView, QInputDialog,
 )
 from PyQt5.QtCore import (
     Qt, QPropertyAnimation, QEasingCurve, pyqtProperty, pyqtSignal, QTimer, QSize, QRect,
@@ -29,6 +29,8 @@ from pages.part_dialog import PartDialog
 from pages.dialogs.merge_dialog import MergeDialog
 from core.services.merge_service import MergeService
 from core.repositories.merge_repository import MergeRepository
+from core.repositories.bom_repository import BomRepository
+from core.services.part_file_service import PartFileService
 from core.services.ui_permission import UIPermissionHelper
 from core.services.role_service import RoleService
 from core.services.project_service import ProjectService
@@ -204,6 +206,168 @@ class DropListWidget(QListWidget):
 # ═══════════════════════════════════════════════════════════════════════════
 #  STAT CARD WIDGET
 # ═══════════════════════════════════════════════════════════════════════════
+
+class AffectedBomDropCard(QFrame):
+    filesDropped = pyqtSignal(int, list)
+    docRemoveRequested = pyqtSignal(int, int)
+
+    def __init__(self, part_info: dict, parent=None):
+        super().__init__(parent)
+        self.part_info = dict(part_info or {})
+        self.part_id = int(self.part_info.get("id") or 0)
+        self.setAcceptDrops(True)
+        self.setMinimumHeight(76)
+        self.setStyleSheet("""
+            AffectedBomDropCard {
+                background: #ffffff;
+                border: 1px solid #d1d5db;
+                border-radius: 8px;
+            }
+            AffectedBomDropCard:hover {
+                border-color: #2563eb;
+                background: #eff6ff;
+            }
+            QLabel {
+                background: transparent;
+                border: none;
+            }
+        """)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 7, 10, 7)
+        layout.setSpacing(2)
+
+        title = QLabel(
+            f"{self.part_info.get('name') or 'BOM item'}"
+            f"  |  {self.part_info.get('aes_number') or ''}"
+        )
+        title.setStyleSheet("font-size: 11px; font-weight: 700; color: #111827;")
+        layout.addWidget(title)
+
+        meta = QLabel(
+            f"{self.part_info.get('type') or ''}"
+            f"  |  {self.part_info.get('filename') or ''}"
+            f"  |  {self.part_info.get('drawing') or ''}"
+        )
+        meta.setStyleSheet("font-size: 9px; color: #64748b;")
+        layout.addWidget(meta)
+
+        hint = QLabel("Drop PDF, STEP, or validation docs here to stage with this commit")
+        hint.setStyleSheet("font-size: 9px; color: #2563eb;")
+        layout.addWidget(hint)
+
+        self.preview = QListWidget()
+        self.preview.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.preview.customContextMenuRequested.connect(self._show_doc_context_menu)
+        self.preview.setMaximumHeight(110)
+        self.preview.setMinimumHeight(42)
+        self.preview.setStyleSheet("""
+            QListWidget {
+                border: 1px solid #e5e7eb;
+                border-radius: 6px;
+                background: #f8fafc;
+                font-size: 9px;
+                color: #374151;
+            }
+            QListWidget::item { padding: 3px 5px; }
+            QListWidget::item:selected { background: #dbeafe; color: #1e3a8a; }
+        """)
+        layout.addWidget(self.preview)
+
+    def set_attachments(self, attachments: list):
+        self.preview.clear()
+        rows = list(attachments or [])
+        if not rows:
+            item = QListWidgetItem("No staged documents")
+            item.setFlags(item.flags() & ~Qt.ItemIsSelectable)
+            self.preview.addItem(item)
+            return
+        for index, item in enumerate(rows):
+            name = os.path.basename(item.get("source_path") or item.get("filename") or "")
+            ftype = (item.get("file_type") or "").upper()
+            role = (item.get("file_role") or "").replace("_", " ")
+            rev = (item.get("revision") or "").strip()
+            note = (item.get("note") or "").strip()
+            suffix = []
+            if role:
+                suffix.append(role)
+            if rev:
+                suffix.append(f"rev {rev}")
+            if note:
+                suffix.append(note)
+            label = f"{ftype}: {name}" if ftype else name
+            if suffix:
+                label = f"{label} ({', '.join(suffix)})"
+            row = QListWidgetItem(label)
+            row.setToolTip(item.get("source_path") or name)
+            row.setData(Qt.UserRole, index)
+            self.preview.addItem(row)
+
+    def _show_doc_context_menu(self, pos):
+        item = self.preview.itemAt(pos)
+        if not item:
+            return
+        index = item.data(Qt.UserRole)
+        if index is None:
+            return
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background: #ffffff;
+                color: #111827;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                padding: 4px 0;
+            }
+            QMenu::item {
+                background: transparent;
+                color: #111827;
+                padding: 6px 18px;
+                font-size: 11px;
+            }
+            QMenu::item:selected {
+                background: #dbeafe;
+                color: #1e3a8a;
+            }
+            QMenu::item:disabled {
+                color: #9ca3af;
+            }
+        """)
+        remove = menu.addAction("Delete staged document")
+        chosen = menu.exec_(self.preview.viewport().mapToGlobal(pos))
+        if chosen == remove:
+            self.docRemoveRequested.emit(self.part_id, int(index))
+
+    def _accepted_paths(self, event):
+        paths = []
+        if not event.mimeData().hasUrls():
+            return paths
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            ext = os.path.splitext(path or "")[1].lower()
+            if path and os.path.isfile(path) and ext not in (".prt", ".asm", ".drw"):
+                paths.append(path)
+        return paths
+
+    def dragEnterEvent(self, event):
+        if self._accepted_paths(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._accepted_paths(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        paths = self._accepted_paths(event)
+        if paths:
+            self.filesDropped.emit(self.part_id, paths)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
 
 class _PageProcessingOverlay(QWidget):
     """Full-page busy veil used while commit/merge operations run."""
@@ -644,6 +808,8 @@ class CommitPage(QWidget):
         super().__init__()
         self.commit_service = CommitService()
         self.bom_service = bom_service
+        self.bom_repo = BomRepository()
+        self.part_file_service = PartFileService()
         self.project_service = ProjectService()
         self.issue_service = IssueService()
 
@@ -660,6 +826,8 @@ class CommitPage(QWidget):
         self._processing_action = False
         self._processing_thread = None
         self._processing_worker = None
+        self._pending_engineering_attachments = {}
+        self._affected_dialog_cards = {}
 
         if self.session.project_id:
             self.working_dir = self.get_working_dir()
@@ -789,6 +957,13 @@ class CommitPage(QWidget):
         clear_all_btn.clicked.connect(self._clear_staging)
         file_btns.addWidget(clear_all_btn)
 
+        self.attach_affected_btn = QPushButton("Attach docs to affected BOM...")
+        self.attach_affected_btn.setObjectName("neutral")
+        self.attach_affected_btn.setCursor(Qt.PointingHandCursor)
+        self.attach_affected_btn.clicked.connect(self._open_affected_bom_attachment_dialog)
+        self.attach_affected_btn.setEnabled(False)
+        file_btns.addWidget(self.attach_affected_btn)
+
         file_btns.addStretch()
         self._staged_count_lbl = QLabel("0 files staged")
         self._staged_count_lbl.setStyleSheet("font-size: 10px; color: #6b7280;")
@@ -832,6 +1007,7 @@ class CommitPage(QWidget):
             self.designed_by.addItem(self.username)
         else:
             self.designed_by.addItems(self.usernames)
+        self.designed_by.currentTextChanged.connect(lambda *_: self._refresh_affected_bom_items())
         meta_lay.addRow("Designer:", self.designed_by)
 
         self.commit_message = RichTextImageEditor()
@@ -1107,6 +1283,7 @@ class CommitPage(QWidget):
 
     def _clear_staging(self):
         self.uncommitted_parts.clear()
+        self._pending_engineering_attachments.clear()
         self.changes_list.clear()
         self._update_staged_count()
 
@@ -1115,6 +1292,7 @@ class CommitPage(QWidget):
         self._staged_count_lbl.setText(f"{n} file{'s' if n != 1 else ''} staged")
         self._stat_staged.set_value(str(n))
         self._refresh_resolved_issues()
+        self._refresh_affected_bom_items()
 
     def _refresh_resolved_issues(self):
         if not hasattr(self, "resolved_issues_list"):
@@ -1138,6 +1316,230 @@ class CommitPage(QWidget):
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Checked if int(issue["id"]) in checked else Qt.Unchecked)
             self.resolved_issues_list.addItem(item)
+
+    def _designer_id_for_commit(self):
+        try:
+            user = self.user_service.get_user_by_username(self.designed_by.currentText())
+            return int(user.id) if user else None
+        except Exception:
+            return None
+
+    def _clear_affected_bom_items(self):
+        return
+
+    def _affected_bom_items_for_staging(self):
+        project_id = self.session.project_id
+        if not project_id:
+            return []
+        designer_id = self._designer_id_for_commit()
+        result = {}
+        for staged in self.uncommitted_parts or []:
+            filename = os.path.basename(staged.get("path") or staged.get("filename") or "")
+            if not filename or not is_creo_file(filename):
+                continue
+            base_name = ".".join(filename.split(".")[:-1])
+            ext = ".".join(base_name.split(".")[1:]).lower()
+            try:
+                if ext == "drw":
+                    bom = self.bom_repo.get_by_drawing_file_name_for_commit(
+                        base_name,
+                        int(project_id),
+                        designer_id,
+                    )
+                else:
+                    bom = self.bom_repo.get_by_base_file_name_for_commit(
+                        base_name,
+                        int(project_id),
+                        designer_id,
+                    )
+            except Exception:
+                bom = None
+            if not bom:
+                continue
+            info = self.bom_service.get_part_details(int(bom.id)) or {}
+            if info:
+                result[int(bom.id)] = info
+        return list(result.values())
+
+    def _refresh_affected_bom_items(self):
+        if not hasattr(self, "attach_affected_btn"):
+            return
+        items = self._affected_bom_items_for_staging()
+        active_part_ids = {int(item.get("id")) for item in items if item.get("id") is not None}
+        pending = getattr(self, "_pending_engineering_attachments", {})
+        for part_id in list(pending.keys()):
+            if int(part_id) not in active_part_ids:
+                pending.pop(part_id, None)
+        count = len(items)
+        pending_count = sum(len(v or []) for v in getattr(self, "_pending_engineering_attachments", {}).values())
+        self.attach_affected_btn.setEnabled(count > 0 and not getattr(self, "_processing_action", False))
+        if count and pending_count:
+            text = f"Attach docs to affected BOM ({count}, {pending_count} staged)..."
+        elif count:
+            text = f"Attach docs to affected BOM ({count})..."
+        else:
+            text = "Attach docs to affected BOM..."
+        self.attach_affected_btn.setText(text)
+
+    def _open_affected_bom_attachment_dialog(self):
+        items = self._affected_bom_items_for_staging()
+        if not items:
+            QMessageBox.information(self, "Affected BOM", "Stage Creo files first to resolve affected BOM items.")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Attach Documents to Affected BOM Items")
+        dialog.resize(560, 420)
+        layout = QVBoxLayout(dialog)
+        intro = QLabel(
+            "Drop PDF, STEP, or validation documents onto the correct BOM item. Files are staged with this commit and will be added to the vault only after push to master."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("font-size: 10px; color: #374151;")
+        layout.addWidget(intro)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        content.setStyleSheet("background: transparent;")
+        cards_layout = QVBoxLayout(content)
+        cards_layout.setContentsMargins(0, 0, 0, 0)
+        cards_layout.setSpacing(6)
+        cards_layout.setAlignment(Qt.AlignTop)
+        self._affected_dialog_cards = {}
+        for info in items:
+            card = AffectedBomDropCard(info, dialog)
+            part_id = int(info.get("id") or 0)
+            card.set_attachments(self._pending_engineering_attachments.get(part_id, []))
+            card.filesDropped.connect(self._attach_files_to_affected_bom_item)
+            card.docRemoveRequested.connect(self._remove_staged_doc_from_affected_bom_item)
+            self._affected_dialog_cards[part_id] = card
+            cards_layout.addWidget(card)
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
+
+        close_btn = QPushButton("Close")
+        close_btn.setObjectName("neutral")
+        close_btn.clicked.connect(dialog.accept)
+        footer = QHBoxLayout()
+        footer.addStretch()
+        footer.addWidget(close_btn)
+        layout.addLayout(footer)
+        dialog.exec_()
+        self._affected_dialog_cards = {}
+
+    def _commit_attachment_type(self, path: str) -> str:
+        ext = os.path.splitext(path or "")[1].lower()
+        if ext == ".pdf":
+            return "PDF"
+        if ext in (".step", ".stp"):
+            return "STEP"
+        if ext:
+            return ext.lstrip(".").upper()
+        return "DOC"
+
+    def _default_attachment_role(self, path: str) -> str:
+        ext = os.path.splitext(path or "")[1].lower()
+        if ext == ".pdf":
+            return "exported_pdf"
+        if ext in (".step", ".stp"):
+            return "exported_step"
+        return "validation_doc"
+
+    def _attach_files_to_affected_bom_item(self, part_id: int, paths: list):
+        clean_paths = [
+            p for p in (paths or [])
+            if p and os.path.isfile(p) and os.path.splitext(p)[1].lower() not in (".prt", ".asm", ".drw")
+        ]
+        if not clean_paths:
+            QMessageBox.warning(self, "Attachment", "Drop PDF, STEP, or validation/supporting documents only.")
+            return
+
+        default_role = self._default_attachment_role(clean_paths[0])
+        roles = [
+            "exported_pdf",
+            "exported_step",
+            "validation_doc",
+            "inspection_report",
+            "screenshot",
+            "supporting_doc",
+            "other",
+        ]
+        role, ok = QInputDialog.getItem(
+            self,
+            "Attachment Role",
+            "Traceability role for dropped file(s):",
+            roles,
+            max(0, roles.index(default_role) if default_role in roles else 0),
+            False,
+        )
+        if not ok:
+            return
+
+        revision, ok = QInputDialog.getText(
+            self,
+            "Attachment Revision",
+            "Revision for dropped file(s), optional:",
+        )
+        if not ok:
+            return
+        revision = (revision or "").strip().upper()
+        note, ok = QInputDialog.getText(
+            self,
+            "Attachment Note",
+            "Note for dropped file(s), optional:",
+        )
+        if not ok:
+            return
+
+        added = 0
+        staged = self._pending_engineering_attachments.setdefault(int(part_id), [])
+        for path in clean_paths:
+            file_type = self._commit_attachment_type(path)
+            staged.append({
+                "part_id": int(part_id),
+                "file_type": file_type,
+                "file_role": role,
+                "source_path": path,
+                "filename": os.path.basename(path),
+                "note": note or "",
+                "revision": revision,
+            })
+            added += 1
+
+        if added:
+            card = getattr(self, "_affected_dialog_cards", {}).get(int(part_id))
+            if card:
+                card.set_attachments(staged)
+            self._refresh_affected_bom_items()
+            try:
+                self.window().statusBar().showMessage(
+                    f"{added} file(s) staged for the affected BOM item."
+                )
+            except Exception:
+                pass
+            QMessageBox.information(
+                self,
+                "Staged",
+                f"{added} file(s) staged. They will enter the vault after the commit is pushed to master.",
+            )
+
+    def _remove_staged_doc_from_affected_bom_item(self, part_id: int, index: int):
+        staged = self._pending_engineering_attachments.get(int(part_id), [])
+        if index < 0 or index >= len(staged):
+            return
+        removed = staged.pop(index)
+        if not staged:
+            self._pending_engineering_attachments.pop(int(part_id), None)
+        card = getattr(self, "_affected_dialog_cards", {}).get(int(part_id))
+        if card:
+            card.set_attachments(staged)
+        self._refresh_affected_bom_items()
+        try:
+            name = os.path.basename(removed.get("source_path") or removed.get("filename") or "document")
+            self.window().statusBar().showMessage(f"Removed staged document: {name}")
+        except Exception:
+            pass
 
     def _update_dashboard_stats(self):
         cache = getattr(self, "_history_cache", []) or []
@@ -1355,7 +1757,16 @@ class CommitPage(QWidget):
         dlg = QDialog(self)
         dlg.setWindowTitle(f"{sty['icon']}  Commit Details — {data.get('filename', '')}")
         dlg.setMinimumSize(760, 480)
-        layout = QVBoxLayout(dlg)
+        root = QVBoxLayout(dlg)
+        root.setSpacing(10)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setStyleSheet("QScrollArea { border: none; }")
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(4, 4, 12, 4)
         layout.setSpacing(10)
 
         # Header
@@ -1420,6 +1831,8 @@ class CommitPage(QWidget):
         grid.setEditTriggers(QAbstractItemView.NoEditTriggers)
         grid.verticalHeader().setVisible(False)
         grid.setAlternatingRowColors(True)
+        grid.setMinimumHeight(170)
+        grid.setMaximumHeight(300)
         grid.setRowCount(0)
 
         def add_row(k, v):
@@ -1504,6 +1917,7 @@ class CommitPage(QWidget):
         files_tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         files_tree.header().setSectionResizeMode(1, QHeaderView.Stretch)
         files_tree.setAlternatingRowColors(True)
+        files_tree.setMinimumHeight(230)
         selected_id = str((selected_file or {}).get("id") or "")
 
         def add_child(parent, label, value):
@@ -1566,6 +1980,8 @@ class CommitPage(QWidget):
             ])
             issues_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
             issues_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            issues_table.setMinimumHeight(150)
+            issues_table.setMaximumHeight(260)
             issues_table.setRowCount(len(issues))
             for r, issue in enumerate(issues):
                 values = [
@@ -1580,6 +1996,17 @@ class CommitPage(QWidget):
                 for c, value in enumerate(values):
                     issues_table.setItem(r, c, QTableWidgetItem(str(value or "")))
             layout.addWidget(issues_table)
+
+        self._add_engineering_files_section(
+            layout,
+            group_details.get("engineering_files") or [],
+            "Vaulted Engineering Outputs",
+        )
+        self._add_engineering_files_section(
+            layout,
+            group_details.get("validation_docs") or [],
+            "Validation Documents",
+        )
 
         # Action buttons
         btn_row = QHBoxLayout()
@@ -1608,7 +2035,9 @@ class CommitPage(QWidget):
         close.setObjectName("neutral")
         close.clicked.connect(dlg.accept)
         btn_row.addWidget(close)
-        layout.addLayout(btn_row)
+        scroll.setWidget(content)
+        root.addWidget(scroll, 1)
+        root.addLayout(btn_row)
 
         dlg.exec_()
 
@@ -1673,6 +2102,72 @@ class CommitPage(QWidget):
         if data:
             self._show_history_details_dialog(data)
 
+    def _add_engineering_files_section(self, layout, files: list, title: str = "Attached Files"):
+        if not files:
+            return
+        label = QLabel(f"<b>{title} ({len(files)})</b>")
+        label.setStyleSheet("font-size:12px;color:#111827;")
+        layout.addWidget(label)
+
+        table = QTableWidget()
+        table.setColumnCount(8)
+        table.setHorizontalHeaderLabels([
+            "Role", "Type", "Filename", "Part", "Version", "Revision", "Exists", "Path"
+        ])
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setMinimumHeight(170)
+        table.setMaximumHeight(300)
+        table.setRowCount(len(files))
+        for r, item in enumerate(files):
+            path = item.get("source_path") or ""
+            if not path:
+                path = item.get("stored_path") or ""
+            exists = item.get("exists")
+            if exists is None:
+                exists = bool(path and os.path.exists(path))
+            values = [
+                item.get("doc_role") or item.get("file_role"),
+                item.get("file_type"),
+                item.get("original_filename") or item.get("filename") or item.get("display_name"),
+                item.get("part_name") or item.get("part_id"),
+                item.get("version_no") or item.get("resolved_version_id"),
+                item.get("revision"),
+                "Yes" if exists else "Missing",
+                path,
+            ]
+            for c, value in enumerate(values):
+                cell = QTableWidgetItem(str(value or ""))
+                cell.setToolTip(str(value or ""))
+                cell.setData(Qt.UserRole, path)
+                table.setItem(r, c, cell)
+        layout.addWidget(table)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        open_btn = QPushButton("Open Selected Doc")
+        open_btn.setObjectName("neutral")
+        open_btn.clicked.connect(lambda _c=False, t=table: self._open_selected_engineering_doc(t))
+        row.addWidget(open_btn)
+        layout.addLayout(row)
+
+    def _open_selected_engineering_doc(self, table):
+        row = table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "Open Document", "Select a document first.")
+            return
+        item = table.item(row, table.columnCount() - 1)
+        path = item.data(Qt.UserRole) if item else ""
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(self, "Open Document", f"File not found:\n{path}")
+            return
+        try:
+            os.startfile(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Open Document", f"Failed to open file:\n{exc}")
+
     def _open_step_file_in_viewer(self, data: dict):
         step_path = str(data.get("step_file_path") or "").strip()
         if not step_path:
@@ -1718,6 +2213,10 @@ class CommitPage(QWidget):
     # ═══════════════════════════════════════════════════════════════════
 
     def show_commit_details(self, group):
+        group_details = self.commit_service.get_commit_group_details(
+            group.get("commit_id") or "",
+            group.get("project_id"),
+        )
         screen = QApplication.primaryScreen().availableGeometry()
         max_w = int(screen.width() * 0.85)
         max_h = int(screen.height() * 0.85)
@@ -1739,6 +2238,8 @@ class CommitPage(QWidget):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setStyleSheet("QScrollArea { border: none; }")
         scroll_content = QWidget()
         main = QVBoxLayout(scroll_content)
@@ -1822,6 +2323,17 @@ class CommitPage(QWidget):
                 item.setCheckState(Qt.Checked)
                 issue_checks.addItem(item)
             main.addWidget(issue_checks)
+
+        self._add_engineering_files_section(
+            main,
+            group_details.get("engineering_files") or [],
+            "Vaulted Engineering Outputs",
+        )
+        self._add_engineering_files_section(
+            main,
+            group_details.get("validation_docs") or [],
+            "Validation Documents",
+        )
 
         # ── Action row ────────────────────────────────────────────────
         btn_layout = QHBoxLayout()
@@ -2040,6 +2552,7 @@ class CommitPage(QWidget):
             (getattr(self, "commit_btn", None), can_commit),
             (getattr(self, "add_file_btn", None), can_commit),
             (getattr(self, "remove_part_btn", None), can_commit),
+            (getattr(self, "attach_affected_btn", None), can_commit and bool(self.uncommitted_parts)),
             (getattr(self, "push_dev_btn", None), can_merge),
             (getattr(self, "merge_master_btn", None), can_merge),
             (getattr(self, "revert_btn", None), project_loaded),
@@ -2204,6 +2717,7 @@ class CommitPage(QWidget):
                     resolved_issue_relation_type=issue_relation,
                     jira_key=jira_key,
                     jira_url=jira_url,
+                    engineering_attachments=self._pending_engineering_attachments,
                 )
                 affected_part_ids = set((commit_result or {}).get("affected_part_ids") or [])
                 affected_part_ids.update(resolved_issue_part_ids)
@@ -2229,6 +2743,7 @@ class CommitPage(QWidget):
                     self.commit_jira_key.clear()
                     self.commit_jira_url.clear()
                     self.uncommitted_parts.clear()
+                    self._pending_engineering_attachments.clear()
                     self.changes_list.clear()
                     self._update_staged_count()
 

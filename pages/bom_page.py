@@ -4,8 +4,9 @@ from PyQt5.QtWidgets import (
     QTreeWidgetItem, QSplitter, QTabWidget, QLabel, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QTextEdit, QComboBox, QSpinBox, QDateTimeEdit,
     QMessageBox, QInputDialog, QFileDialog, QMenu, QAction, QDialog, QDialogButtonBox, QFrame,
-    QPlainTextEdit, QStackedWidget, QSizePolicy, QCheckBox, QGridLayout,
+    QPlainTextEdit, QStackedWidget, QSizePolicy, QCheckBox, QGridLayout, QScrollArea,
     QGraphicsDropShadowEffect, QToolTip, QStyledItemDelegate, QStyle, QStyleOptionViewItem,
+    QApplication,
 )
 from PyQt5.QtCore import Qt, QDateTime, pyqtSignal, QTimer, QObject, QThread, QSize, QRect, QEvent
 from PyQt5.QtGui import QColor, QPen, QFont, QBrush, QCursor, QPalette, QFontMetrics
@@ -32,6 +33,7 @@ from core.services.part_doc_ack_service import PartDocAckService
 from core.services.issue_service import IssueService
 from core.services.traceability_service import TraceabilityService
 from core.repositories.commit_repository import CommitRepository
+from core.services.commit_service import CommitService
 from pages.dialogs.package_parts_dialog import PackagePartsDialog
 from pages.dialogs.addChild_dialog import AddChildDialog
 from pages.pdf_viewer_widget import PdfViewerWidget
@@ -3157,7 +3159,6 @@ class BomPage(QWidget):
         roles = [
             "exported_pdf",
             "exported_step",
-            "validation_doc",
             "inspection_report",
             "screenshot",
             "supporting_doc",
@@ -5179,8 +5180,16 @@ class BomPage(QWidget):
         if not ev_data:
             return
 
-        ts = str(ev_data.get("timestamp", "") or "")
         ev_type = str(ev_data.get("event", "") or "")
+        commit_id = str(ev_data.get("commit_id", "") or "")
+        if ev_type.upper() == "COMMIT" and commit_id:
+            try:
+                self._open_commit_history_details_dialog(ev_data, commit_id)
+                return
+            except Exception as exc:
+                QMessageBox.warning(self, "Commit Details", f"Could not load full commit details:\n{exc}")
+
+        ts = str(ev_data.get("timestamp", "") or "")
         user = str(ev_data.get("user", "") or "")
         details_text = str(ev_data.get("details", "") or "")
         style = _style_for(ev_type)
@@ -5338,6 +5347,268 @@ class BomPage(QWidget):
 
         layout.addLayout(btn_row)
         dlg.exec_()
+
+    def _open_commit_history_details_dialog(self, ev_data: dict, commit_id: str):
+        project_id = getattr(self.session, "project_id", None)
+        details = CommitService().get_commit_group_details(
+            str(commit_id),
+            int(project_id) if project_id is not None else None,
+        )
+        files = details.get("files") or []
+        if not files:
+            raise ValueError(f"No commit rows found for {commit_id}.")
+
+        first = files[0]
+        status = details.get("status") or first.get("status") or ""
+        style = _style_for("COMMIT")
+        if str(status).lower() == "approved":
+            style = {"icon": "✅", "label": "Approved", "color": "#16a34a", "bg": "#dcfce7"}
+        elif str(status).lower() == "validated":
+            style = {"icon": "🔵", "label": "Validated", "color": "#2563eb", "bg": "#dbeafe"}
+        elif str(status).lower() == "pending":
+            style = {"icon": "🟡", "label": "Pending", "color": "#ca8a04", "bg": "#fef9c3"}
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"{style['icon']}  Commit Details — {details.get('title') or commit_id}")
+        dlg.setMinimumSize(900, 680)
+        screen = QApplication.primaryScreen().availableGeometry()
+        dlg.resize(min(1040, int(screen.width() * 0.88)), min(820, int(screen.height() * 0.88)))
+        root = QVBoxLayout(dlg)
+        root.setContentsMargins(10, 10, 10, 10)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setStyleSheet("QScrollArea { border: none; }")
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(4, 4, 12, 4)
+        layout.setSpacing(12)
+
+        header = QFrame()
+        header.setStyleSheet(f"""
+            QFrame {{
+                background: {style['bg']};
+                border: 1px solid {style['color']}40;
+                border-left: 5px solid {style['color']};
+                border-radius: 8px;
+            }}
+        """)
+        h_lay = QVBoxLayout(header)
+        h_lay.setSpacing(5)
+        badge = QLabel(f"  {style['icon']}  {style['label'].upper()}  ")
+        badge.setStyleSheet(f"""
+            background: {style['color']}; color: #ffffff;
+            border-radius: 10px; padding: 3px 12px;
+            font-size: 12px; font-weight: bold;
+        """)
+        badge.setFixedWidth(badge.sizeHint().width() + 20)
+        h_lay.addWidget(badge)
+        h_lay.addWidget(QLabel(f"<b style='font-size:13px'>{details.get('title') or first.get('filename') or commit_id}</b>"))
+        meta = []
+        if details.get("author"):
+            meta.append(f"👤 {details.get('author')}")
+        if details.get("checker"):
+            meta.append(f"🔍 {details.get('checker')}")
+        if details.get("committed_at"):
+            meta.append(f"🗓 {str(details.get('committed_at'))[:19]} ({_relative_time(str(details.get('committed_at')))})")
+        meta.append(f"🏷 {commit_id[:16]}")
+        meta_lbl = QLabel("    ".join(meta))
+        meta_lbl.setWordWrap(True)
+        meta_lbl.setStyleSheet("color:#4b5563;font-size:11px;border:none;background:transparent;")
+        h_lay.addWidget(meta_lbl)
+        layout.addWidget(header)
+
+        message = details.get("message") or ev_data.get("details") or ""
+        if message:
+            msg = QTextEdit()
+            msg.setReadOnly(True)
+            msg.setMinimumHeight(140)
+            msg.setMaximumHeight(280)
+            msg.setPlainText(str(message))
+            layout.addWidget(msg)
+
+        self._add_commit_key_value_table(layout, details, first)
+        self._add_commit_files_tree(layout, files)
+        self._add_commit_issues_table(layout, details.get("issues") or [])
+        self._add_commit_doc_table(layout, details.get("engineering_files") or [], "Vaulted Engineering Outputs")
+        self._add_commit_doc_table(layout, details.get("validation_docs") or [], "Validation Documents")
+
+        scroll.setWidget(content)
+        root.addWidget(scroll, 1)
+
+        buttons = QHBoxLayout()
+        copy_btn = QPushButton("📋  Copy to Clipboard")
+        copy_btn.setObjectName("neutral")
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(json.dumps(details, indent=2, default=str)))
+        buttons.addWidget(copy_btn)
+        buttons.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setObjectName("neutral")
+        close_btn.clicked.connect(dlg.accept)
+        buttons.addWidget(close_btn)
+        root.addLayout(buttons)
+        dlg.exec_()
+
+    def _add_commit_key_value_table(self, layout, details: dict, first: dict):
+        table = QTableWidget()
+        table.setColumnCount(2)
+        table.setHorizontalHeaderLabels(["Field", "Value"])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.setMinimumHeight(190)
+        table.setMaximumHeight(330)
+        rows = [
+            ("Status", details.get("status")),
+            ("Commit ID", details.get("commit_id")),
+            ("Project", details.get("project_name")),
+            ("Project Version", details.get("project_version_label")),
+            ("Author", details.get("author")),
+            ("Designer", details.get("designer")),
+            ("Checker", details.get("checker")),
+            ("Committed At", details.get("committed_at")),
+            ("Merged By", details.get("merged_by")),
+            ("Merged At", details.get("merged_at")),
+            ("Merge ID", details.get("merge_id")),
+            ("Merge Message", details.get("merge_message")),
+            ("Approved Version", details.get("approved_version")),
+            ("PR Path", details.get("pr_path")),
+            ("Signature", details.get("signature")),
+            ("Selected BOM Part", first.get("part_name") or first.get("part_id")),
+        ]
+        rows = [(k, v) for k, v in rows if v not in (None, "")]
+        table.setRowCount(len(rows))
+        for r, (key, value) in enumerate(rows):
+            key_item = QTableWidgetItem(str(key))
+            key_item.setFont(QFont("Segoe UI", 10, QFont.Bold))
+            table.setItem(r, 0, key_item)
+            val_item = QTableWidgetItem(str(value))
+            val_item.setToolTip(str(value))
+            table.setItem(r, 1, val_item)
+        layout.addWidget(table)
+
+    def _add_commit_files_tree(self, layout, files: list):
+        layout.addWidget(QLabel(f"<b>Files in this commit ({len(files)})</b>"))
+        tree = QTreeWidget()
+        tree.setColumnCount(2)
+        tree.setHeaderLabels(["File / Field", "Value"])
+        tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        tree.header().setSectionResizeMode(1, QHeaderView.Stretch)
+        tree.setAlternatingRowColors(True)
+        tree.setMinimumHeight(260)
+        for item in files:
+            filename = str(item.get("filename") or "")
+            top = QTreeWidgetItem([filename, f"Status: {item.get('status') or ''} | Approved version: {item.get('approved_version') or ''}"])
+            font = top.font(0)
+            font.setBold(True)
+            top.setFont(0, font)
+            tree.addTopLevelItem(top)
+            for label, value in (
+                ("Row ID", item.get("id")),
+                ("Commit ID", item.get("commit_id")),
+                ("Status", item.get("status")),
+                ("Type", item.get("type")),
+                ("Part", item.get("part_name") or item.get("part_id")),
+                ("Part ID", item.get("part_id")),
+                ("AES", item.get("aes_number")),
+                ("Revision", item.get("part_revision")),
+                ("Source Path", item.get("file_path")),
+                ("PR Path", item.get("pr_path")),
+                ("Approved Version", item.get("approved_version")),
+                ("Merged At", item.get("merged_at")),
+                ("STEP Status", item.get("step_diff_status")),
+                ("STEP File", item.get("step_file_path")),
+                ("STEP Diff", item.get("step_diff_path")),
+            ):
+                if value not in (None, ""):
+                    child = QTreeWidgetItem([str(label), str(value)])
+                    child.setToolTip(1, str(value))
+                    top.addChild(child)
+            top.setExpanded(True)
+        layout.addWidget(tree)
+
+    def _add_commit_issues_table(self, layout, issues: list):
+        if not issues:
+            return
+        layout.addWidget(QLabel(f"<b>Linked Issues ({len(issues)})</b>"))
+        table = QTableWidget()
+        table.setColumnCount(7)
+        table.setHorizontalHeaderLabels(["Issue", "Title", "Status", "Priority", "Relation", "Validation", "Resolution"])
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setMinimumHeight(170)
+        table.setMaximumHeight(300)
+        table.setRowCount(len(issues))
+        for r, issue in enumerate(issues):
+            values = [
+                issue.get("issue_number"), issue.get("title"), issue.get("status"),
+                issue.get("priority"), issue.get("relation_type"),
+                issue.get("validation_status"), issue.get("resolution_comment"),
+            ]
+            for c, value in enumerate(values):
+                table.setItem(r, c, QTableWidgetItem(str(value or "")))
+        layout.addWidget(table)
+
+    def _add_commit_doc_table(self, layout, docs: list, title: str):
+        if not docs:
+            return
+        layout.addWidget(QLabel(f"<b>{title} ({len(docs)})</b>"))
+        table = QTableWidget()
+        table.setColumnCount(8)
+        table.setHorizontalHeaderLabels(["Role", "Type", "Filename", "Part", "Version", "Revision", "Exists", "Path"])
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setMinimumHeight(180)
+        table.setMaximumHeight(320)
+        table.setRowCount(len(docs))
+        for r, doc in enumerate(docs):
+            path = doc.get("source_path") or doc.get("stored_path") or ""
+            exists = bool(path and os.path.exists(path))
+            values = [
+                doc.get("doc_role") or doc.get("file_role"),
+                doc.get("file_type"),
+                doc.get("original_filename") or doc.get("filename") or doc.get("display_name"),
+                doc.get("part_name") or doc.get("part_id"),
+                doc.get("version_no") or doc.get("resolved_version_id"),
+                doc.get("revision"),
+                "Yes" if exists else "Missing",
+                path,
+            ]
+            for c, value in enumerate(values):
+                cell = QTableWidgetItem(str(value or ""))
+                cell.setToolTip(str(value or ""))
+                cell.setData(Qt.UserRole, path)
+                table.setItem(r, c, cell)
+        layout.addWidget(table)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        open_btn = QPushButton("Open Selected Doc")
+        open_btn.setObjectName("neutral")
+        open_btn.clicked.connect(lambda _c=False, t=table: self._open_selected_commit_doc(t))
+        row.addWidget(open_btn)
+        layout.addLayout(row)
+
+    def _open_selected_commit_doc(self, table):
+        row = table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "Open Document", "Select a document first.")
+            return
+        item = table.item(row, table.columnCount() - 1)
+        path = item.data(Qt.UserRole) if item else ""
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(self, "Open Document", f"File not found:\n{path}")
+            return
+        try:
+            os.startfile(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Open Document", f"Failed to open file:\n{exc}")
 
     def _copy_event_to_clipboard(self, ev_data: dict):
         from PyQt5.QtWidgets import QApplication

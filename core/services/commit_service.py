@@ -165,6 +165,101 @@ class CommitService(BaseService):
             "step_face_map_path": face_map_path,
         }
 
+    def _safe_attachment_name(self, name: str) -> str:
+        cleaned = "".join(ch if ch.isalnum() or ch in "._- ()" else "_" for ch in os.path.basename(name or ""))
+        return cleaned or f"attachment_{uuid.uuid4().hex[:8]}"
+
+    def _normalize_engineering_attachments(self, engineering_attachments) -> list[dict]:
+        if not engineering_attachments:
+            return []
+        rows = []
+        if isinstance(engineering_attachments, dict):
+            iterable = []
+            for part_id, items in engineering_attachments.items():
+                for item in items or []:
+                    data = dict(item or {})
+                    data.setdefault("part_id", part_id)
+                    iterable.append(data)
+        else:
+            iterable = engineering_attachments or []
+        for item in iterable:
+            try:
+                part_id = int(item.get("part_id"))
+            except Exception:
+                continue
+            source_path = item.get("source_path") or item.get("path")
+            file_type = str(item.get("file_type") or "").strip().upper()
+            if not source_path or not file_type:
+                continue
+            rows.append({
+                "part_id": part_id,
+                "file_type": file_type,
+                "file_role": item.get("file_role") or item.get("role") or (
+                    "exported_pdf" if file_type == "PDF"
+                    else "exported_step" if file_type == "STEP"
+                    else "validation_doc"
+                ),
+                "source_path": source_path,
+                "filename": item.get("filename") or os.path.basename(source_path),
+                "note": item.get("note") or "",
+                "revision": item.get("revision") or "",
+                "display_name": item.get("display_name") or f"{file_type} attachment",
+                "description": item.get("description") or "Attached from Commit page",
+            })
+        return rows
+
+    def _write_engineering_attachment_manifest(
+        self,
+        commit_user_dir: str,
+        attachments: list[dict],
+        allowed_part_ids: set[int],
+        commit_id: str,
+    ) -> list[dict]:
+        if not attachments:
+            return []
+
+        root_dir = os.path.join(commit_user_dir, "_engineering_attachments")
+        manifest_rows = []
+        seen = set()
+        for item in attachments:
+            part_id = int(item["part_id"])
+            if part_id not in allowed_part_ids:
+                continue
+            source_path = item["source_path"]
+            if not source_path or not os.path.exists(source_path):
+                raise ValueError(f"Commit blocked: engineering attachment is missing: {os.path.basename(source_path or '')}")
+            file_type = str(item["file_type"] or "").strip().upper()
+            dedupe_key = (part_id, file_type, os.path.abspath(source_path).lower())
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+
+            part_dir = os.path.join(root_dir, f"part_{part_id}")
+            ensure_dir_exists(part_dir)
+            safe_name = self._safe_attachment_name(item.get("filename") or source_path)
+            dest_name = f"{uuid.uuid4().hex[:8]}_{safe_name}"
+            dest_path = os.path.join(part_dir, dest_name)
+            shutil.copy2(source_path, dest_path)
+            manifest_rows.append({
+                "commit_id": commit_id,
+                "part_id": part_id,
+                "file_type": file_type,
+                "file_role": item.get("file_role") or "other",
+                "filename": safe_name,
+                "stored_rel_path": os.path.relpath(dest_path, commit_user_dir),
+                "note": item.get("note") or "",
+                "revision": item.get("revision") or "",
+                "display_name": item.get("display_name") or f"{file_type} attachment",
+                "description": item.get("description") or f"Attached during commit {commit_id}",
+            })
+
+        if manifest_rows:
+            ensure_dir_exists(root_dir)
+            manifest_path = os.path.join(root_dir, "manifest.json")
+            with open(manifest_path, "w", encoding="utf-8") as handle:
+                json.dump({"commit_id": commit_id, "attachments": manifest_rows}, handle, indent=2)
+        return manifest_rows
+
     @require_permission("commit")
     def commit_file(
         self,
@@ -179,6 +274,7 @@ class CommitService(BaseService):
         resolved_issue_relation_type: str = "solves",
         jira_key: str | None = None,
         jira_url: str | None = None,
+        engineering_attachments=None,
     ):
 
         commit_id = f"commit_{uuid.uuid4().hex[:8]}"
@@ -269,8 +365,6 @@ class CommitService(BaseService):
             })
 
         inserted_any = False
-        vault_versions_created = []
-        vault_files_created = []
         try:
             ensure_dir_exists(commit_user_dir)
 
@@ -321,6 +415,7 @@ class CommitService(BaseService):
                         raise ValueError(f"STEP compare failed for {item['filename']}: {str(e)}")
                 item["step_meta"] = step_meta
 
+            delayed_attachments = self._normalize_engineering_attachments(engineering_attachments)
             for item in commit_plan:
                 step_meta = item.get("step_meta") or {}
                 step_path = step_meta.get("step_file_path")
@@ -330,24 +425,23 @@ class CommitService(BaseService):
                     and step_path
                     and os.path.exists(step_path)
                 ):
-                    before_ids = {
-                        int(f.id)
-                        for f in self.part_file_service.list_attachments(int(item["part_id"]))
-                        if str(f.file_type or "").strip().upper() == "STEP"
-                    }
-                    file_id, version_id = self.part_file_service.upsert_part_file_version(
-                        part_id=int(item["part_id"]),
-                        file_type="STEP",
-                        source_path=step_path,
-                        note="compared",
-                        revision="",
-                        display_name=f"{item['base_f_name']} STEP",
-                        description=f"STEP captured during commit {commit_id}",
-                    )
-                    if version_id:
-                        vault_versions_created.append((int(file_id), int(version_id)))
-                    if int(file_id) not in before_ids:
-                        vault_files_created.append(int(file_id))
+                    delayed_attachments.append({
+                        "part_id": int(item["part_id"]),
+                        "file_type": "STEP",
+                        "file_role": "exported_step",
+                        "source_path": step_path,
+                        "note": "compared",
+                        "revision": "",
+                        "display_name": f"{item['base_f_name']} STEP",
+                        "description": f"STEP captured during commit {commit_id}",
+                    })
+
+            self._write_engineering_attachment_manifest(
+                commit_user_dir,
+                delayed_attachments,
+                {int(item["part_id"]) for item in commit_plan},
+                commit_id,
+            )
 
             # Phase 3: persist all rows and traceability links.
             for item in commit_plan:
@@ -399,17 +493,6 @@ class CommitService(BaseService):
             if inserted_any:
                 try:
                     self.commit_repository.hard_delete_by_commit_id(commit_id, self.session.project_id)
-                except Exception:
-                    pass
-            for file_id, version_id in reversed(vault_versions_created):
-                try:
-                    if int(file_id) not in vault_files_created:
-                        self.part_file_service.delete_version(int(file_id), int(version_id))
-                except Exception:
-                    pass
-            for file_id in reversed(vault_files_created):
-                try:
-                    self.part_file_service.delete_attachment(int(file_id))
                 except Exception:
                     pass
             try:
@@ -550,6 +633,24 @@ class CommitService(BaseService):
         statuses = [str(r.get("status") or "") for r in rows]
         group_status = max(statuses, key=lambda s: status_order.get(s, 0)) if statuses else ""
         issues = self.issue_service.issues_for_commit(str(commit_id))
+        engineering_files = self.traceability_service.engineering_files_for_commit(str(commit_id))
+        for item in engineering_files:
+            self._resolve_engineering_file_path(item)
+        validation_docs = self.traceability_service.validation_docs_for_commit(str(commit_id))
+        for item in validation_docs:
+            path = item.get("stored_path") or ""
+            item["source_path"] = path
+            item["exists"] = bool(path and os.path.exists(path))
+        if not engineering_files and not validation_docs:
+            pending_items = self._pending_commit_attachments_for_commit(rows, str(commit_id))
+            engineering_files = [
+                item for item in pending_items
+                if item.get("file_role") in {"exported_pdf", "exported_step"}
+            ]
+            validation_docs = [
+                item for item in pending_items
+                if item.get("file_role") not in {"exported_pdf", "exported_step"}
+            ]
         return {
             "commit_id": str(commit_id),
             "title": first.get("title") or "",
@@ -574,7 +675,73 @@ class CommitService(BaseService):
             "snapshotted_in": first.get("snapshotted_in") or "",
             "files": rows,
             "issues": issues,
+            "engineering_files": engineering_files,
+            "validation_docs": validation_docs,
         }
+
+    def _resolve_engineering_file_path(self, item: dict):
+        if item.get("source_path"):
+            item["exists"] = bool(os.path.exists(item.get("source_path")))
+            return
+        version_id = item.get("resolved_version_id") or item.get("part_file_version_id")
+        path = ""
+        if version_id:
+            try:
+                version = self.part_file_service.repo.get_version_by_id(int(version_id))
+                path = self.part_file_service.resolve_version_path(version) if version else ""
+            except Exception:
+                path = ""
+        item["source_path"] = path
+        item["exists"] = bool(path and os.path.exists(path))
+
+    def _pending_commit_attachments_for_commit(self, rows: list[dict], commit_id: str) -> list[dict]:
+        if not rows:
+            return []
+        first = rows[0]
+        title = first.get("title") or ""
+        designer = first.get("designer_name") or first.get("committed_by_name") or ""
+        project_id = first.get("project_id") or self.session.project_id
+        if not title or not designer:
+            return []
+        try:
+            project = self.project_service.get_project_by_id(int(project_id)) if project_id else None
+            working_dir = (project or {}).get("working_directory", "") or ""
+        except Exception:
+            working_dir = ""
+        if not working_dir:
+            return []
+        manifest_path = os.path.join(
+            working_dir,
+            "commits",
+            designer,
+            f"{title}_{commit_id}",
+            "_engineering_attachments",
+            "manifest.json",
+        )
+        if not os.path.exists(manifest_path):
+            return []
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as handle:
+                manifest = json.load(handle) or {}
+        except Exception:
+            return []
+        base_dir = os.path.dirname(os.path.dirname(manifest_path))
+        result = []
+        for idx, item in enumerate(manifest.get("attachments") or [], start=1):
+            source_path = os.path.join(base_dir, item.get("stored_rel_path") or "")
+            row = dict(item)
+            row.update({
+                "id": f"pending-{idx}",
+                "commit_id": commit_id,
+                "file_role": item.get("file_role") or "other",
+                "original_filename": item.get("filename"),
+                "stored_path": source_path,
+                "source_path": source_path,
+                "exists": bool(source_path and os.path.exists(source_path)),
+                "pending": True,
+            })
+            result.append(row)
+        return result
 
     
     def revert_commit(self, commit_id: int, project_id: int = None):

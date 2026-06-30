@@ -121,12 +121,66 @@ class TraceabilityRepository:
                     FOREIGN KEY (part_id) REFERENCES bom(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS commit_engineering_file_links (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    commit_id TEXT NOT NULL,
+                    project_id INTEGER,
+                    part_id INTEGER,
+                    part_file_id INTEGER NOT NULL,
+                    part_file_version_id INTEGER,
+                    file_role TEXT NOT NULL DEFAULT 'other',
+                    linked_by INTEGER,
+                    linked_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    note TEXT DEFAULT '',
+                    UNIQUE(commit_id, part_file_id, part_file_version_id, file_role),
+                    FOREIGN KEY (project_id) REFERENCES projects(id),
+                    FOREIGN KEY (part_id) REFERENCES bom(id),
+                    FOREIGN KEY (part_file_id) REFERENCES part_files(id),
+                    FOREIGN KEY (part_file_version_id) REFERENCES part_file_versions(id),
+                    FOREIGN KEY (linked_by) REFERENCES users(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS commit_validation_docs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    commit_id TEXT NOT NULL,
+                    project_id INTEGER,
+                    part_id INTEGER,
+                    original_filename TEXT NOT NULL,
+                    stored_path TEXT NOT NULL,
+                    file_type TEXT,
+                    doc_role TEXT NOT NULL DEFAULT 'validation_doc',
+                    linked_by INTEGER,
+                    linked_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    note TEXT DEFAULT '',
+                    UNIQUE(commit_id, stored_path),
+                    FOREIGN KEY (project_id) REFERENCES projects(id),
+                    FOREIGN KEY (part_id) REFERENCES bom(id),
+                    FOREIGN KEY (linked_by) REFERENCES users(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS validation_doc_issue_links (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    validation_doc_id INTEGER NOT NULL,
+                    issue_id INTEGER NOT NULL,
+                    linked_by INTEGER,
+                    linked_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    note TEXT DEFAULT '',
+                    UNIQUE(validation_doc_id, issue_id),
+                    FOREIGN KEY (validation_doc_id) REFERENCES commit_validation_docs(id),
+                    FOREIGN KEY (issue_id) REFERENCES issues(id),
+                    FOREIGN KEY (linked_by) REFERENCES users(id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_issue_jira_links_issue ON issue_jira_links(issue_id);
                 CREATE INDEX IF NOT EXISTS idx_issue_jira_links_key ON issue_jira_links(jira_key);
                 CREATE INDEX IF NOT EXISTS idx_issue_file_links_issue ON issue_file_links(issue_id);
                 CREATE INDEX IF NOT EXISTS idx_issue_file_links_file ON issue_file_links(part_file_id);
                 CREATE INDEX IF NOT EXISTS idx_commit_groups_commit ON commit_groups(commit_id);
                 CREATE INDEX IF NOT EXISTS idx_commit_file_links_group ON commit_file_links(commit_group_id);
+                CREATE INDEX IF NOT EXISTS idx_commit_eng_files_commit ON commit_engineering_file_links(commit_id);
+                CREATE INDEX IF NOT EXISTS idx_commit_eng_files_file ON commit_engineering_file_links(part_file_id);
+                CREATE INDEX IF NOT EXISTS idx_validation_docs_commit ON commit_validation_docs(commit_id);
+                CREATE INDEX IF NOT EXISTS idx_validation_doc_issues_issue ON validation_doc_issue_links(issue_id);
                 """
             )
             if self._table_exists(conn, "issue_commit_links"):
@@ -279,6 +333,18 @@ class TraceabilityRepository:
                     actor_id,
                     {"commit_id": commit_id, "relation_type": relation, "note": note},
                 )
+                for doc in conn.execute(
+                    "SELECT id FROM commit_validation_docs WHERE commit_id=?",
+                    (str(commit_id),),
+                ).fetchall():
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO validation_doc_issue_links(
+                            validation_doc_id, issue_id, linked_by, note
+                        ) VALUES(?,?,?,?)
+                        """,
+                        (int(doc["id"]), issue_id, actor_id, note or ""),
+                    )
                 if old and old["status"] != "Ready For Validation" and relation in {"solves", "partial_fix"}:
                     self._history(conn, issue_id, "Status changed to Ready For Validation", actor_id,
                                   {"from": old["status"], "to": "Ready For Validation"})
@@ -325,6 +391,211 @@ class TraceabilityRepository:
                 {"part_file_id": part_file_id, "version_id": version_id, "file_role": file_role, "note": note},
             )
             return int(cur.lastrowid or 0)
+
+    def link_commit_to_engineering_file(
+        self,
+        commit_id: str,
+        project_id: Optional[int],
+        part_id: Optional[int],
+        part_file_id: int,
+        version_id: Optional[int],
+        role: str,
+        actor_id: Optional[int],
+        note: str = "",
+    ) -> int:
+        file_role = role if role in self.ISSUE_FILE_ROLES else "other"
+        with self.get_conn() as conn:
+            existing = conn.execute(
+                """
+                SELECT id FROM commit_engineering_file_links
+                WHERE commit_id=? AND part_file_id=?
+                  AND ((part_file_version_id IS NULL AND ? IS NULL) OR part_file_version_id=?)
+                  AND file_role=?
+                """,
+                (str(commit_id), int(part_file_id), version_id, version_id, file_role),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE commit_engineering_file_links SET note=COALESCE(NULLIF(?, ''), note) WHERE id=?",
+                    (note or "", int(existing["id"])),
+                )
+                return int(existing["id"])
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO commit_engineering_file_links(
+                    commit_id, project_id, part_id, part_file_id, part_file_version_id,
+                    file_role, linked_by, note
+                ) VALUES(?,?,?,?,?,?,?,?)
+                """,
+                (
+                    str(commit_id),
+                    int(project_id) if project_id is not None else None,
+                    int(part_id) if part_id is not None else None,
+                    int(part_file_id),
+                    int(version_id) if version_id is not None else None,
+                    file_role,
+                    actor_id,
+                    note or "",
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def linked_issue_ids_for_commit(self, commit_id: str) -> list[int]:
+        with self.get_conn() as conn:
+            return [
+                int(r["issue_id"])
+                for r in conn.execute(
+                    "SELECT DISTINCT issue_id FROM issue_commit_links WHERE commit_id=?",
+                    (str(commit_id),),
+                ).fetchall()
+            ]
+
+    def engineering_files_for_commit(self, commit_id: str) -> list[dict]:
+        with self.get_conn() as conn:
+            return [dict(r) for r in conn.execute(
+                """
+                SELECT
+                    l.*,
+                    pf.file_type,
+                    pf.display_name,
+                    pf.active_version_id,
+                    b.name AS part_name,
+                    b.aes_number,
+                    COALESCE(v.id, av.id) AS resolved_version_id,
+                    COALESCE(v.version_no, av.version_no) AS version_no,
+                    COALESCE(v.original_filename, av.original_filename) AS original_filename,
+                    COALESCE(v.vault_rel_path, av.vault_rel_path) AS vault_rel_path,
+                    COALESCE(v.sha256, av.sha256) AS sha256,
+                    COALESCE(v.size_bytes, av.size_bytes) AS size_bytes,
+                    COALESCE(v.created_at, av.created_at) AS version_created_at,
+                    COALESCE(v.root_project_id, av.root_project_id) AS root_project_id,
+                    COALESCE(v.project_version_label, av.project_version_label) AS project_version_label,
+                    COALESCE(v.lifecycle_state, av.lifecycle_state) AS lifecycle_state,
+                    COALESCE(v.note, av.note) AS version_note,
+                    COALESCE(v.revision, av.revision, b.revision) AS revision
+                FROM commit_engineering_file_links l
+                JOIN part_files pf ON pf.id=l.part_file_id
+                LEFT JOIN bom b ON b.id=COALESCE(l.part_id, pf.part_id)
+                LEFT JOIN part_file_versions v ON v.id=l.part_file_version_id
+                LEFT JOIN part_file_versions av ON av.id=pf.active_version_id
+                WHERE l.commit_id=?
+                ORDER BY l.linked_at DESC, l.id DESC
+                """,
+                (str(commit_id),),
+            ).fetchall()]
+
+    def register_validation_doc(
+        self,
+        commit_id: str,
+        project_id: Optional[int],
+        part_id: Optional[int],
+        original_filename: str,
+        stored_path: str,
+        file_type: str,
+        doc_role: str,
+        actor_id: Optional[int],
+        note: str = "",
+    ) -> int:
+        role = doc_role or "validation_doc"
+        with self.get_conn() as conn:
+            existing = conn.execute(
+                "SELECT id FROM commit_validation_docs WHERE commit_id=? AND stored_path=?",
+                (str(commit_id), stored_path),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE commit_validation_docs SET note=COALESCE(NULLIF(?, ''), note) WHERE id=?",
+                    (note or "", int(existing["id"])),
+                )
+                return int(existing["id"])
+            cur = conn.execute(
+                """
+                INSERT INTO commit_validation_docs(
+                    commit_id, project_id, part_id, original_filename, stored_path,
+                    file_type, doc_role, linked_by, note
+                ) VALUES(?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    str(commit_id),
+                    int(project_id) if project_id is not None else None,
+                    int(part_id) if part_id is not None else None,
+                    original_filename,
+                    stored_path,
+                    file_type,
+                    role,
+                    actor_id,
+                    note or "",
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def link_validation_doc_to_issue(
+        self,
+        validation_doc_id: int,
+        issue_id: int,
+        actor_id: Optional[int],
+        note: str = "",
+    ) -> int:
+        with self.get_conn() as conn:
+            existing = conn.execute(
+                "SELECT id FROM validation_doc_issue_links WHERE validation_doc_id=? AND issue_id=?",
+                (int(validation_doc_id), int(issue_id)),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE validation_doc_issue_links SET note=COALESCE(NULLIF(?, ''), note) WHERE id=?",
+                    (note or "", int(existing["id"])),
+                )
+                return int(existing["id"])
+            cur = conn.execute(
+                """
+                INSERT INTO validation_doc_issue_links(validation_doc_id, issue_id, linked_by, note)
+                VALUES(?,?,?,?)
+                """,
+                (int(validation_doc_id), int(issue_id), actor_id, note or ""),
+            )
+            self._history(
+                conn,
+                int(issue_id),
+                "Validation document linked",
+                actor_id,
+                {"validation_doc_id": int(validation_doc_id), "note": note},
+            )
+            return int(cur.lastrowid or 0)
+
+    def validation_docs_for_commit(self, commit_id: str) -> list[dict]:
+        with self.get_conn() as conn:
+            return [dict(r) for r in conn.execute(
+                """
+                SELECT vd.*, b.name AS part_name, b.aes_number
+                FROM commit_validation_docs vd
+                LEFT JOIN bom b ON b.id=vd.part_id
+                WHERE vd.commit_id=?
+                ORDER BY vd.linked_at DESC, vd.id DESC
+                """,
+                (str(commit_id),),
+            ).fetchall()]
+
+    def validation_docs_for_issue(self, issue_id: int) -> list[dict]:
+        with self.get_conn() as conn:
+            return [dict(r) for r in conn.execute(
+                """
+                SELECT
+                    l.id AS issue_validation_link_id,
+                    l.issue_id,
+                    l.linked_at AS issue_linked_at,
+                    l.note AS issue_link_note,
+                    vd.*,
+                    b.name AS part_name,
+                    b.aes_number
+                FROM validation_doc_issue_links l
+                JOIN commit_validation_docs vd ON vd.id=l.validation_doc_id
+                LEFT JOIN bom b ON b.id=vd.part_id
+                WHERE l.issue_id=?
+                ORDER BY l.linked_at DESC, l.id DESC
+                """,
+                (int(issue_id),),
+            ).fetchall()]
 
     def engineering_files_for_issue(self, issue_id: int) -> list[dict]:
         with self.get_conn() as conn:
@@ -511,12 +782,15 @@ class TraceabilityRepository:
         commits = self.commit_links_for_issue(issue_id)
         for commit in commits:
             commit["files_changed"] = self.commit_files(commit["commit_id"])
+            commit["engineering_files"] = self.engineering_files_for_commit(commit["commit_id"])
+            commit["validation_docs"] = self.validation_docs_for_commit(commit["commit_id"])
         return {
             "issue": dict(issue),
             "jira_links": self.jira_links(issue_id),
             "linked_commits": commits,
             "native_creo_files": parts,
             "engineering_files": self.engineering_files_for_issue(issue_id),
+            "validation_docs": self.validation_docs_for_issue(issue_id),
             "timeline": history,
         }
 

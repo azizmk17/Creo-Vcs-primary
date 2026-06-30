@@ -52,6 +52,57 @@ class TraceabilityService(BaseService):
             note=note,
         )
 
+    def link_commit_to_engineering_file(self, commit_id: str, project_id: Optional[int],
+                                        part_id: Optional[int], part_file_id: int,
+                                        version_id: Optional[int] = None,
+                                        role: str = "other", note: str = "") -> int:
+        return self.repo.link_commit_to_engineering_file(
+            commit_id=commit_id,
+            project_id=project_id,
+            part_id=part_id,
+            part_file_id=part_file_id,
+            version_id=version_id,
+            role=role,
+            actor_id=self.user_id,
+            note=note,
+        )
+
+    def linked_issue_ids_for_commit(self, commit_id: str) -> list[int]:
+        return self.repo.linked_issue_ids_for_commit(commit_id)
+
+    def engineering_files_for_commit(self, commit_id: str) -> list[dict]:
+        return self.repo.engineering_files_for_commit(commit_id)
+
+    def register_validation_doc(self, commit_id: str, project_id: Optional[int],
+                                part_id: Optional[int], original_filename: str,
+                                stored_path: str, file_type: str = "",
+                                doc_role: str = "validation_doc", note: str = "") -> int:
+        return self.repo.register_validation_doc(
+            commit_id=commit_id,
+            project_id=project_id,
+            part_id=part_id,
+            original_filename=original_filename,
+            stored_path=stored_path,
+            file_type=file_type,
+            doc_role=doc_role,
+            actor_id=self.user_id,
+            note=note,
+        )
+
+    def link_validation_doc_to_issue(self, validation_doc_id: int, issue_id: int, note: str = "") -> int:
+        return self.repo.link_validation_doc_to_issue(
+            validation_doc_id=validation_doc_id,
+            issue_id=issue_id,
+            actor_id=self.user_id,
+            note=note,
+        )
+
+    def validation_docs_for_commit(self, commit_id: str) -> list[dict]:
+        return self.repo.validation_docs_for_commit(commit_id)
+
+    def validation_docs_for_issue(self, issue_id: int) -> list[dict]:
+        return self.repo.validation_docs_for_issue(issue_id)
+
     def engineering_files_for_issue(self, issue_id: int) -> list[dict]:
         return self.repo.engineering_files_for_issue(issue_id)
 
@@ -110,12 +161,15 @@ class TraceabilityService(BaseService):
         package_dir = os.path.join(destination_dir, package_name)
         input_dir = os.path.join(package_dir, "input_data")
         output_dir = os.path.join(package_dir, "output_engineering_files")
+        validation_dir = os.path.join(package_dir, "validation_docs")
         os.makedirs(input_dir, exist_ok=True)
         os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(validation_dir, exist_ok=True)
 
         engineering_links = self._expanded_engineering_links(report.get("engineering_files") or [])
         copied_inputs = self._copy_issue_attachments(int(issue_id), input_dir)
         copied_outputs = self._copy_engineering_files(engineering_links, output_dir)
+        copied_validation_docs = self._copy_validation_docs(report.get("validation_docs") or [], validation_dir)
 
         workbook_path = os.path.join(package_dir, "issue_traceability.xlsx")
         sheets = []
@@ -176,6 +230,8 @@ class TraceabilityService(BaseService):
                 ["Input attachments copied", len(copied_inputs)],
                 ["Engineering outputs copied", sum(1 for x in copied_outputs if x.get("exists"))],
                 ["Engineering output links", len(copied_outputs)],
+                ["Validation docs copied", sum(1 for x in copied_validation_docs if x.get("exists"))],
+                ["Validation doc links", len(copied_validation_docs)],
                 ["Linked commits", len(report.get("linked_commits") or [])],
                 ["Native Creo files", len(report.get("native_creo_files") or [])],
                 ["Created at", datetime.now().isoformat(timespec="seconds")],
@@ -254,6 +310,17 @@ class TraceabilityService(BaseService):
             "Linked vaulted engineering output files copied into output_engineering_files.",
         )
         add_sheet(
+            "Validation Docs",
+            ["Doc ID", "Commit ID", "Role", "Type", "Filename", "Package Path", "Source Path",
+             "Exists", "Part ID", "Part Name", "AES", "Linked At", "Note"],
+            [[v.get("id"), v.get("commit_id"), v.get("doc_role"), v.get("file_type"),
+              v.get("original_filename"), v.get("package_path"), v.get("source_path"),
+              v.get("exists"), v.get("part_id"), v.get("part_name"), v.get("aes_number"),
+              v.get("issue_linked_at") or v.get("linked_at"), v.get("issue_link_note") or v.get("note")]
+             for v in copied_validation_docs],
+            "Validation evidence files linked through commits and copied into validation_docs.",
+        )
+        add_sheet(
             "Timeline",
             ["ID", "Action", "Field", "Old Value", "New Value", "Details", "User", "Created At"],
             [[h.get("id"), h.get("action"), h.get("field_name"), h.get("old_value"),
@@ -271,11 +338,13 @@ class TraceabilityService(BaseService):
             "workbook": workbook_path,
             "input_data_dir": input_dir,
             "output_engineering_files_dir": output_dir,
+            "validation_docs_dir": validation_dir,
             "issue_id": int(issue_id),
             "issue_number": issue_number,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "input_files": copied_inputs,
             "output_files": copied_outputs,
+            "validation_docs": copied_validation_docs,
         }
         with open(os.path.join(package_dir, "manifest.json"), "w", encoding="utf-8") as handle:
             json.dump(manifest, handle, indent=2, default=str)
@@ -292,6 +361,27 @@ class TraceabilityService(BaseService):
                 shutil.copy2(src, dst)
             copied.append({
                 **attachment,
+                "source_path": src,
+                "package_path": dst,
+                "exists": exists,
+            })
+        return copied
+
+    def _copy_validation_docs(self, docs: list[dict], destination_dir: str) -> list[dict]:
+        copied = []
+        for doc in docs:
+            src = str(doc.get("stored_path") or doc.get("source_path") or "")
+            dst = ""
+            exists = bool(src and os.path.exists(src))
+            if exists:
+                role = self._safe_filename(str(doc.get("doc_role") or "validation_doc"))
+                part = self._safe_filename(str(doc.get("part_name") or doc.get("part_id") or "part"))
+                filename = doc.get("original_filename") or os.path.basename(src)
+                dst = self._unique_path(os.path.join(destination_dir, role), f"{part}_{filename}")
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
+            copied.append({
+                **doc,
                 "source_path": src,
                 "package_path": dst,
                 "exists": exists,

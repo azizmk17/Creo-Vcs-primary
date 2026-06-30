@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import os
 import shutil
 from datetime import datetime
@@ -16,6 +17,7 @@ from core.services.bom_service import BomService
 from core.services.base_service import BaseService
 from core.services.issue_service import IssueService
 from core.services.traceability_service import TraceabilityService
+from core.services.part_file_service import PartFileService
 from utils import (
     is_creo_file,
     ensure_dir_exists,
@@ -35,12 +37,129 @@ class MergeService(BaseService):
         self.bom_service = BomService(BomRepository(), BomChildrenRepository(), LockRepository(), SignatureRepository())
         self.issue_service = IssueService()
         self.traceability_service = TraceabilityService()
+        self.part_file_service = PartFileService()
 
         self.working_dir = working_dir
         self.commits_dir = commits_dir
         self.pr_dir = pr_dir
 
         self.merge_id = f"merge_{uuid.uuid4().hex[:8]}"
+
+    def _commit_group_dir(self, commit) -> str:
+        designer = getattr(commit, "designer_username", "") or ""
+        title = getattr(commit, "title", "") or ""
+        logical_id = getattr(commit, "commit_id", "") or ""
+        if designer and title and logical_id:
+            return os.path.join(self.commits_dir, designer, f"{title}_{logical_id}")
+        return ""
+
+    def _safe_filename(self, name: str) -> str:
+        cleaned = "".join(ch if ch.isalnum() or ch in "._- ()" else "_" for ch in os.path.basename(name or ""))
+        return cleaned or f"validation_{uuid.uuid4().hex[:8]}"
+
+    def _store_validation_doc(self, source_path: str, commit_id: str, filename: str) -> str:
+        root = os.path.join(self.working_dir, ".creo_vcs", "validation_docs", str(commit_id))
+        ensure_dir_exists(root)
+        safe_name = self._safe_filename(filename or source_path)
+        destination = os.path.join(root, safe_name)
+        if os.path.exists(destination):
+            stem, ext = os.path.splitext(safe_name)
+            destination = os.path.join(root, f"{stem}_{uuid.uuid4().hex[:8]}{ext}")
+        shutil.copy2(source_path, destination)
+        return destination
+
+    def _process_commit_attachments(self, commit_dir: str, commit_id: str, project_id: int | None) -> list[int]:
+        if not commit_dir:
+            return []
+        attachment_dir = os.path.join(commit_dir, "_engineering_attachments")
+        manifest_path = os.path.join(attachment_dir, "manifest.json")
+        if not os.path.exists(manifest_path):
+            return []
+
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle) or {}
+
+        changed_part_ids = []
+        linked_issue_ids = self.traceability_service.linked_issue_ids_for_commit(commit_id)
+        for item in manifest.get("attachments") or []:
+            part_id = int(item.get("part_id") or 0)
+            source_path = os.path.join(commit_dir, item.get("stored_rel_path") or "")
+            if not part_id or not os.path.exists(source_path):
+                raise ValueError(
+                    f"Cannot vault engineering attachment; file is missing: {os.path.basename(source_path)}"
+                )
+            file_type = str(item.get("file_type") or "").strip().upper()
+            file_role = str(item.get("file_role") or "").strip() or (
+                "exported_pdf" if file_type == "PDF"
+                else "exported_step" if file_type == "STEP"
+                else "validation_doc"
+            )
+            if file_role in {"exported_pdf", "exported_step"}:
+                file_id, version_id = self.part_file_service.upsert_part_file_version(
+                    part_id=part_id,
+                    file_type=file_type,
+                    source_path=source_path,
+                    note=item.get("note") or "",
+                    revision=item.get("revision") or "",
+                    display_name=item.get("display_name") or f"{file_type} attachment",
+                    description=item.get("description") or "Attached during commit push",
+                )
+                self.traceability_service.link_commit_to_engineering_file(
+                    commit_id=commit_id,
+                    project_id=project_id,
+                    part_id=part_id,
+                    part_file_id=int(file_id),
+                    version_id=int(version_id) if version_id else None,
+                    role=file_role,
+                    note=item.get("note") or "",
+                )
+                for issue_id in linked_issue_ids:
+                    self.traceability_service.link_issue_to_engineering_file(
+                        int(issue_id),
+                        int(file_id),
+                        int(version_id) if version_id else None,
+                        role=file_role,
+                        note=item.get("note") or f"Attached from commit {commit_id}",
+                    )
+            else:
+                stored_path = self._store_validation_doc(
+                    source_path,
+                    commit_id,
+                    item.get("filename") or os.path.basename(source_path),
+                )
+                validation_doc_id = self.traceability_service.register_validation_doc(
+                    commit_id=commit_id,
+                    project_id=project_id,
+                    part_id=part_id,
+                    original_filename=item.get("filename") or os.path.basename(source_path),
+                    stored_path=stored_path,
+                    file_type=file_type,
+                    doc_role=file_role,
+                    note=item.get("note") or "",
+                )
+                for issue_id in linked_issue_ids:
+                    self.traceability_service.link_validation_doc_to_issue(
+                        int(validation_doc_id),
+                        int(issue_id),
+                        note=item.get("note") or f"Attached from commit {commit_id}",
+                    )
+            changed_part_ids.append(part_id)
+
+        try:
+            shutil.rmtree(attachment_dir)
+        except Exception as exc:
+            print(f"Warning: Failed to remove temporary engineering attachments {attachment_dir}: {exc}")
+
+        try:
+            if os.path.isdir(commit_dir) and not os.listdir(commit_dir):
+                shutil.rmtree(commit_dir)
+                user_dir = os.path.dirname(commit_dir)
+                if os.path.isdir(user_dir) and not os.listdir(user_dir):
+                    shutil.rmtree(user_dir)
+        except Exception as exc:
+            print(f"Warning: Failed to remove empty commit attachment directory {commit_dir}: {exc}")
+
+        return sorted(set(changed_part_ids))
 
     def get_last_approved_version(self, base_name):
         max_version = 0
@@ -241,6 +360,9 @@ class MergeService(BaseService):
         commit_data = self.merge_repository.get_commit_ids_by_commitid(commit_id)
         if not commit_data:
             raise ValueError(f"No validated commit found for {commit_id}.")
+        commit_group_dir = self._commit_group_dir(commit_data[0])
+        logical_commit_id = str(getattr(commit_data[0], "commit_id", commit_id) or commit_id)
+        logical_project_id = getattr(commit_data[0], "project_id", None)
         self.issue_service.assert_no_critical_issues(
             self._part_ids_for_issue_gate(commit_data), operation="merge", include_children=True
         )
@@ -271,8 +393,20 @@ class MergeService(BaseService):
 
         if merged_entries:
             self.finalize_merge(merged_entries, self.user_id, self.merge_id, message)
+            attachment_part_ids = self._process_commit_attachments(
+                commit_group_dir,
+                logical_commit_id,
+                int(logical_project_id) if logical_project_id is not None else None,
+            )
             print(f"Merged {len(merged_entries)} commits.")
-            return sorted({int(item["item_id"]) for item in merged_entries if item.get("item_id") is not None})
+            return sorted(
+                {
+                    int(item["item_id"])
+                    for item in merged_entries
+                    if item.get("item_id") is not None
+                }
+                | {int(pid) for pid in attachment_part_ids}
+            )
 
         return []
 
