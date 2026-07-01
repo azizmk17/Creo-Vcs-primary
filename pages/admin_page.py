@@ -16,6 +16,7 @@ from core.services.permission_service import PermissionService
 from core.services.user_service import UserService
 from core.services.project_service import ProjectService
 from core.repositories.user_repository import UserRepository
+from utils import safe_exists, safe_isdir, safe_startfile
 
 
 class AdminMetricCard(QFrame):
@@ -854,10 +855,10 @@ class AdminPage(QWidget):
             return QMessageBox.warning(self, "Select", "Select a configuration path first.")
         target = Path(path)
         folder = target if target.is_dir() else target.parent
-        if not folder.exists():
+        if not safe_exists(str(folder)):
             return QMessageBox.warning(self, "Missing", f"Folder does not exist:\n{folder}")
         try:
-            os.startfile(str(folder))
+            safe_startfile(str(folder))
         except Exception as e:
             QMessageBox.warning(self, "Open Folder", str(e))
 
@@ -866,10 +867,10 @@ class AdminPage(QWidget):
         if not path:
             return QMessageBox.warning(self, "Select", "Select a configuration path first.")
         target = Path(path)
-        if not target.is_file():
+        if not safe_exists(str(target)) or safe_isdir(str(target)):
             return QMessageBox.warning(self, "Missing", f"File does not exist:\n{target}")
         try:
-            os.startfile(str(target))
+            safe_startfile(str(target))
         except Exception as e:
             QMessageBox.warning(self, "Open File", str(e))
 

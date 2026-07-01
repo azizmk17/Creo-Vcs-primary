@@ -38,7 +38,7 @@ from core.session_manager import SessionManager
 from core.services.issue_service import IssueService
 from pages.rich_text_image_editor import RichTextImageEditor, html_to_plain_text, looks_like_html
 
-from utils import is_creo_file, ensure_dir_exists
+from utils import is_creo_file, ensure_dir_exists, safe_exists, safe_isfile, safe_startfile
 
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -1449,7 +1449,7 @@ class CommitPage(QWidget):
     def _attach_files_to_affected_bom_item(self, part_id: int, paths: list):
         clean_paths = [
             p for p in (paths or [])
-            if p and os.path.isfile(p) and os.path.splitext(p)[1].lower() not in (".prt", ".asm", ".drw")
+            if p and safe_isfile(p) and os.path.splitext(p)[1].lower() not in (".prt", ".asm", ".drw")
         ]
         if not clean_paths:
             QMessageBox.warning(self, "Attachment", "Drop PDF, STEP, or validation/supporting documents only.")
@@ -2127,7 +2127,7 @@ class CommitPage(QWidget):
                 path = item.get("stored_path") or ""
             exists = item.get("exists")
             if exists is None:
-                exists = bool(path and os.path.exists(path))
+                exists = bool(path and safe_exists(path))
             values = [
                 item.get("doc_role") or item.get("file_role"),
                 item.get("file_type"),
@@ -2160,11 +2160,11 @@ class CommitPage(QWidget):
             return
         item = table.item(row, table.columnCount() - 1)
         path = item.data(Qt.UserRole) if item else ""
-        if not path or not os.path.exists(path):
+        if not path or not safe_exists(path):
             QMessageBox.warning(self, "Open Document", f"File not found:\n{path}")
             return
         try:
-            os.startfile(path)
+            safe_startfile(path)
         except Exception as exc:
             QMessageBox.critical(self, "Open Document", f"Failed to open file:\n{exc}")
 
@@ -2462,13 +2462,29 @@ class CommitPage(QWidget):
             self.add_file_btn.setEnabled(True)
             self.commit_btn.setEnabled(True)
 
+    def _commit_directory_for_group(self, group):
+        title = str(group.get("title") or "")
+        commit_id = str(group.get("commit_id") or "")
+        username = str(group.get("username") or "")
+        candidates = []
+        if username and title and commit_id:
+            candidates.append(os.path.join(self.commits_dir, username, f"{title}_{commit_id}"))
+            safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)
+            if safe_title != title:
+                candidates.append(os.path.join(self.commits_dir, username, f"{safe_title}_{commit_id}"))
+        for path in candidates:
+            path = os.path.normpath(path)
+            if safe_exists(path):
+                return path
+        return os.path.normpath(candidates[0]) if candidates else ""
+
     def browse_commit_directory(self, group):
-        safe_title = re.sub(r'[<>:"/\\|?*]', '_', group.get("title", ""))
-        folder_name = f"{safe_title}_{group.get('commit_id', '')}"
-        path = os.path.join(self.commits_dir, group.get("username", ""), folder_name)
-        path = os.path.normpath(path)
-        if os.path.exists(path):
-            subprocess.Popen(["explorer", path])
+        path = self._commit_directory_for_group(group)
+        if safe_exists(path):
+            try:
+                safe_startfile(path)
+            except Exception:
+                subprocess.Popen(["explorer", path])
         else:
             QMessageBox.warning(self, "Not Found", f"Commit directory not found:\n{path}")
 

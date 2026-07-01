@@ -36,6 +36,7 @@ from core.services.issue_service import IssueService
 from core.services.user_service import UserService
 from core.services.project_service import ProjectService
 from pages.rich_text_image_editor import RichTextImageEditor, looks_like_html
+from utils import safe_exists, safe_startfile
 
 
 PRIORITY_COLORS = {
@@ -382,7 +383,7 @@ class EngineeringIssuePage(QWidget):
         attachments_layout = QVBoxLayout(attachments_tab)
         self.attachments_list = QListWidget()
         self.attachments_list.itemDoubleClicked.connect(
-            lambda item: os.startfile(item.toolTip()) if item and item.toolTip() else None
+            lambda item: safe_startfile(item.toolTip()) if item and item.toolTip() else None
         )
         add_attachment_btn = QPushButton("Add Attachment")
         add_attachment_btn.clicked.connect(self.add_attachment)
@@ -726,7 +727,7 @@ class EngineeringIssuePage(QWidget):
                 path = doc.get("stored_path") or doc.get("source_path") or ""
             except Exception:
                 path = doc.get("source_path") or ""
-            exists = bool(path and os.path.exists(path))
+            exists = bool(path and safe_exists(path))
             values = [
                 doc.get("doc_role") or doc.get("file_role"),
                 doc.get("file_type"),
@@ -759,11 +760,11 @@ class EngineeringIssuePage(QWidget):
             return
         item = table.item(row, table.columnCount() - 1)
         path = item.data(Qt.UserRole) if item else ""
-        if not path or not os.path.exists(path):
+        if not path or not safe_exists(path):
             QMessageBox.warning(self, "Open Document", f"File not found:\n{path}")
             return
         try:
-            os.startfile(path)
+            safe_startfile(path)
         except Exception as exc:
             QMessageBox.critical(self, "Open Document", f"Failed to open file:\n{exc}")
 

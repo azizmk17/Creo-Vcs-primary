@@ -17,6 +17,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from utils import safe_startfile
 
 try:
     import fitz
@@ -274,7 +275,7 @@ class PdfViewerWidget(QWidget):
         if not self._current_path:
             return
         try:
-            os.startfile(self._current_path)
+            safe_startfile(self._current_path)
         except Exception:
             pass
 

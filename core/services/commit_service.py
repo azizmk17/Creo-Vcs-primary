@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import re
 import shutil
 from datetime import datetime
 import uuid
@@ -21,7 +22,12 @@ from core.services.part_file_service import PartFileService
 
 from utils import (
     is_creo_file,
-    ensure_dir_exists
+    ensure_dir_exists,
+    safe_copy2,
+    safe_exists,
+    safe_isdir,
+    safe_open,
+    safe_rmtree,
 )
 class CommitService(BaseService):
     def __init__(self):
@@ -90,7 +96,7 @@ class CommitService(BaseService):
         from tools.CAD.step_diff_engine.diff_engine import compare_models
         from tools.CAD.step_diff_engine.database import JsonDiffDatabase
 
-        if not current_step_source_path or not os.path.exists(current_step_source_path):
+        if not current_step_source_path or not safe_exists(current_step_source_path):
             raise ValueError("STEP file path is invalid or missing.")
 
         step_store_dir = os.path.join(commit_dir, "_step_artifacts")
@@ -98,15 +104,15 @@ class CommitService(BaseService):
 
         step_ext = os.path.splitext(current_step_source_path)[1] or ".step"
         copied_step_path = os.path.join(step_store_dir, f"{part_id}_{commit_id}{step_ext}")
-        shutil.copy2(current_step_source_path, copied_step_path)
+        safe_copy2(current_step_source_path, copied_step_path)
 
-        if not previous_step_path or not os.path.exists(previous_step_path):
+        if not previous_step_path or not safe_exists(previous_step_path):
             # BASELINE — no previous STEP to compare, but still build face map
             try:
                 baseline_model = parse_step_file(copied_step_path, commit_id=current_commit_label)
                 face_map = self._build_face_map(baseline_model)
                 face_map_path = os.path.join(step_store_dir, f"{part_id}_{commit_id}_face_map.json")
-                with open(face_map_path, "w", encoding="utf-8") as fh:
+                with safe_open(face_map_path, "w", encoding="utf-8") as fh:
                     json.dump(face_map, fh, indent=2)
             except Exception:
                 face_map_path = None
@@ -129,14 +135,14 @@ class CommitService(BaseService):
         diff_dir = os.path.join(step_store_dir, "diffs")
         ensure_dir_exists(diff_dir)
         diff_path = os.path.join(diff_dir, f"{part_id}_{commit_id}.json")
-        with open(diff_path, "w", encoding="utf-8") as handle:
+        with safe_open(diff_path, "w", encoding="utf-8") as handle:
             json.dump(asdict(diff), handle, indent=2)
 
         # Save face map for the current model (model_b)
         try:
             face_map = self._build_face_map(model_b)
             face_map_path = os.path.join(step_store_dir, f"{part_id}_{commit_id}_face_map.json")
-            with open(face_map_path, "w", encoding="utf-8") as fh:
+            with safe_open(face_map_path, "w", encoding="utf-8") as fh:
                 json.dump(face_map, fh, indent=2)
         except Exception:
             face_map_path = None
@@ -226,7 +232,7 @@ class CommitService(BaseService):
             if part_id not in allowed_part_ids:
                 continue
             source_path = item["source_path"]
-            if not source_path or not os.path.exists(source_path):
+            if not source_path or not safe_exists(source_path):
                 raise ValueError(f"Commit blocked: engineering attachment is missing: {os.path.basename(source_path or '')}")
             file_type = str(item["file_type"] or "").strip().upper()
             dedupe_key = (part_id, file_type, os.path.abspath(source_path).lower())
@@ -239,7 +245,7 @@ class CommitService(BaseService):
             safe_name = self._safe_attachment_name(item.get("filename") or source_path)
             dest_name = f"{uuid.uuid4().hex[:8]}_{safe_name}"
             dest_path = os.path.join(part_dir, dest_name)
-            shutil.copy2(source_path, dest_path)
+            safe_copy2(source_path, dest_path)
             manifest_rows.append({
                 "commit_id": commit_id,
                 "part_id": part_id,
@@ -256,7 +262,7 @@ class CommitService(BaseService):
         if manifest_rows:
             ensure_dir_exists(root_dir)
             manifest_path = os.path.join(root_dir, "manifest.json")
-            with open(manifest_path, "w", encoding="utf-8") as handle:
+            with safe_open(manifest_path, "w", encoding="utf-8") as handle:
                 json.dump({"commit_id": commit_id, "attachments": manifest_rows}, handle, indent=2)
         return manifest_rows
 
@@ -307,7 +313,7 @@ class CommitService(BaseService):
             print(f"Processing file: {filepath}")
             filename = os.path.basename(filepath)
 
-            if not os.path.exists(filepath):
+            if not safe_exists(filepath):
                 raise ValueError(f"Commit blocked: source file is missing: {filename}")
 
             if not is_creo_file(filename):
@@ -370,7 +376,7 @@ class CommitService(BaseService):
 
             # Phase 2: copy/process all files. No DB rows are visible until every staged file succeeds.
             for item in commit_plan:
-                shutil.copy2(item["filepath"], item["dest_path"])
+                safe_copy2(item["filepath"], item["dest_path"])
                 print(f"Committed {item['filename']} for approval.")
                 print(f"File copied to {item['dest_path']}")
 
@@ -423,7 +429,7 @@ class CommitService(BaseService):
                     step_meta.get("step_compare_enabled")
                     and item["part_type"] == "Cad"
                     and step_path
-                    and os.path.exists(step_path)
+                    and safe_exists(step_path)
                 ):
                     delayed_attachments.append({
                         "part_id": int(item["part_id"]),
@@ -496,8 +502,8 @@ class CommitService(BaseService):
                 except Exception:
                     pass
             try:
-                if os.path.isdir(commit_user_dir):
-                    shutil.rmtree(commit_user_dir)
+                if safe_isdir(commit_user_dir):
+                    safe_rmtree(commit_user_dir)
             except Exception:
                 pass
             msg = str(e)
@@ -640,7 +646,7 @@ class CommitService(BaseService):
         for item in validation_docs:
             path = item.get("stored_path") or ""
             item["source_path"] = path
-            item["exists"] = bool(path and os.path.exists(path))
+            item["exists"] = bool(path and safe_exists(path))
         if not engineering_files and not validation_docs:
             pending_items = self._pending_commit_attachments_for_commit(rows, str(commit_id))
             engineering_files = [
@@ -681,7 +687,7 @@ class CommitService(BaseService):
 
     def _resolve_engineering_file_path(self, item: dict):
         if item.get("source_path"):
-            item["exists"] = bool(os.path.exists(item.get("source_path")))
+            item["exists"] = bool(safe_exists(item.get("source_path")))
             return
         version_id = item.get("resolved_version_id") or item.get("part_file_version_id")
         path = ""
@@ -692,7 +698,7 @@ class CommitService(BaseService):
             except Exception:
                 path = ""
         item["source_path"] = path
-        item["exists"] = bool(path and os.path.exists(path))
+        item["exists"] = bool(path and safe_exists(path))
 
     def _pending_commit_attachments_for_commit(self, rows: list[dict], commit_id: str) -> list[dict]:
         if not rows:
@@ -710,18 +716,27 @@ class CommitService(BaseService):
             working_dir = ""
         if not working_dir:
             return []
-        manifest_path = os.path.join(
-            working_dir,
-            "commits",
-            designer,
-            f"{title}_{commit_id}",
-            "_engineering_attachments",
-            "manifest.json",
-        )
-        if not os.path.exists(manifest_path):
+        commit_folder_names = [f"{title}_{commit_id}"]
+        safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)
+        if safe_title != title:
+            commit_folder_names.append(f"{safe_title}_{commit_id}")
+        manifest_path = ""
+        for folder_name in commit_folder_names:
+            candidate = os.path.join(
+                working_dir,
+                "commits",
+                designer,
+                folder_name,
+                "_engineering_attachments",
+                "manifest.json",
+            )
+            if safe_exists(candidate):
+                manifest_path = candidate
+                break
+        if not safe_exists(manifest_path):
             return []
         try:
-            with open(manifest_path, "r", encoding="utf-8") as handle:
+            with safe_open(manifest_path, "r", encoding="utf-8") as handle:
                 manifest = json.load(handle) or {}
         except Exception:
             return []
@@ -737,7 +752,7 @@ class CommitService(BaseService):
                 "original_filename": item.get("filename"),
                 "stored_path": source_path,
                 "source_path": source_path,
-                "exists": bool(source_path and os.path.exists(source_path)),
+                "exists": bool(source_path and safe_exists(source_path)),
                 "pending": True,
             })
             result.append(row)

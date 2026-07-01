@@ -1,6 +1,5 @@
 import hashlib
 import os
-import shutil
 from typing import List, Optional, Tuple
 
 from core.repositories.bom_repository import BomRepository
@@ -9,6 +8,7 @@ from core.session_manager import SessionManager
 from core.services.project_service import ProjectService
 from core.models.part_file_model import PartFile
 from core.models.part_file_version_model import PartFileVersion
+from utils import ensure_dir_exists, safe_copy2, safe_exists, safe_open, safe_remove
 
 
 class PartFileService:
@@ -31,7 +31,7 @@ class PartFileService:
 
     def _hash_file_sha256(self, path: str) -> str:
         h = hashlib.sha256()
-        with open(path, "rb") as f:
+        with safe_open(path, "rb") as f:
             for chunk in iter(lambda: f.read(1024 * 1024), b""):
                 h.update(chunk)
         return h.hexdigest()
@@ -105,7 +105,7 @@ class PartFileService:
         wd = self._working_dir()
         if not wd:
             raise ValueError("Project working directory is not set")
-        if not source_path or not os.path.exists(source_path):
+        if not source_path or not safe_exists(source_path):
             raise ValueError("Source file does not exist")
 
         created_by = self.session.user_id
@@ -116,9 +116,9 @@ class PartFileService:
         version_no = 1
         rel_path = self._version_dest_relpath(part_id, file_id, version_no, source_path)
         abs_path = os.path.join(wd, rel_path)
-        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        ensure_dir_exists(os.path.dirname(abs_path))
 
-        shutil.copy2(source_path, abs_path)
+        safe_copy2(source_path, abs_path)
         sha256 = self._hash_file_sha256(abs_path)
         size_bytes = os.path.getsize(abs_path)
 
@@ -145,7 +145,7 @@ class PartFileService:
         wd = self._working_dir()
         if not wd:
             raise ValueError("Project working directory is not set")
-        if not source_path or not os.path.exists(source_path):
+        if not source_path or not safe_exists(source_path):
             raise ValueError("Source file does not exist")
 
         created_by = self.session.user_id
@@ -155,9 +155,9 @@ class PartFileService:
 
         rel_path = self._version_dest_relpath(pf.part_id, file_id, version_no, source_path)
         abs_path = os.path.join(wd, rel_path)
-        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        ensure_dir_exists(os.path.dirname(abs_path))
 
-        shutil.copy2(source_path, abs_path)
+        safe_copy2(source_path, abs_path)
         sha256 = self._hash_file_sha256(abs_path)
         size_bytes = os.path.getsize(abs_path)
 
@@ -190,7 +190,7 @@ class PartFileService:
         wd = self._working_dir()
         if not wd:
             raise ValueError("Project working directory is not set")
-        if not source_path or not os.path.exists(source_path):
+        if not source_path or not safe_exists(source_path):
             raise ValueError("Source file does not exist")
 
         created_by = self.session.user_id
@@ -199,9 +199,9 @@ class PartFileService:
 
         rel_path = self._version_dest_relpath(pf.part_id, file_id, version_no, source_path)
         abs_path = os.path.join(wd, rel_path)
-        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        ensure_dir_exists(os.path.dirname(abs_path))
 
-        shutil.copy2(source_path, abs_path)
+        safe_copy2(source_path, abs_path)
         sha256 = self._hash_file_sha256(abs_path)
         size_bytes = os.path.getsize(abs_path)
 
@@ -282,13 +282,13 @@ class PartFileService:
         # If it still doesn't exist, try hard fallback to A (covers cases where the row says 'B'
         # but the physical file was copied/stored only in A's vault).
         try:
-            if p and not os.path.exists(p):
+            if p and not safe_exists(p):
                 root_id = getattr(version, "root_project_id", None)
                 if root_id:
                     wd_a = self._working_dir_for_root_label(root_id, "A")
                     if wd_a:
                         p_a = os.path.join(wd_a, version.vault_rel_path)
-                        if os.path.exists(p_a):
+                        if safe_exists(p_a):
                             return p_a
         except Exception:
             pass
@@ -329,8 +329,8 @@ class PartFileService:
         if ver:
             abs_path = self.resolve_version_path(ver)
             try:
-                if abs_path and os.path.exists(abs_path):
-                    os.remove(abs_path)
+                if abs_path and safe_exists(abs_path):
+                    safe_remove(abs_path)
             except Exception:
                 pass
 
@@ -351,8 +351,8 @@ class PartFileService:
         for v in versions:
             abs_path = self.resolve_version_path(v)
             try:
-                if abs_path and os.path.exists(abs_path):
-                    os.remove(abs_path)
+                if abs_path and safe_exists(abs_path):
+                    safe_remove(abs_path)
             except Exception:
                 pass
 

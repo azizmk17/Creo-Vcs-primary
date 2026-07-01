@@ -37,6 +37,7 @@ from core.services.commit_service import CommitService
 from pages.dialogs.package_parts_dialog import PackagePartsDialog
 from pages.dialogs.addChild_dialog import AddChildDialog
 from pages.pdf_viewer_widget import PdfViewerWidget
+from utils import safe_exists, safe_startfile
 from PyQt5.QtGui import QKeyEvent
 from PyQt5.QtGui import QKeyEvent, QPalette, QColor
 from PyQt5.QtGui import QPainter, QPixmap, QIcon
@@ -3272,14 +3273,14 @@ class BomPage(QWidget):
             return
         path = self.part_file_service.resolve_active_path(file_id)
         resolved = self._resolve_file_path(path)
-        if not resolved or not os.path.exists(resolved):
+        if not resolved or not safe_exists(resolved):
             QMessageBox.warning(self, "Missing File", f"Attachment file not found:\n{resolved}")
             return
         try:
             subprocess.Popen(["explorer", "/select,", resolved])
         except Exception:
             try:
-                os.startfile(os.path.dirname(resolved))
+                safe_startfile(os.path.dirname(resolved))
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to open folder:\n{e}")
 
@@ -3312,7 +3313,7 @@ class BomPage(QWidget):
 
         for p in paths:
             try:
-                if not p or not os.path.exists(p):
+                if not p or not safe_exists(p):
                     raise ValueError("File not found")
 
                 file_type = self._infer_file_type_from_path(p)
@@ -3494,7 +3495,7 @@ class BomPage(QWidget):
             )
             if out_dir:
                 try:
-                    os.startfile(out_dir)
+                    safe_startfile(out_dir)
                 except Exception:
                     pass
         except Exception as e:
@@ -3518,11 +3519,11 @@ class BomPage(QWidget):
         if not resolved:
             QMessageBox.warning(self, "Not Found", f"No {label} file associated with this part.")
             return
-        if not os.path.exists(resolved):
+        if not safe_exists(resolved):
             QMessageBox.warning(self, "Missing File", f"{label} file not found:\n{resolved}")
             return
         try:
-            os.startfile(resolved)  # Windows
+            safe_startfile(resolved)  # Windows
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to open {label} file:\n{e}")
 
@@ -4701,7 +4702,7 @@ class BomPage(QWidget):
 
             created_dt = self._parse_dt(getattr(ver, "created_at", None) or "")
             path = self.part_file_service.resolve_version_path(ver)
-            if not path or not os.path.exists(path):
+            if not path or not safe_exists(path):
                 return {"state": "bad", "tooltip": f"{label}: file missing on disk"}
 
             if doc_type == "STEP" and latest_commit:
@@ -4725,7 +4726,7 @@ class BomPage(QWidget):
         legacy_path = self._legacy_doc_path(int(part_id), doc_type)
         if legacy_path:
             resolved = self._resolve_file_path(legacy_path)
-            if not resolved or not os.path.exists(resolved):
+            if not resolved or not safe_exists(resolved):
                 return {"state": "bad", "tooltip": f"{label}: file missing on disk"}
             if latest_commit:
                 try:
@@ -5569,7 +5570,7 @@ class BomPage(QWidget):
         table.setRowCount(len(docs))
         for r, doc in enumerate(docs):
             path = doc.get("source_path") or doc.get("stored_path") or ""
-            exists = bool(path and os.path.exists(path))
+            exists = bool(path and safe_exists(path))
             values = [
                 doc.get("doc_role") or doc.get("file_role"),
                 doc.get("file_type"),
@@ -5602,11 +5603,11 @@ class BomPage(QWidget):
             return
         item = table.item(row, table.columnCount() - 1)
         path = item.data(Qt.UserRole) if item else ""
-        if not path or not os.path.exists(path):
+        if not path or not safe_exists(path):
             QMessageBox.warning(self, "Open Document", f"File not found:\n{path}")
             return
         try:
-            os.startfile(path)
+            safe_startfile(path)
         except Exception as exc:
             QMessageBox.critical(self, "Open Document", f"Failed to open file:\n{exc}")
 

@@ -23,7 +23,14 @@ from utils import (
     ensure_dir_exists,
     get_version_number,
     get_base_name,
-    get_next_version_number
+    get_next_version_number,
+    safe_copy2,
+    safe_exists,
+    safe_isdir,
+    safe_listdir,
+    safe_open,
+    safe_remove,
+    safe_rmtree,
 )
 class MergeService(BaseService):
     def __init__(self, working_dir, commits_dir, pr_dir):
@@ -57,15 +64,88 @@ class MergeService(BaseService):
         cleaned = "".join(ch if ch.isalnum() or ch in "._- ()" else "_" for ch in os.path.basename(name or ""))
         return cleaned or f"validation_{uuid.uuid4().hex[:8]}"
 
+    def _drawing_index_for_part(self, part) -> str:
+        for field_name in (
+            "drawing_index",
+            "draw_index",
+            "drawing_indice",
+            "indice",
+            "index",
+        ):
+            value = str(getattr(part, field_name, "") or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _legacy_engineering_filename(
+        self,
+        part_id: int,
+        file_role: str,
+        file_type: str,
+        source_path: str,
+        drawing_revision: str = "",
+    ) -> str:
+        part = self.bom_repo.get_by_id(int(part_id))
+        ext = os.path.splitext(source_path or "")[1].lower()
+        if not ext:
+            ext = ".pdf" if file_role == "exported_pdf" else ".step" if file_role == "exported_step" else ""
+
+        drawing_number = str(getattr(part, "drawing_number", "") or "").strip()
+        if not drawing_number:
+            drawing_number = str(getattr(part, "base_drw_name", "") or getattr(part, "base_file_name", "") or f"part_{part_id}").strip()
+        index = self._drawing_index_for_part(part)
+        aes = str(getattr(part, "aes_number", "") or "").strip()
+        part_name = str(getattr(part, "name", "") or "").strip()
+
+        parts = [drawing_number, index, aes, part_name]
+        if file_role == "exported_pdf":
+            rev = str(drawing_revision or "").strip()
+            if rev:
+                parts.append(rev)
+
+        stem = "_".join(
+            self._safe_filename(piece).strip("._- ")
+            for piece in parts
+            if str(piece or "").strip()
+        )
+        if not stem:
+            stem = self._safe_filename(os.path.splitext(os.path.basename(source_path or ""))[0] or f"part_{part_id}")
+        return f"{stem}{ext}"
+
+    def _copy_with_legacy_engineering_name(
+        self,
+        commit_dir: str,
+        source_path: str,
+        part_id: int,
+        file_role: str,
+        file_type: str,
+        drawing_revision: str = "",
+    ) -> str:
+        legacy_name = self._legacy_engineering_filename(
+            part_id=part_id,
+            file_role=file_role,
+            file_type=file_type,
+            source_path=source_path,
+            drawing_revision=drawing_revision,
+        )
+        target_dir = os.path.join(commit_dir, "_engineering_attachments", "_legacy_names")
+        ensure_dir_exists(target_dir)
+        target = os.path.join(target_dir, legacy_name)
+        if safe_exists(target):
+            stem, ext = os.path.splitext(legacy_name)
+            target = os.path.join(target_dir, f"{stem}_{uuid.uuid4().hex[:8]}{ext}")
+        safe_copy2(source_path, target)
+        return target
+
     def _store_validation_doc(self, source_path: str, commit_id: str, filename: str) -> str:
         root = os.path.join(self.working_dir, ".creo_vcs", "validation_docs", str(commit_id))
         ensure_dir_exists(root)
         safe_name = self._safe_filename(filename or source_path)
         destination = os.path.join(root, safe_name)
-        if os.path.exists(destination):
+        if safe_exists(destination):
             stem, ext = os.path.splitext(safe_name)
             destination = os.path.join(root, f"{stem}_{uuid.uuid4().hex[:8]}{ext}")
-        shutil.copy2(source_path, destination)
+        safe_copy2(source_path, destination)
         return destination
 
     def _process_commit_attachments(self, commit_dir: str, commit_id: str, project_id: int | None) -> list[int]:
@@ -73,10 +153,10 @@ class MergeService(BaseService):
             return []
         attachment_dir = os.path.join(commit_dir, "_engineering_attachments")
         manifest_path = os.path.join(attachment_dir, "manifest.json")
-        if not os.path.exists(manifest_path):
+        if not safe_exists(manifest_path):
             return []
 
-        with open(manifest_path, "r", encoding="utf-8") as handle:
+        with safe_open(manifest_path, "r", encoding="utf-8") as handle:
             manifest = json.load(handle) or {}
 
         changed_part_ids = []
@@ -84,7 +164,7 @@ class MergeService(BaseService):
         for item in manifest.get("attachments") or []:
             part_id = int(item.get("part_id") or 0)
             source_path = os.path.join(commit_dir, item.get("stored_rel_path") or "")
-            if not part_id or not os.path.exists(source_path):
+            if not part_id or not safe_exists(source_path):
                 raise ValueError(
                     f"Cannot vault engineering attachment; file is missing: {os.path.basename(source_path)}"
                 )
@@ -95,13 +175,21 @@ class MergeService(BaseService):
                 else "validation_doc"
             )
             if file_role in {"exported_pdf", "exported_step"}:
+                vault_source_path = self._copy_with_legacy_engineering_name(
+                    commit_dir=commit_dir,
+                    source_path=source_path,
+                    part_id=part_id,
+                    file_role=file_role,
+                    file_type=file_type,
+                    drawing_revision=item.get("revision") or "",
+                )
                 file_id, version_id = self.part_file_service.upsert_part_file_version(
                     part_id=part_id,
                     file_type=file_type,
-                    source_path=source_path,
+                    source_path=vault_source_path,
                     note=item.get("note") or "",
                     revision=item.get("revision") or "",
-                    display_name=item.get("display_name") or f"{file_type} attachment",
+                    display_name=os.path.splitext(os.path.basename(vault_source_path))[0],
                     description=item.get("description") or "Attached during commit push",
                 )
                 self.traceability_service.link_commit_to_engineering_file(
@@ -146,16 +234,16 @@ class MergeService(BaseService):
             changed_part_ids.append(part_id)
 
         try:
-            shutil.rmtree(attachment_dir)
+            safe_rmtree(attachment_dir)
         except Exception as exc:
             print(f"Warning: Failed to remove temporary engineering attachments {attachment_dir}: {exc}")
 
         try:
-            if os.path.isdir(commit_dir) and not os.listdir(commit_dir):
-                shutil.rmtree(commit_dir)
+            if safe_isdir(commit_dir) and not safe_listdir(commit_dir):
+                safe_rmtree(commit_dir)
                 user_dir = os.path.dirname(commit_dir)
-                if os.path.isdir(user_dir) and not os.listdir(user_dir):
-                    shutil.rmtree(user_dir)
+                if safe_isdir(user_dir) and not safe_listdir(user_dir):
+                    safe_rmtree(user_dir)
         except Exception as exc:
             print(f"Warning: Failed to remove empty commit attachment directory {commit_dir}: {exc}")
 
@@ -163,7 +251,7 @@ class MergeService(BaseService):
 
     def get_last_approved_version(self, base_name):
         max_version = 0
-        for f in os.listdir(self.working_dir):
+        for f in safe_listdir(self.working_dir):
             if f.startswith(base_name + '.') and is_creo_file(f):
                 version = get_version_number(f)
                 if version > max_version:
@@ -192,7 +280,7 @@ class MergeService(BaseService):
         print(f"Processing commit file: {commit_path}")
         print(f"Base name: {base_name}, Commit version: {commit_version}, New version: {new_version}")
 
-        if not os.path.exists(commit_path):
+        if not safe_exists(commit_path):
             print(f"Commit file does not exist: {commit_path}")
             return None
         
@@ -200,9 +288,9 @@ class MergeService(BaseService):
 
         try:
             working_path = os.path.join(self.working_dir, new_filename)
-            shutil.copy2(commit_path, working_path)
+            safe_copy2(commit_path, working_path)
             pr_path = os.path.join(pr_dir, new_filename)
-            shutil.copy2(commit_path, pr_path)
+            safe_copy2(commit_path, pr_path)
 
             #debugging info
             print(f"Merged {filename} to working as {new_filename}")
@@ -212,25 +300,25 @@ class MergeService(BaseService):
             print(f"To PR: {pr_path}")
 
             try:
-                os.remove(commit_path)
+                safe_remove(commit_path)
 
             except Exception as e:
                 print(f"Warning: Failed to remove commit file {commit_path}: {e}")
 
             commit_dir = os.path.dirname(commit_path)
-            if os.path.exists(commit_dir) and not os.listdir(commit_dir):
+            if safe_exists(commit_dir) and not safe_listdir(commit_dir):
                 try:
                     print(f"Removing empty commit directory {commit_dir}")
-                    shutil.rmtree(commit_dir)
+                    safe_rmtree(commit_dir)
 
                 except Exception as e:
                     print(f"Warning: Failed to remove empty commit directory {commit_dir}: {e}")
             
             user_dir = os.path.dirname(commit_dir)
-            if os.path.exists(user_dir) and not os.listdir(user_dir):
+            if safe_exists(user_dir) and not safe_listdir(user_dir):
                 try:
                     print(f"Removing empty user directory {user_dir}")
-                    shutil.rmtree(user_dir)
+                    safe_rmtree(user_dir)
 
                 except Exception as e:
                     print(f"Warning: Failed to remove empty user directory {user_dir}: {e}")
@@ -458,7 +546,7 @@ class MergeService(BaseService):
     def _previous_working_filename(self, base_name: str, approved_version: int) -> str | None:
         previous_version = None
         try:
-            names = os.listdir(self.working_dir)
+            names = safe_listdir(self.working_dir)
         except OSError:
             names = []
         for name in names:
@@ -503,14 +591,14 @@ class MergeService(BaseService):
 
             approved_filename = f"{base_name}.{approved_version}"
             approved_path = os.path.join(self.working_dir, approved_filename)
-            if not os.path.exists(approved_path):
+            if not safe_exists(approved_path):
                 raise ValueError(f"Cannot restore {filename}: approved file is missing:\n{approved_path}")
 
             previous_filename = self._previous_working_filename(base_name, approved_version)
             if not previous_filename:
                 raise ValueError(f"Cannot restore {filename}: no previous working version was found.")
             previous_path = os.path.join(self.working_dir, previous_filename)
-            if not os.path.exists(previous_path):
+            if not safe_exists(previous_path):
                 raise ValueError(f"Cannot restore {filename}: previous file is missing:\n{previous_path}")
 
             part_id = row.get("part_id")
@@ -609,7 +697,7 @@ class MergeService(BaseService):
                     pass
             for archived_path, original_path in reversed(moved_files):
                 try:
-                    if os.path.exists(archived_path) and not os.path.exists(original_path):
+                    if safe_exists(archived_path) and not safe_exists(original_path):
                         shutil.move(archived_path, original_path)
                 except Exception:
                     pass
