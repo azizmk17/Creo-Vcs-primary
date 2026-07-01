@@ -4216,6 +4216,22 @@ class BomPage(QWidget):
             return {}
         for item in self._find_tree_items(int(part_id)):
             self._apply_tree_item_data(item, info)
+        try:
+            if getattr(self, "_in_search_mode", False) and self._part_matches_current_search(info):
+                if not self._find_tree_items(int(part_id), self._search_tree):
+                    self._add_node_to_tree(self._search_tree, dict(info, children=[]))
+        except Exception:
+            pass
+        try:
+            if not self._is_default_bom_advanced_filter():
+                self.apply_bom_tree_filter(self._bom_advanced_filters)
+        except Exception:
+            pass
+        for tree in (getattr(self, "tree", None), getattr(self, "_search_tree", None)):
+            try:
+                tree.viewport().update()
+            except Exception:
+                pass
         return info
 
     def refresh_parts_after_merge(self, part_ids) -> None:
@@ -4409,26 +4425,16 @@ class BomPage(QWidget):
                 QMessageBox.critical(self, "Error", f"Failed to delete part: {str(e)}")
 
     def _refresh_current_tree_item_lock_state(self, part_id: int | None = None):
-        """Fast refresh of just the selected tree item's lock state (inline 'In Work' beside name).
-
-        Updates BOM_TREE_INWORK_ROLE on column 0 based on latest DB state.
-        """
+        """Refresh the selected part row in every visible BOM tree representation."""
         try:
-            item = self.tree.currentItem()
-            if not item:
-                return
-            pid = part_id or item.data(0, Qt.UserRole)
+            pid = part_id or getattr(self, "current_part_id", None)
+            if not pid:
+                current_tree = self._current_tree_for_filtering()
+                item = current_tree.currentItem() if current_tree else None
+                pid = item.data(0, Qt.UserRole) if item else None
             if not pid:
                 return
-
-            info = self.bom_service.get_part_details(int(pid)) or {}
-            locked = bool(info.get("locked"))
-            who = str(info.get("locked_by_username") or "").strip()
-            if locked:
-                item.setData(0, BOM_TREE_INWORK_ROLE, f"In Work ({who})" if who else "In Work")
-            else:
-                item.setData(0, BOM_TREE_INWORK_ROLE, "")
-            item.setText(1, "")
+            self._refresh_part_in_tree(int(pid))
         except Exception:
             pass
 
@@ -5856,12 +5862,13 @@ class BomPage(QWidget):
         return icon
 
     def _refresh_current_tree_item_indicator(self):
-        """Fast refresh of just the selected tree item's PDF/STEP indicator."""
+        """Refresh the selected row's PDF/STEP indicator in all visible trees."""
         try:
-            item = self.tree.currentItem()
-            if not item:
-                return
-            part_id = item.data(0, Qt.UserRole)
+            part_id = getattr(self, "current_part_id", None)
+            if not part_id:
+                current_tree = self._current_tree_for_filtering()
+                item = current_tree.currentItem() if current_tree else None
+                part_id = item.data(0, Qt.UserRole) if item else None
             if not part_id:
                 return
 
