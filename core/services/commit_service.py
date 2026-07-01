@@ -370,6 +370,22 @@ class CommitService(BaseService):
                 "part_id": part_id,
             })
 
+        delayed_attachments = self._normalize_engineering_attachments(engineering_attachments)
+        step_attachment_by_part = {}
+        if bool(step_compare_enabled):
+            for attachment in delayed_attachments:
+                file_type = str(attachment.get("file_type") or "").strip().upper()
+                role = str(attachment.get("file_role") or "").strip()
+                if file_type != "STEP" and role != "exported_step":
+                    continue
+                part_id = int(attachment.get("part_id") or 0)
+                if part_id in step_attachment_by_part:
+                    raise ValueError(
+                        "Commit blocked: multiple STEP files are attached to the same BOM item. "
+                        "Keep one STEP per affected item before running comparison."
+                    )
+                step_attachment_by_part[part_id] = attachment
+
         inserted_any = False
         try:
             ensure_dir_exists(commit_user_dir)
@@ -390,7 +406,10 @@ class CommitService(BaseService):
                     "step_error": None,
                     "step_face_map_path": None,
                 }
-                if bool(step_compare_enabled) and item["part_type"] == "Cad" and step_file_path:
+                step_source_path = step_file_path
+                if bool(step_compare_enabled) and item["part_type"] == "Cad":
+                    step_source_path = (step_attachment_by_part.get(int(item["part_id"])) or {}).get("source_path")
+                if bool(step_compare_enabled) and item["part_type"] == "Cad" and step_source_path:
                     try:
                         previous_step_commit = self.commit_repository.get_latest_step_commit_for_base_name_family(
                             str(item["base_f_name"]),
@@ -403,7 +422,7 @@ class CommitService(BaseService):
                             commit_dir=commit_dir,
                             part_id=int(item["part_id"]),
                             commit_id=str(commit_id),
-                            current_step_source_path=step_file_path,
+                            current_step_source_path=step_source_path,
                             current_commit_label=str(commit_id),
                             previous_commit_hint=previous_commit_hint,
                             previous_step_path=previous_step_path,
@@ -421,7 +440,22 @@ class CommitService(BaseService):
                         raise ValueError(f"STEP compare failed for {item['filename']}: {str(e)}")
                 item["step_meta"] = step_meta
 
-            delayed_attachments = self._normalize_engineering_attachments(engineering_attachments)
+            compared_step_part_ids = {
+                int(item["part_id"])
+                for item in commit_plan
+                if (item.get("step_meta") or {}).get("step_compare_enabled")
+            }
+            if compared_step_part_ids:
+                delayed_attachments = [
+                    attachment for attachment in delayed_attachments
+                    if not (
+                        int(attachment.get("part_id") or 0) in compared_step_part_ids
+                        and (
+                            str(attachment.get("file_type") or "").strip().upper() == "STEP"
+                            or str(attachment.get("file_role") or "").strip() == "exported_step"
+                        )
+                    )
+                ]
             for item in commit_plan:
                 step_meta = item.get("step_meta") or {}
                 step_path = step_meta.get("step_file_path")

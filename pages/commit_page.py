@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import (
     Qt, QPropertyAnimation, QEasingCurve, pyqtProperty, pyqtSignal, QTimer, QSize, QRect,
-    QObject, QThread,
+    QObject, QThread, QEvent,
 )
 from PyQt5.QtGui import (
     QColor, QPainter, QPen, QFont, QCursor, QBrush, QTransform,
@@ -896,18 +896,23 @@ class CommitPage(QWidget):
         # ── Main splitter (top: staging + pending | bottom: history) ─
         main_splitter = QSplitter(Qt.Vertical)
         main_splitter.setHandleWidth(3)
-
+        main_splitter.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
+        self.main_splitter = main_splitter
         # ── TOP AREA ─────────────────────────────────────────────────
         top_widget = QWidget()
+        self.commit_sections_widget = top_widget
+        top_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
         top_layout = QHBoxLayout(top_widget)
         top_layout.setContentsMargins(0, 0, 0, 0)
         top_layout.setSpacing(8)
 
         # ── Left: staging + metadata ─────────────────────────────────
         left_splitter = QSplitter(Qt.Vertical)
+        left_splitter.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
 
         # Staging area
         staging_group = QGroupBox("📂 Staging Area")
+        staging_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
         staging_group.setStyleSheet("""
             QGroupBox {
                 font-weight: bold; border: 1px solid #d1d5db;
@@ -964,6 +969,15 @@ class CommitPage(QWidget):
         self.attach_affected_btn.setEnabled(False)
         file_btns.addWidget(self.attach_affected_btn)
 
+        self.step_compare_checkbox = QCheckBox("Compare attached STEP")
+        self.step_compare_checkbox.setChecked(False)
+        self.step_compare_checkbox.setEnabled(False)
+        self.step_compare_checkbox.setToolTip(
+            "Run STEP comparison using the STEP file attached to each affected BOM item."
+        )
+        self.attached_step_compare_checkbox = self.step_compare_checkbox
+        file_btns.addWidget(self.step_compare_checkbox)
+
         file_btns.addStretch()
         self._staged_count_lbl = QLabel("0 files staged")
         self._staged_count_lbl.setStyleSheet("font-size: 10px; color: #6b7280;")
@@ -974,6 +988,7 @@ class CommitPage(QWidget):
 
         # Commit metadata
         meta_group = QGroupBox("📝 Commit Details")
+        meta_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
         meta_group.setStyleSheet("""
             QGroupBox {
                 font-weight: bold; border: 1px solid #d1d5db;
@@ -1025,33 +1040,6 @@ class CommitPage(QWidget):
         """)
         meta_lay.addRow("Message:", self.commit_message)
 
-        # STEP compare row
-        step_frame = QFrame()
-        step_frame.setStyleSheet("QFrame { background: transparent; border: none; }")
-        step_lay = QVBoxLayout(step_frame)
-        step_lay.setContentsMargins(0, 0, 0, 0)
-        step_lay.setSpacing(4)
-
-        self.step_compare_checkbox = QCheckBox("🧊 Process STEP comparison for this commit")
-        self.step_compare_checkbox.setChecked(False)
-        self.step_compare_checkbox.toggled.connect(self._toggle_step_controls)
-        step_lay.addWidget(self.step_compare_checkbox)
-
-        step_file_row = QHBoxLayout()
-        self.step_file_input = QLineEdit()
-        self.step_file_input.setPlaceholderText("Select STEP file (*.step, *.stp)…")
-        self.step_file_input.setEnabled(False)
-        self.step_browse_btn = QPushButton("Browse")
-        self.step_browse_btn.setObjectName("neutral")
-        self.step_browse_btn.setEnabled(False)
-        self.step_browse_btn.setFixedWidth(70)
-        self.step_browse_btn.clicked.connect(self._browse_step_file)
-        step_file_row.addWidget(self.step_file_input, 1)
-        step_file_row.addWidget(self.step_browse_btn)
-        step_lay.addLayout(step_file_row)
-
-        meta_lay.addRow("STEP:", step_frame)
-
         self.resolved_issues_list = QListWidget()
         self.resolved_issues_list.setMaximumHeight(115)
         self.resolved_issues_list.setAlternatingRowColors(True)
@@ -1083,6 +1071,7 @@ class CommitPage(QWidget):
 
         # ── Right: pending commits ───────────────────────────────────
         pending_group = QGroupBox("⏳ Pending Commits")
+        pending_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
         pending_group.setStyleSheet("""
             QGroupBox {
                 font-weight: bold; border: 1px solid #d1d5db;
@@ -1163,22 +1152,51 @@ class CommitPage(QWidget):
 
         # ── BOTTOM AREA: History ─────────────────────────────────────
         history_group = QGroupBox("📋 Commit History")
+        self.history_group = history_group
+        history_group.setParent(self)
+        history_group.setTitle("")
+        history_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
         history_group.setStyleSheet("""
             QGroupBox {
-                font-weight: bold; border: 1px solid #d1d5db;
-                border-radius: 8px; margin-top: 8px; padding-top: 14px;
+                font-weight: bold; border: 1px solid #111827;
+                border-radius: 8px; margin-top: 0; padding-top: 0;
                 background: #fafbfc;
             }
             QGroupBox::title {
                 subcontrol-origin: margin; left: 12px; padding: 0 6px;
-                color: #374151;
+                color: transparent;
             }
         """)
         history_lay = QVBoxLayout(history_group)
+        history_lay.setContentsMargins(0, 0, 0, 8)
         history_lay.setSpacing(6)
 
+        self.history_header_btn = QPushButton("▲  Commit History")
+        self.history_header_btn.setCursor(Qt.PointingHandCursor)
+        self.history_header_btn.setToolTip("Click to expand/collapse. Drag up or down to resize when expanded.")
+        self.history_header_btn.setFixedHeight(38)
+        self.history_header_btn.setStyleSheet("""
+            QPushButton {
+                background: #111827; color: #ffffff; border: none;
+                border-top-left-radius: 7px; border-top-right-radius: 7px;
+                padding: 0 14px; text-align: left; font-size: 12px; font-weight: 700;
+            }
+            QPushButton:hover { background: #1f2937; }
+        """)
+        self.history_header_btn.clicked.connect(
+            lambda: self._collapse_history_section()
+            if getattr(self, "_history_expanded", False)
+            else self._expand_history_section()
+        )
+        history_lay.addWidget(self.history_header_btn)
+
         # Filter row
-        filter_row = QHBoxLayout()
+        self.history_filter_frame = QFrame()
+        self.history_filter_frame.setFixedHeight(36)
+        self.history_filter_frame.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.history_filter_frame.setStyleSheet("QFrame { background: transparent; border: none; }")
+        filter_row = QHBoxLayout(self.history_filter_frame)
+        filter_row.setContentsMargins(8, 0, 8, 0)
         filter_row.setSpacing(6)
 
         self.history_search = QLineEdit()
@@ -1220,21 +1238,30 @@ class CommitPage(QWidget):
         self._hist_count_lbl.setStyleSheet("font-size: 10px; color: #9ca3af;")
         filter_row.addWidget(self._hist_count_lbl)
 
-        history_lay.addLayout(filter_row)
+        history_lay.addWidget(self.history_filter_frame)
 
         # Table
         self.history_table = _HistoryTable()
+        self.history_table.setMinimumHeight(0)
+        self.history_table.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
         self.history_table.itemDoubleClicked.connect(self._on_history_double_click)
         self.history_table.restore_requested.connect(self._restore_commit_group_from_history)
         self.history_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.history_table.customContextMenuRequested.connect(self._show_history_context_menu)
-        history_lay.addWidget(self.history_table)
+        history_lay.addWidget(self.history_table, 1)
 
-        main_splitter.addWidget(history_group)
         main_splitter.setStretchFactor(0, 3)
-        main_splitter.setStretchFactor(1, 2)
 
         root.addWidget(main_splitter, 1)
+        self._history_content_widgets = [
+            self.history_filter_frame,
+            self.history_table,
+        ]
+        self._history_expanded = True
+        self._history_overlay_height = None
+        self._history_resize_drag = None
+        self._set_history_expanded(False)
+        QApplication.instance().installEventFilter(self)
 
         # ── Search debounce ──────────────────────────────────────────
         self._history_search_timer = QTimer(self)
@@ -1258,28 +1285,114 @@ class CommitPage(QWidget):
     #  HELPERS
     # ═══════════════════════════════════════════════════════════════════
 
+    def eventFilter(self, obj, event):
+        if obj is getattr(self, "history_header_btn", None):
+            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self._history_resize_drag = {
+                    "start_y": event.globalPos().y(),
+                    "start_h": getattr(self, "history_group", self).height(),
+                    "moved": False,
+                }
+            elif event.type() == QEvent.MouseMove and getattr(self, "_history_resize_drag", None):
+                if getattr(self, "_history_expanded", False):
+                    drag = self._history_resize_drag
+                    delta = drag["start_y"] - event.globalPos().y()
+                    if abs(delta) > 3:
+                        drag["moved"] = True
+                    self._history_overlay_height = self._clamp_history_overlay_height(
+                        int(drag["start_h"] + delta)
+                    )
+                    self._position_history_overlay()
+                    return True
+            elif event.type() == QEvent.MouseButtonRelease and getattr(self, "_history_resize_drag", None):
+                moved = bool(self._history_resize_drag.get("moved"))
+                self._history_resize_drag = None
+                if moved:
+                    return True
+
+        if event.type() == QEvent.MouseButtonPress:
+            try:
+                history_group = getattr(self, "history_group", None)
+                commit_sections = getattr(self, "commit_sections_widget", None)
+                if isinstance(obj, QWidget) and history_group and (
+                    obj is history_group or history_group.isAncestorOf(obj)
+                ):
+                    if not getattr(self, "_history_expanded", False):
+                        QTimer.singleShot(0, self._expand_history_section)
+                elif (
+                    getattr(self, "_history_expanded", False)
+                    and isinstance(obj, QWidget)
+                    and commit_sections
+                    and (obj is commit_sections or commit_sections.isAncestorOf(obj))
+                ):
+                    QTimer.singleShot(0, self._collapse_history_section)
+            except Exception:
+                pass
+        return super().eventFilter(obj, event)
+
+    def _set_history_expanded(self, expanded: bool):
+        self._history_expanded = bool(expanded)
+        history_group = getattr(self, "history_group", None)
+        if not history_group:
+            return
+        if hasattr(self, "history_header_btn"):
+            self.history_header_btn.setText("▼  Commit History" if expanded else "▲  Commit History")
+        for widget in getattr(self, "_history_content_widgets", []):
+            widget.setVisible(bool(expanded))
+        self._position_history_overlay()
+        history_group.show()
+        history_group.raise_()
+
+    def _position_history_overlay(self):
+        history_group = getattr(self, "history_group", None)
+        if not history_group:
+            return
+        margin = 8
+        header_h = 48
+        available_h = max(header_h, self.height() - (margin * 2))
+        if getattr(self, "_history_expanded", False):
+            default_h = max(220, int(available_h * 0.34))
+            panel_h = self._clamp_history_overlay_height(
+                getattr(self, "_history_overlay_height", None) or default_h
+            )
+            self._history_overlay_height = panel_h
+        else:
+            panel_h = header_h
+        history_group.setMinimumHeight(0)
+        history_group.setMaximumHeight(panel_h)
+        history_group.setGeometry(
+            margin,
+            max(margin, self.height() - panel_h - margin),
+            max(120, self.width() - (margin * 2)),
+            panel_h,
+        )
+        history_group.raise_()
+
+    def _clamp_history_overlay_height(self, requested_height: int) -> int:
+        margin = 8
+        header_h = 48
+        available_h = max(header_h, self.height() - (margin * 2))
+        max_h = max(header_h, available_h - 70)
+        min_h = min(max_h, 170)
+        return max(min_h, min(int(requested_height), max_h))
+
+    def _expand_history_section(self):
+        if not getattr(self, "_history_expanded", False):
+            self._set_history_expanded(True)
+
+    def _collapse_history_section(self):
+        if getattr(self, "_history_expanded", False):
+            self._set_history_expanded(False)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         try:
+            self._position_history_overlay()
             self.processing_overlay.setGeometry(self.rect())
             if self.processing_overlay.isVisible():
                 self.processing_overlay.raise_()
         except Exception:
             pass
-
-    def _toggle_step_controls(self, enabled):
-        self.step_file_input.setEnabled(bool(enabled))
-        self.step_browse_btn.setEnabled(bool(enabled))
-        if not enabled:
-            self.step_file_input.clear()
-
-    def _browse_step_file(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select STEP file", "",
-            "STEP Files (*.step *.stp);;All Files (*.*)",
-        )
-        if path:
-            self.step_file_input.setText(path)
 
     def _clear_staging(self):
         self.uncommitted_parts.clear()
@@ -1372,7 +1485,12 @@ class CommitPage(QWidget):
                 pending.pop(part_id, None)
         count = len(items)
         pending_count = sum(len(v or []) for v in getattr(self, "_pending_engineering_attachments", {}).values())
-        self.attach_affected_btn.setEnabled(count > 0 and not getattr(self, "_processing_action", False))
+        enabled = count > 0 and not getattr(self, "_processing_action", False)
+        self.attach_affected_btn.setEnabled(enabled)
+        if hasattr(self, "attached_step_compare_checkbox"):
+            self.attached_step_compare_checkbox.setEnabled(enabled)
+            if not enabled:
+                self.attached_step_compare_checkbox.setChecked(False)
         if count and pending_count:
             text = f"Attach docs to affected BOM ({count}, {pending_count} staged)..."
         elif count:
@@ -2538,12 +2656,6 @@ class CommitPage(QWidget):
         self.changes_list.addItem(display)
         self._update_staged_count()
 
-        # Auto-detect STEP: if user drops a .step/.stp, offer to enable STEP compare
-        fn_lower = (part_dict.get("filename") or "").lower()
-        if (".step" in fn_lower or ".stp" in fn_lower) and not self.step_compare_checkbox.isChecked():
-            self.step_compare_checkbox.setChecked(True)
-            self.step_file_input.setText(part_dict["path"])
-
     # ═══════════════════════════════════════════════════════════════════
     #  COMMIT ACTION
     # ═══════════════════════════════════════════════════════════════════
@@ -2679,7 +2791,7 @@ class CommitPage(QWidget):
         message = self.commit_message.content()
         designer = self.designed_by.currentText()
         step_compare_enabled = bool(self.step_compare_checkbox.isChecked())
-        step_file_path = (self.step_file_input.text() or "").strip()
+        step_file_path = None
         issue_relation = self.issue_relation_combo.currentText() if hasattr(self, "issue_relation_combo") else "solves"
         jira_key = self.commit_jira_key.text().strip() if hasattr(self, "commit_jira_key") else ""
         jira_url = self.commit_jira_url.text().strip() if hasattr(self, "commit_jira_url") else ""
@@ -2698,11 +2810,6 @@ class CommitPage(QWidget):
         if not self.uncommitted_parts:
             QMessageBox.warning(self, "Validation", "No files staged for commit.")
             return
-        if step_compare_enabled and not step_file_path:
-            QMessageBox.warning(self, "Validation",
-                "Select a STEP file or uncheck STEP compare.")
-            return
-
         uncommitted_filenames = [p['path'] for p in self.uncommitted_parts]
         resolved_issue_ids = [
             int(self.resolved_issues_list.item(i).data(Qt.UserRole))
@@ -2755,7 +2862,6 @@ class CommitPage(QWidget):
                     self.commit_title.clear()
                     self.commit_message.clear()
                     self.step_compare_checkbox.setChecked(False)
-                    self.step_file_input.clear()
                     self.commit_jira_key.clear()
                     self.commit_jira_url.clear()
                     self.uncommitted_parts.clear()
