@@ -411,8 +411,8 @@ class CommitService(BaseService):
                     step_source_path = (step_attachment_by_part.get(int(item["part_id"])) or {}).get("source_path")
                 if bool(step_compare_enabled) and item["part_type"] == "Cad" and step_source_path:
                     try:
-                        previous_step_commit = self.commit_repository.get_latest_step_commit_for_base_name_family(
-                            str(item["base_f_name"]),
+                        previous_step_commit = self.commit_repository.get_latest_step_commit_for_part(
+                            int(item["part_id"]),
                             int(self.session.project_id),
                             exclude_commit_id=str(commit_id),
                         )
