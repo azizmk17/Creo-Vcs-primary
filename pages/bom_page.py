@@ -2972,13 +2972,16 @@ class BomPage(QWidget):
 
         # Auto-preview the active version if it is a PDF
         self._try_pdf_preview_for_active(file_id)
-        self._load_related_issues_for_file(file_id)
+        self._load_related_issues_for_file(file_id, self._selected_version_id())
 
-    def _load_related_issues_for_file(self, file_id):
+    def _load_related_issues_for_file(self, file_id, version_id=None):
         if not hasattr(self, "file_related_issues_table"):
             return
         try:
-            issues = self.traceability_service.issues_for_engineering_file(int(file_id))
+            issues = self.traceability_service.issues_for_engineering_file(
+                int(file_id),
+                int(version_id) if version_id else None,
+            )
         except Exception:
             issues = []
         self.file_related_issues_table.setRowCount(len(issues))
@@ -3021,9 +3024,12 @@ class BomPage(QWidget):
 
     def _on_version_selection_changed(self):
         """When a specific version row is selected, preview it if it is a PDF."""
+        file_id = self._selected_attachment_id()
+        version_id = self._selected_version_id()
+        if file_id:
+            self._load_related_issues_for_file(file_id, version_id)
         if not hasattr(self, "pdf_viewer"):
             return
-        version_id = self._selected_version_id()
         if not version_id:
             return
         try:
@@ -3185,7 +3191,7 @@ class BomPage(QWidget):
                 role,
                 note or "",
             )
-            self._load_related_issues_for_file(file_id)
+            self._load_related_issues_for_file(file_id, version_id)
             self._refresh_linked_issue_traceability(int(issue["id"]))
             QMessageBox.information(self, "Linked", "Engineering file linked to issue.")
         except Exception as e:

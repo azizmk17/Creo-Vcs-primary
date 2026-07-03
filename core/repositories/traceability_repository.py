@@ -632,17 +632,22 @@ class TraceabilityRepository:
                 (int(issue_id),),
             ).fetchall()]
 
-    def issues_for_engineering_file(self, part_file_id: int) -> list[dict]:
+    def issues_for_engineering_file(self, part_file_id: int, version_id: Optional[int] = None) -> list[dict]:
+        where = ["l.part_file_id=?"]
+        params = [int(part_file_id)]
+        if version_id is not None:
+            where.append("l.part_file_version_id=?")
+            params.append(int(version_id))
         with self.get_conn() as conn:
             return [dict(r) for r in conn.execute(
-                """
+                f"""
                 SELECT i.*, l.file_role, l.part_file_version_id, l.note, l.linked_at
                 FROM issue_file_links l
                 JOIN issues i ON i.id=l.issue_id
-                WHERE l.part_file_id=?
+                WHERE {" AND ".join(where)}
                 ORDER BY i.status <> 'Closed' DESC, i.updated_at DESC
                 """,
-                (int(part_file_id),),
+                tuple(params),
             ).fetchall()]
 
     def commit_links_for_issue(self, issue_id: int) -> list[dict]:

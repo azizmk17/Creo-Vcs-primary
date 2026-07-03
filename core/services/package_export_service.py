@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from core.repositories.bom_children_repository import BomChildrenRepository
 from core.repositories.bom_repository import BomRepository
+from core.services.export_naming import exported_document_filename, safe_filename
 from core.services.part_file_service import PartFileService
 
 
@@ -44,7 +45,7 @@ class PackageExportService:
         return order
 
     def _safe_filename(self, s: str) -> str:
-        return "".join(ch if ch.isalnum() or ch in "._- ()" else "_" for ch in (s or ""))
+        return safe_filename(s)
 
     def export_package(
         self,
@@ -137,6 +138,7 @@ class PackageExportService:
                             "active_version_note": getattr(active_ver, "note", None),
                             "active_version_revision": getattr(active_ver, "revision", None),
                             "active_original_filename": getattr(active_ver, "original_filename", None),
+                            "project_version_label": getattr(active_ver, "project_version_label", None),
                         }
                 return None, None
 
@@ -146,29 +148,16 @@ class PackageExportService:
             row = {**part_info, "pdf": None, "step": None}
 
             if pdf_path and os.path.exists(pdf_path):
-                # Build dst name: drawingNumber - aesNumber - name - revision - YYYYMMDD
-                drawing_no = getattr(part, "drawing_number", None) or ""
-                aes = part_info.get("aes_number") or ""
-                pname = part_info.get("name") or ""
-                # normalize name and revision to underscores between words
-                def _norm(s: Optional[str]) -> str:
-                    if s is None:
-                        return ""
-                    return "_".join(str(s).split())
-
-                name_us = _norm(pname)
-                revision_us = _norm((pdf_meta or {}).get("active_version_revision") or getattr(part, "revision", None) or "")
-                date_str = datetime.now().strftime("%Y%m%d")
-
-                parts = [drawing_no, aes, name_us]
-                if revision_us:
-                    parts.append(revision_us)
-                parts.append(date_str)
-
-                # sanitize each part and join
-                safe_parts = [self._safe_filename(p) for p in parts if p and str(p).strip()]
-                ext = os.path.splitext(os.path.basename(pdf_path))[1] or ".pdf"
-                dst_name = "-".join(safe_parts) + ext
+                active_revision = (pdf_meta or {}).get("active_version_revision") or getattr(part, "revision", None) or ""
+                project_version_label = (pdf_meta or {}).get("project_version_label") or ""
+                dst_name = exported_document_filename(
+                    part=part,
+                    file_type="PDF",
+                    source_path=pdf_path,
+                    revision=active_revision,
+                    project_version_label=project_version_label,
+                    include_date=True,
+                )
                 dst_path = os.path.join(pdf_dir, dst_name)
                 shutil.copy2(pdf_path, dst_path)
                 row["pdf"] = {"src": pdf_path, "dst": dst_path, **(pdf_meta or {})}
@@ -178,28 +167,14 @@ class PackageExportService:
 
             
             if step_path and os.path.exists(step_path):
-                # Build dst name: drawingNumber - aesNumber - name - revision - YYYYMMDD
-                drawing_no = getattr(part, "drawing_number", None) or ""
-                aes = part_info.get("aes_number") or ""
-                pname = part_info.get("name") or ""
-                # normalize name and revision to underscores between words
-                def _norm(s: Optional[str]) -> str:
-                    if s is None:
-                        return ""
-                    return "_".join(str(s).split())
-
-                name_us = _norm(pname)
-                revision_us = _norm((step_meta or {}).get("active_version_revision") or getattr(part, "revision", None) or "")
-                date_str = datetime.now().strftime("%Y%m%d")
-                parts = [drawing_no, aes, name_us]
-                if revision_us:
-                    parts.append(revision_us)
-                parts.append(date_str)
-
-                # sanitize each part and join
-                safe_parts = [self._safe_filename(p) for p in parts if p and str(p).strip()]
-                ext = os.path.splitext(os.path.basename(step_path))[1] or ".step"
-                dst_name = "-".join(safe_parts) + ext
+                dst_name = exported_document_filename(
+                    part=part,
+                    file_type="STEP",
+                    source_path=step_path,
+                    revision="",
+                    project_version_label=(step_meta or {}).get("project_version_label") or "",
+                    include_date=True,
+                )
                 dst_path = os.path.join(step_dir, dst_name)
                 shutil.copy2(step_path, dst_path)
                 row["step"] = {"src": step_path, "dst": dst_path, **(step_meta or {})}

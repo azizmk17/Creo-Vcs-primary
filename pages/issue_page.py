@@ -272,6 +272,8 @@ class EngineeringIssuePage(QWidget):
         self.issue_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.issue_table.setAlternatingRowColors(True)
         self.issue_table.itemSelectionChanged.connect(self._selection_changed)
+        self.issue_table.cellClicked.connect(lambda row, _col: self._sync_issue_details_from_row(row))
+        self.issue_table.itemClicked.connect(lambda item: self._sync_issue_details_from_row(item.row() if item else -1))
         splitter.addWidget(self.issue_table)
 
         detail = QWidget()
@@ -448,15 +450,20 @@ class EngineeringIssuePage(QWidget):
                     if col == 3:
                         item.setForeground(QBrush(QColor(PRIORITY_COLORS.get(issue["priority"], "#374151"))))
                     self.issue_table.setItem(row, col, item)
+            if selected_row is None and issues:
+                selected_row = 0
             if selected_row is not None:
                 self.issue_table.selectRow(selected_row)
+                self.issue_table.setCurrentCell(selected_row, 0)
         finally:
             self.issue_table.blockSignals(signals_were_blocked)
         self.issue_table.resizeColumnsToContents()
         self.issue_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.issue_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
-        if selected_issue_id is not None:
-            self.refresh_current_issue_details()
+        if selected_row is not None:
+            self._sync_issue_details_from_row(selected_row)
+        else:
+            self._clear_issue_details()
 
     def open_for_part(self, part_id: int):
         index = self.part_filter.findData(int(part_id))
@@ -504,8 +511,35 @@ class EngineeringIssuePage(QWidget):
         selected = self.issue_table.selectedItems()
         if not selected:
             return
-        self.current_issue_id = int(selected[0].data(Qt.UserRole))
+        self._sync_issue_details_from_row(selected[0].row())
+
+    def _sync_issue_details_from_row(self, row: int):
+        if row is None or row < 0 or row >= self.issue_table.rowCount():
+            self._clear_issue_details()
+            return
+        item = self.issue_table.item(int(row), 0)
+        if not item:
+            self._clear_issue_details()
+            return
+        issue_id = item.data(Qt.UserRole)
+        if issue_id is None:
+            self._clear_issue_details()
+            return
+        self.current_issue_id = int(issue_id)
         self.refresh_current_issue_details()
+
+    def _clear_issue_details(self):
+        self.current_issue_id = None
+        self.detail_title.setText("Select an issue")
+        self.detail_meta.setText("")
+        self.detail_description.clear()
+        self.comments_list.clear()
+        self.jira_table.setRowCount(0)
+        self.creo_files_table.setRowCount(0)
+        self.history_table.setRowCount(0)
+        self.commit_table.setRowCount(0)
+        self.engineering_files_table.setRowCount(0)
+        self.attachments_list.clear()
 
     def refresh_current_issue_details(self):
         """Reload the selected issue header, commits, audit trail, and related tabs."""

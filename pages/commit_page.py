@@ -58,6 +58,20 @@ _STATUS_STYLES = {
 _DEFAULT_STATUS = {"icon": "ðŸ“‹", "color": "#6b7280", "bg": "#f3f4f6", "label": "Unknown"}
 
 
+# Override fragile emoji/mojibake glyphs with ASCII labels for consistent PyQt rendering.
+_STATUS_STYLES = {
+    "approved":   {"icon": "[OK]", "color": "#16a34a", "bg": "#dcfce7", "label": "Approved"},
+    "validated":  {"icon": "[VAL]", "color": "#2563eb", "bg": "#dbeafe", "label": "Validated"},
+    "pending":    {"icon": "[PEND]", "color": "#ca8a04", "bg": "#fef9c3", "label": "Pending"},
+    "integrated": {"icon": "[INT]", "color": "#6b7280", "bg": "#f3f4f6", "label": "Integrated"},
+    "reverted":   {"icon": "[REV]", "color": "#dc2626", "bg": "#fee2e2", "label": "Reverted"},
+    "pushed":     {"icon": "[PUSH]", "color": "#0284c7", "bg": "#e0f2fe", "label": "Pushed"},
+    "released":   {"icon": "[REL]", "color": "#7c3aed", "bg": "#ede9fe", "label": "Released"},
+    "wip":        {"icon": "[WIP]", "color": "#ea580c", "bg": "#ffedd5", "label": "WIP"},
+}
+_DEFAULT_STATUS = {"icon": "[?]", "color": "#6b7280", "bg": "#f3f4f6", "label": "Unknown"}
+
+
 def _status_style(status: str) -> dict:
     return _STATUS_STYLES.get((status or "").strip().lower(), _DEFAULT_STATUS)
 
@@ -75,6 +89,21 @@ def _file_icon(filename: str) -> str:
     if ".pdf" in fn:
         return "ðŸ“„"
     return "ðŸ“"
+
+
+def _file_icon(filename: str) -> str:
+    fn = (filename or "").lower()
+    if ".prt" in fn:
+        return "[PRT]"
+    if ".asm" in fn:
+        return "[ASM]"
+    if ".drw" in fn:
+        return "[DRW]"
+    if ".step" in fn or ".stp" in fn:
+        return "[STEP]"
+    if ".pdf" in fn:
+        return "[PDF]"
+    return "[FILE]"
 
 
 def _relative_time(ts: str) -> str:
@@ -217,6 +246,7 @@ class AffectedBomDropCard(QFrame):
         self.part_id = int(self.part_info.get("id") or 0)
         self.setAcceptDrops(True)
         self.setMinimumHeight(76)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setStyleSheet("""
             AffectedBomDropCard {
                 background: #ffffff;
@@ -241,7 +271,9 @@ class AffectedBomDropCard(QFrame):
             f"  |  {self.part_info.get('aes_number') or ''}"
         )
         title.setStyleSheet("font-size: 11px; font-weight: 700; color: #111827;")
-        layout.addWidget(title)
+        title.setFixedHeight(18)
+        title.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        layout.addWidget(title, 0)
 
         meta = QLabel(
             f"{self.part_info.get('type') or ''}"
@@ -249,17 +281,22 @@ class AffectedBomDropCard(QFrame):
             f"  |  {self.part_info.get('drawing') or ''}"
         )
         meta.setStyleSheet("font-size: 9px; color: #64748b;")
-        layout.addWidget(meta)
+        meta.setFixedHeight(15)
+        meta.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        layout.addWidget(meta, 0)
 
         hint = QLabel("Drop PDF, STEP, or validation docs here to stage with this commit")
         hint.setStyleSheet("font-size: 9px; color: #2563eb;")
-        layout.addWidget(hint)
+        hint.setFixedHeight(15)
+        hint.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        layout.addWidget(hint, 0)
 
         self.preview = QListWidget()
         self.preview.setContextMenuPolicy(Qt.CustomContextMenu)
         self.preview.customContextMenuRequested.connect(self._show_doc_context_menu)
         self.preview.setMaximumHeight(110)
         self.preview.setMinimumHeight(42)
+        self.preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.preview.setStyleSheet("""
             QListWidget {
                 border: 1px solid #e5e7eb;
@@ -271,7 +308,7 @@ class AffectedBomDropCard(QFrame):
             QListWidget::item { padding: 3px 5px; }
             QListWidget::item:selected { background: #dbeafe; color: #1e3a8a; }
         """)
-        layout.addWidget(self.preview)
+        layout.addWidget(self.preview, 0)
 
     def set_attachments(self, attachments: list):
         self.preview.clear()
@@ -280,6 +317,7 @@ class AffectedBomDropCard(QFrame):
             item = QListWidgetItem("No staged documents")
             item.setFlags(item.flags() & ~Qt.ItemIsSelectable)
             self.preview.addItem(item)
+            self._sync_preview_height()
             return
         for index, item in enumerate(rows):
             name = os.path.basename(item.get("source_path") or item.get("filename") or "")
@@ -301,6 +339,14 @@ class AffectedBomDropCard(QFrame):
             row.setToolTip(item.get("source_path") or name)
             row.setData(Qt.UserRole, index)
             self.preview.addItem(row)
+        self._sync_preview_height()
+
+    def _sync_preview_height(self):
+        rows = max(1, self.preview.count())
+        row_h = 22
+        frame_h = 10
+        self.preview.setFixedHeight(max(42, min(110, frame_h + rows * row_h)))
+        self.adjustSize()
 
     def _show_doc_context_menu(self, pos):
         item = self.preview.itemAt(pos)
@@ -877,7 +923,9 @@ class CommitPage(QWidget):
 
     def _build_ui(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(8, 8, 8, 8)
+        # The commit history panel is a floating overlay at the bottom of this page.
+        # Keep normal commit controls out from under the collapsed history header.
+        root.setContentsMargins(8, 8, 8, 60)
         root.setSpacing(8)
 
         # ── Stats dashboard ──────────────────────────────────────────
@@ -1533,6 +1581,7 @@ class CommitPage(QWidget):
             card.docRemoveRequested.connect(self._remove_staged_doc_from_affected_bom_item)
             self._affected_dialog_cards[part_id] = card
             cards_layout.addWidget(card)
+        cards_layout.addStretch(1)
         scroll.setWidget(content)
         layout.addWidget(scroll, 1)
 

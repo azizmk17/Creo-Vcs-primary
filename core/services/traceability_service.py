@@ -106,8 +106,8 @@ class TraceabilityService(BaseService):
     def engineering_files_for_issue(self, issue_id: int) -> list[dict]:
         return self.repo.engineering_files_for_issue(issue_id)
 
-    def issues_for_engineering_file(self, part_file_id: int) -> list[dict]:
-        return self.repo.issues_for_engineering_file(part_file_id)
+    def issues_for_engineering_file(self, part_file_id: int, version_id: Optional[int] = None) -> list[dict]:
+        return self.repo.issues_for_engineering_file(part_file_id, version_id)
 
     def commit_links_for_issue(self, issue_id: int) -> list[dict]:
         return self.repo.commit_links_for_issue(issue_id)

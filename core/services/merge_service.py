@@ -18,6 +18,7 @@ from core.services.base_service import BaseService
 from core.services.issue_service import IssueService
 from core.services.traceability_service import TraceabilityService
 from core.services.part_file_service import PartFileService
+from core.services.export_naming import is_project_revision
 from utils import (
     is_creo_file,
     ensure_dir_exists,
@@ -77,6 +78,17 @@ class MergeService(BaseService):
                 return value
         return ""
 
+    def _project_version_label(self, project_id: int | None) -> str:
+        if not project_id:
+            return ""
+        try:
+            from core.services.project_service import ProjectService
+
+            project = ProjectService().get_project_by_id(int(project_id)) or {}
+            return str(project.get("version_label") or "").strip().upper()
+        except Exception:
+            return ""
+
     def _legacy_engineering_filename(
         self,
         part_id: int,
@@ -84,6 +96,7 @@ class MergeService(BaseService):
         file_type: str,
         source_path: str,
         drawing_revision: str = "",
+        project_version_label: str = "",
     ) -> str:
         part = self.bom_repo.get_by_id(int(part_id))
         ext = os.path.splitext(source_path or "")[1].lower()
@@ -100,7 +113,7 @@ class MergeService(BaseService):
         parts = [drawing_number, index, aes, part_name]
         if file_role == "exported_pdf":
             rev = str(drawing_revision or "").strip()
-            if rev:
+            if rev and not is_project_revision(rev, project_version_label):
                 parts.append(rev)
 
         stem = "_".join(
@@ -120,6 +133,7 @@ class MergeService(BaseService):
         file_role: str,
         file_type: str,
         drawing_revision: str = "",
+        project_version_label: str = "",
     ) -> str:
         legacy_name = self._legacy_engineering_filename(
             part_id=part_id,
@@ -127,6 +141,7 @@ class MergeService(BaseService):
             file_type=file_type,
             source_path=source_path,
             drawing_revision=drawing_revision,
+            project_version_label=project_version_label,
         )
         target_dir = os.path.join(commit_dir, "_engineering_attachments", "_legacy_names")
         ensure_dir_exists(target_dir)
@@ -161,6 +176,7 @@ class MergeService(BaseService):
 
         changed_part_ids = []
         linked_issue_ids = self.traceability_service.linked_issue_ids_for_commit(commit_id)
+        project_version_label = self._project_version_label(project_id)
         for item in manifest.get("attachments") or []:
             part_id = int(item.get("part_id") or 0)
             source_path = os.path.join(commit_dir, item.get("stored_rel_path") or "")
@@ -182,6 +198,7 @@ class MergeService(BaseService):
                     file_role=file_role,
                     file_type=file_type,
                     drawing_revision=item.get("revision") or "",
+                    project_version_label=project_version_label,
                 )
                 file_id, version_id = self.part_file_service.upsert_part_file_version(
                     part_id=part_id,
