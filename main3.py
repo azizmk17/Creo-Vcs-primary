@@ -251,6 +251,7 @@ class BomGUI(QMainWindow):
         self.project_service = ProjectService()
 
         self._project_combo_initializing = False
+        self._projects_for_user = []
         self._ensure_valid_current_project()
 
         # Toolbar with navigation
@@ -473,68 +474,37 @@ class BomGUI(QMainWindow):
 
         toolbar.addSeparator()
 
-        # === Project Selector Combo ===
+        # === Project / Version Selectors ===
         self.project_combo = QComboBox()
-        projects = self.project_service.get_projects_for_user(self.session.user_id)
-        if not projects:
-            self.project_combo.addItem("No Projects")
-            self.project_combo.setEnabled(False)
-        else:
-            self.project_combo.setEnabled(True)
-
-            # If no current project (or it was cleared), show a placeholder.
-            if not self.session.project_id:
-                self.project_combo.addItem("Select a project...", None)
-
-            for project in projects:
-                # New schema: project may include root_name + version_label
-                pid = project.get("id")
-                name = project.get("name")
-                root_name = project.get("root_name")
-                version_label = project.get("version_label")
-                if root_name and version_label:
-                    label = f"{root_name} ({version_label})"
-                else:
-                    label = str(name or pid)
-                self.project_combo.addItem(label, pid)
-
-            # Set selection to current project if present.
-            if self.session.project_id:
-                idx = self.project_combo.findData(self.session.project_id)
-                if idx >= 0:
-                    self.project_combo.setCurrentIndex(idx)
-            else:
-                try:
-                    self.project_combo.setCurrentIndex(0)
-                except Exception:
-                    pass
-
-        self.project_combo.currentIndexChanged.connect(self.save_current_project)
+        self.project_combo.currentIndexChanged.connect(self._on_project_root_changed)
         self.project_combo.setMinimumWidth(210)
         self.project_combo.setMaximumWidth(270)
+
+        self.project_version_combo = QComboBox()
+        self.project_version_combo.currentIndexChanged.connect(self.save_current_project)
+        self.project_version_combo.setMinimumWidth(90)
+        self.project_version_combo.setMaximumWidth(130)
 
         project_caption = QLabel("Project")
         project_caption.setStyleSheet("color: #e5e7eb; font-weight: 700; padding-left: 6px;")
         toolbar.addWidget(project_caption)
         toolbar.addWidget(self.project_combo)
+
+        version_caption = QLabel("Version")
+        version_caption.setStyleSheet("color: #e5e7eb; font-weight: 700; padding-left: 6px;")
+        toolbar.addWidget(version_caption)
+        toolbar.addWidget(self.project_version_combo)
         toolbar.addSeparator()
 
         
         # Create and store the project label
-        current_project_name = "None"
-        if self.session.project_id:
-            p = self.project_service.get_project_by_id(self.session.project_id) or {}
-            current_project_name = p.get("name") or str(self.session.project_id)
-            version_label = p.get("version_label")
-            if version_label:
-                current_project_name = f"{current_project_name} ({version_label})"
-
-        self.project_label = QLabel(f"Current: {current_project_name}")
+        self.project_label = QLabel("Current: None")
         self.project_label.setMinimumWidth(260)
         self.project_label.setMaximumWidth(430)
         self.project_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.project_label.setStyleSheet("color: #ffffff; font-weight: 700; padding: 0 8px;")
         toolbar.addWidget(self.project_label)
+        self.refresh_project_selector(select_project_id=self.session.project_id, reload_on_change=False)
 
         # Add button to toolbar
         new_version_button = QPushButton("New Version")
@@ -553,6 +523,135 @@ class BomGUI(QMainWindow):
         """)
         new_version_button.clicked.connect(self.show_new_version_dialog)
         toolbar.addWidget(new_version_button)
+
+    def _project_root_id(self, project: dict):
+        root_id = project.get("root_project_id") or project.get("id")
+        try:
+            return int(root_id) if root_id is not None else None
+        except Exception:
+            return None
+
+    def _clean_project_display_name(self, name: str, version_label: str = "") -> str:
+        text = str(name or "").strip()
+        version = str(version_label or "").strip()
+        if version and text.upper().endswith(f"__{version.upper()}"):
+            text = text[:-(len(version) + 2)].rstrip()
+        return text
+
+    def _project_display_name(self, project: dict) -> str:
+        root_name = self._clean_project_display_name(project.get("root_name") or "", "")
+        if root_name:
+            return root_name
+        return self._clean_project_display_name(project.get("name") or project.get("id"), project.get("version_label") or "")
+
+    def _version_sort_key(self, project: dict):
+        label = str(project.get("version_label") or "A").strip().upper()
+        n = 0
+        for ch in label:
+            if not ch.isalpha():
+                return (999999, label)
+            n = n * 26 + (ord(ch) - ord("A") + 1)
+        return (n or 1, label)
+
+    def _projects_for_root(self, root_id):
+        try:
+            root_id = int(root_id)
+        except Exception:
+            return []
+        return sorted(
+            [p for p in self._projects_for_user if self._project_root_id(p) == root_id],
+            key=self._version_sort_key,
+        )
+
+    def refresh_project_selector(self, select_project_id=None, reload_on_change: bool = False):
+        try:
+            self._projects_for_user = self.project_service.get_projects_for_user(self.session.user_id) or []
+        except Exception:
+            self._projects_for_user = []
+
+        try:
+            self._project_combo_initializing = True
+            self.project_combo.clear()
+            self.project_version_combo.clear()
+
+            if not self._projects_for_user:
+                self.project_combo.addItem("No Projects", None)
+                self.project_combo.setEnabled(False)
+                self.project_version_combo.addItem("-", None)
+                self.project_version_combo.setEnabled(False)
+                self.refresh_project_label()
+                return
+
+            self.project_combo.setEnabled(True)
+            self.project_version_combo.setEnabled(True)
+            if not select_project_id:
+                self.project_combo.addItem("Select a project...", None)
+
+            roots = {}
+            for project in self._projects_for_user:
+                root_id = self._project_root_id(project)
+                if root_id is not None and root_id not in roots:
+                    roots[root_id] = self._project_display_name(project)
+
+            for root_id, label in sorted(roots.items(), key=lambda item: str(item[1]).lower()):
+                self.project_combo.addItem(str(label or root_id), root_id)
+
+            selected_project = None
+            if select_project_id:
+                for project in self._projects_for_user:
+                    if int(project.get("id")) == int(select_project_id):
+                        selected_project = project
+                        break
+
+            selected_root_id = self._project_root_id(selected_project) if selected_project else None
+            if selected_root_id is not None:
+                idx = self.project_combo.findData(selected_root_id)
+                if idx >= 0:
+                    self.project_combo.setCurrentIndex(idx)
+                    self._populate_project_version_combo(selected_root_id, select_project_id)
+            elif self.project_combo.count() > 0:
+                self.project_combo.setCurrentIndex(0)
+                self._populate_project_version_combo(self.project_combo.currentData(), None)
+            self.refresh_project_label()
+        finally:
+            self._project_combo_initializing = False
+
+        if reload_on_change:
+            self.reload_main_window()
+
+    def _populate_project_version_combo(self, root_id, select_project_id=None):
+        self.project_version_combo.clear()
+        if root_id is None:
+            self.project_version_combo.addItem("-", None)
+            self.project_version_combo.setEnabled(False)
+            return
+
+        versions = self._projects_for_root(root_id)
+        self.project_version_combo.setEnabled(bool(versions))
+        for project in versions:
+            label = str(project.get("version_label") or "A").strip() or "A"
+            state = str(project.get("version_state") or "").strip()
+            display = f"{label} - {state}" if state else label
+            self.project_version_combo.addItem(display, project.get("id"))
+
+        if select_project_id:
+            idx = self.project_version_combo.findData(int(select_project_id))
+            if idx >= 0:
+                self.project_version_combo.setCurrentIndex(idx)
+                return
+        if self.project_version_combo.count() > 0:
+            self.project_version_combo.setCurrentIndex(0)
+
+    def _on_project_root_changed(self):
+        if getattr(self, "_project_combo_initializing", False):
+            return
+        try:
+            self._project_combo_initializing = True
+            root_id = self.project_combo.currentData()
+            self._populate_project_version_combo(root_id, None)
+        finally:
+            self._project_combo_initializing = False
+        self.save_current_project()
 
     def show_new_version_dialog(self):
         if not self.session.project_id:
@@ -633,6 +732,13 @@ class BomGUI(QMainWindow):
             except Exception:
                 pass
             QMessageBox.information(self, "Success", f"New version created. New project ID: {new_project_id}")
+            self.session.update_project(int(new_project_id))
+            try:
+                if getattr(self.session, "user_id", None):
+                    self.user_repo.set_last_project_id(self.session.user_id, int(new_project_id))
+            except Exception:
+                pass
+            self.refresh_project_selector(select_project_id=int(new_project_id))
             self.reload_main_window()
 
         def _on_failed(err: str):
@@ -658,7 +764,7 @@ class BomGUI(QMainWindow):
         if getattr(self, "_project_combo_initializing", False):
             return
 
-        pid = self.project_combo.currentData()
+        pid = self.project_version_combo.currentData() if hasattr(self, "project_version_combo") else self.project_combo.currentData()
 
         # Placeholder / "no project"
         if pid is None:
@@ -678,7 +784,7 @@ class BomGUI(QMainWindow):
 
         if not pid:
             # fallback to old behavior (name-based)
-            project = self.project_combo.currentText()
+            project = self.project_version_combo.currentText() if hasattr(self, "project_version_combo") else self.project_combo.currentText()
             pid = self.project_service.get_project_id(project)
 
         # Validate working directory before switching.
@@ -714,6 +820,10 @@ class BomGUI(QMainWindow):
                 placeholder_idx = self.project_combo.findData(None)
                 if placeholder_idx >= 0:
                     self.project_combo.setCurrentIndex(placeholder_idx)
+                if hasattr(self, "project_version_combo"):
+                    self.project_version_combo.clear()
+                    self.project_version_combo.addItem("-", None)
+                    self.project_version_combo.setEnabled(False)
             finally:
                 self._project_combo_initializing = False
 
@@ -721,22 +831,22 @@ class BomGUI(QMainWindow):
             self.reload_main_window()
             return
 
-        self.statusBar().showMessage(f"Project set to: {self.project_combo.currentText()}")
         self.session.update_project(pid)
         try:
             if getattr(self.session, "user_id", None):
                 self.user_repo.set_last_project_id(self.session.user_id, pid)
         except Exception:
             pass
+        self.refresh_project_label()
+        self.statusBar().showMessage(f"Project set to: {self.project_label.text().replace('Current: ', '')}")
         self.reload_main_window()
     
     def refresh_project_label(self):
         p = self.project_service.get_project_by_id(self.session.project_id) or {}
-        name = p.get("name") or str(self.session.project_id)
-        ver = p.get("version_label")
-        label = str(name or "None")
-        if ver:
-            label = f"{label} ({ver})"
+        if not p:
+            label = "None"
+        else:
+            label = self._clean_project_display_name(p.get("name") or str(self.session.project_id), p.get("version_label") or "")
         self.project_label.setText(f"Current: {label}")
 
     def switch_page(self, index):

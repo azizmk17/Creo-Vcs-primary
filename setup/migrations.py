@@ -660,6 +660,82 @@ def _migration_15(conn):
         )
 
 
+def _migration_16(conn):
+    """Allow project versions to share the same clean project name."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    for key, value in (
+        ("app_version", "2.2.0"),
+        ("minimum_app_version", "2.2.0"),
+        ("db_schema_version", "16"),
+    ):
+        conn.execute(
+            "INSERT OR REPLACE INTO app_metadata(key, value) VALUES(?, ?)",
+            (key, value),
+        )
+
+    table = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='projects'"
+    ).fetchone()
+    if not table or not table["sql"]:
+        return
+
+    table_sql = str(table["sql"])
+    if "UNIQUE" in table_sql.upper():
+        new_sql = re.sub(
+            r"CREATE\s+TABLE\s+projects\b",
+            "CREATE TABLE projects_new",
+            table_sql,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        new_sql = re.sub(
+            r"\bname\s+TEXT\s+NOT\s+NULL\s+UNIQUE\b",
+            "name TEXT NOT NULL",
+            new_sql,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        new_sql = re.sub(
+            r",\s*UNIQUE\s*\(\s*name\s*\)",
+            "",
+            new_sql,
+            flags=re.IGNORECASE,
+        )
+
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("DROP TABLE IF EXISTS projects_new")
+        conn.execute(new_sql)
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(projects)").fetchall()]
+        col_sql = ", ".join(cols)
+        conn.execute(f"INSERT INTO projects_new ({col_sql}) SELECT {col_sql} FROM projects")
+        conn.execute("DROP TABLE projects")
+        conn.execute("ALTER TABLE projects_new RENAME TO projects")
+        conn.execute("PRAGMA foreign_keys=ON")
+
+    cols = set(_table_columns(conn, "projects"))
+    if {"name", "version_label"}.issubset(cols):
+        conn.execute(
+            """
+            UPDATE projects
+            SET name = SUBSTR(name, 1, LENGTH(name) - LENGTH(version_label) - 2)
+            WHERE version_label IS NOT NULL
+              AND TRIM(version_label) <> ''
+              AND UPPER(name) LIKE '%__' || UPPER(TRIM(version_label))
+            """
+        )
+
+    if {"root_project_id", "version_label"}.issubset(cols):
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_projects_root_version ON projects(root_project_id, version_label)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_projects_root_project_id ON projects(root_project_id)")
+
+
 MIGRATIONS = {
     1: """
     CREATE TABLE IF NOT EXISTS users (
@@ -1000,6 +1076,8 @@ WHERE r.name = 'designer' AND p.name = 'manage_issues';
     14: _migration_14,
 
     15: _migration_15,
+
+    16: _migration_16,
 
 }
 

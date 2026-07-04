@@ -356,12 +356,13 @@ class ProjectRepository:
                 for _attempt in range(30):
                     # Build name/description for this label
                     if not explicit_name:
-                        candidate_name = f"{root_name}__{version_label}"
+                        candidate_name = root_name
                     else:
                         candidate_name = str(new_project_name).strip()
 
-                    # Ensure unique name
-                    if conn.execute("SELECT 1 FROM projects WHERE name = ? LIMIT 1", (candidate_name,)).fetchone():
+                    # Legacy databases may still require unique names; version-aware schemas
+                    # distinguish rows by root_project_id + version_label instead.
+                    if (not supports_versioning) and conn.execute("SELECT 1 FROM projects WHERE name = ? LIMIT 1", (candidate_name,)).fetchone():
                         candidate_name = f"{candidate_name}__{uuid.uuid4().hex[:6]}"
 
                     if not explicit_desc:

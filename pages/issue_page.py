@@ -1,7 +1,8 @@
-from PyQt5.QtCore import QDate, Qt, pyqtSignal, QTimer
-from PyQt5.QtGui import QColor, QBrush
+from PyQt5.QtCore import QObject, QDate, QRect, Qt, QThread, pyqtSignal, QTimer
+from PyQt5.QtGui import QColor, QBrush, QFont, QPainter, QPen
 from PyQt5.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QComboBox,
     QDateEdit,
     QDialog,
@@ -178,6 +179,95 @@ class MetricCard(QFrame):
         layout.addWidget(caption)
 
 
+class _IssueProcessingOverlay(QWidget):
+    """Full-page busy overlay for Issue Center long-running actions."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._angle = 0
+        self._message = "Processing..."
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        self.setCursor(Qt.WaitCursor)
+        self._timer = QTimer(self)
+        self._timer.setInterval(45)
+        self._timer.timeout.connect(self._tick)
+        self.hide()
+
+    def show_overlay(self, message: str):
+        self._message = message or "Processing..."
+        if self.parent():
+            self.setGeometry(self.parent().rect())
+        self.raise_()
+        self.show()
+        self._timer.start()
+        self.update()
+
+    def hide_overlay(self):
+        self._timer.stop()
+        self.hide()
+
+    def _tick(self):
+        self._angle = (self._angle + 18) % 360
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QColor(248, 250, 252, 190))
+
+        card_w = min(380, max(280, self.width() - 48))
+        card_h = 156
+        card_x = (self.width() - card_w) // 2
+        card_y = (self.height() - card_h) // 2
+
+        painter.setPen(QPen(QColor("#bfdbfe"), 1))
+        painter.setBrush(QBrush(QColor(255, 255, 255, 238)))
+        painter.drawRoundedRect(QRect(card_x, card_y, card_w, card_h), 10, 10)
+
+        spinner_size = 50
+        spinner_x = card_x + (card_w - spinner_size) // 2
+        spinner_y = card_y + 30
+        arc_rect = QRect(spinner_x + 5, spinner_y + 5, spinner_size - 10, spinner_size - 10)
+        painter.setPen(QPen(QColor("#dbeafe"), 5, Qt.SolidLine, Qt.RoundCap))
+        painter.drawArc(arc_rect, 0, 360 * 16)
+        painter.setPen(QPen(QColor("#2563eb"), 5, Qt.SolidLine, Qt.RoundCap))
+        painter.drawArc(arc_rect, int(self._angle * 16), int(110 * 16))
+
+        painter.setPen(QColor("#111827"))
+        title_font = QFont()
+        title_font.setPointSize(11)
+        title_font.setBold(True)
+        painter.setFont(title_font)
+        text_rect = QRect(card_x + 20, spinner_y + spinner_size + 18, card_w - 40, 28)
+        painter.drawText(text_rect, Qt.AlignCenter, self._message)
+
+        painter.setPen(QColor("#64748b"))
+        hint_font = QFont()
+        hint_font.setPointSize(9)
+        painter.setFont(hint_font)
+        hint_rect = QRect(card_x + 20, text_rect.bottom() + 4, card_w - 40, 24)
+        painter.drawText(hint_rect, Qt.AlignCenter, "Please wait. The Issue Center is locked while this finishes.")
+
+    def keyPressEvent(self, event):
+        event.accept()
+
+
+class _IssueProcessingWorker(QObject):
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(object)
+
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def run(self):
+        try:
+            self.finished.emit(self._fn())
+        except Exception as exc:
+            self.failed.emit(exc)
+
+
 class EngineeringIssuePage(QWidget):
     issue_changed = pyqtSignal(object)
 
@@ -185,9 +275,24 @@ class EngineeringIssuePage(QWidget):
         super().__init__(parent)
         self.service = IssueService()
         self.current_issue_id = None
+        self._processing_action = False
+        self._processing_thread = None
+        self._processing_worker = None
         self._build_ui()
+        self.processing_overlay = _IssueProcessingOverlay(self)
+        self.processing_overlay.setGeometry(self.rect())
+        self.processing_overlay.hide()
         if self.service.project_id:
             QTimer.singleShot(0, self.refresh)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        try:
+            self.processing_overlay.setGeometry(self.rect())
+            if self.processing_overlay.isVisible():
+                self.processing_overlay.raise_()
+        except Exception:
+            pass
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -299,14 +404,14 @@ class EngineeringIssuePage(QWidget):
         transition_btn.clicked.connect(self.change_status)
         archive_btn = QPushButton("Archive")
         archive_btn.clicked.connect(self.archive_issue)
-        export_btn = QPushButton("Export Traceability")
-        export_btn.setObjectName("neutral")
-        export_btn.clicked.connect(self.export_current_traceability)
+        self.export_traceability_btn = QPushButton("Export Traceability")
+        self.export_traceability_btn.setObjectName("neutral")
+        self.export_traceability_btn.clicked.connect(self.export_current_traceability)
         actions.addWidget(edit_btn)
         actions.addWidget(self.transition_combo)
         actions.addWidget(transition_btn)
         actions.addWidget(archive_btn)
-        actions.addWidget(export_btn)
+        actions.addWidget(self.export_traceability_btn)
         detail_layout.addLayout(actions)
 
         tabs = QTabWidget()
@@ -938,7 +1043,67 @@ class EngineeringIssuePage(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "Jira", str(exc))
 
+    def _set_processing_state(self, busy: bool, message: str = "Processing..."):
+        self._processing_action = bool(busy)
+        try:
+            if busy:
+                self.processing_overlay.show_overlay(message)
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+            else:
+                self.processing_overlay.hide_overlay()
+                QApplication.restoreOverrideCursor()
+        except Exception:
+            pass
+
+        try:
+            self.export_traceability_btn.setEnabled(not busy)
+        except Exception:
+            pass
+
+        try:
+            QApplication.processEvents()
+        except Exception:
+            pass
+
+    def _run_processing_task(self, message: str, work_fn, success_fn=None, error_fn=None):
+        if getattr(self, "_processing_action", False):
+            return
+        self._set_processing_state(True, message)
+        thread = QThread(self)
+        worker = _IssueProcessingWorker(work_fn)
+        worker.moveToThread(thread)
+
+        def cleanup():
+            self._set_processing_state(False)
+            self._processing_worker = None
+            self._processing_thread = None
+
+        def handle_success(result):
+            cleanup()
+            if success_fn:
+                success_fn(result)
+
+        def handle_error(exc):
+            cleanup()
+            if error_fn:
+                error_fn(exc)
+            else:
+                QMessageBox.critical(self, "Error", str(exc))
+
+        thread.started.connect(worker.run)
+        worker.finished.connect(handle_success)
+        worker.failed.connect(handle_error)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._processing_thread = thread
+        self._processing_worker = worker
+        thread.start()
+
     def export_current_traceability(self):
+        if getattr(self, "_processing_action", False):
+            return
         if not self.current_issue_id:
             return
         folder = QFileDialog.getExistingDirectory(
@@ -947,8 +1112,13 @@ class EngineeringIssuePage(QWidget):
         )
         if not folder:
             return
-        try:
-            manifest = self.service.export_traceability_package(self.current_issue_id, folder)
+
+        issue_id = int(self.current_issue_id)
+
+        def work():
+            return self.service.export_traceability_package(issue_id, folder)
+
+        def success(manifest):
             QMessageBox.information(
                 self,
                 "Export",
@@ -958,8 +1128,11 @@ class EngineeringIssuePage(QWidget):
                 f"Engineering output files: {len(manifest.get('output_files') or [])}\n"
                 f"Validation docs: {len(manifest.get('validation_docs') or [])}",
             )
-        except Exception as exc:
+
+        def error(exc):
             QMessageBox.critical(self, "Export", str(exc))
+
+        self._run_processing_task("Exporting traceability...", work, success, error)
 
     def change_status(self):
         if not self.current_issue_id:
