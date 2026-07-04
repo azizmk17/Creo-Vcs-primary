@@ -2269,8 +2269,8 @@ class BomPage(QWidget):
         action_layout.addWidget(self.add_part_btn)
         action_layout.addWidget(self.edit_part_btn)
         action_layout.addWidget(self.delete_part_btn)
-        action_layout.addWidget(self.checkin_part_btn)
         action_layout.addWidget(self.checkout_part_btn)
+        action_layout.addWidget(self.checkin_part_btn)
         action_layout.addWidget(self.add_child_btn)
         action_layout.addWidget(self.set_revision_btn)
         right_layout.addWidget(action_group)
@@ -4452,7 +4452,7 @@ class BomPage(QWidget):
             part_id = self.current_part_id
         try:
             as_user_id = None
-            # Master/Admin can check in as a project-assigned user
+            # Master/Admin can check in a part on behalf of a project-assigned user.
             if self.perm.can("merge") and self.session.project_id:
                 users = self.project_service.get_users_for_project(self.session.project_id) or []
                 # Build choices: username (email)
@@ -4520,7 +4520,7 @@ class BomPage(QWidget):
             part_id = self.current_part_id
 
         as_user_id = None
-        # Master/Admin can check out as a project-assigned user if part is checked in by another user
+        # Master/Admin can check out as a project-assigned user.
         if self.perm.can("merge") and self.session.project_id:
             users = self.project_service.get_users_for_project(self.session.project_id) or []
             choices = []
@@ -4563,13 +4563,13 @@ class BomPage(QWidget):
         reply = QMessageBox.question(
             self,
             "Confirm Check Out",
-            f"Are you sure you want to checkout part {part_id}? This part will be released without modifications.",
+            f"Are you sure you want to check out part {part_id}? This part will be blocked for work.",
             QMessageBox.Yes | QMessageBox.No
         )
         if reply == QMessageBox.Yes:
             try:
                 self.bom_service.checkout_part(part_id, as_user_id=as_user_id)
-                QMessageBox.information(self, "Success", "Part checked out successfully [Released].")
+                QMessageBox.information(self, "Success", "Part checked out successfully.")
                 # Fast refresh: update only this row
                 self._refresh_current_tree_item_lock_state(int(part_id))
                 self._refresh_current_tree_item_indicator()

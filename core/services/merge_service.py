@@ -551,11 +551,11 @@ class MergeService(BaseService):
             self.signature_repo.add_signature('Merge', merge_user_id , message)
             print(f"Added signature")
 
-            #checkout lock if exists
+            # Check in the part after merge: release the checkout lock if it exists.
             lock = self.lock_repo.get_lock_by_part(item['item_id'])
             if lock:
-                self.bom_service.checkout_by_part_id(item['item_id'], lock.user_id)
-                print(f"Checked out lock for part ID {item['item_id']} by user ID {lock.user_id}")
+                self.bom_service.checkin_by_part_id(item['item_id'], lock.user_id)
+                print(f"Checked in lock for part ID {item['item_id']} by user ID {lock.user_id}")
 
         
         print(f"Finalized merge for entries: {merged_entries}")

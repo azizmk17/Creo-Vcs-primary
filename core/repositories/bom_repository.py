@@ -268,7 +268,7 @@ class BomRepository:
             cur = conn.cursor()
             cur.execute("""
                 UPDATE bom
-                SET locked = 1
+                SET locked = 0
                 WHERE id=?
             """, (
                 id,
@@ -279,7 +279,7 @@ class BomRepository:
             cur = conn.cursor()
             cur.execute("""
                 UPDATE bom
-                SET locked = 0
+                SET locked = 1
                 WHERE id=?
             """, (
                 id,

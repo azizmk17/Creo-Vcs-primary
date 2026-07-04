@@ -356,10 +356,10 @@ class CommitService(BaseService):
             part_id = bom_entry.id
             locked = self.lock_repo.get_by_part(part_id)
             if not locked:
-                raise ValueError(f"Commit blocked: {filename} is not checked in.")
+                raise ValueError(f"Commit blocked: {filename} is not checked out.")
             elif locked.user_id != designer_id:
                 print(locked.user_id)
-                raise ValueError(f"Commit blocked: {filename} is checked in by another user.")
+                raise ValueError(f"Commit blocked: {filename} is checked out by another user.")
 
             commit_plan.append({
                 "filepath": filepath,

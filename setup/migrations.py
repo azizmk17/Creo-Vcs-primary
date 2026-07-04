@@ -736,6 +736,55 @@ def _migration_16(conn):
         conn.execute("CREATE INDEX IF NOT EXISTS idx_projects_root_project_id ON projects(root_project_id)")
 
 
+def _migration_17(conn):
+    """Correct inverted check-in/check-out action names in existing audit rows."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    for key, value in (
+        ("app_version", "2.2.0"),
+        ("minimum_app_version", "2.2.0"),
+        ("db_schema_version", "17"),
+    ):
+        conn.execute(
+            "INSERT OR REPLACE INTO app_metadata(key, value) VALUES(?, ?)",
+            (key, value),
+        )
+
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "lock_logs" in tables:
+        conn.execute(
+            """
+            UPDATE lock_logs
+            SET action = CASE LOWER(action)
+                WHEN 'checkin' THEN 'checkout'
+                WHEN 'checkout' THEN 'checkin'
+                ELSE action
+            END
+            WHERE LOWER(action) IN ('checkin', 'checkout')
+            """
+        )
+
+    if "signature" in tables:
+        conn.execute(
+            """
+            UPDATE signature
+            SET action = CASE LOWER(action)
+                WHEN 'checkin' THEN 'checkout'
+                WHEN 'checkout' THEN 'checkin'
+                ELSE action
+            END
+            WHERE LOWER(action) IN ('checkin', 'checkout')
+              AND id IN (SELECT signature FROM lock_logs WHERE signature IS NOT NULL)
+            """
+        )
+
+
 MIGRATIONS = {
     1: """
     CREATE TABLE IF NOT EXISTS users (
@@ -1078,6 +1127,8 @@ WHERE r.name = 'designer' AND p.name = 'manage_issues';
     15: _migration_15,
 
     16: _migration_16,
+
+    17: _migration_17,
 
 }
 

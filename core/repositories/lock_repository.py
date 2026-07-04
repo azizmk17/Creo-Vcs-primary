@@ -16,9 +16,19 @@ class LockRepository:
         return conn
 
     # -------------------------------
-    # CREATE / INSERT
-    # -------------------------------
     def checkin(self, part_id, user_id, signature) -> bool:
+        with self.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM locks WHERE part_id = ?", (part_id,))
+            cur.execute("""
+                INSERT INTO lock_logs (part_id, user_id, action, timestamp, signature)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                part_id, user_id, "checkin", sqlite3.datetime.datetime.now().isoformat(), signature
+            ))
+            return True
+        
+    def checkout(self, part_id, user_id, signature) -> bool:
         with self.get_conn() as conn:
             cur = conn.cursor()
             cur.execute("""
@@ -31,21 +41,9 @@ class LockRepository:
                 INSERT INTO lock_logs (part_id, user_id, action, timestamp, signature)
                 VALUES (?, ?, ?, ?, ?)
             """, (
-                part_id, user_id, "checkin", sqlite3.datetime.datetime.now().isoformat(), signature
-            ))
-            return cur.lastrowid > 0
-        
-    def checkout(self, part_id, user_id, signature) -> bool:
-        with self.get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("DELETE FROM locks WHERE part_id = ?", (part_id,))
-            cur.execute("""
-                INSERT INTO lock_logs (part_id, user_id, action, timestamp, signature)
-                VALUES (?, ?, ?, ?, ?)
-            """, (
                 part_id, user_id, "checkout", sqlite3.datetime.datetime.now().isoformat(), signature
             ))
-            return True
+            return cur.lastrowid > 0
         
     
         

@@ -3013,7 +3013,7 @@ class CommitPage(QWidget):
                 self.bom_service.add_part(part_data)
                 QMessageBox.information(self, "Success",
                     "Part added successfully.")
-                self.bom_service.checkin_part(part_data["aes_number"])
+                self.bom_service.checkout_part(part_data["aes_number"])
                 self.commit_changes()
             except Exception as e:
                 QMessageBox.critical(self, "Error",

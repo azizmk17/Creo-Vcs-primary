@@ -138,32 +138,31 @@ class BomService(BaseService):
     # CHECKIN PART
     # -------------------------------
     def checkin_part(self, part_id: str, as_user_id: int | None = None):
-
         part = self.bom_repo.get_by_id(part_id)
         if not part:
             raise ValueError("Part not found")
-        
-        existing = self.lock_repo.get_by_part(part.id)
-        if existing:
-            raise ValueError("Part is already checked in.")
-
+        locked = self.lock_repo.get_by_part(part.id)
+        if not locked:
+            raise ValueError("Part is not checked out.")
         actor_user_id = int(self.session.user_id) if self.session.user_id is not None else None
         if not actor_user_id:
             raise PermissionError("You must be logged in")
 
-        # Impersonation is allowed only for master/admin (merge permission).
-        if as_user_id is not None and int(as_user_id) != int(actor_user_id):
+        if locked.user_id != actor_user_id:
             if not self.permission_repo.user_has_permission(actor_user_id, "merge", self.session.project_id):
-                raise PermissionError("Only Master/Admin can check in as another user")
-            effective_user_id = int(as_user_id)
+                raise ValueError("Part is checked out by another user.")
+            effective_user_id = int(as_user_id) if as_user_id is not None else int(actor_user_id)
         else:
             effective_user_id = int(actor_user_id)
 
-        signature = self.signature_repo.add_signature("checkin", effective_user_id, note="Checked in part")
+        signature = self.signature_repo.add_signature(
+            "checkin",
+            effective_user_id,
+            note="Checked in part (admin override)" if locked.user_id != actor_user_id else "Checked in part",
+        )
         success = self.lock_repo.checkin(part.id, effective_user_id, signature)
         if not success:
             raise ValueError("Failed to check in part")
-        
         self.bom_repo.checkin_bom(part.id)
         self._tree_dirty.add(int(self.session.project_id))
         return True
@@ -172,35 +171,21 @@ class BomService(BaseService):
         part = self.bom_repo.get_by_id(part_id)
         if not part:
             raise ValueError("Part not found")
-        locked = self.lock_repo.get_by_part(part.id)
+        existing = self.lock_repo.get_by_part(part.id)
+        if existing:
+            raise ValueError("Part is already checked out.")
         actor_user_id = int(self.session.user_id) if self.session.user_id is not None else None
         if not actor_user_id:
             raise PermissionError("You must be logged in")
 
-        # If part is not checked in, normal checkout
-        if not locked:
-            signature = self.signature_repo.add_signature("checkout", actor_user_id, note="Checked out part")
-            success = self.lock_repo.checkout(part.id, actor_user_id, signature)
-            if not success:
-                raise ValueError("Failed to check out part")
-            self.bom_repo.checkout_bom(part.id)
-            self._tree_dirty.add(int(self.session.project_id))
-            return True
-
-        # If checked in by another user, only allow admin/master to override
-        if locked.user_id != actor_user_id:
+        if as_user_id is not None and int(as_user_id) != int(actor_user_id):
             if not self.permission_repo.user_has_permission(actor_user_id, "merge", self.session.project_id):
-                raise ValueError("Part is checked in by another user.")
-            # Admin/master override: impersonate
-            effective_user_id = actor_user_id if as_user_id is None else int(as_user_id)
+                raise PermissionError("Only Master/Admin can check out as another user")
+            effective_user_id = int(as_user_id)
         else:
-            effective_user_id = actor_user_id
+            effective_user_id = int(actor_user_id)
 
-        signature = self.signature_repo.add_signature(
-            "checkout",
-            effective_user_id,
-            note="Checked out part (admin override)" if locked.user_id != actor_user_id else "Checked out part"
-        )
+        signature = self.signature_repo.add_signature("checkout", effective_user_id, note="Checked out part")
         success = self.lock_repo.checkout(part.id, effective_user_id, signature)
         if not success:
             raise ValueError("Failed to check out part")
@@ -208,20 +193,21 @@ class BomService(BaseService):
         self._tree_dirty.add(int(self.session.project_id))
         return True
 
-    def checkout_by_part_id(self, part_id: int, user_id: int):
-
-        
+    def checkin_by_part_id(self, part_id: int, user_id: int):
         locked = self.lock_repo.get_by_part(part_id)
         if not locked:
-            raise ValueError("Part is not checked in.")
+            raise ValueError("Part is not checked out.")
 
-        signature = self.signature_repo.add_signature("checkout", user_id , note="Checked out part")
-        success = self.lock_repo.checkout(part_id, user_id, signature)
+        signature = self.signature_repo.add_signature("checkin", user_id, note="Checked in part")
+        success = self.lock_repo.checkin(part_id, user_id, signature)
         if not success:
-            raise ValueError("Failed to check out part")
-        self.bom_repo.checkout_bom(part_id)
+            raise ValueError("Failed to check in part")
+        self.bom_repo.checkin_bom(part_id)
         self._tree_dirty.add(int(self.session.project_id))
         return True
+
+    def checkout_by_part_id(self, part_id: int, user_id: int):
+        return self.checkin_by_part_id(part_id, user_id)
 
     # -------------------------------
     # GET CHILDREN OF A PART
