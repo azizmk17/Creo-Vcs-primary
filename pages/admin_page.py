@@ -267,11 +267,6 @@ class AdminPage(QWidget):
         available_layout = QVBoxLayout(available_panel)
         available_layout.setContentsMargins(12, 12, 12, 12)
         available_layout.setSpacing(8)
-        available_layout.addWidget(self._field_label("Available role"))
-        self.role_combo = QComboBox()
-        for r in self.role_service.get_all_roles():
-            self.role_combo.addItem(r["name"], r["id"])
-        available_layout.addWidget(self.role_combo)
         assign = self.create_button("Assign Role", "primary", self.assign_role_to_user)
         available_layout.addWidget(assign, 0, Qt.AlignLeft)
         available_layout.addStretch()
@@ -443,11 +438,6 @@ class AdminPage(QWidget):
         available_layout = QVBoxLayout(available_panel)
         available_layout.setContentsMargins(12, 12, 12, 12)
         available_layout.setSpacing(8)
-        available_layout.addWidget(self._field_label("Available permission"))
-        self.permission_combo = QComboBox()
-        for p in self.permission_service.get_all_permissions():
-            self.permission_combo.addItem(p["name"], p["id"])
-        available_layout.addWidget(self.permission_combo)
         add = self.create_button("Add Permission", "primary", self.add_permission_to_role)
         btn_new_perm = self.create_button("New Permission", "neutral", self.create_permission)
         btn_del_perm = self.create_button("Delete Permission", "danger", self.delete_permission)
@@ -467,17 +457,12 @@ class AdminPage(QWidget):
 
     def _reload_roles(self):
         roles = self.role_service.get_all_roles()
-        self.role_combo.clear()
         self.role_perm_combo.clear()
         for r in roles:
-            self.role_combo.addItem(r["name"], r["id"])
             self.role_perm_combo.addItem(r["name"], r["id"])
 
     def _reload_permissions(self):
-        perms = self.permission_service.get_all_permissions()
-        self.permission_combo.clear()
-        for p in perms:
-            self.permission_combo.addItem(p["name"], p["id"])
+        return self.permission_service.get_all_permissions()
 
     def create_role(self):
         name, ok = QInputDialog.getText(self, "New Role", "Role name:")
@@ -538,13 +523,15 @@ class AdminPage(QWidget):
         self.refresh_stats()
 
     def delete_permission(self):
-        perm_id = self.permission_combo.currentData()
+        perms = self.permission_service.get_all_permissions()
+        perm_id = self._choose_from_items("Delete Permission", "Permission to delete:", perms)
         if not perm_id:
-            return QMessageBox.warning(self, "Select", "Select a permission to delete.")
+            return
+        name = next((str(p.get("name") or "") for p in perms if int(p.get("id")) == int(perm_id)), str(perm_id))
         res = QMessageBox.question(
             self,
             "Confirm",
-            f"Delete permission '{self.permission_combo.currentText()}'?",
+            f"Delete permission '{name}'?",
             QMessageBox.Yes | QMessageBox.No,
         )
         if res != QMessageBox.Yes:
@@ -607,13 +594,11 @@ class AdminPage(QWidget):
         members_layout.setSpacing(8)
         members_layout.addLayout(self._section_header("Project members", "Membership for the selected project"))
         members_top = QHBoxLayout()
-        self.project_user_combo = QComboBox()
-        members_top.addWidget(self._field_label("User"))
-        members_top.addWidget(self.project_user_combo)
         btn_add_user = self.create_button("Add Member", "primary", self.add_user_to_project)
         btn_remove_user = self.create_button("Remove Member", "danger", self.remove_user_from_project)
         members_top.addWidget(btn_add_user)
         members_top.addWidget(btn_remove_user)
+        members_top.addStretch()
         members_layout.addLayout(members_top)
         self.project_members_list = QListWidget()
         self.project_members_list.setAlternatingRowColors(True)
@@ -738,6 +723,27 @@ class AdminPage(QWidget):
         btn.setObjectName(style if style in ("primary", "danger", "neutral") else "neutral")
         return btn
 
+    def _choose_from_items(self, title, prompt, items, label_key="name", id_key="id"):
+        choices = []
+        ids_by_choice = {}
+        for item in items or []:
+            label = str(item.get(label_key) or "").strip()
+            item_id = item.get(id_key)
+            if not label or item_id is None:
+                continue
+            choice = label
+            if choice in ids_by_choice:
+                choice = f"{label} (ID {item_id})"
+            choices.append(choice)
+            ids_by_choice[choice] = int(item_id)
+        if not choices:
+            QMessageBox.information(self, title, "No items are available.")
+            return None
+        selected, ok = QInputDialog.getItem(self, title, prompt, choices, 0, False)
+        if not ok or not selected:
+            return None
+        return ids_by_choice.get(selected)
+
     # -------------------- DATA LOADING --------------------
     def load_user_roles(self):
         self.user_roles_list.clear()
@@ -767,10 +773,8 @@ class AdminPage(QWidget):
         # User combos used in multiple tabs
         users = self.user_service.get_all_users()
         self.user_combo.clear()
-        self.project_user_combo.clear()
         for u in users:
             self.user_combo.addItem(u.username, u.id)
-            self.project_user_combo.addItem(u.username, u.id)
 
     def load_projects(self):
         self.table.setSortingEnabled(False)
@@ -957,14 +961,18 @@ class AdminPage(QWidget):
 
     # -------------------- ACTIONS --------------------
     def assign_role_to_user(self):
-        u, r = self.user_combo.currentData(), self.role_combo.currentData()
-        if u and r:
-            try:
-                self.admin_service.assign_role_to_user(u, r)
-            except Exception as e:
-                return QMessageBox.warning(self, "Failed", str(e))
-            QMessageBox.information(self, "Success", "Role assigned.")
-            self.load_user_roles()
+        u = self.user_combo.currentData()
+        if not u:
+            return QMessageBox.warning(self, "Select", "Select a user first.")
+        r = self._choose_from_items("Assign Role", f"Role to assign to {self.user_combo.currentText()}:", self.role_service.get_all_roles())
+        if not r:
+            return
+        try:
+            self.admin_service.assign_role_to_user(u, r)
+        except Exception as e:
+            return QMessageBox.warning(self, "Failed", str(e))
+        QMessageBox.information(self, "Success", "Role assigned.")
+        self.load_user_roles()
 
     def remove_role_from_user(self):
         u = self.user_combo.currentData()
@@ -982,14 +990,22 @@ class AdminPage(QWidget):
         self.load_user_roles()
 
     def add_permission_to_role(self):
-        r, p = self.role_perm_combo.currentData(), self.permission_combo.currentData()
-        if r and p:
-            try:
-                self.admin_service.add_permission_to_role(r, p)
-            except Exception as e:
-                return QMessageBox.warning(self, "Failed", str(e))
-            QMessageBox.information(self, "Added", "Permission added.")
-            self.load_role_permissions()
+        r = self.role_perm_combo.currentData()
+        if not r:
+            return QMessageBox.warning(self, "Select", "Select a role first.")
+        p = self._choose_from_items(
+            "Add Permission",
+            f"Permission to add to {self.role_perm_combo.currentText()}:",
+            self.permission_service.get_all_permissions(),
+        )
+        if not p:
+            return
+        try:
+            self.admin_service.add_permission_to_role(r, p)
+        except Exception as e:
+            return QMessageBox.warning(self, "Failed", str(e))
+        QMessageBox.information(self, "Added", "Permission added.")
+        self.load_role_permissions()
 
     def remove_permission_from_role(self):
         r = self.role_perm_combo.currentData()
@@ -1106,9 +1122,15 @@ class AdminPage(QWidget):
 
     def add_user_to_project(self):
         pid = self._selected_project_id()
-        uid = self.project_user_combo.currentData()
-        if not pid or not uid:
-            return QMessageBox.warning(self, "Select", "Select a project and a user.")
+        if not pid:
+            return QMessageBox.warning(self, "Select", "Select a project first.")
+        users = [
+            {"id": getattr(user, "id", None), "name": getattr(user, "username", "")}
+            for user in self.user_service.get_all_users()
+        ]
+        uid = self._choose_from_items("Add Member", "User to add to the selected project:", users)
+        if not uid:
+            return
         try:
             self.project_service.add_user_to_project(int(uid), int(pid))
         except Exception as e:

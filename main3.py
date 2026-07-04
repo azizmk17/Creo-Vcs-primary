@@ -494,20 +494,8 @@ class BomGUI(QMainWindow):
         version_caption.setStyleSheet("color: #e5e7eb; font-weight: 700; padding-left: 6px;")
         toolbar.addWidget(version_caption)
         toolbar.addWidget(self.project_version_combo)
-        toolbar.addSeparator()
 
-        
-        # Create and store the project label
-        self.project_label = QLabel("Current: None")
-        self.project_label.setMinimumWidth(260)
-        self.project_label.setMaximumWidth(430)
-        self.project_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.project_label.setStyleSheet("color: #ffffff; font-weight: 700; padding: 0 8px;")
-        toolbar.addWidget(self.project_label)
-        self.refresh_project_selector(select_project_id=self.session.project_id, reload_on_change=False)
-
-        # Add button to toolbar
-        new_version_button = QPushButton("New Version")
+        new_version_button = QPushButton("Create New Version")
         new_version_button.setCursor(Qt.PointingHandCursor)
         new_version_button.setStyleSheet("""
             QPushButton {
@@ -523,6 +511,17 @@ class BomGUI(QMainWindow):
         """)
         new_version_button.clicked.connect(self.show_new_version_dialog)
         toolbar.addWidget(new_version_button)
+        toolbar.addSeparator()
+
+        
+        # Create and store the project label
+        self.project_label = QLabel("Current: None")
+        self.project_label.setMinimumWidth(160)
+        self.project_label.setMaximumWidth(260)
+        self.project_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.project_label.setStyleSheet("color: #ffffff; font-weight: 700; padding: 0 8px;")
+        toolbar.addWidget(self.project_label)
+        self.refresh_project_selector(select_project_id=self.session.project_id, reload_on_change=False)
 
     def _project_root_id(self, project: dict):
         root_id = project.get("root_project_id") or project.get("id")

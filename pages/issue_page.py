@@ -428,12 +428,19 @@ class EngineeringIssuePage(QWidget):
         jira_layout.addLayout(jira_form)
         add_jira_btn = QPushButton("Add Jira Link")
         add_jira_btn.clicked.connect(self.add_jira_link)
-        jira_layout.addWidget(add_jira_btn)
+        open_jira_btn = QPushButton("Open Jira Link")
+        open_jira_btn.clicked.connect(lambda _checked=False: self.open_selected_jira_link())
+        jira_actions = QHBoxLayout()
+        jira_actions.addWidget(add_jira_btn)
+        jira_actions.addWidget(open_jira_btn)
+        jira_actions.addStretch()
+        jira_layout.addLayout(jira_actions)
         self.jira_table = QTableWidget()
         self.jira_table.setColumnCount(4)
         self.jira_table.setHorizontalHeaderLabels(["Key", "URL", "Status", "Created"])
         self.jira_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.jira_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.jira_table.itemDoubleClicked.connect(lambda item: self.open_selected_jira_link(item))
         jira_layout.addWidget(self.jira_table, 1)
         tabs.addTab(jira_tab, "Jira")
 
@@ -945,6 +952,19 @@ class EngineeringIssuePage(QWidget):
             self.jira_table.setItem(row, 1, QTableWidgetItem(link.get("jira_url") or ""))
             self.jira_table.setItem(row, 2, QTableWidgetItem(link.get("jira_status") or ""))
             self.jira_table.setItem(row, 3, QTableWidgetItem(link.get("created_at") or ""))
+
+    def open_selected_jira_link(self, item=None):
+        row = item.row() if hasattr(item, "row") else self.jira_table.currentRow()
+        if row < 0:
+            return QMessageBox.warning(self, "Jira", "Select a Jira link first.")
+        url_item = self.jira_table.item(row, 1)
+        url = str(url_item.text() if url_item else "").strip()
+        if not url:
+            return QMessageBox.information(self, "Jira", "The selected Jira link has no URL.")
+        try:
+            safe_startfile(url)
+        except Exception as exc:
+            QMessageBox.warning(self, "Jira", f"Unable to open Jira link:\n{exc}")
 
     def _load_creo_files(self, issue):
         parts = issue.get("parts", []) if issue else []

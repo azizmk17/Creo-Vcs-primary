@@ -2141,16 +2141,19 @@ class CommitPage(QWidget):
             issues_label.setStyleSheet("font-size:12px;color:#111827;")
             layout.addWidget(issues_label)
             issues_table = QTableWidget()
-            issues_table.setColumnCount(7)
+            issues_table.setColumnCount(8)
             issues_table.setHorizontalHeaderLabels([
-                "Issue", "Title", "Status", "Priority", "Relation", "Validation", "Resolution"
+                "Issue", "Title", "Status", "Priority", "Relation", "Validation", "Resolution", "Jira"
             ])
             issues_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+            issues_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
             issues_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
             issues_table.setMinimumHeight(150)
             issues_table.setMaximumHeight(260)
             issues_table.setRowCount(len(issues))
             for r, issue in enumerate(issues):
+                jira_url = issue.get("jira_url") or ""
+                jira_label = issue.get("jira_key") or jira_url
                 values = [
                     issue.get("issue_number"),
                     issue.get("title"),
@@ -2159,10 +2162,19 @@ class CommitPage(QWidget):
                     issue.get("relation_type"),
                     issue.get("validation_status"),
                     issue.get("resolution_comment"),
+                    jira_label,
                 ]
                 for c, value in enumerate(values):
-                    issues_table.setItem(r, c, QTableWidgetItem(str(value or "")))
+                    item = QTableWidgetItem(str(value or ""))
+                    if jira_url:
+                        item.setData(Qt.UserRole, jira_url)
+                        item.setToolTip(jira_url)
+                    issues_table.setItem(r, c, item)
+            issues_table.itemDoubleClicked.connect(lambda item, table=issues_table: self._open_jira_link_from_table(table, item))
             layout.addWidget(issues_table)
+            open_jira_btn = QPushButton("Open Jira Link")
+            open_jira_btn.clicked.connect(lambda _checked=False, table=issues_table: self._open_jira_link_from_table(table))
+            layout.addWidget(open_jira_btn, 0, Qt.AlignLeft)
 
         self._add_engineering_files_section(
             layout,
@@ -2378,6 +2390,23 @@ class CommitPage(QWidget):
     # ═══════════════════════════════════════════════════════════════════
     #  COMMIT DETAILS DIALOG (for pending commits)
     # ═══════════════════════════════════════════════════════════════════
+
+    def _open_jira_link_from_table(self, table: QTableWidget, item=None):
+        row = item.row() if item is not None else table.currentRow()
+        if row < 0:
+            return QMessageBox.warning(self, "Jira", "Select a Jira-linked issue first.")
+        url = ""
+        for col in range(table.columnCount()):
+            cell = table.item(row, col)
+            if cell:
+                url = cell.data(Qt.UserRole) or url
+        url = str(url or "").strip()
+        if not url:
+            return QMessageBox.information(self, "Jira", "The selected issue has no Jira URL.")
+        try:
+            safe_startfile(url)
+        except Exception as exc:
+            QMessageBox.warning(self, "Jira", f"Unable to open Jira link:\n{exc}")
 
     def show_commit_details(self, group):
         group_details = self.commit_service.get_commit_group_details(

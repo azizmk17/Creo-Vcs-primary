@@ -673,6 +673,15 @@ class CommitService(BaseService):
         statuses = [str(r.get("status") or "") for r in rows]
         group_status = max(statuses, key=lambda s: status_order.get(s, 0)) if statuses else ""
         issues = self.issue_service.issues_for_commit(str(commit_id))
+        for issue in issues:
+            try:
+                jira_links = self.issue_service.jira_links(int(issue.get("id")))
+            except Exception:
+                jira_links = []
+            issue["jira_links"] = jira_links
+            primary_jira = next((link for link in jira_links if link.get("jira_url")), jira_links[0] if jira_links else {})
+            issue["jira_key"] = primary_jira.get("jira_key") or ""
+            issue["jira_url"] = primary_jira.get("jira_url") or ""
         engineering_files = self.traceability_service.engineering_files_for_commit(str(commit_id))
         for item in engineering_files:
             self._resolve_engineering_file_path(item)
