@@ -809,11 +809,11 @@ class _FilterChip(QPushButton):
         else:
             self.setStyleSheet(f"""
                 QPushButton {{
-                    background: #f3f4f6; color: #9ca3af;
+                    background: #f3f4f6; color: #475569;
                     border: 1px solid #d1d5db; border-radius: 12px;
                     padding: 2px 10px; font-size: 11px; font-weight: 500;
                 }}
-                QPushButton:hover {{ background: #e5e7eb; color: #6b7280; }}
+                QPushButton:hover {{ background: #e5e7eb; color: #111827; }}
             """)
 
     def toggle_state(self):
@@ -1216,14 +1216,20 @@ class HistoryPanel(QWidget):
         # Select-all / none
         sel_all = QPushButton("All")
         sel_all.setFixedSize(36, 24)
-        sel_all.setStyleSheet("font-size: 10px; border-radius: 8px; background: #e5e7eb; border: none;")
+        sel_all.setStyleSheet(
+            "font-size: 10px; font-weight: 700; color: #111827; "
+            "border-radius: 8px; background: #e5e7eb; border: none;"
+        )
         sel_all.setCursor(Qt.PointingHandCursor)
         sel_all.clicked.connect(lambda: self._set_all_chips(True))
         chips_row.addWidget(sel_all)
 
         sel_none = QPushButton("None")
         sel_none.setFixedSize(40, 24)
-        sel_none.setStyleSheet("font-size: 10px; border-radius: 8px; background: #e5e7eb; border: none;")
+        sel_none.setStyleSheet(
+            "font-size: 10px; font-weight: 700; color: #111827; "
+            "border-radius: 8px; background: #e5e7eb; border: none;"
+        )
         sel_none.setCursor(Qt.PointingHandCursor)
         sel_none.clicked.connect(lambda: self._set_all_chips(False))
         chips_row.addWidget(sel_none)
@@ -4444,6 +4450,15 @@ class BomPage(QWidget):
         except Exception:
             pass
 
+    def _refresh_lock_family_rows(self, part_id: int):
+        try:
+            part_ids = self.bom_service.part_ids_sharing_base_file(int(part_id)) or [int(part_id)]
+        except Exception:
+            part_ids = [int(part_id)]
+        for pid in part_ids:
+            self._refresh_current_tree_item_lock_state(int(pid))
+            self._invalidate_doc_indicator(int(pid))
+
     def checkin_part(self, part_id=None):
         if not part_id:
             if not self.current_part_id:
@@ -4498,8 +4513,7 @@ class BomPage(QWidget):
 
             self.bom_service.checkin_part(part_id, as_user_id=as_user_id)
             QMessageBox.information(self, "Success", "Part checked in successfully.")
-            # Fast refresh: update only this row
-            self._refresh_current_tree_item_lock_state(int(part_id))
+            self._refresh_lock_family_rows(int(part_id))
             self._refresh_current_tree_item_indicator()
             try:
                 self.display_details(int(part_id))
@@ -4570,8 +4584,7 @@ class BomPage(QWidget):
             try:
                 self.bom_service.checkout_part(part_id, as_user_id=as_user_id)
                 QMessageBox.information(self, "Success", "Part checked out successfully.")
-                # Fast refresh: update only this row
-                self._refresh_current_tree_item_lock_state(int(part_id))
+                self._refresh_lock_family_rows(int(part_id))
                 self._refresh_current_tree_item_indicator()
                 try:
                     self.display_details(int(part_id))
@@ -5759,29 +5772,221 @@ class BomPage(QWidget):
     # -------------------------
     # Export
     # -------------------------
+    def _doc_export_text(self, item: QTreeWidgetItem, doc_key: str) -> str:
+        payload = item.data(1, BOM_TREE_FILES_ROLE) or {}
+        value = payload.get(doc_key)
+        if isinstance(value, (tuple, list)) and value:
+            state = str(value[0] or "na").lower()
+            labels = {
+                "ok": "OK",
+                "outdated": "Outdated",
+                "missing": "Missing",
+                "na": "Not attached",
+                "bad": "Missing",
+                "ack": "OK",
+            }
+            return labels.get(state, state.title() if state else "Unknown")
+        return "Unknown"
+
+    def _integrity_export_text(self, item: QTreeWidgetItem) -> str:
+        payload = item.data(6, BOM_TREE_INTEGRITY_ROLE) or {}
+        state = str(payload.get("state") or "ok").lower()
+        return "Has issues" if state == "warn" else "Healthy"
+
+    def _issue_export_text(self, item: QTreeWidgetItem) -> str:
+        summary = item.data(0, BOM_TREE_ISSUE_ROLE) or {}
+        active = int(summary.get("active_count") or 0)
+        total = int(summary.get("total_count") or 0)
+        if active:
+            return f"{active} active / {total} linked"
+        if total:
+            return f"0 active / {total} linked"
+        return "No linked issues"
+
+    def _active_filter_summary(self) -> list[tuple[str, str]]:
+        filters = dict(getattr(self, "_bom_advanced_filters", {}) or self._default_bom_advanced_filters())
+        defaults = self._default_bom_advanced_filters()
+        labels = {
+            "text": "Contains",
+            "work_state": "Work state",
+            "work_owner": "Owner",
+            "status": "Status",
+            "type": "Type",
+            "revision": "Revision",
+            "structure": "Structure",
+            "pdf": "PDF",
+            "step": "STEP",
+            "integrity": "Integrity",
+            "issues": "Issues",
+            "expand_matches": "Expand matches",
+        }
+        rows = []
+        for key, label in labels.items():
+            value = filters.get(key, defaults.get(key, ""))
+            if value != defaults.get(key, ""):
+                rows.append((label, str(value)))
+        if getattr(self, "_in_search_mode", False):
+            rows.append(("Search mode", "Current search results"))
+        return rows or [("Filter", "None - all visible BOM rows")]
+
+    def _collect_visible_bom_export_rows(self) -> list[dict]:
+        tree = self._current_tree_for_filtering()
+        rows: list[dict] = []
+
+        def recurse(item: QTreeWidgetItem, level: int, ancestor_visible: bool = True):
+            visible = ancestor_visible and not item.isHidden()
+            if not visible:
+                return
+            part_id = item.data(0, Qt.UserRole)
+            issue_text = self._issue_export_text(item)
+            integrity_payload = item.data(6, BOM_TREE_INTEGRITY_ROLE) or {}
+            details = []
+            for tip in (item.toolTip(0), item.toolTip(1), integrity_payload.get("tooltip")):
+                tip = str(tip or "").strip()
+                if tip and tip not in details:
+                    details.append(tip)
+            rows.append({
+                "level": level,
+                "name": item.text(0),
+                "aes_number": item.text(2),
+                "type": item.text(3),
+                "revision": item.text(4),
+                "status": item.text(5),
+                "work_state": item.data(0, BOM_TREE_INWORK_ROLE) or "Checked In",
+                "pdf": self._doc_export_text(item, "pdf"),
+                "step": self._doc_export_text(item, "step"),
+                "integrity": self._integrity_export_text(item),
+                "issues": issue_text,
+                "part_id": "" if part_id is None else str(part_id),
+                "details": "\n".join(details),
+            })
+            for child_index in range(item.childCount()):
+                recurse(item.child(child_index), level + 1, visible)
+
+        for top_index in range(tree.topLevelItemCount()):
+            recurse(tree.topLevelItem(top_index), 0)
+        return rows
+
+    def _export_visible_bom_csv(self, file_path: str, rows: list[dict]) -> None:
+        fieldnames = [
+            "level", "name", "aes_number", "type", "revision", "status",
+            "work_state", "pdf", "step", "integrity", "issues", "part_id", "details",
+        ]
+        with open(file_path, "w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def _export_visible_bom_xlsx(self, file_path: str, rows: list[dict]) -> None:
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Alignment, Font, PatternFill
+            from openpyxl.utils import get_column_letter
+        except ImportError as exc:
+            raise RuntimeError(
+                "Excel export requires openpyxl. Install dependencies from requirements.txt, then try again."
+            ) from exc
+
+        headers = [
+            ("level", "Level"),
+            ("name", "Name"),
+            ("aes_number", "AES Number"),
+            ("type", "Type"),
+            ("revision", "Revision"),
+            ("status", "Status"),
+            ("work_state", "Work State"),
+            ("pdf", "PDF"),
+            ("step", "STEP"),
+            ("integrity", "Integrity"),
+            ("issues", "Issues"),
+            ("part_id", "Part ID"),
+            ("details", "Details"),
+        ]
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Filtered BOM"
+
+        title = "BOM Export"
+        if not self._is_default_bom_advanced_filter() or getattr(self, "_in_search_mode", False):
+            title = "Filtered BOM Export"
+        ws["A1"] = title
+        ws["A1"].font = Font(bold=True, size=14, color="111827")
+        ws["A2"] = f"Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        ws["A3"] = f"Rows: {len(rows)}"
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+        ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(headers))
+        ws.merge_cells(start_row=3, start_column=1, end_row=3, end_column=len(headers))
+
+        header_row = 5
+        for col, (_, label) in enumerate(headers, start=1):
+            cell = ws.cell(row=header_row, column=col, value=label)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="1F2937")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        for row_index, row in enumerate(rows, start=header_row + 1):
+            for col, (key, _) in enumerate(headers, start=1):
+                value = row.get(key, "")
+                cell = ws.cell(row=row_index, column=col, value=value)
+                cell.alignment = Alignment(vertical="top", wrap_text=(key == "details"))
+                if key == "name":
+                    cell.alignment = Alignment(indent=min(int(row.get("level") or 0), 10), vertical="top")
+                    if int(row.get("level") or 0) == 0:
+                        cell.font = Font(bold=True)
+            try:
+                ws.row_dimensions[row_index].outlineLevel = min(int(row.get("level") or 0), 7)
+            except Exception:
+                pass
+
+        ws.freeze_panes = "A6"
+        ws.auto_filter.ref = f"A{header_row}:{get_column_letter(len(headers))}{max(header_row, header_row + len(rows))}"
+        widths = {
+            "A": 8, "B": 32, "C": 16, "D": 12, "E": 12, "F": 14, "G": 18,
+            "H": 14, "I": 14, "J": 16, "K": 20, "L": 10, "M": 54,
+        }
+        for column, width in widths.items():
+            ws.column_dimensions[column].width = width
+
+        summary = wb.create_sheet("Export Filter")
+        summary["A1"] = "Filter"
+        summary["B1"] = "Value"
+        summary["A1"].font = Font(bold=True, color="FFFFFF")
+        summary["B1"].font = Font(bold=True, color="FFFFFF")
+        summary["A1"].fill = PatternFill("solid", fgColor="1F2937")
+        summary["B1"].fill = PatternFill("solid", fgColor="1F2937")
+        for idx, (label, value) in enumerate(self._active_filter_summary(), start=2):
+            summary.cell(row=idx, column=1, value=label)
+            summary.cell(row=idx, column=2, value=value)
+        summary.column_dimensions["A"].width = 24
+        summary.column_dimensions["B"].width = 48
+        wb.save(file_path)
+
     def export_bom(self):
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "Export BOM", "", "CSV Files (*.csv);;All Files (*)"
+        default_name = "bom_filtered.xlsx" if not self._is_default_bom_advanced_filter() else "bom.xlsx"
+        file_path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Export BOM",
+            default_name,
+            "Excel Workbook (*.xlsx);;CSV Files (*.csv);;All Files (*)",
         )
         if not file_path:
             return
         try:
-            # If your service supports exporting directly, call it. Otherwise dump tree.
-            if hasattr(self.bom_service, "export_bom"):
-                self.bom_service.export_bom(file_path)
+            rows = self._collect_visible_bom_export_rows()
+            if not rows:
+                QMessageBox.warning(self, "Export BOM", "There are no visible BOM rows to export.")
+                return
+
+            lower = file_path.lower()
+            wants_csv = "csv" in selected_filter.lower() or lower.endswith(".csv")
+            if wants_csv:
+                if not lower.endswith(".csv"):
+                    file_path += ".csv"
+                self._export_visible_bom_csv(file_path, rows)
             else:
-                # Fallback: write CSV from current tree
-                with open(file_path, "w", encoding="utf-8") as f:
-                    f.write("AES,Name,Type,Status\n")
-                    # iterate top level
-                    def recurse(item):
-                        f.write(
-                            f'{item.text(0)},{item.text(2)},{item.text(3)},{item.text(5)}\n'
-                        )
-                        for i in range(item.childCount()):
-                            recurse(item.child(i))
-                    for i in range(self.tree.topLevelItemCount()):
-                        recurse(self.tree.topLevelItem(i))
+                if not lower.endswith(".xlsx"):
+                    file_path += ".xlsx"
+                self._export_visible_bom_xlsx(file_path, rows)
             QMessageBox.information(self, "Success", f"BOM exported to {file_path}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to export BOM: {str(e)}")

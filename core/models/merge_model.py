@@ -13,6 +13,7 @@ class Merge:
     filename: str
     title: Optional[str]
     commit_id: Optional[str]
+    project_id: Optional[int]
     designer_username: str
     
     

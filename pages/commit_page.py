@@ -1507,19 +1507,21 @@ class CommitPage(QWidget):
                         int(project_id),
                         designer_id,
                     )
+                    boms = [bom] if bom else []
                 else:
-                    bom = self.bom_repo.get_by_base_file_name_for_commit(
+                    boms = self.bom_repo.get_all_by_base_file_name_for_commit(
                         base_name,
                         int(project_id),
                         designer_id,
-                    )
+                    ) or []
             except Exception:
-                bom = None
-            if not bom:
-                continue
-            info = self.bom_service.get_part_details(int(bom.id)) or {}
-            if info:
-                result[int(bom.id)] = info
+                boms = []
+            for bom in boms:
+                if not bom:
+                    continue
+                info = self.bom_service.get_part_details(int(bom.id)) or {}
+                if info:
+                    result[int(bom.id)] = info
         return list(result.values())
 
     def _refresh_affected_bom_items(self):
@@ -2663,15 +2665,21 @@ class CommitPage(QWidget):
         commit_id = str(group.get("commit_id") or "")
         username = str(group.get("username") or "")
         candidates = []
+        commit_dir = str(group.get("commit_dir") or "").strip()
+        if commit_dir:
+            candidates.append(commit_dir)
         if username and title and commit_id:
-            candidates.append(os.path.join(self.commits_dir, username, f"{title}_{commit_id}"))
+            commits_dir = self.commits_dir or os.path.join(self.working_dir or "", "commits")
+            candidates.append(os.path.join(commits_dir, username, f"{title}_{commit_id}"))
             safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)
             if safe_title != title:
-                candidates.append(os.path.join(self.commits_dir, username, f"{safe_title}_{commit_id}"))
+                candidates.append(os.path.join(commits_dir, username, f"{safe_title}_{commit_id}"))
         for path in candidates:
             path = os.path.normpath(path)
             if safe_exists(path):
                 return path
+        if self.working_dir and safe_exists(self.working_dir):
+            return os.path.normpath(self.working_dir)
         return os.path.normpath(candidates[0]) if candidates else ""
 
     def browse_commit_directory(self, group):

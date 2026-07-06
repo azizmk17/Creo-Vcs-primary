@@ -18,6 +18,12 @@ def _resource_path(relative: str) -> str:
     return os.path.join(base, relative)
 
 
+APP_NAME = "Nexus"
+APP_ICON_PATH = "assets/pictures/nexus_logo.ico"
+APP_LOADER_LOGO_PATH = "assets/pictures/nexus_logo_glow.png"
+APP_TOOLBAR_LOGO_PATH = "assets/pictures/nexus_logo_glow.png"
+
+
 def _run_migrations_safely():
     try:
         from setup.migrations import migrate
@@ -57,7 +63,7 @@ class AdvancedSpinner(QWidget):
         self.timer.start(33)
 
         self.logo = QPixmap(logo_path).scaled(
-            82, 82, Qt.KeepAspectRatio, Qt.SmoothTransformation
+            128, 128, Qt.KeepAspectRatio, Qt.SmoothTransformation
         ) if logo_path else None
 
     def rotate(self):
@@ -80,9 +86,6 @@ class AdvancedSpinner(QWidget):
             painter.drawPoint(int(x), int(y))
 
         if self.logo:
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(22, 38, 61))
-            painter.drawEllipse(center, 51, 51)
             logo_rect = self.logo.rect()
             logo_rect.moveCenter(center)
             painter.drawPixmap(logo_rect, self.logo)
@@ -100,7 +103,7 @@ class AdvancedLoader(QWidget):
         self.spinner = AdvancedSpinner(logo_path)
         layout.addWidget(self.spinner, 0, Qt.AlignCenter)
 
-        self.loading_label = QLabel("Preparing CreoVCS", self)
+        self.loading_label = QLabel(f"Preparing {APP_NAME}", self)
         self.loading_label.setAlignment(Qt.AlignCenter)
         self.loading_label.setObjectName("loaderTitle")
         self.loading_label.setFont(QFont("Segoe UI", 18, QFont.Bold))
@@ -152,9 +155,9 @@ class StartupWindow(QMainWindow):
 
     def __init__(self, logo_path=None):
         super().__init__()
-        self.setWindowTitle("CreoVCS")
+        self.setWindowTitle(APP_NAME)
         self.resize(1400, 900)
-        self.setWindowIcon(QIcon(_resource_path("assets/pictures/creovcs_logo-main.ico")))
+        self.setWindowIcon(QIcon(_resource_path(APP_ICON_PATH)))
 
         self.pages = QStackedWidget()
         self.setCentralWidget(self.pages)
@@ -194,7 +197,7 @@ class StartupWindow(QMainWindow):
         try:
             self.main_page = BomGUI(startup_progress=self._set_loading_status)
         except Exception as exc:
-            QMessageBox.critical(self, "Startup Error", f"CreoVCS could not start:\n\n{exc}")
+            QMessageBox.critical(self, "Startup Error", f"{APP_NAME} could not start:\n\n{exc}")
             self.pages.setCurrentWidget(self.login_page)
             self.login_page._set_busy(False)
             raise
@@ -240,9 +243,9 @@ class BomGUI(QMainWindow):
 
     def __init__(self, startup_progress=None):
         super().__init__()
-        self.setWindowTitle("BOM Manager - CreoVCS")
+        self.setWindowTitle(f"BOM Manager - {APP_NAME}")
         self.resize(1400, 900)
-        self.setWindowIcon(QIcon(_resource_path("assets/pictures/creovcs_logo-main.ico")))
+        self.setWindowIcon(QIcon(_resource_path(APP_ICON_PATH)))
 
         self.session = SessionManager()
         self.user_repo = UserRepository()
@@ -393,7 +396,7 @@ class BomGUI(QMainWindow):
         return page
 
     def _check_version_notification(self):
-        """Show a popup dialog if a newer CreoVCS version is available in the DB."""
+        """Show a popup dialog if a newer Nexus version is available in the DB."""
         try:
             import os as _os
             from core.licensing.version_check import check_version_notification
@@ -419,6 +422,16 @@ class BomGUI(QMainWindow):
         toolbar = QToolBar("Main Toolbar")
         toolbar.setMovable(False)
         self.addToolBar(Qt.TopToolBarArea, toolbar)
+
+        logo_label = QLabel()
+        logo = QPixmap(_resource_path(APP_TOOLBAR_LOGO_PATH))
+        if not logo.isNull():
+            logo_label.setPixmap(logo.scaled(34, 34, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        logo_label.setFixedSize(42, 36)
+        logo_label.setAlignment(Qt.AlignCenter)
+        logo_label.setToolTip(APP_NAME)
+        logo_label.setStyleSheet("padding: 0 4px;")
+        toolbar.addWidget(logo_label)
 
         # Navigation buttons
         bom_action = QAction("BOM", self)
@@ -1131,7 +1144,7 @@ class BomGUI(QMainWindow):
 if __name__ == "__main__":
 
     app = QApplication(sys.argv)
-    logo_path = _resource_path("assets/pictures/logo.png")
+    logo_path = _resource_path(APP_LOADER_LOGO_PATH)
     app.setStyle("Fusion")
 
     # ------------------------------------------------------------------
@@ -1152,7 +1165,7 @@ if __name__ == "__main__":
             None,
             "Workspace Required",
             "No workspace folder was selected.\n\n"
-            f"CreoVCS needs a shared folder that contains '{_cfg_mod._DB_FILENAME}'.\n"
+            f"{APP_NAME} needs a shared folder that contains '{_cfg_mod._DB_FILENAME}'.\n"
             "The application cannot start without it.",
         )
         sys.exit(1)
@@ -1199,7 +1212,7 @@ if __name__ == "__main__":
         QMessageBox.critical(
             None,
             "License Error",
-            f"CreoVCS cannot start:\n\n{_lic_exc}\n\n"
+            f"{APP_NAME} cannot start:\n\n{_lic_exc}\n\n"
             "Contact your administrator to obtain a valid license.",
         )
         sys.exit(1)

@@ -50,15 +50,16 @@ $Common = @(
     "--nofollow-import-to=scipy"
 )
 
-Write-Host "[2/4] Compiling CreoVCS main application..."
+Write-Host "[2/4] Compiling Nexus main application..."
 $MainArgs = $Common + @(
     "--windows-console-mode=disable",
-    "--windows-icon-from-ico=$Root\assets\pictures\creovcs_logo-main.ico",
+    "--windows-icon-from-ico=$Root\assets\pictures\nexus_logo.ico",
     "--include-data-dir=$Root\assets\pictures=assets/pictures",
     "--include-data-files=$Root\modern_theme.qss=modern_theme.qss",
     "--include-package=core",
     "--include-package=pages",
     "--include-package=setup",
+    "--include-package=openpyxl",
     "--include-module=utils",
     "--include-module=config",
     "--include-module=tools.CAD.step_viewer.launcher",
@@ -66,18 +67,18 @@ $MainArgs = $Common + @(
     "--nofollow-import-to=OCC",
     "--nofollow-import-to=tools.CAD.step_viewer.main_window",
     "--nofollow-import-to=tools.CAD.step_diff_engine.step_diff_gui",
-    "--output-filename=CreoVCS.exe",
+    "--output-filename=Nexus.exe",
     "--report=$OutputRoot\nuitka-main-report.xml",
     "$Root\main3.py"
 )
 & $Python -m nuitka @MainArgs
-if ($LASTEXITCODE -ne 0) { throw "CreoVCS Nuitka build failed." }
+if ($LASTEXITCODE -ne 0) { throw "Nexus Nuitka build failed." }
 
 if (-not $SkipCadViewer) {
     Write-Host "[3/4] Compiling CAD Viewer and collecting OpenCascade DLLs..."
     $CadArgs = $Common + @(
         "--windows-console-mode=disable",
-        "--windows-icon-from-ico=$Root\assets\pictures\creovcs_logo-main.ico",
+        "--windows-icon-from-ico=$Root\assets\pictures\nexus_logo.ico",
         "--include-package=tools.CAD.step_viewer",
         "--include-package=tools.CAD.step_diff_engine",
         "--include-package=OCC",
@@ -98,7 +99,7 @@ if (-not $SkipCadViewer) {
     Write-Host "[4/4] Runtime merge skipped."
 }
 
-$MainExe = Join-Path $MainDist "CreoVCS.exe"
+$MainExe = Join-Path $MainDist "Nexus.exe"
 if (-not (Test-Path -LiteralPath $MainExe)) {
     throw "Expected output executable not found: $MainExe"
 }

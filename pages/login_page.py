@@ -1,6 +1,8 @@
 import os
+import sys
 
 from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import (
     QFormLayout,
     QFrame,
@@ -16,6 +18,11 @@ from core.repositories.user_repository import UserRepository
 from core.services.project_service import ProjectService
 from core.services.user_service import UserService
 from core.session_manager import SessionManager
+
+
+def _resource_path(relative: str) -> str:
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return os.path.join(base, relative)
 
 
 class LoginPage(QWidget):
@@ -47,8 +54,12 @@ class LoginPage(QWidget):
         layout.setContentsMargins(44, 40, 44, 40)
         layout.setSpacing(18)
 
-        brand = QLabel("CreoVCS")
-        brand.setObjectName("loginBrand")
+        brand = QLabel("Nexus")
+        brand.setObjectName("loginBrandLogo")
+        brand.setAlignment(Qt.AlignCenter)
+        logo = QPixmap(_resource_path("assets/pictures/nexus_logo_landscape.png"))
+        if not logo.isNull():
+            brand.setPixmap(logo.scaled(320, 96, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         subtitle = QLabel("Engineering workspace")
         subtitle.setObjectName("loginSubtitle")
         subtitle.setWordWrap(True)
@@ -100,7 +111,7 @@ class LoginPage(QWidget):
                 border: 1px solid #d9e1ea;
                 border-radius: 8px;
             }
-            QLabel#loginBrand {
+            QLabel#loginBrandLogo {
                 color: #16263d;
                 font-size: 28px;
                 font-weight: 700;

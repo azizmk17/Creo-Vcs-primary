@@ -338,14 +338,16 @@ class CommitService(BaseService):
                     if cad_file not in uncommitted_bases:
                         raise ValueError(f"Error: Cannot Commit drawing without its related CAD,\n Please provide the CAD file {cad_file} related to drawing {filename} in the uncommitted parts.")
                 part_type = "Drw"
+                bom_entries = [bom_entry] if bom_entry else []
                 print(f"Identified as Drawing file: {filename}")
             else:
                 part_type = "Cad"
-                bom_entry = self.bom_repo.get_by_base_file_name_for_commit(
+                bom_entries = self.bom_repo.get_all_by_base_file_name_for_commit(
                     base_f_name,
                     self.session.project_id,
                     designer_id,
-                )
+                ) or []
+                bom_entry = bom_entries[0] if bom_entries else None
 
             if not bom_entry:
                 if part_type == "Cad":
@@ -353,22 +355,23 @@ class CommitService(BaseService):
                 elif part_type == "Drw":
                     raise ValueError(f"drw404:{filename}")
 
-            part_id = bom_entry.id
-            locked = self.lock_repo.get_by_part(part_id)
-            if not locked:
-                raise ValueError(f"Commit blocked: {filename} is not checked out.")
-            elif locked.user_id != designer_id:
-                print(locked.user_id)
-                raise ValueError(f"Commit blocked: {filename} is checked out by another user.")
+            for bom in bom_entries:
+                part_id = int(bom.id)
+                locked = self.lock_repo.get_by_part(part_id)
+                if not locked:
+                    raise ValueError(f"Commit blocked: {filename} is not checked out for {bom.aes_number or bom.name or part_id}.")
+                elif locked.user_id != designer_id:
+                    print(locked.user_id)
+                    raise ValueError(f"Commit blocked: {filename} is checked out by another user for {bom.aes_number or bom.name or part_id}.")
 
-            commit_plan.append({
-                "filepath": filepath,
-                "filename": filename,
-                "dest_path": os.path.join(commit_user_dir, filename),
-                "base_f_name": base_f_name,
-                "part_type": part_type,
-                "part_id": part_id,
-            })
+                commit_plan.append({
+                    "filepath": filepath,
+                    "filename": filename,
+                    "dest_path": os.path.join(commit_user_dir, filename),
+                    "base_f_name": base_f_name,
+                    "part_type": part_type,
+                    "part_id": part_id,
+                })
 
         delayed_attachments = self._normalize_engineering_attachments(engineering_attachments)
         step_attachment_by_part = {}
@@ -641,9 +644,12 @@ class CommitService(BaseService):
                 all_commits = [c for c in all_commits if _designer_id(c) == user_id_int]
         
         grouped = {}
+        seen_files_by_group = {}
         for c in all_commits:
             key = (c.designer, c.commit_id)
             if key not in grouped:
+                file_path = str(getattr(c, "file_path", "") or "")
+                commit_dir = os.path.dirname(file_path) if file_path else ""
                 grouped[key] = {
                     "designer": c.designer,
                     "status": c.status,
@@ -652,10 +658,20 @@ class CommitService(BaseService):
                     "project_id": getattr(c, "project_id", None),
                     "title": c.title,
                     "date": c.committed_at,
+                    "commit_dir": commit_dir,
                     "parts": [],
                     "related_issues": self.issue_service.issues_for_commit(c.commit_id),
                 }
-            grouped[key]["parts"].append(c.filename)
+                seen_files_by_group[key] = set()
+            elif not grouped[key].get("commit_dir"):
+                file_path = str(getattr(c, "file_path", "") or "")
+                if file_path:
+                    grouped[key]["commit_dir"] = os.path.dirname(file_path)
+            file_label = str(getattr(c, "filename", "") or "")
+            file_key = file_label.lower()
+            if file_label and file_key not in seen_files_by_group.setdefault(key, set()):
+                grouped[key]["parts"].append(file_label)
+                seen_files_by_group[key].add(file_key)
         return list(grouped.values())
 
     def get_commit_group_details(self, commit_id: str, project_id: int | None = None) -> dict:

@@ -31,11 +31,7 @@ def exported_document_filename(
     """Build customer-facing export names without leaking project version labels."""
 
     file_type_upper = str(file_type or "").strip().upper()
-    drawing_no = (
-        str(getattr(part, "drawing_number", "") or "").strip()
-        or str(getattr(part, "base_drw_name", "") or "").strip()
-        or str(getattr(part, "base_file_name", "") or "").strip()
-    )
+    drawing_no = str(getattr(part, "drawing_number", "") or "").strip()
     aes = str(getattr(part, "aes_number", "") or "").strip()
     part_name = str(getattr(part, "name", "") or "").strip()
     rev = normalize_name_part(revision)

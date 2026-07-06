@@ -693,7 +693,7 @@ class TraceabilityService(BaseService):
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
             '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" '
             'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">'
-            '<Application>Creo VCS</Application></Properties>'
+            '<Application>Nexus</Application></Properties>'
         )
         core_xml = (
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -702,8 +702,8 @@ class TraceabilityService(BaseService):
             'xmlns:dcterms="http://purl.org/dc/terms/" '
             'xmlns:dcmitype="http://purl.org/dc/dcmitype/" '
             'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
-            '<dc:creator>Creo VCS</dc:creator>'
-            '<cp:lastModifiedBy>Creo VCS</cp:lastModifiedBy>'
+            '<dc:creator>Nexus</dc:creator>'
+            '<cp:lastModifiedBy>Nexus</cp:lastModifiedBy>'
             f'<dcterms:created xsi:type="dcterms:W3CDTF">{created}</dcterms:created>'
             f'<dcterms:modified xsi:type="dcterms:W3CDTF">{created}</dcterms:modified>'
             '</cp:coreProperties>'

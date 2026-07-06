@@ -1,9 +1,9 @@
 @echo off
 setlocal EnableDelayedExpansion
-title CreoVCS Build
+title Nexus Build
 
 echo ============================================================
-echo  CreoVCS Build Pipeline
+echo  Nexus Build Pipeline
 echo  Stage 1 : Copy source tree to dist_obf\
 echo  Stage 2 : PyArmor  (critical files only)
 echo  Stage 3 : PyInstaller  (EXE packaging)
@@ -74,7 +74,7 @@ if errorlevel 1 (echo [ERROR] PyInstaller build failed & exit /b 1)
 echo.
 echo ============================================================
 echo  BUILD SUCCESSFUL
-echo  Output : dist\CreoVCS.exe
+echo  Output : dist\Nexus.exe
 echo ============================================================
 echo.
 

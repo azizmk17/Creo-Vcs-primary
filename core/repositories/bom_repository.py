@@ -161,7 +161,7 @@ class BomRepository:
         project_id: int,
         preferred_user_id: Optional[int] = None,
     ) -> Optional[Bom]:
-        """Project-scoped BOM lookup that prefers the part checked-in by preferred_user_id.
+        """Project-scoped BOM lookup that prefers the part checked out by preferred_user_id.
 
         This avoids selecting the wrong BOM row when the same base_file_name exists more
         than once (e.g., after versioning/duplication).
@@ -186,6 +186,31 @@ class BomRepository:
             if row:
                 return Bom(**row)
             return None
+
+    def get_all_by_base_file_name_for_commit(
+        self,
+        base_file_name: str,
+        project_id: int,
+        preferred_user_id: Optional[int] = None,
+    ) -> List[Bom]:
+        """Return every BOM row in this project that shares the same CAD base file."""
+        with self.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT b.*
+                FROM bom b
+                LEFT JOIN locks l ON l.part_id = b.id
+                WHERE b.base_file_name = ? AND b.project_id = ?
+                ORDER BY
+                    CASE WHEN l.user_id = ? THEN 1 ELSE 0 END DESC,
+                    CASE WHEN l.user_id IS NOT NULL THEN 1 ELSE 0 END DESC,
+                    b.id ASC
+                """,
+                (base_file_name, project_id, preferred_user_id),
+            )
+            rows = cur.fetchall()
+            return [Bom(**row) for row in rows]
         
     def get_by_drawing_file_name(self, base_drw_name: str) -> Optional[Bom]:
         with self.get_conn() as conn:

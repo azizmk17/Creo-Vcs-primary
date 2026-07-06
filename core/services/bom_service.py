@@ -135,35 +135,64 @@ class BomService(BaseService):
         return result
     
     # -------------------------------
+    def _parts_sharing_base_file(self, part) -> List:
+        base = str(getattr(part, "base_file_name", "") or "").strip()
+        project_id = getattr(part, "project_id", None) or self.session.project_id
+        if not base or not project_id:
+            return [part]
+        try:
+            related = self.bom_repo.get_all_by_base_file_name_for_commit(base, int(project_id), self.session.user_id) or []
+        except Exception:
+            related = []
+        return related or [part]
+
+    def part_ids_sharing_base_file(self, part_id: int) -> List[int]:
+        part = self.bom_repo.get_by_id(int(part_id))
+        if not part:
+            return []
+        return [int(p.id) for p in self._parts_sharing_base_file(part) if getattr(p, "id", None) is not None]
+
     # CHECKIN PART
     # -------------------------------
     def checkin_part(self, part_id: str, as_user_id: int | None = None):
         part = self.bom_repo.get_by_id(part_id)
         if not part:
             raise ValueError("Part not found")
-        locked = self.lock_repo.get_by_part(part.id)
-        if not locked:
+        related_parts = self._parts_sharing_base_file(part)
+        locked_by_part = {
+            int(p.id): self.lock_repo.get_by_part(int(p.id))
+            for p in related_parts
+            if getattr(p, "id", None) is not None
+        }
+        active_locks = [lock for lock in locked_by_part.values() if lock]
+        if not active_locks:
             raise ValueError("Part is not checked out.")
         actor_user_id = int(self.session.user_id) if self.session.user_id is not None else None
         if not actor_user_id:
             raise PermissionError("You must be logged in")
 
-        if locked.user_id != actor_user_id:
+        other_locks = [lock for lock in active_locks if int(lock.user_id) != actor_user_id]
+        if other_locks:
             if not self.permission_repo.user_has_permission(actor_user_id, "merge", self.session.project_id):
                 raise ValueError("Part is checked out by another user.")
             effective_user_id = int(as_user_id) if as_user_id is not None else int(actor_user_id)
         else:
             effective_user_id = int(actor_user_id)
 
-        signature = self.signature_repo.add_signature(
-            "checkin",
-            effective_user_id,
-            note="Checked in part (admin override)" if locked.user_id != actor_user_id else "Checked in part",
-        )
-        success = self.lock_repo.checkin(part.id, effective_user_id, signature)
-        if not success:
-            raise ValueError("Failed to check in part")
-        self.bom_repo.checkin_bom(part.id)
+        for related in related_parts:
+            related_id = int(related.id)
+            if not locked_by_part.get(related_id):
+                self.bom_repo.checkin_bom(related_id)
+                continue
+            signature = self.signature_repo.add_signature(
+                "checkin",
+                effective_user_id,
+                note="Checked in shared CAD family part" if len(related_parts) > 1 else "Checked in part",
+            )
+            success = self.lock_repo.checkin(related_id, effective_user_id, signature)
+            if not success:
+                raise ValueError("Failed to check in part")
+            self.bom_repo.checkin_bom(related_id)
         self._tree_dirty.add(int(self.session.project_id))
         return True
 
@@ -171,8 +200,13 @@ class BomService(BaseService):
         part = self.bom_repo.get_by_id(part_id)
         if not part:
             raise ValueError("Part not found")
-        existing = self.lock_repo.get_by_part(part.id)
-        if existing:
+        related_parts = self._parts_sharing_base_file(part)
+        existing_locks = [
+            self.lock_repo.get_by_part(int(p.id))
+            for p in related_parts
+            if getattr(p, "id", None) is not None
+        ]
+        if any(existing_locks):
             raise ValueError("Part is already checked out.")
         actor_user_id = int(self.session.user_id) if self.session.user_id is not None else None
         if not actor_user_id:
@@ -185,24 +219,47 @@ class BomService(BaseService):
         else:
             effective_user_id = int(actor_user_id)
 
-        signature = self.signature_repo.add_signature("checkout", effective_user_id, note="Checked out part")
-        success = self.lock_repo.checkout(part.id, effective_user_id, signature)
-        if not success:
-            raise ValueError("Failed to check out part")
-        self.bom_repo.checkout_bom(part.id)
+        for related in related_parts:
+            related_id = int(related.id)
+            signature = self.signature_repo.add_signature(
+                "checkout",
+                effective_user_id,
+                note="Checked out shared CAD family part" if len(related_parts) > 1 else "Checked out part",
+            )
+            success = self.lock_repo.checkout(related_id, effective_user_id, signature)
+            if not success:
+                raise ValueError("Failed to check out part")
+            self.bom_repo.checkout_bom(related_id)
         self._tree_dirty.add(int(self.session.project_id))
         return True
 
     def checkin_by_part_id(self, part_id: int, user_id: int):
-        locked = self.lock_repo.get_by_part(part_id)
-        if not locked:
+        part = self.bom_repo.get_by_id(int(part_id))
+        if not part:
+            raise ValueError("Part not found")
+        related_parts = self._parts_sharing_base_file(part)
+        locked_by_part = {
+            int(p.id): self.lock_repo.get_by_part(int(p.id))
+            for p in related_parts
+            if getattr(p, "id", None) is not None
+        }
+        if not any(locked_by_part.values()):
             raise ValueError("Part is not checked out.")
 
-        signature = self.signature_repo.add_signature("checkin", user_id, note="Checked in part")
-        success = self.lock_repo.checkin(part_id, user_id, signature)
-        if not success:
-            raise ValueError("Failed to check in part")
-        self.bom_repo.checkin_bom(part_id)
+        for related in related_parts:
+            related_id = int(related.id)
+            if not locked_by_part.get(related_id):
+                self.bom_repo.checkin_bom(related_id)
+                continue
+            signature = self.signature_repo.add_signature(
+                "checkin",
+                user_id,
+                note="Checked in shared CAD family part" if len(related_parts) > 1 else "Checked in part",
+            )
+            success = self.lock_repo.checkin(related_id, user_id, signature)
+            if not success:
+                raise ValueError("Failed to check in part")
+            self.bom_repo.checkin_bom(related_id)
         self._tree_dirty.add(int(self.session.project_id))
         return True
 

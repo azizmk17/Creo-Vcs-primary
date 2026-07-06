@@ -1,4 +1,4 @@
-# CreoVCS (BOM Manager)
+# Nexus (BOM Manager)
 
 Desktop (PyQt5) application for managing a Creo-based BOM with a lightweight, PLM-inspired workflow:
 

@@ -420,33 +420,10 @@ class MergeService(BaseService):
         candidate_parts = self._part_ids_for_issue_gate(selected_commits)
         self.issue_service.assert_no_critical_issues(candidate_parts, operation="merge", include_children=True)
 
-        for commit_id in selected_ids:
-            commit = self.merge_repository.get_ready_to_merge_by_id(commit_id)
-            if commit:
-                file_path = os.path.join(commit.designer_username, commit.filename)
-                print(commit)
-                print(file_path)
-                commit_entry = {
-                    "id": commit.id,
-                    "part_id": commit.part_id,
-                    "filename": commit.filename,
-                    "path": file_path,
-                    "user": commit.designer_username
-                }
-                result = self.merge_parts(commit_entry)
-
-                db_processing = {
-                    "item_id": commit.part_id,
-                    "commit_id": commit.id,
-                    "part_type": commit.type,
-                    "new_filename": result["new_filename"],
-                    "new_version": result["new_version"],
-                    "pr_path": result["pr_path"],
-                } if result else None
-                if result:
-                    merged_entries.append(db_processing)
-            else:
-                print(f"Commit ID {commit_id} not found or not pending.")
+        merged_entries = self._merge_commit_rows(
+            selected_commits,
+            lambda commit: os.path.join(commit.designer_username, commit.filename),
+        )
 
         if merged_entries:
             self.finalize_merge(merged_entries, self.user_id, self.merge_id, message)
@@ -472,29 +449,15 @@ class MergeService(BaseService):
             self._part_ids_for_issue_gate(commit_data), operation="merge", include_children=True
         )
         
-        #store them
-        selected_ids = [c.id for c in commit_data] 
-
-        for commit_id in selected_ids:
-            commit = self.merge_repository.get_ready_to_merge_by_id(commit_id)
-            if commit:
-                file_path = os.path.join(commit.designer_username, f"{commit.title}_{commit.commit_id}" , commit.filename)
-                print(commit)
-                print(file_path)
-                commit_entry = {
-                    "id": commit.id,
-                    "part_id": commit.part_id,
-                    "filename": commit.filename,
-                    "path": file_path,
-                    "user": commit.designer_username
-                }
-                result = self.merge_parts(commit_entry)
-
-                db_processing = {"item_id": commit.part_id, "commit_id": commit.id,"part_type": commit.type,  "new_filename" : result["new_filename"],  "new_version": result["new_version"], "pr_path" : result["pr_path"]} if result else None
-                if result:
-                    merged_entries.append(db_processing)
-            else:
-                print(f"Commit ID {commit_id} not found or not pending.")
+        merged_entries = self._merge_commit_rows(
+            commit_data,
+            lambda commit: os.path.join(
+                commit.designer_username,
+                f"{commit.title}_{commit.commit_id}",
+                commit.filename,
+            ),
+            self._approved_merge_results_for_commit(logical_commit_id, logical_project_id),
+        )
 
         if merged_entries:
             self.finalize_merge(merged_entries, self.user_id, self.merge_id, message)
@@ -516,7 +479,72 @@ class MergeService(BaseService):
         return []
 
 
-   
+    def _approved_merge_results_for_commit(self, commit_id: str, project_id: int | None = None):
+        rows = self.commit_repository.get_rows_by_commit_id(
+            str(commit_id),
+            int(project_id) if project_id is not None else None,
+        )
+        results = {}
+        for row in rows:
+            if str(row.get("status") or "").lower() != "approved":
+                continue
+            filename = str(row.get("filename") or "")
+            approved_version = row.get("approved_version")
+            pr_path = str(row.get("pr_path") or "")
+            new_filename = os.path.basename(pr_path) if pr_path else ""
+            if not new_filename and approved_version:
+                base_name = get_base_name(filename)
+                if base_name:
+                    new_filename = f"{base_name}.{approved_version}"
+            if not filename or not new_filename or not approved_version:
+                continue
+            file_path = os.path.join(
+                str(row.get("designer_name") or row.get("committed_by_name") or ""),
+                f"{row.get('title') or ''}_{row.get('commit_id') or commit_id}",
+                filename,
+            )
+            results[os.path.normcase(os.path.normpath(file_path))] = {
+                "new_filename": new_filename,
+                "new_version": approved_version,
+                "pr_path": pr_path,
+            }
+        return results
+
+    def _merge_commit_rows(self, commits, path_builder, existing_results_by_path=None):
+        """Merge each staged file once, then apply that result to every linked BOM row."""
+        merged_entries = []
+        results_by_path = dict(existing_results_by_path or {})
+
+        for commit in commits:
+            file_path = path_builder(commit)
+            print(commit)
+            print(file_path)
+            path_key = os.path.normcase(os.path.normpath(file_path))
+
+            if path_key not in results_by_path:
+                commit_entry = {
+                    "id": commit.id,
+                    "part_id": commit.part_id,
+                    "filename": commit.filename,
+                    "path": file_path,
+                    "user": commit.designer_username,
+                }
+                results_by_path[path_key] = self.merge_parts(commit_entry)
+
+            result = results_by_path.get(path_key)
+            if result:
+                merged_entries.append({
+                    "item_id": commit.part_id,
+                    "commit_id": commit.id,
+                    "part_type": commit.type,
+                    "new_filename": result["new_filename"],
+                    "new_version": result["new_version"],
+                    "pr_path": result["pr_path"],
+                })
+            else:
+                print(f"Commit row ID {commit.id} could not be merged.")
+
+        return merged_entries
 
     def finalize_merge(self, merged_entries, merge_user_id, merge_id, message):
         """Finalize the merge by updating database entries."""
