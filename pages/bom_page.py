@@ -1599,6 +1599,7 @@ class BomPage(QWidget):
         self._cached_tree_data = None
         self._cached_missing_map = None
         self._in_search_mode = False     # True while _search_tree (index 2) is visible
+        self._advanced_filter_flat_mode = False
         self._bom_advanced_filters = self._default_bom_advanced_filters()
         self.init_ui()
 
@@ -2462,6 +2463,7 @@ class BomPage(QWidget):
             "step": "Any",
             "integrity": "Any",
             "issues": "Any",
+            "show_parent_matches": True,
             "expand_matches": True,
         }
 
@@ -2574,7 +2576,7 @@ class BomPage(QWidget):
     def show_advanced_filter_dialog(self):
         dialog = QDialog(self)
         dialog.setWindowTitle("Advanced BOM Filter")
-        dialog.resize(560, 360)
+        dialog.resize(560, 390)
         layout = QVBoxLayout(dialog)
         layout.setSpacing(10)
 
@@ -2665,6 +2667,10 @@ class BomPage(QWidget):
 
         layout.addLayout(grid)
 
+        show_parent_check = QCheckBox("Show parent branches for matching child items")
+        show_parent_check.setChecked(bool(current.get("show_parent_matches", True)))
+        layout.addWidget(show_parent_check)
+
         expand_check = QCheckBox("Expand matching branches after applying")
         expand_check.setChecked(bool(current.get("expand_matches", True)))
         layout.addWidget(expand_check)
@@ -2686,6 +2692,7 @@ class BomPage(QWidget):
                 "step": step_combo.currentText(),
                 "integrity": integrity_combo.currentText(),
                 "issues": issue_combo.currentText(),
+                "show_parent_matches": show_parent_check.isChecked(),
                 "expand_matches": expand_check.isChecked(),
             }
             dialog.accept()
@@ -2697,6 +2704,8 @@ class BomPage(QWidget):
         dialog.exec_()
 
     def clear_bom_tree_filter(self):
+        was_flat_filter = bool(getattr(self, "_advanced_filter_flat_mode", False))
+        self._advanced_filter_flat_mode = False
         self._bom_advanced_filters = self._default_bom_advanced_filters()
         for tree in (getattr(self, "tree", None), getattr(self, "_search_tree", None)):
             if tree is None:
@@ -2706,6 +2715,14 @@ class BomPage(QWidget):
                     item.setHidden(False)
             except Exception:
                 pass
+        if was_flat_filter:
+            try:
+                if self.search_input.text().strip():
+                    self._perform_search_now()
+                else:
+                    self._exit_search_mode()
+            except Exception:
+                self._exit_search_mode()
         self._update_advanced_filter_button_state(visible_count=None)
 
     def _update_advanced_filter_button_state(self, visible_count: int | None = None):
@@ -2725,15 +2742,17 @@ class BomPage(QWidget):
 
     def _apply_bom_tree_filter_to_tree(self, tree: QTreeWidget, filters: dict) -> int:
         visible_count = 0
+        show_parents = bool(filters.get("show_parent_matches", True))
 
         def recurse(item):
             nonlocal visible_count
             show_self = self._bom_tree_item_matches_advanced_filter(item, filters)
-            show = show_self
+            child_match_visible = False
             for i in range(item.childCount()):
                 child = item.child(i)
                 child_show = recurse(child)
-                show = show or child_show
+                child_match_visible = child_match_visible or child_show
+            show = show_self or (show_parents and child_match_visible)
             item.setHidden(not show)
             if show_self:
                 visible_count += 1
@@ -2755,11 +2774,80 @@ class BomPage(QWidget):
                 pass
         return visible_count
 
+    def _clone_tree_item_shallow(self, item: QTreeWidgetItem) -> QTreeWidgetItem:
+        clone = QTreeWidgetItem([str(item.text(col) or "") for col in range(7)])
+        for col in range(7):
+            try:
+                clone.setToolTip(col, item.toolTip(col))
+            except Exception:
+                pass
+        for column, role in (
+            (0, Qt.UserRole),
+            (0, BOM_TREE_INWORK_ROLE),
+            (0, BOM_TREE_IS_ASSEMBLY_ROLE),
+            (0, BOM_TREE_ISSUE_ROLE),
+            (1, BOM_TREE_FILES_ROLE),
+            (6, BOM_TREE_INTEGRITY_ROLE),
+        ):
+            try:
+                clone.setData(column, role, item.data(column, role))
+            except Exception:
+                pass
+        try:
+            clone.setIcon(0, item.icon(0))
+        except Exception:
+            pass
+        return clone
+
+    def _source_tree_for_flat_bom_filter(self) -> QTreeWidget:
+        query = ""
+        try:
+            query = self.search_input.text().strip()
+        except Exception:
+            query = ""
+        if query and getattr(self, "_in_search_mode", False) and not getattr(self, "_advanced_filter_flat_mode", False):
+            return getattr(self, "_search_tree", self.tree)
+        return self.tree
+
+    def _apply_bom_tree_filter_flat(self, filters: dict) -> int:
+        source_tree = self._source_tree_for_flat_bom_filter()
+        matches = [
+            item for item in self._iter_tree_items(source_tree)
+            if self._bom_tree_item_matches_advanced_filter(item, filters)
+        ]
+        self._advanced_filter_flat_mode = True
+        self._enter_search_mode()
+        try:
+            self._search_tree.setUpdatesEnabled(False)
+            for item in matches:
+                clone = self._clone_tree_item_shallow(item)
+                clone.setHidden(False)
+                self._search_tree.addTopLevelItem(clone)
+        finally:
+            try:
+                self._search_tree.setUpdatesEnabled(True)
+            except Exception:
+                pass
+        return len(matches)
+
     def apply_bom_tree_filter(self, filters: dict | None = None):
         self._bom_advanced_filters = dict(filters or self._bom_advanced_filters or self._default_bom_advanced_filters())
         if self._is_default_bom_advanced_filter():
             self.clear_bom_tree_filter()
             return
+        if not bool(self._bom_advanced_filters.get("show_parent_matches", True)):
+            total_visible = self._apply_bom_tree_filter_flat(self._bom_advanced_filters)
+            self._update_advanced_filter_button_state(total_visible)
+            return
+        if getattr(self, "_advanced_filter_flat_mode", False):
+            self._advanced_filter_flat_mode = False
+            try:
+                if self.search_input.text().strip():
+                    self._perform_search_now()
+                    return
+                self._exit_search_mode()
+            except Exception:
+                self._exit_search_mode()
         total_visible = 0
         for tree in (getattr(self, "tree", None), getattr(self, "_search_tree", None)):
             if tree is None:
@@ -5818,6 +5906,7 @@ class BomPage(QWidget):
             "step": "STEP",
             "integrity": "Integrity",
             "issues": "Issues",
+            "show_parent_matches": "Show parent branches",
             "expand_matches": "Expand matches",
         }
         rows = []
