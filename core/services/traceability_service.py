@@ -429,8 +429,7 @@ class TraceabilityService(BaseService):
     def _copy_engineering_files(self, links: list[dict], destination_dir: str) -> list[dict]:
         copied = []
         for link in links:
-            candidates = self._engineering_source_candidates(link)
-            src = next((path for path in candidates if path and os.path.exists(path)), "")
+            src, candidates, used_fallback = self._engineering_source_for_export(link)
             exists = bool(src and os.path.exists(src))
             dst = ""
             if exists:
@@ -446,8 +445,53 @@ class TraceabilityService(BaseService):
                 "package_path": dst,
                 "exists": exists,
                 "source_candidates": candidates,
+                "used_fallback_source_search": used_fallback,
             })
         return copied
+
+    def _engineering_source_for_export(self, link: dict) -> tuple[str, list[str], bool]:
+        direct = self._engineering_direct_source_path(link)
+        if direct and os.path.exists(direct):
+            return direct, [direct], False
+
+        candidates = []
+        if direct:
+            candidates.append(direct)
+        for candidate in self._engineering_source_candidates(link):
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+        src = next((path for path in candidates if path and os.path.exists(path)), "")
+        return src, candidates, True
+
+    def _engineering_direct_source_path(self, link: dict) -> str:
+        for key in ("source_path", "stored_path", "file_path", "package_path"):
+            path = str(link.get(key) or "").strip()
+            if path:
+                return os.path.normpath(path)
+
+        version_id = link.get("resolved_version_id") or link.get("part_file_version_id")
+        if version_id:
+            try:
+                version = self.part_file_service.repo.get_version_by_id(int(version_id))
+            except Exception:
+                version = None
+            if version:
+                return os.path.normpath(self.part_file_service.resolve_version_path(version))
+
+        vault_rel_path = str(link.get("vault_rel_path") or "").strip()
+        if vault_rel_path and os.path.isabs(vault_rel_path):
+            return os.path.normpath(vault_rel_path)
+
+        if vault_rel_path:
+            root_project_id = link.get("root_project_id")
+            project_version_label = link.get("project_version_label")
+            try:
+                wd = self.part_file_service._working_dir_for_version(root_project_id, project_version_label)
+            except Exception:
+                wd = ""
+            if wd:
+                return os.path.normpath(os.path.join(wd, vault_rel_path))
+        return ""
 
     def _engineering_source_candidates(self, link: dict) -> list[str]:
         candidates = []
