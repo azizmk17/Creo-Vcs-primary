@@ -824,7 +824,7 @@ class BomService(BaseService):
         # Proceed to delete the relation
         try:
             self.children_repo.delete(int(parent_id), int(child_id))
-            #self._tree_dirty.add(int(self.session.project_id))
+            self._tree_dirty.add(int(self.session.project_id))
             return True
         except Exception as e:
             raise
@@ -832,6 +832,19 @@ class BomService(BaseService):
     # alias
     def remove_child(self, parent_id: int, child_id: int) -> bool:
         return self.remove_child_by_id(parent_id, child_id)
+
+    def reorder_children(self, parent_id: int, ordered_child_ids: list[int]) -> bool:
+        parent = self.bom_repo.get_by_id(int(parent_id))
+        if not parent:
+            raise ValueError("Parent not found")
+        if str(getattr(parent, "type", "") or "").lower() != "asm":
+            raise ValueError("Only assembly children can be reordered.")
+        current = self.children_repo.ordered_child_ids(int(parent_id))
+        if set(map(int, current)) != set(map(int, ordered_child_ids or [])):
+            raise ValueError("Reorder must keep the same child associations.")
+        result = self.children_repo.set_child_order(int(parent_id), [int(x) for x in ordered_child_ids])
+        self._tree_dirty.add(int(self.session.project_id))
+        return result
 
     # -------------------------------
     # EXPORT BOM

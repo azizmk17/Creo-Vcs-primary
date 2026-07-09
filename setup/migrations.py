@@ -785,6 +785,20 @@ def _migration_17(conn):
         )
 
 
+def _migration_18(conn):
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(bom_children)").fetchall()]
+    if "sort_order" not in cols:
+        conn.execute("ALTER TABLE bom_children ADD COLUMN sort_order INTEGER DEFAULT 0")
+    conn.execute(
+        """
+        UPDATE bom_children
+        SET sort_order = id
+        WHERE sort_order IS NULL OR sort_order = 0
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_bom_children_parent_order ON bom_children(parent_id, sort_order, id)")
+
+
 MIGRATIONS = {
     1: """
     CREATE TABLE IF NOT EXISTS users (
@@ -1129,6 +1143,8 @@ WHERE r.name = 'designer' AND p.name = 'manage_issues';
     16: _migration_16,
 
     17: _migration_17,
+
+    18: _migration_18,
 
 }
 

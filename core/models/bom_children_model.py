@@ -7,4 +7,5 @@ class BomChild:
     parent_id: int
     child_id: int
     quantity: int
+    sort_order: int = 0
     
