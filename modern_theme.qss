@@ -1,15 +1,15 @@
-/* === Base App === */
-QMainWindow {
-    background-color: #f4f5f7;
-    color: #333;
-    font-family: "Segoe UI", "Roboto", "Open Sans";
-    font-size: 12pt;
-}
-
+/* === Base App ===
+   Match the compact information density common in desktop CAD tools. */
 QWidget {
     background-color: #ffffff;
     color: #222;
+    font-family: "Segoe UI", "Roboto", "Open Sans";
+    font-size: 8pt;
     border: none;
+}
+
+QMainWindow {
+    background-color: #f4f5f7;
 }
 
 QDialog, QMessageBox {

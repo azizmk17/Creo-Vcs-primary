@@ -1146,6 +1146,8 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     logo_path = _resource_path(APP_LOADER_LOGO_PATH)
     app.setStyle("Fusion")
+    # Keep standard controls at the compact density used by desktop CAD tools.
+    app.setFont(QFont("Segoe UI", 8))
 
     # ------------------------------------------------------------------
     # Workspace resolution — must run before any DB access so that

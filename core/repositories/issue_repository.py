@@ -712,10 +712,15 @@ class IssueRepository:
             ).fetchone()
             relation_type = (link["relation_type"] if link else "solves") or "solves"
             old = conn.execute("SELECT status FROM issues WHERE id=?", (int(issue_id),)).fetchone()
-            if relation_type in {"solves", "partial_fix"}:
+            old_status = old["status"] if old else "Open"
+            if relation_type == "solves":
                 target = "Closed" if solved else "In Progress"
-            else:
-                target = old["status"] if old else "Open"
+            elif relation_type == "partial_fix":
+                target = "In Progress"
+            elif relation_type == "regression":
+                target = "Open"
+            else:  # related commits are traceability only and never change the issue state.
+                target = old_status
             conn.execute(
                 """
                 UPDATE issue_commit_links SET validation_status=?, validated_by=?,
@@ -724,14 +729,15 @@ class IssueRepository:
                 """,
                 (state, actor_id, comment, int(issue_id), commit_id),
             )
-            conn.execute(
-                """
-                UPDATE issues SET status=?, updated_at=datetime('now'), closed_by=?,
-                    closed_at=CASE WHEN ?='Closed' THEN datetime('now') ELSE NULL END
-                WHERE id=?
-                """,
-                (target, actor_id if solved else None, target, int(issue_id)),
-            )
+            if target != old_status:
+                conn.execute(
+                    """
+                    UPDATE issues SET status=?, updated_at=datetime('now'), closed_by=?,
+                        closed_at=CASE WHEN ?='Closed' THEN datetime('now') ELSE NULL END
+                    WHERE id=?
+                    """,
+                    (target, actor_id if target == "Closed" else None, target, int(issue_id)),
+                )
             self._history(conn, issue_id, f"Commit resolution {state}", actor_id,
                           "status", old["status"] if old else None, target,
                           {"commit_id": commit_id, "comment": comment})

@@ -321,10 +321,25 @@ class TraceabilityRepository:
                     (issue_id, commit_id, note or "", actor_id, relation, note or ""),
                 )
                 old = conn.execute("SELECT status FROM issues WHERE id=?", (issue_id,)).fetchone()
-                if relation in {"solves", "partial_fix"}:
+                old_status = old["status"] if old else None
+                target_status = old_status
+                if relation == "solves":
+                    target_status = "Ready For Validation"
+                elif relation == "partial_fix":
+                    target_status = "In Progress"
+                elif relation == "regression":
+                    target_status = "Open"
+
+                if target_status and target_status != old_status:
                     conn.execute(
-                        "UPDATE issues SET status='Ready For Validation', updated_at=datetime('now') WHERE id=?",
-                        (issue_id,),
+                        """
+                        UPDATE issues
+                        SET status=?, updated_at=datetime('now'),
+                            closed_by=CASE WHEN ?='Closed' THEN closed_by ELSE NULL END,
+                            closed_at=CASE WHEN ?='Closed' THEN closed_at ELSE NULL END
+                        WHERE id=?
+                        """,
+                        (target_status, target_status, target_status, issue_id),
                     )
                 self._history(
                     conn,
@@ -345,9 +360,9 @@ class TraceabilityRepository:
                         """,
                         (int(doc["id"]), issue_id, actor_id, note or ""),
                     )
-                if old and old["status"] != "Ready For Validation" and relation in {"solves", "partial_fix"}:
-                    self._history(conn, issue_id, "Status changed to Ready For Validation", actor_id,
-                                  {"from": old["status"], "to": "Ready For Validation"})
+                if old and target_status != old_status:
+                    self._history(conn, issue_id, "Status changed from commit relation", actor_id,
+                                  {"from": old_status, "to": target_status, "relation_type": relation})
 
     def link_issue_to_engineering_file(
         self,

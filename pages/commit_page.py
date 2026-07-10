@@ -852,6 +852,7 @@ class _PendingCard(QFrame):
 class CommitPage(QWidget):
     def __init__(self, bom_service):
         super().__init__()
+        self.setFont(QFont("Segoe UI", 8))
         self.commit_service = CommitService()
         self.bom_service = bom_service
         self.bom_repo = BomRepository()
@@ -1092,13 +1093,18 @@ class CommitPage(QWidget):
         self.resolved_issues_list.setMaximumHeight(115)
         self.resolved_issues_list.setAlternatingRowColors(True)
         self.resolved_issues_list.setToolTip(
-            "Select active engineering issues addressed by this commit."
+            "Select engineering issues linked to this commit. Only the 'solves' relation "
+            "can close an issue after the commit is validated."
         )
-        meta_lay.addRow("Resolved Issues:", self.resolved_issues_list)
+        meta_lay.addRow("Linked Issues:", self.resolved_issues_list)
 
         self.issue_relation_combo = QComboBox()
         self.issue_relation_combo.addItems(["solves", "partial_fix", "related", "regression"])
-        self.issue_relation_combo.setToolTip("Relation applied to all selected linked issues.")
+        self.issue_relation_combo.setToolTip(
+            "solves: ready for validation, then closed when confirmed; "
+            "partial_fix: remains in progress; related: no status change; "
+            "regression: reopens the issue."
+        )
         meta_lay.addRow("Issue Relation:", self.issue_relation_combo)
 
         self.commit_jira_key = QLineEdit()
@@ -2510,8 +2516,19 @@ class CommitPage(QWidget):
         related_issues = group.get("related_issues") or []
         issue_checks = QListWidget()
         if related_issues:
-            main.addWidget(QLabel("<b style='font-size: 11px; color: #374151;'>Issues claimed as resolved</b>"))
+            linked_issues_label = QLabel(
+                "<b style='font-size: 11px; color: #374151;'>Linked Issues</b>"
+            )
+            linked_issues_label.setToolTip(
+                "Only a confirmed 'solves' relation closes an issue. "
+                "Other relations record traceability without closing it."
+            )
+            main.addWidget(linked_issues_label)
             issue_checks.setMaximumHeight(160)
+            issue_checks.setToolTip(
+                "Confirm the relation for each issue. 'solves' can close the issue; "
+                "partial_fix keeps it in progress, related keeps its status, and regression reopens it."
+            )
             for issue in related_issues:
                 item = QListWidgetItem(
                     f"{issue['issue_number']}  {issue['title']}  [{issue.get('relation_type') or 'solves'}]"

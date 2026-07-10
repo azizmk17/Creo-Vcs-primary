@@ -17,6 +17,7 @@ import os
 class DiagPage(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setFont(QFont("Segoe UI", 8))
         self.service = DiagService()
         self.session = SessionManager()
         self.project_service = ProjectService()

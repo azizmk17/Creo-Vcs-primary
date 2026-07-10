@@ -46,6 +46,7 @@ class AdminMetricCard(QFrame):
 class AdminPage(QWidget):
     def __init__(self):
         super().__init__()
+        self.setFont(QFont("Segoe UI", 8))
         self.admin_service = AdminService()
         self.user_service = UserService(UserRepository())
         self.role_service = RoleService()

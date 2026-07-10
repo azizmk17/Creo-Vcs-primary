@@ -432,7 +432,7 @@ class _BomTreeNameDelegate(QStyledItemDelegate):
 
         is_asm = bool(item.data(0, BOM_TREE_IS_ASSEMBLY_ROLE)) or item.childCount() > 0
         name_font = QFont(opt.font)
-        name_font.setPixelSize(13)
+        name_font.setPixelSize(11)
         name_font.setBold(bool(is_asm))
         display_inwork = "In Work" if suffix else ""
         issue_badges = []
@@ -516,7 +516,7 @@ class _BomTreeNameDelegate(QStyledItemDelegate):
         suf_font = QFont(option.font)
         suf_font.setPixelSize(10)
         extra = _BOM_INWORK_GAP_PX + QFontMetrics(suf_font).horizontalAdvance("In Work")
-        return QSize(sh.width() + extra, max(sh.height(), 28, QFontMetrics(suf_font).height()))
+        return QSize(sh.width() + extra, max(sh.height(), 22, QFontMetrics(suf_font).height()))
 
 
 class _BomTreeFilesDelegate(QStyledItemDelegate):
@@ -730,7 +730,7 @@ class _KpiCard(QFrame):
                  icon_text: str = "", parent=None):
         super().__init__(parent)
         self.setFrameShape(QFrame.StyledPanel)
-        self.setFixedHeight(72)
+        self.setFixedHeight(60)
         self.setMinimumWidth(110)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setStyleSheet(f"""
@@ -758,11 +758,11 @@ class _KpiCard(QFrame):
         top.setSpacing(6)
         if icon_text:
             ic = QLabel(icon_text)
-            ic.setStyleSheet("font-size: 16px; background: transparent; border: none;")
+            ic.setStyleSheet("font-size: 12px; background: transparent; border: none;")
             top.addWidget(ic)
         self._value_lbl = QLabel(str(value))
         self._value_lbl.setStyleSheet(
-            f"font-size: 20px; font-weight: bold; color: {accent}; background: transparent; border: none;"
+            f"font-size: 15px; font-weight: bold; color: {accent}; background: transparent; border: none;"
         )
         top.addWidget(self._value_lbl)
         top.addStretch()
@@ -770,7 +770,7 @@ class _KpiCard(QFrame):
 
         self._label_lbl = QLabel(str(label))
         self._label_lbl.setStyleSheet(
-            "font-size: 10px; color: #6b7280; font-weight: 500; background: transparent; border: none;"
+            "font-size: 8px; color: #6b7280; font-weight: 500; background: transparent; border: none;"
         )
         lay.addWidget(self._label_lbl)
 
@@ -941,7 +941,7 @@ class _TimelineTable(QTableWidget):
                 border-bottom: 2px solid #e5e7eb;
                 padding: 8px 6px;
                 font-weight: 700;
-                font-size: 11px;
+                font-size: 8pt;
                 color: #4b5563;
                 text-transform: uppercase;
             }
@@ -969,7 +969,7 @@ class _TimelineTable(QTableWidget):
             ts_lay.setContentsMargins(4, 2, 4, 2)
             ts_lay.setSpacing(0)
             ts_main = QLabel(ts_raw[:19] if len(ts_raw) >= 19 else ts_raw)
-            ts_main.setStyleSheet("font-size: 11px; color: #374151; font-weight: 500; background: transparent; border: none;")
+            ts_main.setStyleSheet("font-size: 8pt; color: #374151; font-weight: 500; background: transparent; border: none;")
             ts_lay.addWidget(ts_main)
             if rel:
                 ts_rel = QLabel(rel)
@@ -989,7 +989,7 @@ class _TimelineTable(QTableWidget):
                 background: {style['bg']}; color: {style['color']};
                 border: 1px solid {style['color']}40;
                 border-radius: 10px; padding: 2px 8px;
-                font-size: 11px; font-weight: 600;
+                font-size: 8pt; font-weight: 600;
             """)
             badge_container = QWidget()
             badge_lay = QHBoxLayout(badge_container)
@@ -1167,6 +1167,7 @@ class HistoryPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setFont(QFont("Segoe UI", 8))
         self._all_rows: list[dict] = []
         self._filtered_rows: list[dict] = []
         self._analytics: dict = {}
@@ -1239,7 +1240,7 @@ class HistoryPanel(QWidget):
         self._search.setStyleSheet("""
             QLineEdit {
                 border: 1px solid #d1d5db; border-radius: 6px;
-                padding: 5px 10px; font-size: 12px;
+                padding: 5px 10px; font-size: 8pt;
                 background: #ffffff;
             }
             QLineEdit:focus { border-color: #0078d7; }
@@ -1612,6 +1613,7 @@ class BomPage(QWidget):
 
     def __init__(self, bom_service):
         super().__init__()
+        self.setFont(QFont("Segoe UI", 8))
         self.bom_service = bom_service
         self.diag_service = DiagService()
         self.project_service = ProjectService()
@@ -1910,7 +1912,7 @@ class BomPage(QWidget):
         bom_header = QLabel("BOM STRUCTURE")
         bom_header.setStyleSheet("""
             QLabel {
-                font-size: 11px;
+                font-size: 8pt;
                 font-weight: 700;
                 color: #6b7280;
                 letter-spacing: 0.08em;
@@ -1924,18 +1926,18 @@ class BomPage(QWidget):
         bom_header_row.addStretch()
         self.bom_health_label = QLabel("Health: --")
         self.bom_health_label.setStyleSheet(
-            "font-size:11px;font-weight:700;color:#475569;background:transparent;border:none;"
+            "font-size:8pt;font-weight:700;color:#475569;background:transparent;border:none;"
         )
         bom_header_row.addWidget(self.bom_health_label)
         tree_layout.addLayout(bom_header_row)
 
         self.tree = BomTreeWidget()
         try:
-            self.tree.setIconSize(QSize(16, 16))
+            self.tree.setIconSize(QSize(12, 12))
         except Exception:
             pass
         try:
-            self.tree.setIndentation(18)
+            self.tree.setIndentation(14)
             self.tree.setAnimated(True)
             self.tree.setAlternatingRowColors(True)
             self.tree.setUniformRowHeights(True)
@@ -1945,7 +1947,7 @@ class BomPage(QWidget):
         except Exception:
             pass
         self.tree.setHeaderLabels(["#", "Name", "Files", "AES Number", "Type", "Rev", "Status", "Integrity"])
-        self.tree.setColumnWidth(BOM_COL_ROW, 46)
+        self.tree.setColumnWidth(BOM_COL_ROW, 38)
         self.tree.setColumnWidth(BOM_COL_NAME, 280)
         self.tree.setColumnWidth(BOM_COL_FILES, 100)
         self.tree.setColumnWidth(BOM_COL_AES, 90)
@@ -1980,11 +1982,11 @@ class BomPage(QWidget):
         # self.tree is never cleared or rebuilt due to search; switching is a pure UI swap.
         self._search_tree = QTreeWidget()
         try:
-            self._search_tree.setIconSize(QSize(16, 16))
+            self._search_tree.setIconSize(QSize(12, 12))
         except Exception:
             pass
         try:
-            self._search_tree.setIndentation(18)
+            self._search_tree.setIndentation(14)
             self._search_tree.setAnimated(True)
             self._search_tree.setAlternatingRowColors(True)
             self._search_tree.setUniformRowHeights(True)
@@ -1994,7 +1996,7 @@ class BomPage(QWidget):
         except Exception:
             pass
         self._search_tree.setHeaderLabels(["#", "Name", "Files", "AES Number", "Type", "Rev", "Status", "Integrity"])
-        self._search_tree.setColumnWidth(BOM_COL_ROW, 46)
+        self._search_tree.setColumnWidth(BOM_COL_ROW, 38)
         self._search_tree.setColumnWidth(BOM_COL_NAME, 280)
         self._search_tree.setColumnWidth(BOM_COL_FILES, 100)
         self._search_tree.setColumnWidth(BOM_COL_AES, 90)
@@ -2020,7 +2022,7 @@ class BomPage(QWidget):
                 background: #FFFFFF;
                 border: 1px solid #d1d5db;
                 border-radius: 6px;
-                font-size: 13px;
+                font-size: 10px;
                 gridline-color: #e5e7eb;
                 font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", system-ui, sans-serif;
                 font-weight: 400;
@@ -2030,16 +2032,16 @@ class BomPage(QWidget):
             }}
             QHeaderView::section {{
                 background-color: #EEEEEE;
-                font-size: 11px;
+                font-size: 10px;
                 color: #374151;
                 font-weight: 700;
                 text-transform: uppercase;
                 border-bottom: 0.5px solid #DDDDDD;
-                padding: 6px;
+                padding: 4px;
                 border-right: 1px solid #d1d5db;
             }}
             QTreeWidget::item {{
-                height: 28px;
+                height: 22px;
                 border: none;
                 border-bottom: 1px solid #EEEEEE;
                 background: #FFFFFF;

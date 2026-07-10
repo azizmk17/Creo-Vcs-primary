@@ -273,6 +273,7 @@ class EngineeringIssuePage(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setFont(QFont("Segoe UI", 8))
         self.service = IssueService()
         self.current_issue_id = None
         self._processing_action = False
