@@ -10,6 +10,7 @@ from core.repositories.lock_repository import LockRepository
 from core.repositories.signature_repository import SignatureRepository
 from core.repositories.permission_repository import PermissionRepository
 from core.repositories.bom_folder_repository import BomFolderRepository
+from core.repositories.bom_filter_repository import BomFilterRepository
 from core.session_manager import SessionManager
 from config import DB_NAME
 
@@ -25,11 +26,51 @@ class BomService(BaseService):
         self.signature_repo = signature_repo
         self.permission_repo = PermissionRepository()
         self.folder_repo = BomFolderRepository()
+        self.filter_repo = BomFilterRepository()
         self.session = SessionManager()
         self._tree_cache: dict = {}    # project_id -> tree dict
         self._tree_dirty: set = set()  # project_ids that need re-fetch
         self._lazy_index_cache: dict = {}
         print(self.user_id)
+
+    # -------------------------------
+    # SAVED BOM FILTERS
+    # -------------------------------
+    def _saved_filter_context(self) -> tuple[int, int]:
+        if not self.session.project_id:
+            raise ValueError("Select a project before managing saved filters.")
+        if not self.user_id:
+            raise PermissionError("You must be logged in to manage saved filters.")
+        return int(self.session.project_id), int(self.user_id)
+
+    def list_saved_bom_filters(self) -> List[Dict]:
+        project_id, user_id = self._saved_filter_context()
+        return self.filter_repo.list_visible(project_id, user_id)
+
+    def get_saved_bom_filter(self, filter_id: int) -> Dict:
+        project_id, user_id = self._saved_filter_context()
+        return self.filter_repo.get_visible(project_id, user_id, int(filter_id))
+
+    def create_saved_bom_filter(self, name: str, definition: dict, is_shared: bool = False) -> Dict:
+        project_id, user_id = self._saved_filter_context()
+        return self.filter_repo.create(project_id, user_id, name, definition, is_shared)
+
+    def update_saved_bom_filter(self, filter_id: int, **changes) -> Dict:
+        project_id, user_id = self._saved_filter_context()
+        allowed = {key: changes[key] for key in ("name", "definition", "is_shared") if key in changes}
+        return self.filter_repo.update_owned(project_id, user_id, int(filter_id), **allowed)
+
+    def delete_saved_bom_filter(self, filter_id: int) -> None:
+        project_id, user_id = self._saved_filter_context()
+        self.filter_repo.delete_owned(project_id, user_id, int(filter_id))
+
+    def move_saved_bom_filter(self, filter_id: int, direction: int) -> None:
+        project_id, user_id = self._saved_filter_context()
+        self.filter_repo.move_owned(project_id, user_id, int(filter_id), int(direction))
+
+    def duplicate_saved_bom_filter(self, filter_id: int, name: str, is_shared: bool = False) -> Dict:
+        source = self.get_saved_bom_filter(filter_id)
+        return self.create_saved_bom_filter(name, source.get("definition") or {}, is_shared)
 
     # -------------------------------
     # ORGANIZATIONAL FOLDERS

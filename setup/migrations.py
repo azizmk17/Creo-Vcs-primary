@@ -875,6 +875,31 @@ def _migration_20(conn):
     )
 
 
+def _migration_21(conn):
+    """Add reusable private and project-shared BOM filter definitions."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS bom_saved_filters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            owner_user_id INTEGER NOT NULL,
+            name TEXT NOT NULL COLLATE NOCASE,
+            definition_json TEXT NOT NULL,
+            is_shared INTEGER NOT NULL DEFAULT 0,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(project_id, owner_user_id, name),
+            FOREIGN KEY (project_id) REFERENCES projects(id),
+            FOREIGN KEY (owner_user_id) REFERENCES users(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_bom_saved_filters_visible
+            ON bom_saved_filters(project_id, is_shared, owner_user_id, sort_order);
+        """
+    )
+
+
 MIGRATIONS = {
     1: """
     CREATE TABLE IF NOT EXISTS users (
@@ -1225,6 +1250,8 @@ WHERE r.name = 'designer' AND p.name = 'manage_issues';
     19: _migration_19,
 
     20: _migration_20,
+
+    21: _migration_21,
 
 }
 

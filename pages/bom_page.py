@@ -32,6 +32,11 @@ from core.services.baseline_service import BaselineService
 from core.services.part_doc_ack_service import PartDocAckService
 from core.services.issue_service import IssueService
 from core.services.traceability_service import TraceabilityService
+from core.bom_filter import (
+    deduplicate_bom_items_by_id,
+    matches_bom_filter_text,
+    split_bom_filter_terms,
+)
 from core.repositories.commit_repository import CommitRepository
 from core.services.commit_service import CommitService
 from pages.dialogs.package_parts_dialog import PackagePartsDialog
@@ -1807,7 +1812,6 @@ class BomPage(QWidget):
         self.current_part_aes = None
         self.current_part_id = None
         self._tree_load_seq = 0
-        self._initial_tree_target_seq = None
         self._initial_tree_ready_emitted = False
         self._tree_thread = None
         self._tree_worker = None
@@ -1848,6 +1852,9 @@ class BomPage(QWidget):
         self._in_search_mode = False     # True while _search_tree (index 2) is visible
         self._advanced_filter_flat_mode = False
         self._bom_advanced_filters = self._default_bom_advanced_filters()
+        self._active_saved_filter_id = None
+        self._active_saved_filter_name = ""
+        self._advanced_filter_dialog = None
         self.init_ui()
 
         # Pre-render indicator icons (fast + consistent colors)
@@ -2161,10 +2168,13 @@ class BomPage(QWidget):
         filter_row = QHBoxLayout()
         self.advanced_filter_btn = QPushButton("Advanced Filter")
         self.advanced_filter_btn.clicked.connect(self.show_advanced_filter_dialog)
+        self.saved_filters_btn = QPushButton("Saved Filters")
+        self.saved_filters_btn.clicked.connect(self.show_saved_bom_filters_menu)
         self.clear_filter_btn = QPushButton("Clear")
         self.clear_filter_btn.clicked.connect(self.clear_bom_tree_filter)
         self.clear_filter_btn.setEnabled(False)
         filter_row.addWidget(self.advanced_filter_btn)
+        filter_row.addWidget(self.saved_filters_btn)
         filter_row.addWidget(self.clear_filter_btn)
         left_layout.addLayout(filter_row)
 
@@ -3127,6 +3137,7 @@ class BomPage(QWidget):
     def _default_bom_advanced_filters(self) -> dict:
         return {
             "text": "",
+            "text_match_mode": "normal",
             "work_state": "Any",
             "work_owner": "All",
             "status": "All",
@@ -3138,6 +3149,7 @@ class BomPage(QWidget):
             "step": "Any",
             "integrity": "Any",
             "issues": "Any",
+            "remove_duplicates": False,
             "show_parent_matches": True,
             "expand_matches": True,
         }
@@ -3148,7 +3160,351 @@ class BomPage(QWidget):
         legacy_category = str(filters.get("category") or "").strip()
         if legacy_category not in ("", "All"):
             return False
-        return all(filters.get(k, v) == v for k, v in defaults.items())
+        return all(
+            (key == "text_match_mode" and not str(filters.get("text") or "").strip())
+            or filters.get(key, default) == default
+            for key, default in defaults.items()
+        )
+
+    def _normalize_bom_filter_definition(self, definition: dict | None) -> dict:
+        defaults = self._default_bom_advanced_filters()
+        source = definition if isinstance(definition, dict) else {}
+        normalized = dict(defaults)
+        for key in defaults:
+            if key in source:
+                normalized[key] = source[key]
+        categories = normalized.get("categories") or []
+        if isinstance(categories, str):
+            categories = [categories]
+        normalized["categories"] = [
+            str(value).strip() for value in categories
+            if str(value).strip()
+        ]
+        legacy_category = str(source.get("category") or "").strip()
+        if not normalized["categories"] and legacy_category not in ("", "All"):
+            normalized["categories"] = [legacy_category]
+        normalized["text"] = ", ".join(split_bom_filter_terms(normalized.get("text")))
+        match_mode_aliases = {
+            "normal": "normal",
+            "normal filter": "normal",
+            "whole_word": "whole_word",
+            "match whole word": "whole_word",
+        }
+        normalized["text_match_mode"] = match_mode_aliases.get(
+            str(normalized.get("text_match_mode") or "").strip().casefold(),
+            defaults["text_match_mode"],
+        )
+        for key in ("remove_duplicates", "show_parent_matches", "expand_matches"):
+            normalized[key] = bool(normalized.get(key, defaults[key]))
+        return normalized
+
+    def _prompt_saved_filter_details(self, title: str, name: str = "", shared: bool = False):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.setMinimumWidth(380)
+        layout = QVBoxLayout(dialog)
+        form = QGridLayout()
+        name_input = QLineEdit(str(name or ""))
+        name_input.setPlaceholderText("Filter name")
+        shared_check = QCheckBox("Share with everyone in this project")
+        shared_check.setChecked(bool(shared))
+        form.addWidget(QLabel("Name"), 0, 0)
+        form.addWidget(name_input, 0, 1)
+        form.addWidget(shared_check, 1, 1)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        name_input.selectAll()
+        name_input.setFocus()
+        if dialog.exec_() != QDialog.Accepted:
+            return None
+        clean_name = " ".join(name_input.text().split())
+        if not clean_name:
+            QMessageBox.warning(self, "Saved Filter", "Enter a name for the filter.")
+            return None
+        return clean_name, shared_check.isChecked()
+
+    def _save_bom_filter_definition(self, definition: dict, suggested_name: str = ""):
+        normalized = self._normalize_bom_filter_definition(definition)
+        if self._is_default_bom_advanced_filter(normalized):
+            QMessageBox.information(self, "Saved Filter", "Set at least one filter criterion before saving.")
+            return None
+        details = self._prompt_saved_filter_details("Save BOM Filter", suggested_name)
+        if not details:
+            return None
+        try:
+            return self.bom_service.create_saved_bom_filter(details[0], normalized, details[1])
+        except Exception as exc:
+            QMessageBox.warning(self, "Saved Filter", str(exc))
+            return None
+
+    def save_current_bom_filter(self):
+        saved = self._save_bom_filter_definition(self._bom_advanced_filters)
+        if saved:
+            self._active_saved_filter_id = int(saved["id"])
+            self._active_saved_filter_name = str(saved.get("name") or "")
+            self._update_advanced_filter_button_state()
+        return saved
+
+    def apply_saved_bom_filter(self, filter_id: int):
+        try:
+            saved = self.bom_service.get_saved_bom_filter(int(filter_id))
+            definition = self._normalize_bom_filter_definition(saved.get("definition"))
+            active_dialog = getattr(self, "_advanced_filter_dialog", None)
+            if active_dialog is not None:
+                active_dialog.close()
+            self.apply_bom_tree_filter(definition)
+            if self._is_default_bom_advanced_filter():
+                return
+            self._active_saved_filter_id = int(saved["id"])
+            self._active_saved_filter_name = str(saved.get("name") or "")
+            self._update_advanced_filter_button_state()
+        except Exception as exc:
+            QMessageBox.warning(self, "Saved Filter", str(exc))
+
+    def show_saved_bom_filters_menu(self):
+        menu = QMenu(self)
+        try:
+            saved_filters = self.bom_service.list_saved_bom_filters()
+        except Exception as exc:
+            QMessageBox.warning(self, "Saved Filters", str(exc))
+            return
+        if saved_filters:
+            for saved in saved_filters:
+                owner_id = int(saved.get("owner_user_id") or 0)
+                own = owner_id == int(self.session.user_id or 0)
+                suffix = ""
+                if saved.get("is_shared"):
+                    suffix = " [Shared]" if own else f" [Shared by {saved.get('owner_name') or 'user'}]"
+                action = menu.addAction(f"{saved.get('name') or 'Unnamed'}{suffix}")
+                action.setCheckable(True)
+                action.setChecked(int(saved["id"]) == int(self._active_saved_filter_id or 0))
+                action.triggered.connect(
+                    lambda _checked=False, filter_id=int(saved["id"]): self.apply_saved_bom_filter(filter_id)
+                )
+        else:
+            empty_action = menu.addAction("No saved filters")
+            empty_action.setEnabled(False)
+        menu.addSeparator()
+        menu.addAction("Save Current Filter...", self.save_current_bom_filter)
+        menu.addAction("Manage Saved Filters...", self.show_saved_bom_filters_manager)
+        button = self.saved_filters_btn
+        menu.exec_(button.mapToGlobal(button.rect().bottomLeft()))
+
+    def show_saved_bom_filters_manager(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Saved BOM Filters")
+        dialog.resize(720, 430)
+        layout = QVBoxLayout(dialog)
+        info = QLabel("Private filters are visible only to you. Shared filters can be applied by everyone in this project.")
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#475569;")
+        layout.addWidget(info)
+
+        table = QTableWidget(0, 4)
+        table.setHorizontalHeaderLabels(["Name", "Owner", "Visibility", "Updated"])
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        layout.addWidget(table)
+
+        command_row = QHBoxLayout()
+        apply_btn = QPushButton("Apply")
+        save_btn = QPushButton("Save Current As...")
+        update_btn = QPushButton("Update from Current")
+        rename_btn = QPushButton("Rename")
+        duplicate_btn = QPushButton("Duplicate")
+        share_btn = QPushButton("Share")
+        for button in (apply_btn, save_btn, update_btn, rename_btn, duplicate_btn, share_btn):
+            command_row.addWidget(button)
+        layout.addLayout(command_row)
+
+        order_row = QHBoxLayout()
+        up_btn = QPushButton("Move Up")
+        down_btn = QPushButton("Move Down")
+        delete_btn = QPushButton("Delete")
+        delete_btn.setObjectName("danger")
+        close_btn = QPushButton("Close")
+        order_row.addWidget(up_btn)
+        order_row.addWidget(down_btn)
+        order_row.addStretch()
+        order_row.addWidget(delete_btn)
+        order_row.addWidget(close_btn)
+        layout.addLayout(order_row)
+
+        rows_by_id = {}
+
+        def selected_filter():
+            row = table.currentRow()
+            if row < 0:
+                return None
+            item = table.item(row, 0)
+            return rows_by_id.get(int(item.data(Qt.UserRole) or 0)) if item else None
+
+        def refresh(preferred_id=None):
+            nonlocal rows_by_id
+            try:
+                rows = self.bom_service.list_saved_bom_filters()
+            except Exception as exc:
+                QMessageBox.warning(dialog, "Saved Filters", str(exc))
+                rows = []
+            rows_by_id = {int(row["id"]): row for row in rows}
+            table.setRowCount(len(rows))
+            selected_row = -1
+            for index, saved in enumerate(rows):
+                filter_id = int(saved["id"])
+                values = (
+                    str(saved.get("name") or ""),
+                    str(saved.get("owner_name") or ""),
+                    "Shared" if saved.get("is_shared") else "Private",
+                    str(saved.get("updated_at") or ""),
+                )
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    if column == 0:
+                        item.setData(Qt.UserRole, filter_id)
+                    table.setItem(index, column, item)
+                if filter_id == int(preferred_id or 0):
+                    selected_row = index
+            if selected_row < 0 and rows:
+                selected_row = 0
+            if selected_row >= 0:
+                table.selectRow(selected_row)
+            update_actions()
+
+        def update_actions():
+            saved = selected_filter()
+            own = bool(saved) and int(saved.get("owner_user_id") or 0) == int(self.session.user_id or 0)
+            for button in (apply_btn, duplicate_btn):
+                button.setEnabled(bool(saved))
+            for button in (update_btn, rename_btn, share_btn, up_btn, down_btn, delete_btn):
+                button.setEnabled(own)
+            share_btn.setText("Make Private" if own and saved.get("is_shared") else "Share")
+
+        def apply_selected():
+            saved = selected_filter()
+            if saved:
+                dialog.accept()
+                self.apply_saved_bom_filter(int(saved["id"]))
+
+        def save_current():
+            saved = self.save_current_bom_filter()
+            if saved:
+                refresh(saved["id"])
+
+        def update_selected():
+            saved = selected_filter()
+            if not saved:
+                return
+            answer = QMessageBox.question(
+                dialog, "Update Saved Filter",
+                f"Replace the criteria in '{saved['name']}' with the current BOM filter?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+            try:
+                updated = self.bom_service.update_saved_bom_filter(
+                    int(saved["id"]), definition=self._normalize_bom_filter_definition(self._bom_advanced_filters)
+                )
+                refresh(updated["id"])
+            except Exception as exc:
+                QMessageBox.warning(dialog, "Saved Filter", str(exc))
+
+        def rename_selected():
+            saved = selected_filter()
+            if not saved:
+                return
+            name, ok = QInputDialog.getText(dialog, "Rename Saved Filter", "Name:", text=str(saved["name"]))
+            if not ok:
+                return
+            try:
+                updated = self.bom_service.update_saved_bom_filter(int(saved["id"]), name=name)
+                if int(saved["id"]) == int(self._active_saved_filter_id or 0):
+                    self._active_saved_filter_name = str(updated.get("name") or "")
+                    self._update_advanced_filter_button_state()
+                refresh(updated["id"])
+            except Exception as exc:
+                QMessageBox.warning(dialog, "Saved Filter", str(exc))
+
+        def duplicate_selected():
+            saved = selected_filter()
+            if not saved:
+                return
+            details = self._prompt_saved_filter_details("Duplicate BOM Filter", f"Copy of {saved['name']}")
+            if not details:
+                return
+            try:
+                created = self.bom_service.duplicate_saved_bom_filter(
+                    int(saved["id"]), details[0], details[1]
+                )
+                refresh(created["id"])
+            except Exception as exc:
+                QMessageBox.warning(dialog, "Saved Filter", str(exc))
+
+        def toggle_share():
+            saved = selected_filter()
+            if not saved:
+                return
+            try:
+                updated = self.bom_service.update_saved_bom_filter(
+                    int(saved["id"]), is_shared=not bool(saved.get("is_shared"))
+                )
+                refresh(updated["id"])
+            except Exception as exc:
+                QMessageBox.warning(dialog, "Saved Filter", str(exc))
+
+        def move_selected(direction):
+            saved = selected_filter()
+            if not saved:
+                return
+            try:
+                self.bom_service.move_saved_bom_filter(int(saved["id"]), direction)
+                refresh(saved["id"])
+            except Exception as exc:
+                QMessageBox.warning(dialog, "Saved Filter", str(exc))
+
+        def delete_selected():
+            saved = selected_filter()
+            if not saved:
+                return
+            answer = QMessageBox.question(
+                dialog, "Delete Saved Filter", f"Delete '{saved['name']}'?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+            try:
+                self.bom_service.delete_saved_bom_filter(int(saved["id"]))
+                if int(saved["id"]) == int(self._active_saved_filter_id or 0):
+                    self._active_saved_filter_id = None
+                    self._active_saved_filter_name = ""
+                    self._update_advanced_filter_button_state()
+                refresh()
+            except Exception as exc:
+                QMessageBox.warning(dialog, "Saved Filter", str(exc))
+
+        table.itemSelectionChanged.connect(update_actions)
+        table.itemDoubleClicked.connect(lambda _item: apply_selected())
+        apply_btn.clicked.connect(apply_selected)
+        save_btn.clicked.connect(save_current)
+        update_btn.clicked.connect(update_selected)
+        rename_btn.clicked.connect(rename_selected)
+        duplicate_btn.clicked.connect(duplicate_selected)
+        share_btn.clicked.connect(toggle_share)
+        up_btn.clicked.connect(lambda: move_selected(-1))
+        down_btn.clicked.connect(lambda: move_selected(1))
+        delete_btn.clicked.connect(delete_selected)
+        close_btn.clicked.connect(dialog.reject)
+        refresh(self._active_saved_filter_id)
+        dialog.exec_()
 
     def _collect_tree_column_values(self, column: int) -> list[str]:
         values = set()
@@ -3179,7 +3535,7 @@ class BomPage(QWidget):
     def _bom_tree_item_matches_advanced_filter(self, item: QTreeWidgetItem, filters: dict) -> bool:
         if self._is_folder_tree_item(item):
             return False
-        text = str(filters.get("text") or "").strip().lower()
+        text = str(filters.get("text") or "").strip()
         if text:
             haystack = " ".join([
                 str(item.text(col) or "") for col in range(BOM_COL_NAME, BOM_COL_STATUS + 1)
@@ -3188,8 +3544,9 @@ class BomPage(QWidget):
                 ", ".join(item.data(0, BOM_TREE_CATEGORY_ROLE) or []),
                 str(item.toolTip(BOM_COL_NAME) or ""),
                 str(item.toolTip(BOM_COL_FILES) or ""),
-            ]).lower()
-            if text not in haystack:
+            ])
+            whole_word = str(filters.get("text_match_mode") or "normal") == "whole_word"
+            if not matches_bom_filter_text(haystack, text, whole_word=whole_word):
                 return False
 
         locked_txt = str(item.data(0, BOM_TREE_INWORK_ROLE) or "")
@@ -3272,13 +3629,32 @@ class BomPage(QWidget):
         return True
 
     def show_advanced_filter_dialog(self):
-        dialog = QDialog(self)
+        existing = getattr(self, "_advanced_filter_dialog", None)
+        if existing is not None and existing.isVisible():
+            existing.raise_()
+            existing.activateWindow()
+            return
+
+        dialog = QDialog(self, Qt.Tool)
+        dialog.setWindowModality(Qt.NonModal)
+        dialog.setModal(False)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        self._advanced_filter_dialog = dialog
+
+        def forget_dialog(*_):
+            if getattr(self, "_advanced_filter_dialog", None) is dialog:
+                self._advanced_filter_dialog = None
+
+        dialog.destroyed.connect(forget_dialog)
         dialog.setWindowTitle("Advanced BOM Filter")
-        dialog.resize(560, 500)
+        dialog.resize(660, 550)
         layout = QVBoxLayout(dialog)
         layout.setSpacing(10)
 
-        intro = QLabel("Filter the visible BOM by lifecycle state, owner, document health, issues, and integrity.")
+        intro = QLabel(
+            "Filter the visible BOM by text, lifecycle state, owner, document health, issues, and integrity. "
+            "Separate text values with commas to match any value."
+        )
         intro.setWordWrap(True)
         intro.setStyleSheet("color:#475569;")
         layout.addWidget(intro)
@@ -3289,9 +3665,20 @@ class BomPage(QWidget):
         current = dict(getattr(self, "_bom_advanced_filters", {}) or self._default_bom_advanced_filters())
 
         text_input = QLineEdit(str(current.get("text") or ""))
-        text_input.setPlaceholderText("Name, AES, part number, tooltip, file state...")
+        text_input.setPlaceholderText("Multiple values: MA00, MA01")
+        text_input.setToolTip("Separate values with commas. An item is shown when it matches any value.")
+        text_match_combo = QComboBox()
+        text_match_combo.addItem("Normal filter", "normal")
+        text_match_combo.addItem("Match whole word", "whole_word")
+        current_match_mode = str(current.get("text_match_mode") or "normal")
+        current_match_index = text_match_combo.findData(current_match_mode)
+        text_match_combo.setCurrentIndex(max(0, current_match_index))
+        text_match_combo.setToolTip(
+            "Normal filter matches text inside a larger value. Match whole word requires word boundaries."
+        )
         grid.addWidget(QLabel("Contains"), 0, 0)
-        grid.addWidget(text_input, 0, 1, 1, 3)
+        grid.addWidget(text_input, 0, 1, 1, 2)
+        grid.addWidget(text_match_combo, 0, 3)
 
         work_combo = QComboBox()
         work_combo.addItems(["Any", "In Work", "Checked In"])
@@ -3398,13 +3785,31 @@ class BomPage(QWidget):
         expand_check.setChecked(bool(current.get("expand_matches", True)))
         layout.addWidget(expand_check)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        remove_duplicates_check = QCheckBox("Remove duplicate items (keep first occurrence)")
+        remove_duplicates_check.setChecked(bool(current.get("remove_duplicates", False)))
+        remove_duplicates_check.setToolTip(
+            "Show a flat result list with one row per BOM item ID, keeping its first occurrence."
+        )
+        layout.addWidget(remove_duplicates_check)
+
+        def update_tree_option_state(remove_duplicates: bool):
+            show_parent_check.setEnabled(not remove_duplicates)
+            expand_check.setEnabled(not remove_duplicates)
+
+        remove_duplicates_check.toggled.connect(update_tree_option_state)
+        update_tree_option_state(remove_duplicates_check.isChecked())
+
+        buttons = QDialogButtonBox()
+        apply_btn = buttons.addButton("Apply", QDialogButtonBox.ApplyRole)
+        save_btn = buttons.addButton("Save As...", QDialogButtonBox.ActionRole)
         clear_btn = buttons.addButton("Clear Filter", QDialogButtonBox.ResetRole)
+        close_btn = buttons.addButton(QDialogButtonBox.Close)
         layout.addWidget(buttons)
 
-        def on_apply():
-            filters = {
+        def collect_filters():
+            return {
                 "text": text_input.text().strip(),
+                "text_match_mode": text_match_combo.currentData(),
                 "work_state": work_combo.currentText(),
                 "work_owner": owner_combo.currentText(),
                 "status": status_combo.currentText(),
@@ -3420,21 +3825,46 @@ class BomPage(QWidget):
                 "step": step_combo.currentText(),
                 "integrity": integrity_combo.currentText(),
                 "issues": issue_combo.currentText(),
+                "remove_duplicates": remove_duplicates_check.isChecked(),
                 "show_parent_matches": show_parent_check.isChecked(),
                 "expand_matches": expand_check.isChecked(),
             }
-            dialog.accept()
+
+        def on_apply():
+            filters = collect_filters()
+            self._active_saved_filter_id = None
+            self._active_saved_filter_name = ""
             self.apply_bom_tree_filter(filters)
 
-        buttons.accepted.connect(on_apply)
-        buttons.rejected.connect(dialog.reject)
-        clear_btn.clicked.connect(lambda: (dialog.accept(), self.clear_bom_tree_filter()))
-        dialog.exec_()
+        def on_save_as():
+            saved = self._save_bom_filter_definition(collect_filters())
+            if not saved:
+                return
+            self._active_saved_filter_id = int(saved["id"])
+            self._active_saved_filter_name = str(saved.get("name") or "")
+            self.apply_bom_tree_filter(saved.get("definition") or {})
+            self._active_saved_filter_id = int(saved["id"])
+            self._active_saved_filter_name = str(saved.get("name") or "")
+            self._update_advanced_filter_button_state()
+
+        def on_clear():
+            self.clear_bom_tree_filter()
+            dialog.close()
+
+        apply_btn.clicked.connect(on_apply)
+        save_btn.clicked.connect(on_save_as)
+        clear_btn.clicked.connect(on_clear)
+        close_btn.clicked.connect(dialog.close)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def clear_bom_tree_filter(self):
         was_flat_filter = bool(getattr(self, "_advanced_filter_flat_mode", False))
         self._advanced_filter_flat_mode = False
         self._bom_advanced_filters = self._default_bom_advanced_filters()
+        self._active_saved_filter_id = None
+        self._active_saved_filter_name = ""
         for tree in (getattr(self, "tree", None), getattr(self, "_search_tree", None)):
             if tree is None:
                 continue
@@ -3463,9 +3893,20 @@ class BomPage(QWidget):
         try:
             if active:
                 suffix = f" ({visible_count} shown)" if visible_count is not None else ""
-                self.advanced_filter_btn.setText(f"Advanced Filter Active{suffix}")
+                saved_name = str(getattr(self, "_active_saved_filter_name", "") or "").strip()
+                label = saved_name if saved_name else "Active"
+                if len(label) > 24:
+                    label = label[:21] + "..."
+                self.advanced_filter_btn.setText(f"Advanced Filter: {label}{suffix}")
             else:
                 self.advanced_filter_btn.setText("Advanced Filter")
+        except Exception:
+            pass
+        try:
+            saved_name = str(getattr(self, "_active_saved_filter_name", "") or "").strip()
+            self.saved_filters_btn.setToolTip(
+                f"Applied saved filter: {saved_name}" if saved_name else "Apply or manage saved BOM filters"
+            )
         except Exception:
             pass
 
@@ -3540,18 +3981,47 @@ class BomPage(QWidget):
             return getattr(self, "_search_tree", self.tree)
         return self.tree
 
+    def _iter_tree_items_visual_order(self, tree_widget: QTreeWidget):
+        stack = []
+        try:
+            for index in range(tree_widget.topLevelItemCount() - 1, -1, -1):
+                stack.append(tree_widget.topLevelItem(index))
+        except Exception:
+            return
+        while stack:
+            item = stack.pop()
+            yield item
+            try:
+                for index in range(item.childCount() - 1, -1, -1):
+                    stack.append(item.child(index))
+            except Exception:
+                continue
+
     def _apply_bom_tree_filter_flat(self, filters: dict) -> int:
         source_tree = self._source_tree_for_flat_bom_filter()
+        remove_duplicates = bool(filters.get("remove_duplicates", False))
+        source_items = (
+            self._iter_tree_items_visual_order(source_tree)
+            if remove_duplicates
+            else self._iter_tree_items(source_tree)
+        )
         matches = [
-            item for item in self._iter_tree_items(source_tree)
+            item for item in source_items
             if self._bom_tree_item_matches_advanced_filter(item, filters)
         ]
+        if remove_duplicates:
+            matches = deduplicate_bom_items_by_id(
+                matches,
+                lambda item: item.data(0, Qt.UserRole),
+            )
+        # The source may be _search_tree, which _enter_search_mode() clears. Build
+        # detached rows first so deleted Qt item wrappers are never accessed.
+        match_clones = [self._clone_tree_item_shallow(item) for item in matches]
         self._advanced_filter_flat_mode = True
         self._enter_search_mode()
         try:
             self._search_tree.setUpdatesEnabled(False)
-            for item in matches:
-                clone = self._clone_tree_item_shallow(item)
+            for clone in match_clones:
                 clone.setHidden(False)
                 self._search_tree.addTopLevelItem(clone)
         finally:
@@ -3560,18 +4030,31 @@ class BomPage(QWidget):
             except Exception:
                 pass
         self._sync_search_tree_row_numbers()
-        return len(matches)
+        return len(match_clones)
 
     def apply_bom_tree_filter(self, filters: dict | None = None):
-        self._bom_advanced_filters = dict(filters or self._bom_advanced_filters or self._default_bom_advanced_filters())
+        self._bom_advanced_filters = self._normalize_bom_filter_definition(
+            filters or self._bom_advanced_filters or self._default_bom_advanced_filters()
+        )
         if self._is_default_bom_advanced_filter():
             self.clear_bom_tree_filter()
             return
+        # Let an incremental basic-search build finish before filtering its rows.
+        # _search_build_step() reapplies the current advanced filter on completion.
+        try:
+            if self.search_input.text().strip() and self._search_build_timer.isActive():
+                self._update_advanced_filter_button_state(visible_count=None)
+                return
+        except Exception:
+            pass
         # Advanced predicates must inspect the full BOM. Materialize only when the
         # user explicitly filters; normal startup and browsing remain level-lazy.
         if not getattr(self, "_in_search_mode", False):
             self._materialize_all_lazy_branches()
-        if not bool(self._bom_advanced_filters.get("show_parent_matches", True)):
+        if (
+            bool(self._bom_advanced_filters.get("remove_duplicates", False))
+            or not bool(self._bom_advanced_filters.get("show_parent_matches", True))
+        ):
             total_visible = self._apply_bom_tree_filter_flat(self._bom_advanced_filters)
             self._update_advanced_filter_button_state(total_visible)
             return
@@ -4966,6 +5449,8 @@ class BomPage(QWidget):
         query = self.search_input.text().strip()
         if not query:
             self._exit_search_mode()
+            if not self._is_default_bom_advanced_filter():
+                self.apply_bom_tree_filter(self._bom_advanced_filters)
             return
 
         # Show spinner immediately, then fetch results in a background thread.
@@ -5016,6 +5501,8 @@ class BomPage(QWidget):
             pass
         self._search_build_queue = deque(results or [])
 
+        # A new basic search replaces any previous advanced flat result list.
+        self._advanced_filter_flat_mode = False
         self._enter_search_mode()   # switch stack to _search_tree (index 2), clears it
 
         self._set_tree_loading(True)
@@ -6841,9 +7328,6 @@ class BomPage(QWidget):
         self._tree_load_seq += 1
         seq = self._tree_load_seq
 
-        # Remember the first load; used to hide the startup loader at the right time.
-        if self._initial_tree_target_seq is None:
-            self._initial_tree_target_seq = int(seq)
         pid = getattr(self.session, "project_id", None)
         if not pid:
             try:
@@ -6851,6 +7335,7 @@ class BomPage(QWidget):
             except Exception:
                 pass
             self._set_tree_loading(False)
+            self._mark_initial_tree_ready()
             return
         try:
             self._issue_summary_cache = self.issue_service.part_summary()
@@ -6898,6 +7383,18 @@ class BomPage(QWidget):
         except Exception:
             pass
         self._set_tree_loading(False)
+        self._mark_initial_tree_ready()
+
+    def _mark_initial_tree_ready(self) -> None:
+        """Record the first terminal tree state and emit its sticky readiness signal."""
+        if self._initial_tree_ready_emitted:
+            return
+        self._initial_tree_ready_emitted = True
+        self.initial_tree_ready.emit()
+
+    @property
+    def initial_tree_is_ready(self) -> bool:
+        return bool(self._initial_tree_ready_emitted)
 
     def _load_tree_from_data(self, tree_data: dict, missing_map: dict) -> None:
         # Use incremental builder to keep UI responsive.
@@ -7015,17 +7512,23 @@ class BomPage(QWidget):
                 except Exception:
                     pass
 
-                # Fire once when the very first tree load finishes.
+                # Fire once when the first current tree load reaches a terminal state.
                 try:
-                    if (not self._initial_tree_ready_emitted) and self._initial_tree_target_seq is not None:
-                        if int(self._tree_build_seq) == int(self._initial_tree_target_seq):
-                            self._initial_tree_ready_emitted = True
-                            self.initial_tree_ready.emit()
+                    self._mark_initial_tree_ready()
                 except Exception:
                     pass
         except RuntimeError:
             try:
                 self._tree_build_timer.stop()
+            except Exception:
+                pass
+            try:
+                self.tree.setUpdatesEnabled(True)
+                self._set_tree_loading(False)
+            except Exception:
+                pass
+            try:
+                self._mark_initial_tree_ready()
             except Exception:
                 pass
             return
@@ -8457,6 +8960,7 @@ class BomPage(QWidget):
         defaults = self._default_bom_advanced_filters()
         labels = {
             "text": "Contains",
+            "text_match_mode": "Text match mode",
             "work_state": "Work state",
             "work_owner": "Owner",
             "status": "Status",
@@ -8468,18 +8972,30 @@ class BomPage(QWidget):
             "step": "STEP",
             "integrity": "Integrity",
             "issues": "Issues",
+            "remove_duplicates": "Duplicate items",
             "show_parent_matches": "Show parent branches",
             "expand_matches": "Expand matches",
         }
         rows = []
         for key, label in labels.items():
             value = filters.get(key, defaults.get(key, ""))
+            if key == "text_match_mode" and not str(filters.get("text") or "").strip():
+                continue
             if value != defaults.get(key, ""):
                 if isinstance(value, (list, tuple, set)):
                     rows.append((label, ", ".join(str(item) for item in value)))
+                elif key == "text_match_mode":
+                    rows.append((label, "Match whole word" if value == "whole_word" else "Normal filter"))
+                elif key == "remove_duplicates":
+                    rows.append((label, "First occurrence only"))
                 else:
                     rows.append((label, str(value)))
-        if getattr(self, "_in_search_mode", False):
+        search_query = ""
+        try:
+            search_query = self.search_input.text().strip()
+        except Exception:
+            pass
+        if search_query:
             rows.append(("Search mode", "Current search results"))
         return rows or [("Filter", "None - all visible BOM rows")]
 

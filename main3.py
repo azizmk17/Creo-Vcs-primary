@@ -51,6 +51,7 @@ from core.repositories.user_repository import UserRepository
 from core.services.project_service import ProjectService
 from core.services.ui_permission import UIPermissionHelper
 from core.session_manager import SessionManager
+from core.startup_gate import MINIMUM_STARTUP_LOADER_MS, StartupGate
 
 
 class AdvancedSpinner(QWidget):
@@ -171,12 +172,20 @@ class StartupWindow(QMainWindow):
         self._migrate_thread = None
         self._migrate_worker = None
         self._main_shown = False
+        self._startup_gate = StartupGate()
+        self._minimum_loader_timer = QTimer(self)
+        self._minimum_loader_timer.setSingleShot(True)
+        self._minimum_loader_timer.setTimerType(Qt.PreciseTimer)
+        self._minimum_loader_timer.timeout.connect(self._on_minimum_loader_elapsed)
         self.login_page.login_succeeded.connect(self.begin_loading)
 
     def begin_loading(self):
         self.pages.setCurrentWidget(self.loader_page)
+        self._startup_gate.reset()
         self.loader_page.set_status("Checking database migrations...")
         QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+        # Measure the minimum from the first painted loader frame.
+        self._minimum_loader_timer.start(MINIMUM_STARTUP_LOADER_MS)
 
         self._migrate_thread = QThread(self)
         self._migrate_worker = _MigrateWorker()
@@ -197,23 +206,35 @@ class StartupWindow(QMainWindow):
         try:
             self.main_page = BomGUI(startup_progress=self._set_loading_status)
         except Exception as exc:
+            self._minimum_loader_timer.stop()
+            self._startup_gate.reset()
             QMessageBox.critical(self, "Startup Error", f"{APP_NAME} could not start:\n\n{exc}")
             self.pages.setCurrentWidget(self.login_page)
             self.login_page._set_busy(False)
             raise
 
         self._set_loading_status("Loading the initial BOM...")
-        try:
-            if getattr(self.main_page.session, "project_id", None):
-                self.main_page.bom_page.initial_tree_ready.connect(self.show_main_window)
-                QTimer.singleShot(8000, self.show_main_window)
-                return
-        except Exception:
-            pass
-        QTimer.singleShot(0, self.show_main_window)
+        if not getattr(self.main_page.session, "project_id", None):
+            self._mark_page_ready()
+            return
+        bom_page = self.main_page.bom_page
+        bom_page.initial_tree_ready.connect(self._mark_page_ready)
+        # The page may have become ready while BomGUI was being built and
+        # processing startup events, before this signal was connected.
+        if bool(bom_page.initial_tree_is_ready):
+            self._mark_page_ready()
+
+    def _on_minimum_loader_elapsed(self):
+        if self._startup_gate.mark_minimum_elapsed():
+            self.show_main_window()
+
+    def _mark_page_ready(self):
+        self.loader_page.set_status("Application ready...")
+        if self._startup_gate.mark_page_ready():
+            self.show_main_window()
 
     def show_main_window(self):
-        if self._main_shown or self.main_page is None:
+        if self._main_shown or self.main_page is None or not self._startup_gate.released:
             return
         self._main_shown = True
         self.main_page.setGeometry(self.geometry())
