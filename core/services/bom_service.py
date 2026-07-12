@@ -8,6 +8,7 @@ from core.repositories.bom_children_repository import BomChildrenRepository
 from core.repositories.lock_repository import LockRepository
 from core.repositories.signature_repository import SignatureRepository
 from core.repositories.permission_repository import PermissionRepository
+from core.repositories.bom_folder_repository import BomFolderRepository
 from core.session_manager import SessionManager
 from config import DB_NAME
 
@@ -22,10 +23,41 @@ class BomService(BaseService):
         self.lock_repo = lock_repo
         self.signature_repo = signature_repo
         self.permission_repo = PermissionRepository()
+        self.folder_repo = BomFolderRepository()
         self.session = SessionManager()
         self._tree_cache: dict = {}    # project_id -> tree dict
         self._tree_dirty: set = set()  # project_ids that need re-fetch
         print(self.user_id)
+
+    # -------------------------------
+    # ORGANIZATIONAL FOLDERS
+    # -------------------------------
+    def list_bom_folders(self) -> List[Dict]:
+        if not self.session.project_id:
+            return []
+        return self.folder_repo.list_for_project(int(self.session.project_id))
+
+    def create_bom_folder(self, name: str, parent_bom_id=None, parent_folder_id=None) -> Dict:
+        if not self.session.project_id:
+            raise ValueError("Select a project before creating a folder.")
+        return self.folder_repo.create(
+            int(self.session.project_id), name, self.user_id,
+            parent_bom_id=parent_bom_id, parent_folder_id=parent_folder_id,
+        )
+
+    def rename_bom_folder(self, folder_id: int, name: str) -> Dict:
+        return self.folder_repo.rename(int(self.session.project_id), int(folder_id), name)
+
+    def eligible_bom_folder_items(self, folder_id: int) -> List[Dict]:
+        return self.folder_repo.eligible_items(int(self.session.project_id), int(folder_id))
+
+    def set_bom_folder_items(self, folder_id: int, bom_ids) -> List[int]:
+        return self.folder_repo.set_items(
+            int(self.session.project_id), int(folder_id), bom_ids, self.user_id
+        )
+
+    def delete_bom_folder(self, folder_id: int) -> List[int]:
+        return self.folder_repo.delete(int(self.session.project_id), int(folder_id))
 
     # -------------------------------
     # INSERT PART / ASM
@@ -687,6 +719,41 @@ class BomService(BaseService):
         return results
 
     # -------------------------------
+    # PROJECT CATEGORIES
+    # -------------------------------
+    def list_categories(self) -> List[Dict]:
+        if not self.session.project_id:
+            return []
+        return self.bom_repo.list_categories(int(self.session.project_id))
+
+    def categories_for_part(self, part_id: int) -> List[str]:
+        return self.bom_repo.get_categories_for_bom(int(part_id))
+
+    def set_part_categories(self, part_id: int, category_names) -> List[str]:
+        if not self.session.project_id:
+            raise ValueError("Select a project before assigning categories.")
+        categories = self.bom_repo.set_categories_for_bom(
+            int(part_id),
+            int(self.session.project_id),
+            category_names,
+            assigned_by=self.user_id,
+        )
+        self._tree_dirty.add(int(self.session.project_id))
+        return categories
+
+    def category_usage(self, category_id: int) -> Dict:
+        if not self.session.project_id:
+            raise ValueError("Select a project before managing categories.")
+        return self.bom_repo.get_category_usage(int(self.session.project_id), int(category_id))
+
+    def delete_category(self, category_id: int) -> Dict:
+        if not self.session.project_id:
+            raise ValueError("Select a project before managing categories.")
+        result = self.bom_repo.delete_category(int(self.session.project_id), int(category_id))
+        self._tree_dirty.add(int(self.session.project_id))
+        return result
+
+    # -------------------------------
     # GET BOM TREE
     # -------------------------------
     def get_bom_tree(self, project_id) -> Dict:
@@ -700,6 +767,7 @@ class BomService(BaseService):
 
         # Get all parts for the project
         all_parts = {b.id: b for b in self.bom_repo.get_all(project_id)}
+        category_map = self.bom_repo.get_categories_for_boms(all_parts.keys())
         try:
             lock_owner = self.lock_repo.get_lock_owners_for_project(int(project_id))
         except Exception:
@@ -725,6 +793,7 @@ class BomService(BaseService):
 
             part = all_parts[part_id]
             node = part.__dict__.copy()
+            node["categories"] = list(category_map.get(int(part_id), []))
             node["children"] = []
 
             if node.get("locked"):
@@ -760,6 +829,9 @@ class BomService(BaseService):
             return {}
 
         d = part.__dict__.copy()
+        category_names = self.bom_repo.get_categories_for_bom(int(part_id))
+        d["category_names"] = list(category_names)
+        d["categories"] = ", ".join(category_names)
         try:
             if d.get("locked") and self.session.project_id:
                 lock_owner = self.lock_repo.get_lock_owners_for_project(int(self.session.project_id))
@@ -824,6 +896,9 @@ class BomService(BaseService):
         # Proceed to delete the relation
         try:
             self.children_repo.delete(int(parent_id), int(child_id))
+            self.folder_repo.unassign_from_context(
+                int(self.session.project_id), int(parent_id), int(child_id)
+            )
             self._tree_dirty.add(int(self.session.project_id))
             return True
         except Exception as e:
@@ -845,6 +920,90 @@ class BomService(BaseService):
         result = self.children_repo.set_child_order(int(parent_id), [int(x) for x in ordered_child_ids])
         self._tree_dirty.add(int(self.session.project_id))
         return result
+
+    def get_structure_context(self, part_id: int) -> Dict:
+        """Return recursive Uses and direct Where Used relations for one BOM item."""
+        selected = self.bom_repo.get_by_id(int(part_id))
+        if not selected:
+            return {"uses": None, "where_used": None, "uses_count": 0, "where_used_count": 0}
+
+        project_id = int(getattr(selected, "project_id", None) or self.session.project_id)
+        parts = {int(part.id): part for part in self.bom_repo.get_all(project_id)}
+        relations = self.children_repo.get_all_for_project(project_id)
+        children_map = {}
+        parents_map = {}
+        for relation in relations:
+            parent_id = int(relation.parent_id)
+            child_id = int(relation.child_id)
+            quantity = int(getattr(relation, "quantity", 1) or 1)
+            sort_order = int(getattr(relation, "sort_order", 0) or 0)
+            children_map.setdefault(parent_id, []).append((sort_order, child_id, quantity))
+            parents_map.setdefault(child_id, []).append((parent_id, quantity))
+
+        for values in children_map.values():
+            values.sort(key=lambda row: (row[0], row[1]))
+        for values in parents_map.values():
+            values.sort(
+                key=lambda row: (
+                    str(getattr(parts.get(row[0]), "aes_number", "") or "").casefold(),
+                    str(getattr(parts.get(row[0]), "name", "") or "").casefold(),
+                    row[0],
+                )
+            )
+
+        def part_node(node_id: int, relation_label: str, quantity=None, cycle=False) -> Dict:
+            part = parts.get(int(node_id))
+            if not part:
+                return {}
+            node = part.__dict__.copy()
+            node.update({
+                "relation": relation_label,
+                "quantity": quantity,
+                "cycle": bool(cycle),
+                "children": [],
+            })
+            return node
+
+        def build_uses(node_id: int, path: set) -> Dict:
+            node = part_node(node_id, "Selected Item" if not path else "Uses")
+            if not node:
+                return {}
+            next_path = set(path)
+            next_path.add(int(node_id))
+            for _order, child_id, quantity in children_map.get(int(node_id), []):
+                if child_id in next_path:
+                    child = part_node(child_id, "Cycle", quantity, cycle=True)
+                else:
+                    child = build_uses(child_id, next_path)
+                    if child:
+                        child["relation"] = "Uses"
+                        child["quantity"] = quantity
+                if child:
+                    node["children"].append(child)
+            return node
+
+        def build_where_used(node_id: int) -> Dict:
+            node = part_node(node_id, "Selected Item")
+            if not node:
+                return {}
+            for parent_id, quantity in parents_map.get(int(node_id), []):
+                parent = part_node(parent_id, "Used By", quantity)
+                if parent:
+                    node["children"].append(parent)
+            return node
+
+        def descendant_count(node: Dict) -> int:
+            children = list((node or {}).get("children") or [])
+            return len(children) + sum(descendant_count(child) for child in children)
+
+        uses = build_uses(int(part_id), set())
+        where_used = build_where_used(int(part_id))
+        return {
+            "uses": uses,
+            "where_used": where_used,
+            "uses_count": descendant_count(uses),
+            "where_used_count": descendant_count(where_used),
+        }
 
     # -------------------------------
     # EXPORT BOM

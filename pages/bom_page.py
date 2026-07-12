@@ -1,7 +1,7 @@
 from asyncio.windows_events import NULL
 from PyQt5.QtWidgets import (
-    QWidget, QHBoxLayout, QVBoxLayout, QGroupBox, QLineEdit, QPushButton, QTreeWidget,
-    QTreeWidgetItem, QSplitter, QTabWidget, QLabel, QTableWidget, QTableWidgetItem,
+    QWidget, QHBoxLayout, QVBoxLayout, QGroupBox, QLineEdit, QPushButton, QListWidget, QTreeWidget,
+    QListWidgetItem, QTreeWidgetItem, QSplitter, QTabWidget, QLabel, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QTextEdit, QComboBox, QSpinBox, QDateTimeEdit,
     QMessageBox, QInputDialog, QFileDialog, QMenu, QAction, QDialog, QDialogButtonBox, QFrame,
     QPlainTextEdit, QStackedWidget, QSizePolicy, QCheckBox, QGridLayout, QScrollArea,
@@ -173,6 +173,50 @@ BOM_TREE_FILES_ROLE = Qt.UserRole + 36
 BOM_TREE_INTEGRITY_ROLE = Qt.UserRole + 37
 # Value: dict {active_count, total_count, critical_count}
 BOM_TREE_ISSUE_ROLE = Qt.UserRole + 38
+BOM_TREE_CATEGORY_ROLE = Qt.UserRole + 39
+BOM_TREE_FOLDER_ROLE = Qt.UserRole + 40
+
+_BOM_TYPE_ICON_CACHE = {}
+
+
+def _bom_type_icon(part_type: str) -> QIcon:
+    """Return a compact CAD-style icon for assembly and part tree rows."""
+    key = str(part_type or "").strip().lower()
+    if key in _BOM_TYPE_ICON_CACHE:
+        return _BOM_TYPE_ICON_CACHE[key]
+    if key == "folder":
+        icon = QApplication.style().standardIcon(QStyle.SP_DirIcon)
+        _BOM_TYPE_ICON_CACHE[key] = icon
+        return icon
+    if key not in {"asm", "assembly", "prt", "part"}:
+        return QIcon()
+
+    pixmap = QPixmap(14, 14)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+
+    if key in {"asm", "assembly"}:
+        painter.setPen(QPen(QColor("#315b7d"), 1))
+        painter.setBrush(QBrush(QColor("#70a6c9")))
+        painter.drawRoundedRect(1, 1, 6, 6, 1, 1)
+        painter.setBrush(QBrush(QColor("#4f86a8")))
+        painter.drawRoundedRect(7, 7, 6, 6, 1, 1)
+        painter.setPen(QPen(QColor("#315b7d"), 1.2))
+        painter.drawLine(6, 6, 8, 8)
+    else:
+        painter.setPen(QPen(QColor("#536b3f"), 1))
+        painter.setBrush(QBrush(QColor("#8db36f")))
+        painter.drawRoundedRect(2, 2, 10, 10, 1, 1)
+        painter.setPen(QPen(QColor("#6f9254"), 1))
+        painter.drawLine(2, 5, 7, 8)
+        painter.drawLine(12, 5, 7, 8)
+        painter.drawLine(7, 8, 7, 12)
+
+    painter.end()
+    icon = QIcon(pixmap)
+    _BOM_TYPE_ICON_CACHE[key] = icon
+    return icon
 
 BOM_COL_ROW = 0
 BOM_COL_NAME = 1
@@ -543,6 +587,9 @@ class _BomTreeFilesDelegate(QStyledItemDelegate):
         style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
         painter.restore()
 
+        if item.data(0, BOM_TREE_FOLDER_ROLE):
+            return
+
         payload = item.data(BOM_COL_FILES, BOM_TREE_FILES_ROLE) or {}
         pdf = payload.get("pdf") or ("na", "")
         step = payload.get("step") or ("na", "")
@@ -602,6 +649,9 @@ class _BomTreeStatusDelegate(QStyledItemDelegate):
         painter.save()
         style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
         painter.restore()
+
+        if item.data(0, BOM_TREE_FOLDER_ROLE):
+            return
 
         raw = (item.text(BOM_COL_STATUS) or "").strip()
         key = _status_badge_key(raw)
@@ -675,6 +725,9 @@ class _BomTreeIntegrityDelegate(QStyledItemDelegate):
         painter.save()
         style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
         painter.restore()
+
+        if item.data(0, BOM_TREE_FOLDER_ROLE):
+            return
 
         payload = item.data(BOM_COL_INTEGRITY, BOM_TREE_INTEGRITY_ROLE) or {"state": "ok"}
         state = str(payload.get("state") or "ok")
@@ -2111,15 +2164,12 @@ class BomPage(QWidget):
         # Tabs for details
         self.tabs = QTabWidget()
 
-        # Details tab (key/value)
+        # Details tab: compact engineering summary with an on-demand full attribute view.
         details_tab = QWidget()
         details_layout = QVBoxLayout(details_tab)
-        self.details_table = QTableWidget()
-        self.details_table.setColumnCount(2)
-        self.details_table.setHorizontalHeaderLabels(["Property", "Value"])
-        self.details_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.details_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.details_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        details_layout.setContentsMargins(8, 8, 8, 8)
+        details_layout.setSpacing(8)
+        self._current_part_details = {}
 
         # Alert section (hidden by default)
         self.details_alert_frame = QFrame()
@@ -2143,22 +2193,168 @@ class BomPage(QWidget):
         self.details_alert_frame.hide()  # Hidden by default
 
         details_layout.addWidget(self.details_alert_frame)
-        details_layout.addWidget(self.details_table)
+
+        self.details_summary_card = QFrame()
+        self.details_summary_card.setObjectName("bomDetailsSummary")
+        self.details_summary_card.setStyleSheet("""
+            QFrame#bomDetailsSummary {
+                background: #ffffff;
+                border: 1px solid #d7dde5;
+                border-left: 4px solid #0b78d0;
+                border-radius: 6px;
+            }
+            QLabel#bomDetailsTitle {
+                color: #172033;
+                font-size: 13px;
+                font-weight: 700;
+                background: transparent;
+            }
+            QLabel#bomDetailsIdentity {
+                color: #526071;
+                font-size: 10px;
+                background: transparent;
+            }
+            QLabel#bomDetailsField {
+                color: #66758a;
+                font-size: 9px;
+                font-weight: 700;
+                background: transparent;
+            }
+            QLabel#bomDetailsValue {
+                color: #172033;
+                font-size: 10px;
+                font-weight: 600;
+                background: transparent;
+            }
+        """)
+        summary_layout = QVBoxLayout(self.details_summary_card)
+        summary_layout.setContentsMargins(14, 12, 14, 12)
+        summary_layout.setSpacing(10)
+
+        summary_heading = QHBoxLayout()
+        heading_text = QVBoxLayout()
+        heading_text.setSpacing(2)
+        self.details_name_label = QLabel("Select a BOM item")
+        self.details_name_label.setObjectName("bomDetailsTitle")
+        self.details_identity_label = QLabel("Select a row in the BOM structure to view its summary.")
+        self.details_identity_label.setObjectName("bomDetailsIdentity")
+        heading_text.addWidget(self.details_name_label)
+        heading_text.addWidget(self.details_identity_label)
+        summary_heading.addLayout(heading_text, 1)
+        self.view_full_details_btn = QPushButton("View Full Details")
+        self.view_full_details_btn.setObjectName("neutral")
+        self.view_full_details_btn.setEnabled(False)
+        self.view_full_details_btn.clicked.connect(self._open_full_bom_details)
+        self.edit_categories_btn = QPushButton("Edit Categories")
+        self.edit_categories_btn.setObjectName("neutral")
+        self.edit_categories_btn.setEnabled(False)
+        self.edit_categories_btn.clicked.connect(self._edit_current_part_categories)
+        summary_heading.addWidget(self.edit_categories_btn, 0, Qt.AlignTop)
+        summary_heading.addWidget(self.view_full_details_btn, 0, Qt.AlignTop)
+        summary_layout.addLayout(summary_heading)
+
+        self.details_summary_grid = QGridLayout()
+        self.details_summary_grid.setHorizontalSpacing(28)
+        self.details_summary_grid.setVerticalSpacing(10)
+        self._details_summary_fields = {}
+        summary_fields = [
+            ("aes_number", "AES Number", ("aes_number",)),
+            ("part_number", "Part Number", ("part_number",)),
+            ("drawing", "DRW Number", ("drawing_number",)),
+            ("type", "Type", ("type",)),
+            ("revision", "Revision", ("revision",)),
+            ("state", "Lifecycle", ("status", "state", "lifecycle_state")),
+            ("material", "Material", ("material",)),
+            ("categories", "Categories", ("categories",)),
+        ]
+        for index, (field_key, label_text, detail_keys) in enumerate(summary_fields):
+            row = (index // 2) * 2
+            column = (index % 2) * 2
+            field_label = QLabel(label_text.upper())
+            field_label.setObjectName("bomDetailsField")
+            value_label = QLabel("-")
+            value_label.setObjectName("bomDetailsValue")
+            value_label.setWordWrap(True)
+            self.details_summary_grid.addWidget(field_label, row, column)
+            self.details_summary_grid.addWidget(value_label, row + 1, column)
+            self._details_summary_fields[field_key] = (field_label, value_label, detail_keys)
+        self.details_summary_grid.setColumnStretch(0, 1)
+        self.details_summary_grid.setColumnStretch(2, 1)
+        summary_layout.addLayout(self.details_summary_grid)
+        details_layout.addWidget(self.details_summary_card)
+
+        self.associated_files_card = QFrame()
+        self.associated_files_card.setObjectName("associatedFilesCard")
+        self.associated_files_card.setStyleSheet("""
+            QFrame#associatedFilesCard {
+                background: #ffffff;
+                border: 1px solid #d7dde5;
+                border-radius: 6px;
+            }
+            QLabel#associatedFilesTitle {
+                color: #172033;
+                font-size: 11px;
+                font-weight: 700;
+                background: transparent;
+            }
+            QLabel#associatedFilesLabel {
+                color: #66758a;
+                font-size: 9px;
+                font-weight: 700;
+                background: transparent;
+            }
+            QLabel#associatedFilesValue {
+                color: #172033;
+                font-size: 10px;
+                font-weight: 600;
+                background: transparent;
+            }
+        """)
+        files_card_layout = QVBoxLayout(self.associated_files_card)
+        files_card_layout.setContentsMargins(14, 10, 14, 10)
+        files_card_layout.setSpacing(8)
+        files_card_layout.addWidget(self._details_card_label("Associated Files", "associatedFilesTitle"))
+
+        associated_files_grid = QGridLayout()
+        associated_files_grid.setHorizontalSpacing(28)
+        associated_files_grid.setVerticalSpacing(4)
+        associated_files_grid.addWidget(self._details_card_label("CAD FILE", "associatedFilesLabel"), 0, 0)
+        associated_files_grid.addWidget(self._details_card_label("DRAWING FILE", "associatedFilesLabel"), 0, 1)
+        self.associated_cad_file_label = self._details_card_label("Not linked", "associatedFilesValue")
+        self.associated_drawing_file_label = self._details_card_label("Not linked", "associatedFilesValue")
+        self.associated_cad_file_label.setWordWrap(True)
+        self.associated_drawing_file_label.setWordWrap(True)
+        associated_files_grid.addWidget(self.associated_cad_file_label, 1, 0)
+        associated_files_grid.addWidget(self.associated_drawing_file_label, 1, 1)
+        associated_files_grid.setColumnStretch(0, 1)
+        associated_files_grid.setColumnStretch(1, 1)
+        files_card_layout.addLayout(associated_files_grid)
+        details_layout.addWidget(self.associated_files_card)
+        details_layout.addStretch(1)
         self.tabs.addTab(details_tab, "Details")
 
         
 
-        # Children tab
-        children_tab = QWidget()
-        children_layout = QVBoxLayout(children_tab)
-        self.children_table = QTableWidget()
-        self.children_table.setColumnCount(4)
-        self.children_table.setHorizontalHeaderLabels(["AES Number", "Name", "Type", "Quantity"])
-        self.children_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.children_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        children_layout.addWidget(QLabel("Child Components:"))
-        children_layout.addWidget(self.children_table)
-        self.tabs.addTab(children_tab, "Children")
+        # Windchill-style structure workspace: recursive Uses and direct Where Used.
+        structure_tab = QWidget()
+        structure_layout = QVBoxLayout(structure_tab)
+        structure_layout.setContentsMargins(8, 8, 8, 8)
+        structure_layout.setSpacing(6)
+        self.structure_summary_label = QLabel("Select a BOM item")
+        self.structure_summary_label.setStyleSheet(
+            "font-size:10px;font-weight:700;color:#526071;background:transparent;"
+        )
+        structure_layout.addWidget(self.structure_summary_label)
+
+        self.structure_views = QTabWidget()
+        self.uses_tree = self._create_structure_relation_tree()
+        self.where_used_tree = self._create_structure_relation_tree()
+        self.uses_tree.itemDoubleClicked.connect(self._open_structure_tree_item)
+        self.where_used_tree.itemDoubleClicked.connect(self._open_structure_tree_item)
+        self.structure_views.addTab(self.uses_tree, "Uses")
+        self.structure_views.addTab(self.where_used_tree, "Where Used")
+        structure_layout.addWidget(self.structure_views, 1)
+        self.tabs.addTab(structure_tab, "Structure")
 
         # Notes tab
         notes_tab = QWidget()
@@ -2327,6 +2523,9 @@ class BomPage(QWidget):
         self.add_part_btn = QPushButton("Add Part")
         self.add_part_btn.setObjectName("primary")
         self.add_part_btn.clicked.connect(self.add_part)
+        self.add_folder_btn = QPushButton("Add Folder")
+        self.add_folder_btn.setObjectName("neutral")
+        self.add_folder_btn.clicked.connect(self.add_bom_folder)
         self.edit_part_btn = QPushButton("Edit Part")
         self.edit_part_btn.setObjectName("neutral")
         self.edit_part_btn.clicked.connect(self.edit_part)
@@ -2348,6 +2547,7 @@ class BomPage(QWidget):
 
         _can_manage = self.perm.can("manage_parts")
         self.add_part_btn.setEnabled(_can_manage)
+        self.add_folder_btn.setEnabled(_can_manage)
         self.edit_part_btn.setEnabled(_can_manage)
         self.delete_part_btn.setEnabled(_can_manage)
         self.add_child_btn.setEnabled(_can_manage)
@@ -2358,6 +2558,7 @@ class BomPage(QWidget):
         self.set_revision_btn.setEnabled(self.perm.can("set_revision"))
 
         action_layout.addWidget(self.add_part_btn)
+        action_layout.addWidget(self.add_folder_btn)
         action_layout.addWidget(self.edit_part_btn)
         action_layout.addWidget(self.delete_part_btn)
         action_layout.addWidget(self.checkout_part_btn)
@@ -2381,12 +2582,164 @@ class BomPage(QWidget):
     # -------------------------
     # Context menu / tree actions
     # -------------------------
+    def _folder_record(self, folder_id: int) -> dict:
+        for folder in getattr(self, "_bom_folders_cache", []) or []:
+            try:
+                if int(folder.get("id")) == int(folder_id):
+                    return dict(folder)
+            except Exception:
+                continue
+        try:
+            folders = self.bom_service.list_bom_folders() or []
+            self._bom_folders_cache = list(folders)
+            return next(
+                (dict(folder) for folder in folders if int(folder.get("id")) == int(folder_id)),
+                {},
+            )
+        except Exception:
+            return {}
+
+    def add_bom_folder(self, parent_item=None, parent_folder_id=None) -> None:
+        if not self.perm.can("manage_parts"):
+            return
+        selected = parent_item if isinstance(parent_item, QTreeWidgetItem) else None
+        parent_bom_id = None
+        if parent_folder_id is None and selected is not None:
+            selected_folder_id = selected.data(0, BOM_TREE_FOLDER_ROLE)
+            if selected_folder_id:
+                parent_folder_id = int(selected_folder_id)
+            else:
+                selected_id = selected.data(0, Qt.UserRole)
+                selected_type = str(selected.text(BOM_COL_TYPE) or "").strip().lower()
+                if selected_id is not None and selected_type in {"asm", "assembly"}:
+                    parent_bom_id = int(selected_id)
+
+        if parent_folder_id is not None:
+            parent_folder = self._folder_record(int(parent_folder_id))
+            location = f"inside folder '{parent_folder.get('name') or 'Folder'}'"
+        elif parent_bom_id is not None:
+            parent = self.bom_service.get_part_details(int(parent_bom_id)) or {}
+            location = f"inside assembly '{parent.get('name') or parent_bom_id}'"
+        else:
+            location = "at the project root"
+        name, accepted = QInputDialog.getText(
+            self, "Add BOM Folder", f"Folder name ({location}):"
+        )
+        if not accepted:
+            return
+        try:
+            folder = self.bom_service.create_bom_folder(
+                name, parent_bom_id=parent_bom_id, parent_folder_id=parent_folder_id
+            )
+            self._refresh_folder_context(folder.get("effective_parent_bom_id"))
+        except Exception as exc:
+            QMessageBox.critical(self, "Add BOM Folder", f"Could not create folder:\n{exc}")
+
+    def _assign_bom_folder_items(self, folder_id: int) -> None:
+        folder = self._folder_record(int(folder_id))
+        try:
+            eligible = self.bom_service.eligible_bom_folder_items(int(folder_id)) or []
+        except Exception as exc:
+            QMessageBox.critical(self, "Folder Items", f"Could not load eligible items:\n{exc}")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Items in {folder.get('name') or 'Folder'}")
+        dialog.resize(560, 480)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("Select the direct BOM items to display in this folder."))
+        item_list = QListWidget()
+        item_list.setAlternatingRowColors(True)
+        for part in eligible:
+            label = f"{part.get('aes_number') or '-'}  {part.get('name') or ''}  [{part.get('type') or ''}]"
+            list_item = QListWidgetItem(label)
+            list_item.setData(Qt.UserRole, int(part["id"]))
+            list_item.setFlags(list_item.flags() | Qt.ItemIsUserCheckable)
+            list_item.setCheckState(Qt.Checked if part.get("assigned") else Qt.Unchecked)
+            item_list.addItem(list_item)
+        layout.addWidget(item_list, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+
+        def save_items():
+            selected_ids = [
+                int(item_list.item(row).data(Qt.UserRole))
+                for row in range(item_list.count())
+                if item_list.item(row).checkState() == Qt.Checked
+            ]
+            try:
+                self.bom_service.set_bom_folder_items(int(folder_id), selected_ids)
+                self._refresh_folder_context(folder.get("effective_parent_bom_id"))
+                dialog.accept()
+            except Exception as exc:
+                QMessageBox.critical(dialog, "Folder Items", f"Could not save folder items:\n{exc}")
+
+        buttons.accepted.connect(save_items)
+        buttons.rejected.connect(dialog.reject)
+        dialog.exec_()
+
+    def _rename_bom_folder(self, folder_id: int) -> None:
+        folder = self._folder_record(int(folder_id))
+        name, accepted = QInputDialog.getText(
+            self, "Rename BOM Folder", "Folder name:", text=str(folder.get("name") or "")
+        )
+        if not accepted:
+            return
+        try:
+            updated = self.bom_service.rename_bom_folder(int(folder_id), name)
+            self._refresh_folder_context(updated.get("effective_parent_bom_id"))
+        except Exception as exc:
+            QMessageBox.critical(self, "Rename BOM Folder", f"Could not rename folder:\n{exc}")
+
+    def _delete_bom_folder(self, folder_id: int) -> None:
+        folder = self._folder_record(int(folder_id))
+        answer = QMessageBox.question(
+            self,
+            "Delete BOM Folder",
+            f"Delete folder '{folder.get('name') or 'Folder'}'?\n\n"
+            "Its subfolders will also be deleted. BOM items will return to their normal "
+            "structure position; no parts or engineering relations will be deleted.",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        context = folder.get("effective_parent_bom_id")
+        try:
+            self.bom_service.delete_bom_folder(int(folder_id))
+            self._refresh_folder_context(context)
+            self._clear_folder_selection()
+        except Exception as exc:
+            QMessageBox.critical(self, "Delete BOM Folder", f"Could not delete folder:\n{exc}")
+
+    def _show_folder_context_menu(self, tree: QTreeWidget, item: QTreeWidgetItem, folder_id: int) -> None:
+        menu = QMenu(self)
+        assign_action = menu.addAction("Assign Items...")
+        subfolder_action = menu.addAction("Add Subfolder")
+        rename_action = menu.addAction("Rename Folder")
+        menu.addSeparator()
+        delete_action = menu.addAction("Delete Folder")
+        can_manage = self.perm.can("manage_parts")
+        for action in (assign_action, subfolder_action, rename_action, delete_action):
+            action.setEnabled(can_manage)
+        assign_action.triggered.connect(lambda: self._assign_bom_folder_items(int(folder_id)))
+        subfolder_action.triggered.connect(
+            lambda: self.add_bom_folder(parent_item=item, parent_folder_id=int(folder_id))
+        )
+        rename_action.triggered.connect(lambda: self._rename_bom_folder(int(folder_id)))
+        delete_action.triggered.connect(lambda: self._delete_bom_folder(int(folder_id)))
+        menu.exec_(tree.viewport().mapToGlobal(tree.visualItemRect(item).bottomLeft()))
+
     def show_tree_context_menu(self, position):
         tree = self.sender()
         if not isinstance(tree, QTreeWidget):
             tree = self.tree
         item = tree.itemAt(position)
         if not item:
+            if tree is self.tree and self.perm.can("manage_parts"):
+                menu = QMenu(self)
+                create_folder_action = menu.addAction("Create Top-Level Folder")
+                create_folder_action.triggered.connect(lambda: self.add_bom_folder())
+                menu.exec_(tree.viewport().mapToGlobal(position))
             return
         try:
             if item not in tree.selectedItems():
@@ -2395,6 +2748,11 @@ class BomPage(QWidget):
                 tree.setCurrentItem(item)
         except Exception:
             pass
+
+        folder_id = item.data(0, BOM_TREE_FOLDER_ROLE)
+        if folder_id:
+            self._show_folder_context_menu(tree, item, int(folder_id))
+            return
 
         item_id = item.data(0, Qt.UserRole)
         menu = QMenu()
@@ -2419,7 +2777,11 @@ class BomPage(QWidget):
         menu.addAction(compare_action)
         menu.addSeparator()
         menu.addAction(refresh_files_act)
-        if tree is self.tree and item.parent() is not None:
+        if (
+            tree is self.tree
+            and item.parent() is not None
+            and not self._is_folder_tree_item(item.parent())
+        ):
             reorder_menu = menu.addMenu("Reorder")
             move_up_act = QAction("Move Up", self)
             move_down_act = QAction("Move Down", self)
@@ -2441,6 +2803,8 @@ class BomPage(QWidget):
         delete_action.triggered.connect(lambda: self.delete_part(item_id))
         add_child_action = QAction("Add Child", self)
         add_child_action.triggered.connect(lambda: self.add_child(item_id))
+        add_folder_action = QAction("Add Folder Here", self)
+        add_folder_action.triggered.connect(lambda: self.add_bom_folder(parent_item=item))
         add_dwg_action = QAction("Associate Drawing", self)
         add_dwg_action.triggered.connect(lambda: self.add_dwg_to_part(item_id))
 
@@ -2451,6 +2815,8 @@ class BomPage(QWidget):
             menu.addAction(edit_action)
             menu.addAction(delete_action)
             menu.addAction(add_child_action)
+            if str(item.text(BOM_COL_TYPE) or "").strip().lower() in {"asm", "assembly"}:
+                menu.addAction(add_folder_action)
         menu.addAction(add_dwg_action)
 
         try:
@@ -2488,11 +2854,19 @@ class BomPage(QWidget):
         # Allow removing a child relation when right-clicking a child node
         try:
             parent_item = item.parent()
-            if parent_item is not None and self.perm.can("manage_parts"):
+            relation_parent_id = parent_item.data(0, Qt.UserRole) if parent_item is not None else None
+            relation_parent_name = parent_item.text(BOM_COL_NAME) if parent_item is not None else ""
+            if self._is_folder_tree_item(parent_item):
+                parent_folder = self._folder_record(int(parent_item.data(0, BOM_TREE_FOLDER_ROLE)))
+                relation_parent_id = parent_folder.get("effective_parent_bom_id")
+                if relation_parent_id is not None:
+                    relation_parent = self.bom_service.get_part_details(int(relation_parent_id)) or {}
+                    relation_parent_name = str(relation_parent.get("name") or relation_parent_id)
+            if relation_parent_id is not None and self.perm.can("manage_parts"):
                 remove_child_action = QAction("Remove Child", self)
 
                 def _remove_child():
-                    parent_id = parent_item.data(0, Qt.UserRole)
+                    parent_id = relation_parent_id
                     child_id = item.data(0, Qt.UserRole)
                     if not parent_id or not child_id:
                         return
@@ -2500,7 +2874,7 @@ class BomPage(QWidget):
                     reply = QMessageBox.question(
                         self,
                         "Confirm Remove",
-                        f"Remove child {item.text(BOM_COL_NAME)} from parent {parent_item.text(BOM_COL_NAME)}?",
+                        f"Remove child {item.text(BOM_COL_NAME)} from parent {relation_parent_name}?",
                         QMessageBox.Yes | QMessageBox.No,
                     )
                     if reply != QMessageBox.Yes:
@@ -2572,6 +2946,7 @@ class BomPage(QWidget):
             "status": "All",
             "type": "All",
             "revision": "",
+            "categories": [],
             "structure": "Any",
             "pdf": "Any",
             "step": "Any",
@@ -2584,6 +2959,9 @@ class BomPage(QWidget):
     def _is_default_bom_advanced_filter(self, filters: dict | None = None) -> bool:
         filters = filters or getattr(self, "_bom_advanced_filters", {}) or {}
         defaults = self._default_bom_advanced_filters()
+        legacy_category = str(filters.get("category") or "").strip()
+        if legacy_category not in ("", "All"):
+            return False
         return all(filters.get(k, v) == v for k, v in defaults.items())
 
     def _collect_tree_column_values(self, column: int) -> list[str]:
@@ -2613,12 +2991,15 @@ class BomPage(QWidget):
         return "na"
 
     def _bom_tree_item_matches_advanced_filter(self, item: QTreeWidgetItem, filters: dict) -> bool:
+        if self._is_folder_tree_item(item):
+            return False
         text = str(filters.get("text") or "").strip().lower()
         if text:
             haystack = " ".join([
                 str(item.text(col) or "") for col in range(BOM_COL_NAME, BOM_COL_STATUS + 1)
             ] + [
                 str(item.data(0, BOM_TREE_INWORK_ROLE) or ""),
+                ", ".join(item.data(0, BOM_TREE_CATEGORY_ROLE) or []),
                 str(item.toolTip(BOM_COL_NAME) or ""),
                 str(item.toolTip(BOM_COL_FILES) or ""),
             ]).lower()
@@ -2648,6 +3029,23 @@ class BomPage(QWidget):
         revision = str(filters.get("revision") or "").strip().lower()
         if revision and revision not in str(item.text(BOM_COL_REV) or "").strip().lower():
             return False
+
+        selected_categories = [
+            str(value).strip()
+            for value in (filters.get("categories") or [])
+            if str(value).strip()
+        ]
+        # Compatibility with a filter created before category multi-selection.
+        legacy_category = str(filters.get("category") or "").strip()
+        if not selected_categories and legacy_category not in ("", "All"):
+            selected_categories = [legacy_category]
+        item_categories = [str(value).strip() for value in (item.data(0, BOM_TREE_CATEGORY_ROLE) or [])]
+        if selected_categories:
+            selected_keys = {value.casefold() for value in selected_categories}
+            matches_uncategorized = "uncategorized" in selected_keys and not item_categories
+            matches_category = any(value.casefold() in selected_keys for value in item_categories)
+            if not (matches_uncategorized or matches_category):
+                return False
 
         structure = str(filters.get("structure") or "Any")
         is_assembly = bool(item.data(0, BOM_TREE_IS_ASSEMBLY_ROLE)) or item.childCount() > 0
@@ -2690,7 +3088,7 @@ class BomPage(QWidget):
     def show_advanced_filter_dialog(self):
         dialog = QDialog(self)
         dialog.setWindowTitle("Advanced BOM Filter")
-        dialog.resize(560, 390)
+        dialog.resize(560, 500)
         layout = QVBoxLayout(dialog)
         layout.setSpacing(10)
 
@@ -2755,29 +3153,54 @@ class BomPage(QWidget):
         grid.addWidget(QLabel("Structure"), 3, 2)
         grid.addWidget(structure_combo, 3, 3)
 
+        category_list = QListWidget()
+        category_list.setMaximumHeight(92)
+        category_list.setToolTip("Select one or more categories. Items matching any selection are shown.")
+
+        category_names = ["Uncategorized"]
+        try:
+            category_names.extend(row["name"] for row in self.bom_service.list_categories())
+        except Exception:
+            pass
+        current_categories = {
+            str(value).casefold() for value in (current.get("categories") or [])
+        }
+        legacy_category = str(current.get("category") or "").strip()
+        if not current_categories and legacy_category not in ("", "All"):
+            current_categories.add(legacy_category.casefold())
+        for category_name in category_names:
+            item = QListWidgetItem(str(category_name))
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.Checked if str(category_name).casefold() in current_categories else Qt.Unchecked
+            )
+            category_list.addItem(item)
+        grid.addWidget(QLabel("Category"), 4, 0)
+        grid.addWidget(category_list, 4, 1, 1, 3)
+
         pdf_combo = QComboBox()
         pdf_combo.addItems(["Any", "OK", "Outdated", "Missing", "Not attached"])
         pdf_combo.setCurrentText(str(current.get("pdf") or "Any"))
-        grid.addWidget(QLabel("PDF"), 4, 0)
-        grid.addWidget(pdf_combo, 4, 1)
+        grid.addWidget(QLabel("PDF"), 5, 0)
+        grid.addWidget(pdf_combo, 5, 1)
 
         step_combo = QComboBox()
         step_combo.addItems(["Any", "OK", "Outdated", "Missing", "Not attached"])
         step_combo.setCurrentText(str(current.get("step") or "Any"))
-        grid.addWidget(QLabel("STEP"), 4, 2)
-        grid.addWidget(step_combo, 4, 3)
+        grid.addWidget(QLabel("STEP"), 5, 2)
+        grid.addWidget(step_combo, 5, 3)
 
         integrity_combo = QComboBox()
         integrity_combo.addItems(["Any", "Healthy only", "Has integrity issues"])
         integrity_combo.setCurrentText(str(current.get("integrity") or "Any"))
-        grid.addWidget(QLabel("Integrity"), 5, 0)
-        grid.addWidget(integrity_combo, 5, 1)
+        grid.addWidget(QLabel("Integrity"), 6, 0)
+        grid.addWidget(integrity_combo, 6, 1)
 
         issue_combo = QComboBox()
         issue_combo.addItems(["Any", "Active issues", "Any linked issue", "No linked issues"])
         issue_combo.setCurrentText(str(current.get("issues") or "Any"))
-        grid.addWidget(QLabel("Issues"), 5, 2)
-        grid.addWidget(issue_combo, 5, 3)
+        grid.addWidget(QLabel("Issues"), 6, 2)
+        grid.addWidget(issue_combo, 6, 3)
 
         layout.addLayout(grid)
 
@@ -2801,6 +3224,11 @@ class BomPage(QWidget):
                 "status": status_combo.currentText(),
                 "type": type_combo.currentText(),
                 "revision": revision_input.text().strip(),
+                "categories": [
+                    category_list.item(row).text()
+                    for row in range(category_list.count())
+                    if category_list.item(row).checkState() == Qt.Checked
+                ],
                 "structure": structure_combo.currentText(),
                 "pdf": pdf_combo.currentText(),
                 "step": step_combo.currentText(),
@@ -2902,6 +3330,7 @@ class BomPage(QWidget):
             (0, BOM_TREE_INWORK_ROLE),
             (0, BOM_TREE_IS_ASSEMBLY_ROLE),
             (0, BOM_TREE_ISSUE_ROLE),
+            (0, BOM_TREE_CATEGORY_ROLE),
             (BOM_COL_FILES, BOM_TREE_FILES_ROLE),
             (BOM_COL_INTEGRITY, BOM_TREE_INTEGRITY_ROLE),
         ):
@@ -4274,6 +4703,134 @@ class BomPage(QWidget):
         self._apply_tree_item_data(item, info or {})
         return item
 
+    @staticmethod
+    def _is_folder_tree_item(item: QTreeWidgetItem | None) -> bool:
+        return bool(item is not None and item.data(0, BOM_TREE_FOLDER_ROLE))
+
+    def _make_folder_tree_item(self, folder: dict) -> QTreeWidgetItem:
+        item = QTreeWidgetItem(["", str(folder.get("name") or "Folder"), "", "", "", "", "", ""])
+        item.setData(0, Qt.UserRole, None)
+        item.setData(0, BOM_TREE_FOLDER_ROLE, int(folder["id"]))
+        item.setData(0, BOM_TREE_IS_ASSEMBLY_ROLE, True)
+        item.setIcon(BOM_COL_NAME, _bom_type_icon("folder"))
+        item.setToolTip(BOM_COL_NAME, "Organizational folder")
+        return item
+
+    @staticmethod
+    def _container_count(container) -> int:
+        return container.topLevelItemCount() if isinstance(container, QTreeWidget) else container.childCount()
+
+    @staticmethod
+    def _container_item(container, index: int) -> QTreeWidgetItem:
+        return container.topLevelItem(index) if isinstance(container, QTreeWidget) else container.child(index)
+
+    @staticmethod
+    def _container_take(container, index: int) -> QTreeWidgetItem:
+        return container.takeTopLevelItem(index) if isinstance(container, QTreeWidget) else container.takeChild(index)
+
+    @staticmethod
+    def _container_add(container, item: QTreeWidgetItem) -> None:
+        if isinstance(container, QTreeWidget):
+            container.addTopLevelItem(item)
+        else:
+            container.addChild(item)
+
+    def _take_direct_bom_item(self, container, part_id: int) -> QTreeWidgetItem | None:
+        for index in range(self._container_count(container)):
+            item = self._container_item(container, index)
+            if self._is_folder_tree_item(item):
+                continue
+            try:
+                if int(item.data(0, Qt.UserRole)) == int(part_id):
+                    return self._container_take(container, index)
+            except Exception:
+                continue
+        return None
+
+    def _extract_folder_bom_items(self, folder_item: QTreeWidgetItem) -> list[QTreeWidgetItem]:
+        extracted = []
+        while folder_item.childCount():
+            child = folder_item.takeChild(0)
+            if self._is_folder_tree_item(child):
+                extracted.extend(self._extract_folder_bom_items(child))
+            else:
+                extracted.append(child)
+        return extracted
+
+    def _clear_folder_nodes_from_container(self, container) -> None:
+        index = self._container_count(container) - 1
+        promoted = []
+        while index >= 0:
+            item = self._container_item(container, index)
+            if self._is_folder_tree_item(item):
+                folder_item = self._container_take(container, index)
+                promoted.extend(self._extract_folder_bom_items(folder_item))
+            index -= 1
+        for item in promoted:
+            self._container_add(container, item)
+
+    def _folder_context_containers(self, parent_bom_id):
+        if parent_bom_id is None:
+            return [self.tree]
+        return self._find_tree_items(int(parent_bom_id), self.tree)
+
+    def _render_folder_context(self, parent_bom_id, folders: list[dict]) -> None:
+        context_folders = [
+            folder for folder in folders
+            if folder.get("effective_parent_bom_id") == parent_bom_id
+        ]
+        if not context_folders:
+            return
+        children_by_folder = defaultdict(list)
+        roots = []
+        for folder in context_folders:
+            parent_folder_id = folder.get("parent_folder_id")
+            if parent_folder_id is None:
+                roots.append(folder)
+            else:
+                children_by_folder[int(parent_folder_id)].append(folder)
+        roots.sort(key=lambda row: (int(row.get("sort_order") or 0), int(row["id"])))
+        for values in children_by_folder.values():
+            values.sort(key=lambda row: (int(row.get("sort_order") or 0), int(row["id"])))
+
+        def add_folder(folder: dict, display_parent, base_container) -> None:
+            folder_item = self._make_folder_tree_item(folder)
+            self._container_add(display_parent, folder_item)
+            for part_id in folder.get("item_ids") or []:
+                bom_item = self._take_direct_bom_item(base_container, int(part_id))
+                if bom_item is not None:
+                    folder_item.addChild(bom_item)
+            for child_folder in children_by_folder.get(int(folder["id"]), []):
+                add_folder(child_folder, folder_item, base_container)
+            folder_item.setExpanded(True)
+
+        for base_container in self._folder_context_containers(parent_bom_id):
+            for folder in roots:
+                add_folder(folder, base_container, base_container)
+
+    def _apply_organizational_folders(self) -> None:
+        try:
+            folders = self.bom_service.list_bom_folders() or []
+        except Exception:
+            folders = []
+        self._bom_folders_cache = list(folders)
+        contexts = {folder.get("effective_parent_bom_id") for folder in folders}
+        for context in sorted(contexts, key=lambda value: (-1 if value is None else int(value))):
+            self._render_folder_context(context, folders)
+
+    def _refresh_folder_context(self, parent_bom_id) -> None:
+        containers = self._folder_context_containers(parent_bom_id)
+        for container in containers:
+            self._clear_folder_nodes_from_container(container)
+        try:
+            folders = self.bom_service.list_bom_folders() or []
+        except Exception:
+            folders = []
+        self._bom_folders_cache = list(folders)
+        self._render_folder_context(parent_bom_id, folders)
+        self._renumber_full_bom_tree_rows()
+        self._sync_search_tree_row_numbers()
+
     def _apply_tree_item_data(self, item: QTreeWidgetItem, info: dict) -> None:
         part_id = info.get("id")
         issues = self._issues_for_part(part_id)
@@ -4293,6 +4850,10 @@ class BomPage(QWidget):
         item.setData(0, BOM_TREE_IS_ASSEMBLY_ROLE, is_asm)
         issue_summary = self._issue_summary_cache.get(int(part_id), {}) if part_id is not None else {}
         item.setData(0, BOM_TREE_ISSUE_ROLE, issue_summary)
+        category_names = info.get("category_names", info.get("categories", []))
+        if isinstance(category_names, str):
+            category_names = [category_names] if category_names.strip() else []
+        item.setData(0, BOM_TREE_CATEGORY_ROLE, list(category_names or []))
         item.setText(BOM_COL_FILES, "")
         item.setText(BOM_COL_AES, str(info.get("aes_number", "") or ""))
         item.setText(BOM_COL_TYPE, str(info.get("type", "") or ""))
@@ -4305,7 +4866,7 @@ class BomPage(QWidget):
             summary = self._indicator_summary_for_part(part_id, issues)
             item.setData(BOM_COL_FILES, BOM_TREE_FILES_ROLE, _file_badges_payload(part_id, issues, summary))
             item.setData(BOM_COL_INTEGRITY, BOM_TREE_INTEGRITY_ROLE, _integrity_payload(part_id, self.missing_files, self.missing_ids))
-            item.setIcon(BOM_COL_NAME, QIcon())
+            item.setIcon(BOM_COL_NAME, _bom_type_icon(info.get("type")))
             tips0 = []
             if locked_txt:
                 tips0.append(locked_txt)
@@ -4523,8 +5084,11 @@ class BomPage(QWidget):
 
     def _child_exists_under_item(self, parent_item: QTreeWidgetItem, child_id: int) -> bool:
         for idx in range(parent_item.childCount()):
+            child = parent_item.child(idx)
+            if self._is_folder_tree_item(child) and self._child_exists_under_item(child, child_id):
+                return True
             try:
-                if int(parent_item.child(idx).data(0, Qt.UserRole)) == int(child_id):
+                if int(child.data(0, Qt.UserRole)) == int(child_id):
                     return True
             except Exception:
                 continue
@@ -4534,6 +5098,9 @@ class BomPage(QWidget):
         matches = []
         for idx in range(parent_item.childCount()):
             child = parent_item.child(idx)
+            if self._is_folder_tree_item(child):
+                matches.extend(self._direct_child_items(child, child_id))
+                continue
             try:
                 if int(child.data(0, Qt.UserRole)) == int(child_id):
                     matches.append(child)
@@ -4608,7 +5175,13 @@ class BomPage(QWidget):
             for parent_item in self._find_tree_items(int(parent_id), tree_widget):
                 for child_item in list(self._direct_child_items(parent_item, int(child_id))):
                     try:
-                        parent_item.removeChild(child_item)
+                        visual_parent = child_item.parent()
+                        if visual_parent is not None:
+                            visual_parent.removeChild(child_item)
+                        else:
+                            index = tree_widget.indexOfTopLevelItem(child_item)
+                            if index >= 0:
+                                tree_widget.takeTopLevelItem(index)
                         removed += 1
                     except Exception:
                         pass
@@ -5554,11 +6127,15 @@ class BomPage(QWidget):
                 item.setData(0, BOM_TREE_IS_ASSEMBLY_ROLE, bool((info.get("children") or [])))
                 issue_summary = self._issue_summary_cache.get(int(part_id), {}) if part_id is not None else {}
                 item.setData(0, BOM_TREE_ISSUE_ROLE, issue_summary)
+                category_names = info.get("category_names", info.get("categories", []))
+                if isinstance(category_names, str):
+                    category_names = [category_names] if category_names.strip() else []
+                item.setData(0, BOM_TREE_CATEGORY_ROLE, list(category_names or []))
                 try:
                     summary = self._indicator_summary_for_part(part_id, issues)
                     item.setData(BOM_COL_FILES, BOM_TREE_FILES_ROLE, _file_badges_payload(part_id, issues, summary))
                     item.setData(BOM_COL_INTEGRITY, BOM_TREE_INTEGRITY_ROLE, _integrity_payload(part_id, self.missing_files, self.missing_ids))
-                    item.setIcon(BOM_COL_NAME, QIcon())
+                    item.setIcon(BOM_COL_NAME, _bom_type_icon(info.get("type")))
                     _tips0 = ([locked_txt] if locked_txt else []) + [
                         str(summary["pdf"].get("tooltip", "PDF: unknown")),
                         str(summary["step"].get("tooltip", "STEP: unknown")),
@@ -5600,17 +6177,15 @@ class BomPage(QWidget):
                 except Exception:
                     pass
                 try:
+                    self._apply_organizational_folders()
                     self._renumber_full_bom_tree_rows()
                     self._sync_search_tree_row_numbers()
                 except Exception:
                     pass
 
-                # Expanding everything on large trees is very expensive.
+                # Start every BOM level collapsed; users expand only the branches they need.
                 try:
-                    if int(self._last_tree_node_count) <= 400:
-                        self.tree.expandAll()
-                    else:
-                        self.tree.expandToDepth(1)
+                    self.tree.collapseAll()
                 except Exception:
                     pass
 
@@ -5674,8 +6249,117 @@ class BomPage(QWidget):
             pass
 
     def on_tree_item_clicked(self, item, column):
+        folder_id = item.data(0, BOM_TREE_FOLDER_ROLE) if item is not None else None
+        if folder_id:
+            self._show_folder_selection(item, int(folder_id))
+            return
         item_id = item.data(0, Qt.UserRole)
         self.display_details(item_id)
+
+    def _set_engineering_item_actions_enabled(self, enabled: bool) -> None:
+        can_manage = self.perm.can("manage_parts")
+        self.edit_part_btn.setEnabled(bool(enabled and can_manage))
+        self.delete_part_btn.setEnabled(bool(enabled and can_manage))
+        self.add_child_btn.setEnabled(bool(enabled and can_manage))
+        self.checkout_part_btn.setEnabled(bool(enabled))
+        self.checkin_part_btn.setEnabled(bool(enabled))
+        self.set_revision_btn.setEnabled(bool(enabled and self.perm.can("set_revision")))
+
+    def _show_folder_selection(self, item: QTreeWidgetItem, folder_id: int) -> None:
+        self.clear_details()
+        self.current_folder_id = int(folder_id)
+        self.details_summary_card.hide()
+        self.associated_files_card.hide()
+        self.details_alert_frame.hide()
+        self._set_engineering_item_actions_enabled(False)
+        try:
+            self.tabs.setCurrentIndex(0)
+        except Exception:
+            pass
+
+    def _clear_folder_selection(self) -> None:
+        self.current_folder_id = None
+        self.details_summary_card.show()
+        self.associated_files_card.show()
+        self._set_engineering_item_actions_enabled(False)
+        self.clear_details()
+
+    def _create_structure_relation_tree(self) -> QTreeWidget:
+        tree = QTreeWidget()
+        tree.setColumnCount(7)
+        tree.setHeaderLabels(["Name", "AES Number", "Relation", "Qty", "Type", "Revision", "Lifecycle"])
+        tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        tree.setSelectionBehavior(QAbstractItemView.SelectRows)
+        tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        tree.setAlternatingRowColors(True)
+        tree.setUniformRowHeights(True)
+        tree.setIconSize(QSize(12, 12))
+        tree.setIndentation(14)
+        tree.setRootIsDecorated(True)
+        header = tree.header()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        for column in range(1, 7):
+            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        return tree
+
+    def _add_structure_relation_node(
+        self,
+        tree: QTreeWidget,
+        node: dict,
+        parent: QTreeWidgetItem | None = None,
+    ) -> QTreeWidgetItem | None:
+        if not node:
+            return None
+        quantity = node.get("quantity")
+        item = QTreeWidgetItem([
+            str(node.get("name") or ""),
+            str(node.get("aes_number") or ""),
+            str(node.get("relation") or ""),
+            "" if quantity is None else str(quantity),
+            str(node.get("type") or ""),
+            str(node.get("revision") or ""),
+            str(node.get("lifecycle_state") or node.get("status") or ""),
+        ])
+        item.setData(0, Qt.UserRole, node.get("id"))
+        item.setIcon(0, _bom_type_icon(node.get("type")))
+        if node.get("cycle"):
+            item.setToolTip(0, "Circular structure reference")
+            item.setForeground(2, QBrush(QColor("#b91c1c")))
+        if parent is None:
+            tree.addTopLevelItem(item)
+        else:
+            parent.addChild(item)
+        for child in node.get("children") or []:
+            self._add_structure_relation_node(tree, child, item)
+        return item
+
+    def _populate_structure_views(self, context: dict) -> None:
+        uses = (context or {}).get("uses")
+        where_used = (context or {}).get("where_used")
+        for tree, root in ((self.uses_tree, uses), (self.where_used_tree, where_used)):
+            tree.setUpdatesEnabled(False)
+            try:
+                tree.clear()
+                root_item = self._add_structure_relation_node(tree, root)
+                if root_item is not None:
+                    root_item.setExpanded(True)
+            finally:
+                tree.setUpdatesEnabled(True)
+
+        uses_count = int((context or {}).get("uses_count") or 0)
+        where_used_count = int((context or {}).get("where_used_count") or 0)
+        self.structure_summary_label.setText(
+            f"Structure relations: {uses_count} uses  |  {where_used_count} where used"
+        )
+        self.structure_views.setTabText(0, f"Uses ({uses_count})")
+        self.structure_views.setTabText(1, f"Where Used ({where_used_count})")
+
+    def _open_structure_tree_item(self, item: QTreeWidgetItem, _column: int) -> None:
+        part_id = item.data(0, Qt.UserRole) if item is not None else None
+        if part_id is None:
+            return
+        self._select_part_item(int(part_id))
+        self.display_details(int(part_id))
 
     def _on_tree_item_double_clicked(self, item, column):
         item_id = item.data(0, Qt.UserRole)
@@ -5701,9 +6385,18 @@ class BomPage(QWidget):
         self.issue_requested.emit(int(item_id))
 
     def display_details(self, item_id):
+        if item_id is None:
+            return
+        self.current_folder_id = None
+        self.details_summary_card.show()
+        self.associated_files_card.show()
+        self._set_engineering_item_actions_enabled(True)
         self.current_part_id = item_id
         details = self.bom_service.get_part_details(item_id) or {}
-        children = self.bom_service.get_children(item_id) or []
+        try:
+            structure_context = self.bom_service.get_structure_context(int(item_id)) or {}
+        except Exception:
+            structure_context = {}
         # Detailed unified history across revisions
         history = self.bom_service.get_history_detailed(item_id, include_all_revisions=True) or []
         analytics = self.bom_service.get_history_analytics(item_id, include_all_revisions=True) or {}
@@ -5731,19 +6424,9 @@ class BomPage(QWidget):
         else:
             self.hide_alert("details")
 
-        # Details table
-        self.details_table.setRowCount(len(details))
-        for i, (key, value) in enumerate(details.items()):
-            self.details_table.setItem(i, 0, QTableWidgetItem(str(key)))
-            self.details_table.setItem(i, 1, QTableWidgetItem(str(value)))
+        self._update_details_summary(details)
 
-        # Children table
-        self.children_table.setRowCount(len(children))
-        for i, child in enumerate(children):
-            self.children_table.setItem(i, 0, QTableWidgetItem(child.get("aes_number", "")))
-            self.children_table.setItem(i, 1, QTableWidgetItem(child.get("name", "")))
-            self.children_table.setItem(i, 2, QTableWidgetItem(child.get("type", "")))
-            self.children_table.setItem(i, 3, QTableWidgetItem(str(child.get("quantity", ""))))
+        self._populate_structure_views(structure_context)
 
         # History panel (genius panel)
         self._history_rows = list(history)
@@ -5754,8 +6437,12 @@ class BomPage(QWidget):
 
     def clear_details(self):
         self.current_part_id = None
-        self.details_table.setRowCount(0)
-        self.children_table.setRowCount(0)
+        self._update_details_summary({})
+        self.uses_tree.clear()
+        self.where_used_tree.clear()
+        self.structure_summary_label.setText("Select a BOM item")
+        self.structure_views.setTabText(0, "Uses")
+        self.structure_views.setTabText(1, "Where Used")
         self.notes_view.clear()
         try:
             self.part_issues_table.setRowCount(0)
@@ -5767,6 +6454,298 @@ class BomPage(QWidget):
         except Exception:
             pass
         self.refresh_files_tab()
+
+    @staticmethod
+    def _details_card_label(text: str, object_name: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName(object_name)
+        return label
+
+    @staticmethod
+    def _details_value(details: dict, keys) -> str:
+        for key in keys:
+            value = details.get(key)
+            if value is not None and str(value).strip():
+                return str(value)
+        return ""
+
+    def _update_details_summary(self, details: dict) -> None:
+        self._current_part_details = dict(details or {})
+        has_details = bool(self._current_part_details)
+        self.view_full_details_btn.setEnabled(has_details)
+        self.edit_categories_btn.setEnabled(has_details and bool(getattr(self, "current_part_id", None)))
+
+        name = self._details_value(self._current_part_details, ("name", "aes_number", "part_number"))
+        self.details_name_label.setText(name or "Select a BOM item")
+
+        identity_parts = []
+        aes_number = self._details_value(self._current_part_details, ("aes_number",))
+        part_number = self._details_value(self._current_part_details, ("part_number",))
+        part_type = self._details_value(self._current_part_details, ("type",))
+        if aes_number:
+            identity_parts.append(f"AES {aes_number}")
+        if part_number:
+            identity_parts.append(f"Part {part_number}")
+        if part_type:
+            identity_parts.append(part_type.upper())
+        self.details_identity_label.setText(
+            "  |  ".join(identity_parts)
+            if identity_parts else "Select a row in the BOM structure to view its summary."
+        )
+
+        cad_file = self._details_value(
+            self._current_part_details, ("filename", "base_file_name")
+        )
+        drawing_file = self._details_value(
+            self._current_part_details, ("drawing", "base_drw_name", "drawing_number")
+        )
+        self.associated_cad_file_label.setText(cad_file or "Not linked")
+        self.associated_drawing_file_label.setText(drawing_file or "Not linked")
+
+        for _field_key, (field_label, value_label, detail_keys) in self._details_summary_fields.items():
+            value = self._details_value(self._current_part_details, detail_keys)
+            field_label.show()
+            value_label.show()
+            value_label.setText(value)
+
+    def _edit_current_part_categories(self) -> None:
+        part_id = getattr(self, "current_part_id", None)
+        if not part_id:
+            return
+
+        try:
+            available_categories = self.bom_service.list_categories()
+            assigned_categories = set(self.bom_service.categories_for_part(int(part_id)))
+        except Exception as exc:
+            QMessageBox.critical(self, "Categories", f"Could not load categories:\n{exc}")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Assign Categories")
+        dialog.resize(440, 430)
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(8)
+        layout.addWidget(QLabel("Assign this BOM item to one or more project categories."))
+
+        category_list = QListWidget()
+        category_list.setAlternatingRowColors(True)
+
+        def add_category_item(name: str, checked: bool = False, category_id=None) -> None:
+            clean_name = " ".join(str(name or "").split())
+            if not clean_name:
+                return
+            for row in range(category_list.count()):
+                if category_list.item(row).text().casefold() == clean_name.casefold():
+                    if checked:
+                        category_list.item(row).setCheckState(Qt.Checked)
+                    if category_id is not None:
+                        category_list.item(row).setData(Qt.UserRole, int(category_id))
+                    return
+            item = QListWidgetItem(clean_name)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+            item.setData(Qt.UserRole, int(category_id) if category_id is not None else None)
+            category_list.addItem(item)
+
+        for category in available_categories:
+            name = str(category.get("name") or "")
+            add_category_item(name, name in assigned_categories, category.get("id"))
+        layout.addWidget(category_list, 1)
+
+        def confirm_assigned_category_deletion(category_name: str, parts: list) -> bool:
+            confirmation = QDialog(dialog)
+            confirmation.setWindowTitle("Delete Assigned Category")
+            confirmation.resize(620, 430)
+            confirmation_layout = QVBoxLayout(confirmation)
+            warning = QLabel(
+                f"Category '{category_name}' is assigned to {len(parts)} BOM item(s).\n"
+                "Deleting it will remove the category from every item listed below."
+            )
+            warning.setWordWrap(True)
+            warning.setStyleSheet(
+                "color:#991b1b;background:#fee2e2;border:1px solid #f87171;"
+                "border-radius:5px;padding:8px;font-weight:700;"
+            )
+            confirmation_layout.addWidget(warning)
+
+            parts_table = QTableWidget()
+            parts_table.setColumnCount(4)
+            parts_table.setHorizontalHeaderLabels(["AES Number", "Name", "Part Number", "Type"])
+            parts_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+            for column in (0, 2, 3):
+                parts_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+            parts_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            parts_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+            parts_table.setRowCount(len(parts))
+            for row, part in enumerate(parts):
+                values = (
+                    part.get("aes_number") or "",
+                    part.get("name") or "",
+                    part.get("part_number") or "",
+                    part.get("type") or "",
+                )
+                for column, value in enumerate(values):
+                    parts_table.setItem(row, column, QTableWidgetItem(str(value)))
+            confirmation_layout.addWidget(parts_table, 1)
+
+            confirmation_buttons = QDialogButtonBox()
+            delete_button = confirmation_buttons.addButton(
+                "Delete Category", QDialogButtonBox.DestructiveRole
+            )
+            cancel_button = confirmation_buttons.addButton(QDialogButtonBox.Cancel)
+            delete_button.setObjectName("danger")
+            delete_button.clicked.connect(confirmation.accept)
+            cancel_button.clicked.connect(confirmation.reject)
+            confirmation_layout.addWidget(confirmation_buttons)
+            return confirmation.exec_() == QDialog.Accepted
+
+        def delete_category_item(item: QListWidgetItem) -> None:
+            if item is None:
+                return
+            category_name = item.text()
+            category_id = item.data(Qt.UserRole)
+            if category_id is None:
+                category_list.takeItem(category_list.row(item))
+                return
+            try:
+                usage = self.bom_service.category_usage(int(category_id))
+                parts = list(usage.get("parts") or [])
+            except Exception as exc:
+                QMessageBox.critical(dialog, "Delete Category", f"Could not inspect category usage:\n{exc}")
+                return
+
+            if parts:
+                confirmed = confirm_assigned_category_deletion(category_name, parts)
+            else:
+                confirmed = QMessageBox.question(
+                    dialog,
+                    "Delete Category",
+                    f"Delete the empty project category '{category_name}'?",
+                    QMessageBox.Yes | QMessageBox.Cancel,
+                    QMessageBox.Cancel,
+                ) == QMessageBox.Yes
+            if not confirmed:
+                return
+
+            try:
+                result = self.bom_service.delete_category(int(category_id))
+                affected_parts = list(result.get("parts") or [])
+                category_list.takeItem(category_list.row(item))
+                deleted_key = category_name.casefold()
+                for part in affected_parts:
+                    affected_id = int(part["id"])
+                    for tree_item in self._find_tree_items(affected_id):
+                        remaining = [
+                            name for name in (tree_item.data(0, BOM_TREE_CATEGORY_ROLE) or [])
+                            if str(name).casefold() != deleted_key
+                        ]
+                        tree_item.setData(0, BOM_TREE_CATEGORY_ROLE, remaining)
+
+                if any(int(part["id"]) == int(part_id) for part in affected_parts):
+                    assigned = self.bom_service.categories_for_part(int(part_id))
+                    self._current_part_details["categories"] = ", ".join(assigned)
+                    self._update_details_summary(self._current_part_details)
+
+                active_categories = list(self._bom_advanced_filters.get("categories") or [])
+                filtered_categories = [
+                    name for name in active_categories if str(name).casefold() != deleted_key
+                ]
+                if filtered_categories != active_categories:
+                    self._bom_advanced_filters["categories"] = filtered_categories
+                    self.apply_bom_tree_filter(self._bom_advanced_filters)
+            except Exception as exc:
+                QMessageBox.critical(dialog, "Delete Category", f"Could not delete category:\n{exc}")
+
+        def show_category_context_menu(position) -> None:
+            item = category_list.itemAt(position)
+            if item is None:
+                return
+            menu = QMenu(category_list)
+            delete_action = menu.addAction("Delete Category")
+            delete_action.triggered.connect(lambda: delete_category_item(item))
+            menu.exec_(category_list.viewport().mapToGlobal(position))
+
+        category_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        category_list.customContextMenuRequested.connect(show_category_context_menu)
+
+        new_category_row = QHBoxLayout()
+        new_category_input = QLineEdit()
+        new_category_input.setPlaceholderText("New project category")
+        add_category_btn = QPushButton("Add Category")
+
+        def add_new_category() -> None:
+            name = new_category_input.text()
+            if not name.strip():
+                return
+            add_category_item(name, checked=True)
+            new_category_input.clear()
+
+        add_category_btn.clicked.connect(add_new_category)
+        new_category_input.returnPressed.connect(add_new_category)
+        new_category_row.addWidget(new_category_input, 1)
+        new_category_row.addWidget(add_category_btn)
+        layout.addLayout(new_category_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+
+        def save_categories() -> None:
+            add_new_category()
+            names = [
+                category_list.item(row).text()
+                for row in range(category_list.count())
+                if category_list.item(row).checkState() == Qt.Checked
+            ]
+            try:
+                assigned = self.bom_service.set_part_categories(int(part_id), names)
+                self._current_part_details["categories"] = ", ".join(assigned)
+                self._update_details_summary(self._current_part_details)
+                for item in self._find_tree_items(int(part_id)):
+                    item.setData(0, BOM_TREE_CATEGORY_ROLE, list(assigned))
+                if not self._is_default_bom_advanced_filter():
+                    self.apply_bom_tree_filter(self._bom_advanced_filters)
+                dialog.accept()
+            except Exception as exc:
+                QMessageBox.critical(dialog, "Categories", f"Could not save categories:\n{exc}")
+
+        buttons.accepted.connect(save_categories)
+        buttons.rejected.connect(dialog.reject)
+        dialog.exec_()
+
+    def _open_full_bom_details(self) -> None:
+        details = dict(getattr(self, "_current_part_details", {}) or {})
+        if not details:
+            return
+
+        title = self._details_value(details, ("name", "aes_number", "part_number")) or "BOM Item"
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Full Details - {title}")
+        dlg.resize(820, 560)
+
+        layout = QVBoxLayout(dlg)
+        heading = QLabel(title)
+        heading.setStyleSheet("font-size:13px;font-weight:700;color:#172033;")
+        layout.addWidget(heading)
+
+        table = QTableWidget()
+        table.setColumnCount(2)
+        table.setHorizontalHeaderLabels(["Property", "Value"])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setWordWrap(True)
+        table.setRowCount(len(details))
+        for row, (key, value) in enumerate(details.items()):
+            table.setItem(row, 0, QTableWidgetItem(str(key)))
+            table.setItem(row, 1, QTableWidgetItem(str(value if value is not None else "")))
+        table.resizeRowsToContents()
+        layout.addWidget(table, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dlg.reject)
+        buttons.accepted.connect(dlg.accept)
+        layout.addWidget(buttons)
+        dlg.exec_()
 
     def refresh_issues_tab(self):
         if not getattr(self, "current_part_id", None):
@@ -6411,6 +7390,7 @@ class BomPage(QWidget):
             "status": "Status",
             "type": "Type",
             "revision": "Revision",
+            "categories": "Categories",
             "structure": "Structure",
             "pdf": "PDF",
             "step": "STEP",
@@ -6423,7 +7403,10 @@ class BomPage(QWidget):
         for key, label in labels.items():
             value = filters.get(key, defaults.get(key, ""))
             if value != defaults.get(key, ""):
-                rows.append((label, str(value)))
+                if isinstance(value, (list, tuple, set)):
+                    rows.append((label, ", ".join(str(item) for item in value)))
+                else:
+                    rows.append((label, str(value)))
         if getattr(self, "_in_search_mode", False):
             rows.append(("Search mode", "Current search results"))
         return rows or [("Filter", "None - all visible BOM rows")]
@@ -6450,6 +7433,7 @@ class BomPage(QWidget):
                 "aes_number": item.text(BOM_COL_AES),
                 "type": item.text(BOM_COL_TYPE),
                 "revision": item.text(BOM_COL_REV),
+                "categories": ", ".join(item.data(0, BOM_TREE_CATEGORY_ROLE) or []),
                 "status": item.text(BOM_COL_STATUS),
                 "work_state": item.data(0, BOM_TREE_INWORK_ROLE) or "Checked In",
                 "pdf": self._doc_export_text(item, "pdf"),
@@ -6468,7 +7452,7 @@ class BomPage(QWidget):
 
     def _export_visible_bom_csv(self, file_path: str, rows: list[dict]) -> None:
         fieldnames = [
-            "level", "name", "aes_number", "type", "revision", "status",
+            "level", "name", "aes_number", "type", "revision", "categories", "status",
             "work_state", "pdf", "step", "integrity", "issues", "part_id", "details",
         ]
         with open(file_path, "w", newline="", encoding="utf-8-sig") as handle:
@@ -6492,6 +7476,7 @@ class BomPage(QWidget):
             ("aes_number", "AES Number"),
             ("type", "Type"),
             ("revision", "Revision"),
+            ("categories", "Categories"),
             ("status", "Status"),
             ("work_state", "Work State"),
             ("pdf", "PDF"),
@@ -6540,8 +7525,8 @@ class BomPage(QWidget):
         ws.freeze_panes = "A6"
         ws.auto_filter.ref = f"A{header_row}:{get_column_letter(len(headers))}{max(header_row, header_row + len(rows))}"
         widths = {
-            "A": 8, "B": 32, "C": 16, "D": 12, "E": 12, "F": 14, "G": 18,
-            "H": 14, "I": 14, "J": 16, "K": 20, "L": 10, "M": 54,
+            "A": 8, "B": 32, "C": 16, "D": 12, "E": 12, "F": 28, "G": 14,
+            "H": 18, "I": 14, "J": 14, "K": 16, "L": 20, "M": 10, "N": 54,
         }
         for column, width in widths.items():
             ws.column_dimensions[column].width = width

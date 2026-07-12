@@ -799,6 +799,82 @@ def _migration_18(conn):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bom_children_parent_order ON bom_children(parent_id, sort_order, id)")
 
 
+def _migration_19(conn):
+    """Add project-scoped categories with many-to-many BOM item assignments."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS bom_categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            name TEXT NOT NULL COLLATE NOCASE,
+            created_by INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(project_id, name),
+            FOREIGN KEY (project_id) REFERENCES projects(id),
+            FOREIGN KEY (created_by) REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS bom_item_categories (
+            bom_id INTEGER NOT NULL,
+            category_id INTEGER NOT NULL,
+            assigned_by INTEGER,
+            assigned_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (bom_id, category_id),
+            FOREIGN KEY (bom_id) REFERENCES bom(id),
+            FOREIGN KEY (category_id) REFERENCES bom_categories(id),
+            FOREIGN KEY (assigned_by) REFERENCES users(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_bom_categories_project_name
+            ON bom_categories(project_id, name);
+        CREATE INDEX IF NOT EXISTS idx_bom_item_categories_bom
+            ON bom_item_categories(bom_id);
+        CREATE INDEX IF NOT EXISTS idx_bom_item_categories_category
+            ON bom_item_categories(category_id);
+        """
+    )
+
+
+def _migration_20(conn):
+    """Add a non-engineering folder layer for organizing BOM tree occurrences."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS bom_folders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            parent_bom_id INTEGER,
+            parent_folder_id INTEGER,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_by INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (project_id) REFERENCES projects(id),
+            FOREIGN KEY (parent_bom_id) REFERENCES bom(id),
+            FOREIGN KEY (parent_folder_id) REFERENCES bom_folders(id),
+            FOREIGN KEY (created_by) REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS bom_folder_items (
+            folder_id INTEGER NOT NULL,
+            bom_id INTEGER NOT NULL,
+            assigned_by INTEGER,
+            assigned_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (folder_id, bom_id),
+            FOREIGN KEY (folder_id) REFERENCES bom_folders(id),
+            FOREIGN KEY (bom_id) REFERENCES bom(id),
+            FOREIGN KEY (assigned_by) REFERENCES users(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_bom_folders_project_parent
+            ON bom_folders(project_id, parent_bom_id, parent_folder_id, sort_order, id);
+        CREATE INDEX IF NOT EXISTS idx_bom_folder_items_folder
+            ON bom_folder_items(folder_id);
+        CREATE INDEX IF NOT EXISTS idx_bom_folder_items_bom
+            ON bom_folder_items(bom_id);
+        """
+    )
+
+
 MIGRATIONS = {
     1: """
     CREATE TABLE IF NOT EXISTS users (
@@ -1145,6 +1221,10 @@ WHERE r.name = 'designer' AND p.name = 'manage_issues';
     17: _migration_17,
 
     18: _migration_18,
+
+    19: _migration_19,
+
+    20: _migration_20,
 
 }
 
