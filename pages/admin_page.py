@@ -1,8 +1,11 @@
+import os
+from pathlib import Path
+
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QListWidget,
     QComboBox, QFrame, QGroupBox, QTabWidget, QTableWidget, QTableWidgetItem,
     QMessageBox, QHeaderView, QInputDialog, QFileDialog, QLineEdit,
-    QSizePolicy, QSplitter, QAbstractItemView
+    QSizePolicy, QSplitter, QAbstractItemView, QApplication, QPlainTextEdit
 )
 from PyQt5.QtGui import QFont
 from PyQt5.QtCore import Qt
@@ -13,6 +16,7 @@ from core.services.permission_service import PermissionService
 from core.services.user_service import UserService
 from core.services.project_service import ProjectService
 from core.repositories.user_repository import UserRepository
+from utils import safe_exists, safe_isdir, safe_startfile
 
 
 class AdminMetricCard(QFrame):
@@ -42,6 +46,7 @@ class AdminMetricCard(QFrame):
 class AdminPage(QWidget):
     def __init__(self):
         super().__init__()
+        self.setFont(QFont("Segoe UI", 8))
         self.admin_service = AdminService()
         self.user_service = UserService(UserRepository())
         self.role_service = RoleService()
@@ -75,6 +80,7 @@ class AdminPage(QWidget):
         self.tabs.addTab(self.create_user_role_tab(), "Users")
         self.tabs.addTab(self.create_role_perm_tab(), "Access Control")
         self.tabs.addTab(self.create_project_tab(), "Projects")
+        self.tabs.addTab(self.create_configuration_tab(), "Configuration")
         layout.addWidget(self.tabs, 1)
         self.refresh_stats()
 
@@ -135,6 +141,7 @@ class AdminPage(QWidget):
         self.load_user_roles()
         self.load_role_permissions()
         self.load_project_members()
+        self.load_configuration_admin()
         self.refresh_stats()
 
     def _page_stylesheet(self):
@@ -166,11 +173,11 @@ class AdminPage(QWidget):
         QLabel#sectionTitle { color: #172033; font-size: 13px; font-weight: 700; }
         QLabel#sectionCaption { color: #738094; font-size: 10px; font-weight: 400; }
         QLabel#fieldLabel { color: #526071; font-size: 10px; font-weight: 600; }
-        QComboBox, QLineEdit {
+        QComboBox, QLineEdit, QPlainTextEdit {
             min-height: 24px; background: #ffffff; border: 1px solid #cfd6df;
             border-radius: 4px; padding: 3px 7px; color: #172033;
         }
-        QComboBox:focus, QLineEdit:focus { border-color: #2563eb; }
+        QComboBox:focus, QLineEdit:focus, QPlainTextEdit:focus { border-color: #2563eb; }
         QListWidget, QTableWidget {
             background: #ffffff; border: 1px solid #dfe3e8; border-radius: 4px;
             alternate-background-color: #f8fafc; selection-background-color: #e5efff;
@@ -261,11 +268,6 @@ class AdminPage(QWidget):
         available_layout = QVBoxLayout(available_panel)
         available_layout.setContentsMargins(12, 12, 12, 12)
         available_layout.setSpacing(8)
-        available_layout.addWidget(self._field_label("Available role"))
-        self.role_combo = QComboBox()
-        for r in self.role_service.get_all_roles():
-            self.role_combo.addItem(r["name"], r["id"])
-        available_layout.addWidget(self.role_combo)
         assign = self.create_button("Assign Role", "primary", self.assign_role_to_user)
         available_layout.addWidget(assign, 0, Qt.AlignLeft)
         available_layout.addStretch()
@@ -437,11 +439,6 @@ class AdminPage(QWidget):
         available_layout = QVBoxLayout(available_panel)
         available_layout.setContentsMargins(12, 12, 12, 12)
         available_layout.setSpacing(8)
-        available_layout.addWidget(self._field_label("Available permission"))
-        self.permission_combo = QComboBox()
-        for p in self.permission_service.get_all_permissions():
-            self.permission_combo.addItem(p["name"], p["id"])
-        available_layout.addWidget(self.permission_combo)
         add = self.create_button("Add Permission", "primary", self.add_permission_to_role)
         btn_new_perm = self.create_button("New Permission", "neutral", self.create_permission)
         btn_del_perm = self.create_button("Delete Permission", "danger", self.delete_permission)
@@ -461,17 +458,12 @@ class AdminPage(QWidget):
 
     def _reload_roles(self):
         roles = self.role_service.get_all_roles()
-        self.role_combo.clear()
         self.role_perm_combo.clear()
         for r in roles:
-            self.role_combo.addItem(r["name"], r["id"])
             self.role_perm_combo.addItem(r["name"], r["id"])
 
     def _reload_permissions(self):
-        perms = self.permission_service.get_all_permissions()
-        self.permission_combo.clear()
-        for p in perms:
-            self.permission_combo.addItem(p["name"], p["id"])
+        return self.permission_service.get_all_permissions()
 
     def create_role(self):
         name, ok = QInputDialog.getText(self, "New Role", "Role name:")
@@ -532,13 +524,15 @@ class AdminPage(QWidget):
         self.refresh_stats()
 
     def delete_permission(self):
-        perm_id = self.permission_combo.currentData()
+        perms = self.permission_service.get_all_permissions()
+        perm_id = self._choose_from_items("Delete Permission", "Permission to delete:", perms)
         if not perm_id:
-            return QMessageBox.warning(self, "Select", "Select a permission to delete.")
+            return
+        name = next((str(p.get("name") or "") for p in perms if int(p.get("id")) == int(perm_id)), str(perm_id))
         res = QMessageBox.question(
             self,
             "Confirm",
-            f"Delete permission '{self.permission_combo.currentText()}'?",
+            f"Delete permission '{name}'?",
             QMessageBox.Yes | QMessageBox.No,
         )
         if res != QMessageBox.Yes:
@@ -601,13 +595,11 @@ class AdminPage(QWidget):
         members_layout.setSpacing(8)
         members_layout.addLayout(self._section_header("Project members", "Membership for the selected project"))
         members_top = QHBoxLayout()
-        self.project_user_combo = QComboBox()
-        members_top.addWidget(self._field_label("User"))
-        members_top.addWidget(self.project_user_combo)
         btn_add_user = self.create_button("Add Member", "primary", self.add_user_to_project)
         btn_remove_user = self.create_button("Remove Member", "danger", self.remove_user_from_project)
         members_top.addWidget(btn_add_user)
         members_top.addWidget(btn_remove_user)
+        members_top.addStretch()
         members_layout.addLayout(members_top)
         self.project_members_list = QListWidget()
         self.project_members_list.setAlternatingRowColors(True)
@@ -619,6 +611,102 @@ class AdminPage(QWidget):
         self.table.itemSelectionChanged.connect(self.load_project_members)
         self.reload_users()
         self.load_projects()
+        return tab
+
+    # -------------------- TAB 4: CONFIGURATION / METADATA --------------------
+    def create_configuration_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        refresh_btn = self.create_button("Refresh", "neutral", self.load_configuration_admin)
+        layout.addLayout(self._section_header(
+            "System configuration",
+            "Inspect database, license, workspace paths, and administrative metadata",
+            [refresh_btn],
+        ))
+
+        splitter = QSplitter(Qt.Vertical)
+        splitter.setChildrenCollapsible(False)
+
+        paths_panel = self._panel()
+        paths_layout = QVBoxLayout(paths_panel)
+        paths_layout.setContentsMargins(10, 10, 10, 10)
+        paths_layout.setSpacing(8)
+        self.config_summary_label = QLabel("Application version: -")
+        self.config_summary_label.setObjectName("sectionCaption")
+        paths_layout.addWidget(self.config_summary_label)
+        self.config_paths_table = QTableWidget()
+        self.config_paths_table.setColumnCount(4)
+        self.config_paths_table.setHorizontalHeaderLabels(["Item", "Path", "Type", "Status"])
+        self.config_paths_table.setAlternatingRowColors(True)
+        self.config_paths_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.config_paths_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.config_paths_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.config_paths_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.config_paths_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.config_paths_table.verticalHeader().setVisible(False)
+        self.config_paths_table.verticalHeader().setDefaultSectionSize(30)
+        paths_layout.addWidget(self.config_paths_table, 1)
+        path_actions = QHBoxLayout()
+        path_actions.addStretch()
+        path_actions.addWidget(self.create_button("Copy Path", "neutral", self.copy_selected_config_path))
+        path_actions.addWidget(self.create_button("Open Folder", "neutral", self.open_selected_config_folder))
+        path_actions.addWidget(self.create_button("Open File", "neutral", self.open_selected_config_file))
+        paths_layout.addLayout(path_actions)
+        splitter.addWidget(paths_panel)
+
+        metadata_panel = self._panel()
+        metadata_layout = QVBoxLayout(metadata_panel)
+        metadata_layout.setContentsMargins(10, 10, 10, 10)
+        metadata_layout.setSpacing(8)
+        warning = QLabel(
+            "Metadata edits are immediate. Version and signed licensing keys can affect startup checks."
+        )
+        warning.setObjectName("sectionCaption")
+        metadata_layout.addWidget(warning)
+
+        editor_row = QHBoxLayout()
+        editor_left = QVBoxLayout()
+        editor_left.addWidget(self._field_label("Key"))
+        self.metadata_key_input = QLineEdit()
+        self.metadata_key_input.setPlaceholderText("Metadata key")
+        editor_left.addWidget(self.metadata_key_input)
+        editor_right = QVBoxLayout()
+        editor_right.addWidget(self._field_label("Value"))
+        self.metadata_value_input = QPlainTextEdit()
+        self.metadata_value_input.setPlaceholderText("Metadata value")
+        self.metadata_value_input.setFixedHeight(62)
+        editor_right.addWidget(self.metadata_value_input)
+        editor_row.addLayout(editor_left, 1)
+        editor_row.addLayout(editor_right, 2)
+        metadata_layout.addLayout(editor_row)
+
+        editor_actions = QHBoxLayout()
+        editor_actions.addStretch()
+        editor_actions.addWidget(self.create_button("New", "neutral", self.clear_metadata_editor))
+        editor_actions.addWidget(self.create_button("Save", "primary", self.save_metadata_item))
+        editor_actions.addWidget(self.create_button("Delete", "danger", self.delete_metadata_item))
+        metadata_layout.addLayout(editor_actions)
+
+        self.metadata_table = QTableWidget()
+        self.metadata_table.setColumnCount(2)
+        self.metadata_table.setHorizontalHeaderLabels(["Key", "Value"])
+        self.metadata_table.setAlternatingRowColors(True)
+        self.metadata_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.metadata_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.metadata_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.metadata_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.metadata_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.metadata_table.verticalHeader().setVisible(False)
+        self.metadata_table.verticalHeader().setDefaultSectionSize(30)
+        self.metadata_table.itemSelectionChanged.connect(self.load_selected_metadata_item)
+        metadata_layout.addWidget(self.metadata_table, 1)
+        splitter.addWidget(metadata_panel)
+        splitter.setSizes([300, 360])
+
+        layout.addWidget(splitter, 1)
         return tab
 
     # -------------------- HELPERS --------------------
@@ -635,6 +723,27 @@ class AdminPage(QWidget):
         btn.clicked.connect(callback)
         btn.setObjectName(style if style in ("primary", "danger", "neutral") else "neutral")
         return btn
+
+    def _choose_from_items(self, title, prompt, items, label_key="name", id_key="id"):
+        choices = []
+        ids_by_choice = {}
+        for item in items or []:
+            label = str(item.get(label_key) or "").strip()
+            item_id = item.get(id_key)
+            if not label or item_id is None:
+                continue
+            choice = label
+            if choice in ids_by_choice:
+                choice = f"{label} (ID {item_id})"
+            choices.append(choice)
+            ids_by_choice[choice] = int(item_id)
+        if not choices:
+            QMessageBox.information(self, title, "No items are available.")
+            return None
+        selected, ok = QInputDialog.getItem(self, title, prompt, choices, 0, False)
+        if not ok or not selected:
+            return None
+        return ids_by_choice.get(selected)
 
     # -------------------- DATA LOADING --------------------
     def load_user_roles(self):
@@ -665,10 +774,8 @@ class AdminPage(QWidget):
         # User combos used in multiple tabs
         users = self.user_service.get_all_users()
         self.user_combo.clear()
-        self.project_user_combo.clear()
         for u in users:
             self.user_combo.addItem(u.username, u.id)
-            self.project_user_combo.addItem(u.username, u.id)
 
     def load_projects(self):
         self.table.setSortingEnabled(False)
@@ -696,16 +803,177 @@ class AdminPage(QWidget):
             ).lower()
             self.table.setRowHidden(row, bool(query and query not in searchable))
 
+    def load_configuration_admin(self):
+        if not hasattr(self, "config_paths_table"):
+            return
+        try:
+            config = self.admin_service.get_configuration_paths()
+            self.config_summary_label.setText(
+                f"Application version: {config.get('app_version', '-')}   |   "
+                f"License source: {config.get('license_source', '-')}"
+            )
+            self.config_paths_table.setRowCount(0)
+            for row_data in config.get("paths", []):
+                row = self.config_paths_table.rowCount()
+                self.config_paths_table.insertRow(row)
+                values = [
+                    str(row_data.get("name") or ""),
+                    str(row_data.get("path") or ""),
+                    str(row_data.get("kind") or ""),
+                    str(row_data.get("status") or ""),
+                ]
+                for col, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    if col == 1:
+                        item.setData(Qt.UserRole, values[1])
+                    self.config_paths_table.setItem(row, col, item)
+
+            metadata = self.admin_service.list_app_metadata()
+            self.metadata_table.setRowCount(0)
+            for entry in metadata:
+                row = self.metadata_table.rowCount()
+                self.metadata_table.insertRow(row)
+                self.metadata_table.setItem(row, 0, QTableWidgetItem(str(entry.get("key") or "")))
+                self.metadata_table.setItem(row, 1, QTableWidgetItem(str(entry.get("value") or "")))
+        except Exception as e:
+            QMessageBox.warning(self, "Configuration", str(e))
+
+    def _selected_config_path(self):
+        row = self.config_paths_table.currentRow()
+        if row < 0:
+            return None
+        item = self.config_paths_table.item(row, 1)
+        if not item:
+            return None
+        return item.data(Qt.UserRole) or item.text()
+
+    def copy_selected_config_path(self):
+        path = self._selected_config_path()
+        if not path:
+            return QMessageBox.warning(self, "Select", "Select a configuration path first.")
+        QApplication.clipboard().setText(str(path))
+        self.stats_label.setText("Path copied")
+
+    def open_selected_config_folder(self):
+        path = self._selected_config_path()
+        if not path:
+            return QMessageBox.warning(self, "Select", "Select a configuration path first.")
+        target = Path(path)
+        folder = target if target.is_dir() else target.parent
+        if not safe_exists(str(folder)):
+            return QMessageBox.warning(self, "Missing", f"Folder does not exist:\n{folder}")
+        try:
+            safe_startfile(str(folder))
+        except Exception as e:
+            QMessageBox.warning(self, "Open Folder", str(e))
+
+    def open_selected_config_file(self):
+        path = self._selected_config_path()
+        if not path:
+            return QMessageBox.warning(self, "Select", "Select a configuration path first.")
+        target = Path(path)
+        if not safe_exists(str(target)) or safe_isdir(str(target)):
+            return QMessageBox.warning(self, "Missing", f"File does not exist:\n{target}")
+        try:
+            safe_startfile(str(target))
+        except Exception as e:
+            QMessageBox.warning(self, "Open File", str(e))
+
+    def load_selected_metadata_item(self):
+        if not hasattr(self, "metadata_table"):
+            return
+        row = self.metadata_table.currentRow()
+        if row < 0:
+            return
+        key_item = self.metadata_table.item(row, 0)
+        value_item = self.metadata_table.item(row, 1)
+        self.metadata_key_input.setText(key_item.text() if key_item else "")
+        self.metadata_value_input.setPlainText(value_item.text() if value_item else "")
+
+    def clear_metadata_editor(self):
+        self.metadata_table.clearSelection()
+        self.metadata_key_input.clear()
+        self.metadata_value_input.clear()
+        self.metadata_key_input.setFocus()
+
+    def _metadata_key_needs_warning(self, key):
+        sensitive = {
+            "app_version",
+            "minimum_app_version",
+            "latest_version",
+            "latest_version_sig",
+            "db_schema_version",
+        }
+        key_lower = str(key or "").strip().lower()
+        return key_lower in sensitive or "license" in key_lower or "signature" in key_lower
+
+    def save_metadata_item(self):
+        key = self.metadata_key_input.text().strip()
+        value = self.metadata_value_input.toPlainText()
+        if not key:
+            return QMessageBox.warning(self, "Metadata", "Metadata key is required.")
+        if self._metadata_key_needs_warning(key):
+            res = QMessageBox.question(
+                self,
+                "Confirm Metadata Change",
+                "This metadata key can affect startup, version, or licensing checks.\n\nSave it anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if res != QMessageBox.Yes:
+                return
+        try:
+            self.admin_service.set_app_metadata(key, value)
+        except Exception as e:
+            return QMessageBox.warning(self, "Metadata", str(e))
+        self.load_configuration_admin()
+        matches = self.metadata_table.findItems(key, Qt.MatchExactly)
+        if matches:
+            self.metadata_table.selectRow(matches[0].row())
+        self.stats_label.setText("Metadata saved")
+
+    def delete_metadata_item(self):
+        key = self.metadata_key_input.text().strip()
+        if not key:
+            return QMessageBox.warning(self, "Metadata", "Select or enter a metadata key to delete.")
+        res = QMessageBox.question(
+            self,
+            "Delete Metadata",
+            f"Delete metadata key '{key}'?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if res != QMessageBox.Yes:
+            return
+        if self._metadata_key_needs_warning(key):
+            res = QMessageBox.question(
+                self,
+                "Confirm Sensitive Delete",
+                "This key can affect startup, version, or licensing checks.\n\nDelete it anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if res != QMessageBox.Yes:
+                return
+        try:
+            self.admin_service.delete_app_metadata(key)
+        except Exception as e:
+            return QMessageBox.warning(self, "Metadata", str(e))
+        self.clear_metadata_editor()
+        self.load_configuration_admin()
+        self.stats_label.setText("Metadata deleted")
+
     # -------------------- ACTIONS --------------------
     def assign_role_to_user(self):
-        u, r = self.user_combo.currentData(), self.role_combo.currentData()
-        if u and r:
-            try:
-                self.admin_service.assign_role_to_user(u, r)
-            except Exception as e:
-                return QMessageBox.warning(self, "Failed", str(e))
-            QMessageBox.information(self, "Success", "Role assigned.")
-            self.load_user_roles()
+        u = self.user_combo.currentData()
+        if not u:
+            return QMessageBox.warning(self, "Select", "Select a user first.")
+        r = self._choose_from_items("Assign Role", f"Role to assign to {self.user_combo.currentText()}:", self.role_service.get_all_roles())
+        if not r:
+            return
+        try:
+            self.admin_service.assign_role_to_user(u, r)
+        except Exception as e:
+            return QMessageBox.warning(self, "Failed", str(e))
+        QMessageBox.information(self, "Success", "Role assigned.")
+        self.load_user_roles()
 
     def remove_role_from_user(self):
         u = self.user_combo.currentData()
@@ -723,14 +991,22 @@ class AdminPage(QWidget):
         self.load_user_roles()
 
     def add_permission_to_role(self):
-        r, p = self.role_perm_combo.currentData(), self.permission_combo.currentData()
-        if r and p:
-            try:
-                self.admin_service.add_permission_to_role(r, p)
-            except Exception as e:
-                return QMessageBox.warning(self, "Failed", str(e))
-            QMessageBox.information(self, "Added", "Permission added.")
-            self.load_role_permissions()
+        r = self.role_perm_combo.currentData()
+        if not r:
+            return QMessageBox.warning(self, "Select", "Select a role first.")
+        p = self._choose_from_items(
+            "Add Permission",
+            f"Permission to add to {self.role_perm_combo.currentText()}:",
+            self.permission_service.get_all_permissions(),
+        )
+        if not p:
+            return
+        try:
+            self.admin_service.add_permission_to_role(r, p)
+        except Exception as e:
+            return QMessageBox.warning(self, "Failed", str(e))
+        QMessageBox.information(self, "Added", "Permission added.")
+        self.load_role_permissions()
 
     def remove_permission_from_role(self):
         r = self.role_perm_combo.currentData()
@@ -847,9 +1123,15 @@ class AdminPage(QWidget):
 
     def add_user_to_project(self):
         pid = self._selected_project_id()
-        uid = self.project_user_combo.currentData()
-        if not pid or not uid:
-            return QMessageBox.warning(self, "Select", "Select a project and a user.")
+        if not pid:
+            return QMessageBox.warning(self, "Select", "Select a project first.")
+        users = [
+            {"id": getattr(user, "id", None), "name": getattr(user, "username", "")}
+            for user in self.user_service.get_all_users()
+        ]
+        uid = self._choose_from_items("Add Member", "User to add to the selected project:", users)
+        if not uid:
+            return
         try:
             self.project_service.add_user_to_project(int(uid), int(pid))
         except Exception as e:

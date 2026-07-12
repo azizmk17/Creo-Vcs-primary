@@ -17,6 +17,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from utils import safe_startfile
 
 try:
     import fitz
@@ -129,10 +130,13 @@ class PdfViewerWidget(QWidget):
                 border-radius:4px; font-weight:600;
             }
             QPushButton:hover { background:#eef2f7; border-color:#94a3b8; }
-            QPushButton:disabled { color:#9ca3af; background:#f3f4f6; }
+            QPushButton:disabled { color:#475569; background:#f3f4f6; border-color:#cbd5e1; }
             QComboBox {
                 color:#1f2937; background:#ffffff; border:1px solid #cbd5e1;
                 border-radius:4px; padding:2px 5px;
+            }
+            QComboBox:disabled {
+                color:#475569; background:#f3f4f6; border-color:#cbd5e1;
             }
             """
         )
@@ -166,14 +170,14 @@ class PdfViewerWidget(QWidget):
         header_layout.addWidget(self._zoom_combo)
         header_layout.addWidget(self._zoom_in_btn)
 
-        self._fit_width_btn = self._tool_button("Width", "Fit page to viewer width", self.fit_width, 48)
-        self._fit_page_btn = self._tool_button("Page", "Fit entire page", self.fit_page, 44)
+        self._fit_width_btn = self._tool_button("Width", "Fit page to viewer width", self.fit_width, 58)
+        self._fit_page_btn = self._tool_button("Page", "Fit entire page", self.fit_page, 54)
         header_layout.addWidget(self._fit_width_btn)
         header_layout.addWidget(self._fit_page_btn)
 
-        self._open_btn = self._tool_button("Open", "Open PDF in the system viewer", self.open_external, 44)
+        self._open_btn = self._tool_button("Open", "Open PDF in the system viewer", self.open_external, 54)
         header_layout.addWidget(self._open_btn)
-        self._expand_btn = self._tool_button("Expand", "Open a large PDF viewer", self.expand_viewer, 58)
+        self._expand_btn = self._tool_button("Expand", "Open a large PDF viewer", self.expand_viewer, 70)
         self._expand_btn.setVisible(self._show_expand)
         header_layout.addWidget(self._expand_btn)
         self._close_btn = self._tool_button("X", "Close preview", self.close_preview)
@@ -274,7 +278,7 @@ class PdfViewerWidget(QWidget):
         if not self._current_path:
             return
         try:
-            os.startfile(self._current_path)
+            safe_startfile(self._current_path)
         except Exception:
             pass
 

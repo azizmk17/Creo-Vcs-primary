@@ -40,7 +40,8 @@ class MergeRepository:
         with self.get_conn() as conn:
             cur = conn.cursor()
             cur.execute("""
-                SELECT c.id, c.type, c.part_id, c.status, c.filename, c.title, c.commit_id, u.username AS designer_username
+                SELECT c.id, c.type, c.part_id, c.status, c.filename, c.title,
+                       c.commit_id, c.project_id, u.username AS designer_username
                 FROM commits c
                 JOIN users u ON u.id = c.designer
                 WHERE c.status = 'Validated' AND c.id=?
@@ -55,7 +56,7 @@ class MergeRepository:
             cur = conn.cursor()
             cur.execute("""
                 SELECT c.id, c.type, c.part_id, c.status, c.filename, c.title,
-                       c.commit_id, u.username AS designer_username
+                       c.commit_id, c.project_id, u.username AS designer_username
                 FROM commits c
                 JOIN users u ON u.id = c.designer
                 WHERE c.status = 'Validated' AND c.commit_id=?
@@ -75,7 +76,7 @@ class MergeRepository:
         data = dict(row)
         # Fields expected by Commit dataclass
         keys = [
-            'id','part_id','type','filename','designer_username','status', 'title', 'commit_id'
+            'id','part_id','type','filename','designer_username','status', 'title', 'commit_id', 'project_id'
         ]
         filtered = {k: data.get(k) for k in keys}
         return Merge(**filtered)

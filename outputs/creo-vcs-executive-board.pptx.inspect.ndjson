@@ -1,0 +1,303 @@
+{"kind":"deck","id":"pr/ddxt1n","name":"Deck"}
+{"kind":"layout","layoutId":"4546e97b-488d-436c-bead-6c5c950fcf01","name":"Master","type":"master"}
+{"kind":"layout","layoutId":"a5b06423-ecbb-4e1b-84a3-7aea1f55af3b","name":"Title Slide","type":"title"}
+{"kind":"slide","id":"sl/9yr4au","slide":1,"title":"Creo VCS","textShapes":13}
+{"kind":"textbox","id":"sh/sji5snel","slide":1,"text":"Creo VCS","textPreview":"Creo VCS","textChars":8,"textLines":1,"bbox":[58,78,600,82]}
+{"kind":"textbox","id":"sh/3ylc7u54","slide":1,"text":"Plateforme de gestion, traçabilité et gouvernance des données mécaniques","textPreview":"Plateforme de gestion, traçabilité et gouvernance des données mécaniques","textChars":72,"textLines":1,"bbox":[58,178,760,82]}
+{"kind":"shape","id":"sh/adsji5sn","slide":1,"bbox":[58,304,280,6]}
+{"kind":"textbox","id":"sh/lszqtcj6","slide":1,"text":"Objectif de la présentation","textPreview":"Objectif de la présentation","textChars":27,"textLines":1,"bbox":[58,360,430,34]}
+{"kind":"textbox","id":"sh/s72x4nap","slide":1,"text":"Montrer la valeur ajoutée pour l'équipe mécanique, la direction projet et la qualité: moins de risque, plus de visibilité, une traçabilité complète.","textPreview":"Montrer la valeur ajoutée pour l'équipe mécanique, la direction projet et la qualité: moins de risque, plus de visibilité, une traçabilit...","textChars":148,"textLines":1,"bbox":[58,406,780,100]}
+{"kind":"shape","id":"sh/3m94fu18","slide":1,"bbox":[910,86,270,448]}
+{"kind":"textbox","id":"sh/a5gbq1or","slide":1,"text":"Jira","textPreview":"Jira","textChars":4,"textLines":1,"bbox":[960,130,170,36]}
+{"kind":"textbox","id":"sh/hoza1gvy","slide":1,"text":"→","textPreview":"→","textChars":1,"textLines":1,"bbox":[1016,184,60,36]}
+{"kind":"textbox","id":"sh/s36hcrmh","slide":1,"text":"Issue","textPreview":"Issue","textChars":5,"textLines":1,"bbox":[960,238,170,36]}
+{"kind":"textbox","id":"sh/q1orytsv","slide":1,"text":"→","textPreview":"→","textChars":1,"textLines":1,"bbox":[1016,292,60,36]}
+{"kind":"textbox","id":"sh/fmlkjm1c","slide":1,"text":"Commit","textPreview":"Commit","textChars":6,"textLines":1,"bbox":[948,346,196,36]}
+{"kind":"textbox","id":"sh/87ed8bat","slide":1,"text":"→","textPreview":"→","textChars":1,"textLines":1,"bbox":[1016,400,60,36]}
+{"kind":"textbox","id":"sh/xs72x4na","slide":1,"text":"Fichiers","textPreview":"Fichiers","textChars":8,"textLines":1,"bbox":[946,454,198,36]}
+{"kind":"textbox","id":"sh/qtcj6tov","slide":1,"text":"Creo VCS | Présentation Direction","textPreview":"Creo VCS | Présentation Direction","textChars":33,"textLines":1,"bbox":[58,666,420,24]}
+{"kind":"textbox","id":"sh/je9cvixc","slide":1,"text":"01","textPreview":"01","textChars":2,"textLines":1,"bbox":[1175,666,48,24]}
+{"kind":"notes","id":"nt/9yr4au","slide":1,"text":""}
+{"kind":"slide","id":"sl/rwoyr9","slide":2,"title":"CREO VCS","textShapes":12}
+{"kind":"textbox","id":"sh/cfa9w3m9","slide":2,"text":"CREO VCS","textPreview":"CREO VCS","textChars":8,"textLines":1,"bbox":[58,38,260,26]}
+{"kind":"textbox","id":"sh/judg7ads","slide":2,"text":"Message exécutif","textPreview":"Message exécutif","textChars":16,"textLines":1,"bbox":[58,76,940,86]}
+{"kind":"shape","id":"sh/u9knih4b","slide":2,"bbox":[58,170,1164,1]}
+{"kind":"textbox","id":"sh/1orytsvu","slide":2,"text":"Creo VCS transforme un dossier projet dispersé en un système de pilotage technique: chaque modification, problème, fichier natif et export d'ingénierie devient traçable.","textPreview":"Creo VCS transforme un dossier projet dispersé en un système de pilotage technique: chaque modification, problème, fichier natif et expor...","textChars":169,"textLines":1,"bbox":[58,208,1080,74]}
+{"kind":"shape","id":"sh/c7u54zid","slide":2,"bbox":[58,330,350,126]}
+{"kind":"shape","id":"sh/jm1cfa9w","slide":2,"bbox":[58,330,6,126]}
+{"kind":"textbox","id":"sh/u18jqh0f","slide":2,"text":"1 chaîne","textPreview":"1 chaîne","textChars":8,"textLines":1,"bbox":[80,352,306,44]}
+{"kind":"textbox","id":"sh/5gbq1ory","slide":2,"text":"Traçabilité complète: problème → décision → fichier → version","textPreview":"Traçabilité complète: problème → décision → fichier → version","textChars":61,"textLines":1,"bbox":[80,404,306,34]}
+{"kind":"shape","id":"sh/cvixczed","slide":2,"bbox":[465,330,350,126]}
+{"kind":"shape","id":"sh/m1cfa9w3","slide":2,"bbox":[465,330,6,126]}
+{"kind":"textbox","id":"sh/bm58z25k","slide":2,"text":"Moins d'erreurs","textPreview":"Moins d'erreurs","textChars":15,"textLines":1,"bbox":[487,352,306,44]}
+{"kind":"textbox","id":"sh/47y1kre1","slide":2,"text":"Réduction du risque de travailler sur la mauvaise version","textPreview":"Réduction du risque de travailler sur la mauvaise version","textChars":57,"textLines":1,"bbox":[487,404,306,34]}
+{"kind":"shape","id":"sh/tsvu9kni","slide":2,"bbox":[872,330,350,126]}
+{"kind":"shape","id":"sh/mp0bi9s3","slide":2,"bbox":[872,330,6,126]}
+{"kind":"textbox","id":"sh/bat47y1k","slide":2,"text":"Plus clair","textPreview":"Plus clair","textChars":10,"textLines":1,"bbox":[894,352,306,44]}
+{"kind":"textbox","id":"sh/4vmtwra5","slide":2,"text":"Base factuelle pour les revues, audits et arbitrages","textPreview":"Base factuelle pour les revues, audits et arbitrages","textChars":52,"textLines":1,"bbox":[894,404,306,34]}
+{"kind":"textbox","id":"sh/tgfmlkjm","slide":2,"text":"Ce n'est pas seulement un outil de stockage: c'est une couche de gouvernance opérationnelle pour l'équipe mécanique.","textPreview":"Ce n'est pas seulement un outil de stockage: c'est une couche de gouvernance opérationnelle pour l'équipe mécanique.","textChars":116,"textLines":1,"bbox":[58,512,990,58]}
+{"kind":"textbox","id":"sh/mhk3q5o7","slide":2,"text":"Creo VCS | Présentation Direction","textPreview":"Creo VCS | Présentation Direction","textChars":33,"textLines":1,"bbox":[58,666,420,24]}
+{"kind":"textbox","id":"sh/b2hwfyxo","slide":2,"text":"02","textPreview":"02","textChars":2,"textLines":1,"bbox":[1175,666,48,24]}
+{"kind":"notes","id":"nt/rwoyr9","slide":2,"text":""}
+{"kind":"slide","id":"sl/t3o7ve","slide":3,"title":"CREO VCS","textShapes":25}
+{"kind":"textbox","id":"sh/wfyxobm5","slide":3,"text":"CREO VCS","textPreview":"CREO VCS","textChars":8,"textLines":1,"bbox":[58,38,260,26]}
+{"kind":"textbox","id":"sh/7u54zido","slide":3,"text":"Les limites du fonctionnement actuel","textPreview":"Les limites du fonctionnement actuel","textChars":36,"textLines":1,"bbox":[58,76,940,86]}
+{"kind":"shape","id":"sh/ed8bat47","slide":3,"bbox":[58,170,1164,1]}
+{"kind":"shape","id":"sh/lc7u54zi","slide":3,"bbox":[58,216,350,340]}
+{"kind":"shape","id":"sh/wra5gbq1","slide":3,"bbox":[465,216,350,340]}
+{"kind":"shape","id":"sh/36hcrmhk","slide":3,"bbox":[872,216,350,340]}
+{"kind":"textbox","id":"sh/eloj2t83","slide":3,"text":"Versioning fragile","textPreview":"Versioning fragile","textChars":18,"textLines":1,"bbox":[86,250,300,34]}
+{"kind":"textbox","id":"sh/pg3ex0nu","slide":3,"text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[86,313,24,24]}
+{"kind":"textbox","id":"sh/wval87ed","slide":3,"text":"Fichiers copiés ou renommés manuellement","textPreview":"Fichiers copiés ou renommés manuellement","textChars":40,"textLines":1,"bbox":[116,312,256,48]}
+{"kind":"textbox","id":"sh/6hcrmhk3","slide":3,"text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[86,361,24,24]}
+{"kind":"textbox","id":"sh/z25kb6xk","slide":3,"text":"Difficulté à savoir quelle version est validée","textPreview":"Difficulté à savoir quelle version est validée","textChars":46,"textLines":1,"bbox":[116,360,256,48]}
+{"kind":"textbox","id":"sh/onyd0z61","slide":3,"text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[86,409,24,24]}
+{"kind":"textbox","id":"sh/d8v6psfi","slide":3,"text":"Risque de confusion entre PRD/ASM/DRW","textPreview":"Risque de confusion entre PRD/ASM/DRW","textChars":37,"textLines":1,"bbox":[116,408,256,48]}
+{"kind":"textbox","id":"sh/6tovahoz","slide":3,"text":"Traçabilité dispersée","textPreview":"Traçabilité dispersée","textChars":21,"textLines":1,"bbox":[493,250,300,34]}
+{"kind":"textbox","id":"sh/vahoza1g","slide":3,"text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[493,313,24,24]}
+{"kind":"textbox","id":"sh/ovahoza1","slide":3,"text":"Issues, emails, exports et fichiers séparés","textPreview":"Issues, emails, exports et fichiers séparés","textChars":43,"textLines":1,"bbox":[523,312,256,48]}
+{"kind":"textbox","id":"sh/dg7adsji","slide":3,"text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[493,361,24,24]}
+{"kind":"textbox","id":"sh/61032lsz","slide":3,"text":"Lien faible entre décision et modification","textPreview":"Lien faible entre décision et modification","textChars":42,"textLines":1,"bbox":[523,360,256,48]}
+{"kind":"textbox","id":"sh/vmtwra5g","slide":3,"text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[493,409,24,24]}
+{"kind":"textbox","id":"sh/nqxs72x4","slide":3,"text":"Historique difficile à reconstruire","textPreview":"Historique difficile à reconstruire","textChars":35,"textLines":1,"bbox":[523,408,256,48]}
+{"kind":"textbox","id":"sh/u54zidon","slide":3,"text":"Pilotage incomplet","textPreview":"Pilotage incomplet","textChars":18,"textLines":1,"bbox":[900,250,300,34]}
+{"kind":"textbox","id":"sh/5sneloj2","slide":3,"text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[900,313,24,24]}
+{"kind":"textbox","id":"sh/cbulwval","slide":3,"text":"Peu de visibilité sur ce qui bloque","textPreview":"Peu de visibilité sur ce qui bloque","textChars":35,"textLines":1,"bbox":[930,312,256,48]}
+{"kind":"textbox","id":"sh/neloj2t8","slide":3,"text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[900,361,24,24]}
+{"kind":"textbox","id":"sh/ytsvu9kn","slide":3,"text":"Audits et revues longs à préparer","textPreview":"Audits et revues longs à préparer","textChars":33,"textLines":1,"bbox":[930,360,256,48]}
+{"kind":"textbox","id":"sh/5kb6xkf6","slide":3,"text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[900,409,24,24]}
+{"kind":"textbox","id":"sh/czed8v6p","slide":3,"text":"Dépendance aux personnes clés","textPreview":"Dépendance aux personnes clés","textChars":29,"textLines":1,"bbox":[930,408,256,48]}
+{"kind":"textbox","id":"sh/n29gr2p8","slide":3,"text":"Creo VCS | Présentation Direction","textPreview":"Creo VCS | Présentation Direction","textChars":33,"textLines":1,"bbox":[58,666,420,24]}
+{"kind":"textbox","id":"sh/yhgn29gr","slide":3,"text":"03","textPreview":"03","textChars":2,"textLines":1,"bbox":[1175,666,48,24]}
+{"kind":"notes","id":"nt/t3o7ve","slide":3,"text":""}
+{"kind":"slide","id":"sl/rcw2sd","slide":4,"title":"CREO VCS","textShapes":17}
+{"kind":"textbox","id":"sh/5sneloj2","slide":4,"text":"CREO VCS","textPreview":"CREO VCS","textChars":8,"textLines":1,"bbox":[58,38,260,26]}
+{"kind":"textbox","id":"sh/u54zidon","slide":4,"text":"La valeur ajoutée pour l'entreprise","textPreview":"La valeur ajoutée pour l'entreprise","textChars":35,"textLines":1,"bbox":[58,76,940,86]}
+{"kind":"shape","id":"sh/nqxs72x4","slide":4,"bbox":[58,170,1164,1]}
+{"kind":"textbox","id":"sh/czed8v6p","slide":4,"text":"La valeur de Creo VCS est de rendre le travail mécanique vérifiable, partageable et pilotable.","textPreview":"La valeur de Creo VCS est de rendre le travail mécanique vérifiable, partageable et pilotable.","textChars":94,"textLines":1,"bbox":[58,210,980,46]}
+{"kind":"shape","id":"sh/5kb6xkf6","slide":4,"bbox":[58,310,350,126]}
+{"kind":"shape","id":"sh/ytsvu9kn","slide":4,"bbox":[58,310,6,126]}
+{"kind":"textbox","id":"sh/neloj2t8","slide":4,"text":"Maîtrise","textPreview":"Maîtrise","textChars":8,"textLines":1,"bbox":[80,332,306,44]}
+{"kind":"textbox","id":"sh/gn29gr2p","slide":4,"text":"Qualité: chaque correction est reliée à un problème et à une preuve","textPreview":"Qualité: chaque correction est reliée à un problème et à une preuve","textChars":67,"textLines":1,"bbox":[80,384,306,34]}
+{"kind":"shape","id":"sh/58z25kb6","slide":4,"bbox":[465,310,350,126]}
+{"kind":"shape","id":"sh/d8bat47y","slide":4,"bbox":[465,310,6,126]}
+{"kind":"textbox","id":"sh/knih4byh","slide":4,"text":"Vitesse","textPreview":"Vitesse","textChars":7,"textLines":1,"bbox":[487,332,306,44]}
+{"kind":"textbox","id":"sh/v6psfil0","slide":4,"text":"Délais: moins de recherche manuelle, moins de reprises","textPreview":"Délais: moins de recherche manuelle, moins de reprises","textChars":54,"textLines":1,"bbox":[487,384,306,34]}
+{"kind":"shape","id":"sh/2lszqtcj","slide":4,"bbox":[872,310,350,126]}
+{"kind":"shape","id":"sh/d0z61032","slide":4,"bbox":[872,310,6,126]}
+{"kind":"textbox","id":"sh/kf6dcbul","slide":4,"text":"Pilotage","textPreview":"Pilotage","textChars":8,"textLines":1,"bbox":[894,332,306,44]}
+{"kind":"textbox","id":"sh/vu9knih4","slide":4,"text":"Management: vision claire des statuts, décisions, responsabilités","textPreview":"Management: vision claire des statuts, décisions, responsabilités","textChars":65,"textLines":1,"bbox":[894,384,306,34]}
+{"kind":"textbox","id":"sh/29gr2p8n","slide":4,"text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[78,521,24,24]}
+{"kind":"textbox","id":"sh/donyd0z6","slide":4,"text":"Standardise la manière de travailler sans casser l'usage Creo existant","textPreview":"Standardise la manière de travailler sans casser l'usage Creo existant","textChars":70,"textLines":1,"bbox":[108,520,1010,36]}
+{"kind":"textbox","id":"sh/k3q5o7qp","slide":4,"text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[78,557,24,24]}
+{"kind":"textbox","id":"sh/kb6xkf6d","slide":4,"text":"Crée une mémoire technique projet exploitable après les départs, audits ou relances","textPreview":"Crée une mémoire technique projet exploitable après les départs, audits ou relances","textChars":83,"textLines":1,"bbox":[108,556,1010,36]}
+{"kind":"textbox","id":"sh/9w3m94fu","slide":4,"text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[78,593,24,24]}
+{"kind":"textbox","id":"sh/25kb6xkf","slide":4,"text":"Prépare l'intégration future avec Jira, SQL Server/PostgreSQL et reporting avancé","textPreview":"Prépare l'intégration future avec Jira, SQL Server/PostgreSQL et reporting avancé","textChars":81,"textLines":1,"bbox":[108,592,1010,36]}
+{"kind":"textbox","id":"sh/rqd4vmtw","slide":4,"text":"Creo VCS | Présentation Direction","textPreview":"Creo VCS | Présentation Direction","textChars":33,"textLines":1,"bbox":[58,666,420,24]}
+{"kind":"textbox","id":"sh/kzupwb2h","slide":4,"text":"04","textPreview":"04","textChars":2,"textLines":1,"bbox":[1175,666,48,24]}
+{"kind":"notes","id":"nt/rcw2sd","slide":4,"text":""}
+{"kind":"slide","id":"sl/ge5wep","slide":5,"title":"CREO VCS","textShapes":16}
+{"kind":"textbox","id":"sh/d0z61032","slide":5,"text":"CREO VCS","textPreview":"CREO VCS","textChars":8,"textLines":1,"bbox":[58,38,260,26]}
+{"kind":"textbox","id":"sh/29gr2p8n","slide":5,"text":"Ce que fait Creo VCS","textPreview":"Ce que fait Creo VCS","textChars":20,"textLines":1,"bbox":[58,76,940,86]}
+{"kind":"shape","id":"sh/vu9knih4","slide":5,"bbox":[58,170,1164,1]}
+{"kind":"shape","id":"sh/knih4byh","slide":5,"bbox":[58,218,350,122]}
+{"kind":"textbox","id":"sh/d8bat47y","slide":5,"text":"BOM & fichiers","textPreview":"BOM & fichiers","textChars":14,"textLines":1,"bbox":[80,240,300,28]}
+{"kind":"textbox","id":"sh/2lszqtcj","slide":5,"text":"Structure produit, pièces, assemblages, dessins et fichiers associés.","textPreview":"Structure produit, pièces, assemblages, dessins et fichiers associés.","textChars":69,"textLines":1,"bbox":[80,276,300,46]}
+{"kind":"shape","id":"sh/v6psfil0","slide":5,"bbox":[465,218,350,122]}
+{"kind":"textbox","id":"sh/kre1w7mp","slide":5,"text":"Commit / validation","textPreview":"Commit / validation","textChars":19,"textLines":1,"bbox":[487,240,300,28]}
+{"kind":"textbox","id":"sh/dcbulwva","slide":5,"text":"Création de versions, validation, restauration et historique groupé.","textPreview":"Création de versions, validation, restauration et historique groupé.","textChars":68,"textLines":1,"bbox":[487,276,300,46]}
+{"kind":"shape","id":"sh/lszqtcj6","slide":5,"bbox":[872,218,350,122]}
+{"kind":"textbox","id":"sh/s72x4nap","slide":5,"text":"Issues","textPreview":"Issues","textChars":6,"textLines":1,"bbox":[894,240,300,28]}
+{"kind":"textbox","id":"sh/3m94fu18","slide":5,"text":"Suivi des problèmes, assignation, statut, historique et résolution.","textPreview":"Suivi des problèmes, assignation, statut, historique et résolution.","textChars":67,"textLines":1,"bbox":[894,276,300,46]}
+{"kind":"shape","id":"sh/a5gbq1or","slide":5,"bbox":[58,388,350,122]}
+{"kind":"textbox","id":"sh/h4byhgn2","slide":5,"text":"Traceability","textPreview":"Traceability","textChars":12,"textLines":1,"bbox":[80,410,300,28]}
+{"kind":"textbox","id":"sh/sji5snel","slide":5,"text":"Liens entre issue, commit, fichier natif, PDF, STEP, rapport et Jira.","textPreview":"Liens entre issue, commit, fichier natif, PDF, STEP, rapport et Jira.","textChars":69,"textLines":1,"bbox":[80,446,300,46]}
+{"kind":"shape","id":"sh/3ylc7u54","slide":5,"bbox":[465,388,350,122]}
+{"kind":"textbox","id":"sh/adsji5sn","slide":5,"text":"Export","textPreview":"Export","textChars":6,"textLines":1,"bbox":[487,410,300,28]}
+{"kind":"textbox","id":"sh/hgn29gr2","slide":5,"text":"Package complet pour revue: Excel, pièces jointes, exports et preuves.","textPreview":"Package complet pour revue: Excel, pièces jointes, exports et preuves.","textChars":70,"textLines":1,"bbox":[487,446,300,46]}
+{"kind":"shape","id":"sh/svu9knih","slide":5,"bbox":[872,388,350,122]}
+{"kind":"textbox","id":"sh/4r65wjud","slide":5,"text":"Administration","textPreview":"Administration","textChars":14,"textLines":1,"bbox":[894,410,300,28]}
+{"kind":"textbox","id":"sh/xc3ylc7u","slide":5,"text":"Utilisateurs, rôles, projets, configuration, métadonnées et licences.","textPreview":"Utilisateurs, rôles, projets, configuration, métadonnées et licences.","textChars":69,"textLines":1,"bbox":[894,446,300,46]}
+{"kind":"textbox","id":"sh/mlkjm1cf","slide":5,"text":"Creo VCS | Présentation Direction","textPreview":"Creo VCS | Présentation Direction","textChars":33,"textLines":1,"bbox":[58,666,420,24]}
+{"kind":"textbox","id":"sh/f6dcbulw","slide":5,"text":"05","textPreview":"05","textChars":2,"textLines":1,"bbox":[1175,666,48,24]}
+{"kind":"notes","id":"nt/ge5wep","slide":5,"text":""}
+{"kind":"slide","id":"sl/2nvlc1","slide":6,"title":"CREO VCS","textShapes":22}
+{"kind":"textbox","id":"sh/kzupwb2h","slide":6,"text":"CREO VCS","textPreview":"CREO VCS","textChars":8,"textLines":1,"bbox":[58,38,260,26]}
+{"kind":"textbox","id":"sh/re1w7mp0","slide":6,"text":"Chaîne de traçabilité cible","textPreview":"Chaîne de traçabilité cible","textChars":27,"textLines":1,"bbox":[58,76,940,86]}
+{"kind":"shape","id":"sh/2t83itgf","slide":6,"bbox":[58,170,1164,1]}
+{"kind":"shape","id":"sh/9w3m94fu","slide":6,"bbox":[58,270,160,126]}
+{"kind":"shape","id":"sh/kb6xkf6d","slide":6,"bbox":[58,270,160,5]}
+{"kind":"textbox","id":"sh/rqd4vmtw","slide":6,"text":"Jira","textPreview":"Jira","textChars":4,"textLines":1,"bbox":[72,298,132,28]}
+{"kind":"textbox","id":"sh/25kb6xkf","slide":6,"text":"Ticket externe optionnel","textPreview":"Ticket externe optionnel","textChars":24,"textLines":1,"bbox":[72,334,132,42]}
+{"kind":"textbox","id":"sh/94fu18jq","slide":6,"text":"→","textPreview":"→","textChars":1,"textLines":1,"bbox":[226,314,28,30]}
+{"kind":"shape","id":"sh/kjm1cfa9","slide":6,"bbox":[256,270,160,126]}
+{"kind":"shape","id":"sh/mlkjm1cf","slide":6,"bbox":[256,270,160,5]}
+{"kind":"textbox","id":"sh/f6dcbulw","slide":6,"text":"Issue interne","textPreview":"Issue interne","textChars":13,"textLines":1,"bbox":[270,298,132,28]}
+{"kind":"textbox","id":"sh/4r65wjud","slide":6,"text":"Source locale de vérité","textPreview":"Source locale de vérité","textChars":23,"textLines":1,"bbox":[270,334,132,42]}
+{"kind":"textbox","id":"sh/xc3ylc7u","slide":6,"text":"→","textPreview":"→","textChars":1,"textLines":1,"bbox":[424,314,28,30]}
+{"kind":"shape","id":"sh/mtwra5gb","slide":6,"bbox":[454,270,160,126]}
+{"kind":"shape","id":"sh/fepkzupw","slide":6,"bbox":[454,270,160,5]}
+{"kind":"textbox","id":"sh/4zidonyd","slide":6,"text":"Fichiers Creo","textPreview":"Fichiers Creo","textChars":13,"textLines":1,"bbox":[468,298,132,28]}
+{"kind":"textbox","id":"sh/xkf6dcbu","slide":6,"text":".prt / .asm / .drw affectés","textPreview":".prt / .asm / .drw affectés","textChars":27,"textLines":1,"bbox":[468,334,132,42]}
+{"kind":"textbox","id":"sh/qxs72x4n","slide":6,"text":"→","textPreview":"→","textChars":1,"textLines":1,"bbox":[622,314,28,30]}
+{"kind":"shape","id":"sh/fil0rqd4","slide":6,"bbox":[652,270,160,126]}
+{"kind":"shape","id":"sh/7ed8bat4","slide":6,"bbox":[652,270,160,5]}
+{"kind":"textbox","id":"sh/itgfmlkj","slide":6,"text":"Commit","textPreview":"Commit","textChars":6,"textLines":1,"bbox":[666,298,132,28]}
+{"kind":"textbox","id":"sh/pkzupwb2","slide":6,"text":"Correction ou évolution","textPreview":"Correction ou évolution","textChars":23,"textLines":1,"bbox":[666,334,132,42]}
+{"kind":"textbox","id":"sh/0z61032l","slide":6,"text":"→","textPreview":"→","textChars":1,"textLines":1,"bbox":[820,314,28,30]}
+{"kind":"shape","id":"sh/72x4nap4","slide":6,"bbox":[850,270,160,126]}
+{"kind":"shape","id":"sh/ih4byhgn","slide":6,"bbox":[850,270,160,5]}
+{"kind":"textbox","id":"sh/p8nqxs72","slide":6,"text":"Exports","textPreview":"Exports","textChars":7,"textLines":1,"bbox":[864,298,132,28]}
+{"kind":"textbox","id":"sh/0nuxc3yl","slide":6,"text":"PDF / STEP / rapports","textPreview":"PDF / STEP / rapports","textChars":21,"textLines":1,"bbox":[864,334,132,42]}
+{"kind":"textbox","id":"sh/7y1kre1w","slide":6,"text":"→","textPreview":"→","textChars":1,"textLines":1,"bbox":[1018,314,28,30]}
+{"kind":"shape","id":"sh/ed8v6psf","slide":6,"bbox":[1048,270,160,126]}
+{"kind":"shape","id":"sh/crmhk3q5","slide":6,"bbox":[1048,270,160,5]}
+{"kind":"textbox","id":"sh/1cfa9w3m","slide":6,"text":"Package","textPreview":"Package","textChars":7,"textLines":1,"bbox":[1062,298,132,28]}
+{"kind":"textbox","id":"sh/ulwval87","slide":6,"text":"Preuve exportable","textPreview":"Preuve exportable","textChars":17,"textLines":1,"bbox":[1062,334,132,42]}
+{"kind":"textbox","id":"sh/j6tovaho","slide":6,"text":"Principe clé: Jira ne remplace pas l'issue interne. Il devient une référence externe liée à la traçabilité locale.","textPreview":"Principe clé: Jira ne remplace pas l'issue interne. Il devient une référence externe liée à la traçabilité locale.","textChars":114,"textLines":1,"bbox":[124,458,1030,62]}
+{"kind":"textbox","id":"sh/c3ylc7u5","slide":6,"text":"Creo VCS | Présentation Direction","textPreview":"Creo VCS | Présentation Direction","textChars":33,"textLines":1,"bbox":[58,666,420,24]}
+{"kind":"textbox","id":"sh/1kre1w7m","slide":6,"text":"06","textPreview":"06","textChars":2,"textLines":1,"bbox":[1175,666,48,24]}
+{"kind":"notes","id":"nt/2nvlc1","slide":6,"text":""}
+{"kind":"slide","id":"sl/d7oacl","slide":7,"title":"CREO VCS","textShapes":22}
+{"kind":"textbox","id":"sh/kre1w7mp","slide":7,"text":"CREO VCS","textPreview":"CREO VCS","textChars":8,"textLines":1,"bbox":[58,38,260,26]}
+{"kind":"textbox","id":"sh/val87ed8","slide":7,"text":"Guide utilisateur: scénario quotidien","textPreview":"Guide utilisateur: scénario quotidien","textChars":37,"textLines":1,"bbox":[58,76,940,86]}
+{"kind":"shape","id":"sh/6psfil0r","slide":7,"bbox":[58,170,1164,1]}
+{"kind":"shape","id":"sh/donyd0z6","slide":7,"bbox":[58,220,360,138]}
+{"kind":"shape","id":"sh/k3q5o7qp","slide":7,"bbox":[58,220,360,5]}
+{"kind":"textbox","id":"sh/vixczed8","slide":7,"text":"01","textPreview":"01","textChars":2,"textLines":1,"bbox":[76,240,52,38]}
+{"kind":"textbox","id":"sh/2x4nap4r","slide":7,"text":"Sélectionner le projet","textPreview":"Sélectionner le projet","textChars":22,"textLines":1,"bbox":[136,240,260,34]}
+{"kind":"textbox","id":"sh/d0z61032","slide":7,"text":"L'utilisateur choisit le projet et la version de travail.","textPreview":"L'utilisateur choisit le projet et la version de travail.","textChars":57,"textLines":1,"bbox":[136,280,260,54]}
+{"kind":"shape","id":"sh/kf6dcbul","slide":7,"bbox":[460,220,360,138]}
+{"kind":"shape","id":"sh/ylc7u54z","slide":7,"bbox":[460,220,360,5]}
+{"kind":"textbox","id":"sh/r65wjudg","slide":7,"text":"02","textPreview":"02","textChars":2,"textLines":1,"bbox":[478,240,52,38]}
+{"kind":"textbox","id":"sh/gr2p8nqx","slide":7,"text":"Consulter la BOM","textPreview":"Consulter la BOM","textChars":16,"textLines":1,"bbox":[538,240,260,34]}
+{"kind":"textbox","id":"sh/9cvixcze","slide":7,"text":"Il identifie la pièce, l'assemblage ou le dessin concerné.","textPreview":"Il identifie la pièce, l'assemblage ou le dessin concerné.","textChars":58,"textLines":1,"bbox":[538,280,260,54]}
+{"kind":"shape","id":"sh/yxobm58z","slide":7,"bbox":[862,220,360,138]}
+{"kind":"shape","id":"sh/nih4byhg","slide":7,"bbox":[862,220,360,5]}
+{"kind":"textbox","id":"sh/g3ex0nux","slide":7,"text":"03","textPreview":"03","textChars":2,"textLines":1,"bbox":[880,240,52,38]}
+{"kind":"textbox","id":"sh/5o7qpg3e","slide":7,"text":"Créer ou ouvrir une issue","textPreview":"Créer ou ouvrir une issue","textChars":25,"textLines":1,"bbox":[940,240,260,34]}
+{"kind":"textbox","id":"sh/y1kre1w7","slide":7,"text":"Il documente le problème, le statut, l'assignation et les fichiers liés.","textPreview":"Il documente le problème, le statut, l'assignation et les fichiers liés.","textChars":72,"textLines":1,"bbox":[940,280,260,54]}
+{"kind":"shape","id":"sh/rmhk3q5o","slide":7,"bbox":[58,410,360,138]}
+{"kind":"shape","id":"sh/3ylc7u54","slide":7,"bbox":[58,410,360,5]}
+{"kind":"textbox","id":"sh/adsji5sn","slide":7,"text":"04","textPreview":"04","textChars":2,"textLines":1,"bbox":[76,430,52,38]}
+{"kind":"textbox","id":"sh/h4byhgn2","slide":7,"text":"Commit & validation","textPreview":"Commit & validation","textChars":19,"textLines":1,"bbox":[136,430,260,34]}
+{"kind":"textbox","id":"sh/sji5snel","slide":7,"text":"La correction est liée à l'issue, validée, poussée et historisée.","textPreview":"La correction est liée à l'issue, validée, poussée et historisée.","textChars":65,"textLines":1,"bbox":[136,470,260,54]}
+{"kind":"shape","id":"sh/3m94fu18","slide":7,"bbox":[460,410,360,138]}
+{"kind":"shape","id":"sh/a5gbq1or","slide":7,"bbox":[460,410,360,5]}
+{"kind":"textbox","id":"sh/lszqtcj6","slide":7,"text":"05","textPreview":"05","textChars":2,"textLines":1,"bbox":[478,430,52,38]}
+{"kind":"textbox","id":"sh/s72x4nap","slide":7,"text":"Lier les exports","textPreview":"Lier les exports","textChars":16,"textLines":1,"bbox":[538,430,260,34]}
+{"kind":"textbox","id":"sh/zidonyd0","slide":7,"text":"PDF, STEP, capture, rapport ou validation deviennent des fichiers traçables.","textPreview":"PDF, STEP, capture, rapport ou validation deviennent des fichiers traçables.","textChars":76,"textLines":1,"bbox":[538,470,260,54]}
+{"kind":"shape","id":"sh/a1gvy90j","slide":7,"bbox":[862,410,360,138]}
+{"kind":"shape","id":"sh/kre1w7mp","slide":7,"bbox":[862,410,360,5]}
+{"kind":"textbox","id":"sh/dcbulwva","slide":7,"text":"06","textPreview":"06","textChars":2,"textLines":1,"bbox":[880,430,52,38]}
+{"kind":"textbox","id":"sh/6psfil0r","slide":7,"text":"Exporter le dossier","textPreview":"Exporter le dossier","textChars":19,"textLines":1,"bbox":[940,430,260,34]}
+{"kind":"textbox","id":"sh/val87ed8","slide":7,"text":"Le package fournit la preuve complète pour revue ou audit.","textPreview":"Le package fournit la preuve complète pour revue ou audit.","textChars":58,"textLines":1,"bbox":[940,470,260,54]}
+{"kind":"textbox","id":"sh/k3q5o7qp","slide":7,"text":"Creo VCS | Présentation Direction","textPreview":"Creo VCS | Présentation Direction","textChars":33,"textLines":1,"bbox":[58,666,420,24]}
+{"kind":"textbox","id":"sh/donyd0z6","slide":7,"text":"07","textPreview":"07","textChars":2,"textLines":1,"bbox":[1175,666,48,24]}
+{"kind":"notes","id":"nt/d7oacl","slide":7,"text":""}
+{"kind":"slide","id":"sl/agumui","slide":8,"title":"CREO VCS","textShapes":18}
+{"kind":"textbox","id":"sh/25kb6xkf","slide":8,"text":"CREO VCS","textPreview":"CREO VCS","textChars":8,"textLines":1,"bbox":[58,38,260,26]}
+{"kind":"textbox","id":"sh/9w3m94fu","slide":8,"text":"Ce que voit un chef de projet","textPreview":"Ce que voit un chef de projet","textChars":29,"textLines":1,"bbox":[58,76,940,86]}
+{"kind":"shape","id":"sh/kb6xkf6d","slide":8,"bbox":[58,170,1164,1]}
+{"kind":"shape","id":"sh/re1w7mp0","slide":8,"bbox":[58,218,530,336]}
+{"kind":"textbox","id":"sh/2t83itgf","slide":8,"text":"Questions auxquelles l'app répond","textPreview":"Questions auxquelles l'app répond","textChars":33,"textLines":1,"bbox":[88,250,460,34]}
+{"kind":"textbox","id":"sh/9knih4by","slide":8,"text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[88,317,24,24]}
+{"kind":"textbox","id":"sh/kzupwb2h","slide":8,"text":"Quels problèmes sont ouverts ou résolus ?","textPreview":"Quels problèmes sont ouverts ou résolus ?","textChars":41,"textLines":1,"bbox":[118,316,430,38]}
+{"kind":"textbox","id":"sh/ra5gbq1o","slide":8,"text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[88,355,24,24]}
+{"kind":"textbox","id":"sh/2p8nqxs7","slide":8,"text":"Quel commit a corrigé quel problème ?","textPreview":"Quel commit a corrigé quel problème ?","textChars":37,"textLines":1,"bbox":[118,354,430,38]}
+{"kind":"textbox","id":"sh/gvy90je9","slide":8,"text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[88,393,24,24]}
+{"kind":"textbox","id":"sh/9gr2p8nq","slide":8,"text":"Quels fichiers Creo et exports sont impactés ?","textPreview":"Quels fichiers Creo et exports sont impactés ?","textChars":46,"textLines":1,"bbox":[118,392,430,38]}
+{"kind":"textbox","id":"sh/2p8nqxs7","slide":8,"text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[88,431,24,24]}
+{"kind":"textbox","id":"sh/ra5gbq1o","slide":8,"text":"Qui a modifié, validé, restauré ou rouvert ?","textPreview":"Qui a modifié, validé, restauré ou rouvert ?","textChars":44,"textLines":1,"bbox":[118,430,430,38]}
+{"kind":"textbox","id":"sh/kjm1cfa9","slide":8,"text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[88,469,24,24]}
+{"kind":"textbox","id":"sh/94fu18jq","slide":8,"text":"Quelle preuve transmettre à la qualité ou au client ?","textPreview":"Quelle preuve transmettre à la qualité ou au client ?","textChars":53,"textLines":1,"bbox":[118,468,430,38]}
+{"kind":"shape","id":"sh/2hwfyxob","slide":8,"bbox":[660,218,562,336]}
+{"kind":"textbox","id":"sh/r2p8nqxs","slide":8,"text":"Résultat attendu","textPreview":"Résultat attendu","textChars":16,"textLines":1,"bbox":[698,250,460,34]}
+{"kind":"textbox","id":"sh/kb6xkf6d","slide":8,"text":"Une lecture management du travail mécanique: pas seulement des fichiers, mais des décisions, responsabilités, statuts et preuves.","textPreview":"Une lecture management du travail mécanique: pas seulement des fichiers, mais des décisions, responsabilités, statuts et preuves.","textChars":129,"textLines":1,"bbox":[698,310,438,122]}
+{"kind":"textbox","id":"sh/9w3m94fu","slide":8,"text":"L'application devient un support de revue projet, de passation et d'audit.","textPreview":"L'application devient un support de revue projet, de passation et d'audit.","textChars":74,"textLines":1,"bbox":[698,462,438,48]}
+{"kind":"textbox","id":"sh/dg7adsji","slide":8,"text":"Creo VCS | Présentation Direction","textPreview":"Creo VCS | Présentation Direction","textChars":33,"textLines":1,"bbox":[58,666,420,24]}
+{"kind":"textbox","id":"sh/ovahoza1","slide":8,"text":"08","textPreview":"08","textChars":2,"textLines":1,"bbox":[1175,666,48,24]}
+{"kind":"notes","id":"nt/agumui","slide":8,"text":""}
+{"kind":"slide","id":"sl/gjfcd9","slide":9,"title":"CREO VCS","textShapes":16}
+{"kind":"textbox","id":"sh/xobm58z2","slide":9,"text":"CREO VCS","textPreview":"CREO VCS","textChars":8,"textLines":1,"bbox":[58,38,260,26]}
+{"kind":"textbox","id":"sh/qxs72x4n","slide":9,"text":"Gouvernance et robustesse","textPreview":"Gouvernance et robustesse","textChars":25,"textLines":1,"bbox":[58,76,940,86]}
+{"kind":"shape","id":"sh/fil0rqd4","slide":9,"bbox":[58,170,1164,1]}
+{"kind":"textbox","id":"sh/4fu18jqh","slide":9,"text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[86,219,24,24]}
+{"kind":"textbox","id":"sh/x0nuxc3y","slide":9,"text":"Validation atomique: si un fichier pose problème, l'opération complète s'arrête.","textPreview":"Validation atomique: si un fichier pose problème, l'opération complète s'arrête.","textChars":80,"textLines":1,"bbox":[116,218,730,54]}
+{"kind":"textbox","id":"sh/m94fu18j","slide":9,"text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[86,273,24,24]}
+{"kind":"textbox","id":"sh/fu18jqh0","slide":9,"text":"Historique conservé: commits, restaurations et réouvertures restent visibles.","textPreview":"Historique conservé: commits, restaurations et réouvertures restent visibles.","textChars":77,"textLines":1,"bbox":[116,272,730,54]}
+{"kind":"textbox","id":"sh/4r65wjud","slide":9,"text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[86,327,24,24]}
+{"kind":"textbox","id":"sh/xc3ylc7u","slide":9,"text":"Droits utilisateurs: rôles, permissions et administration contrôlée.","textPreview":"Droits utilisateurs: rôles, permissions et administration contrôlée.","textChars":68,"textLines":1,"bbox":[116,326,730,54]}
+{"kind":"textbox","id":"sh/9cvixcze","slide":9,"text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[86,381,24,24]}
+{"kind":"textbox","id":"sh/gr2p8nqx","slide":9,"text":"Version et licence: métadonnées pour maîtriser la compatibilité.","textPreview":"Version et licence: métadonnées pour maîtriser la compatibilité.","textChars":64,"textLines":1,"bbox":[116,380,730,54]}
+{"kind":"textbox","id":"sh/r65wjudg","slide":9,"text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[86,435,24,24]}
+{"kind":"textbox","id":"sh/ylc7u54z","slide":9,"text":"Export sécurisé: fichiers d'entrée, sorties d'ingénierie, Excel et historique.","textPreview":"Export sécurisé: fichiers d'entrée, sorties d'ingénierie, Excel et historique.","textChars":78,"textLines":1,"bbox":[116,434,730,54]}
+{"kind":"shape","id":"sh/5o7qpg3e","slide":9,"bbox":[920,236,260,210]}
+{"kind":"textbox","id":"sh/g3ex0nux","slide":9,"text":"Objectif","textPreview":"Objectif","textChars":8,"textLines":1,"bbox":[960,268,180,32]}
+{"kind":"textbox","id":"sh/nih4byhg","slide":9,"text":"Moins de dépendance aux habitudes individuelles.\nPlus de règles communes.","textPreview":"Moins de dépendance aux habitudes individuelles. | Plus de règles communes.","textChars":73,"textLines":2,"bbox":[956,324,188,92]}
+{"kind":"textbox","id":"sh/yxobm58z","slide":9,"text":"Creo VCS | Présentation Direction","textPreview":"Creo VCS | Présentation Direction","textChars":33,"textLines":1,"bbox":[58,666,420,24]}
+{"kind":"textbox","id":"sh/9s36hcrm","slide":9,"text":"09","textPreview":"09","textChars":2,"textLines":1,"bbox":[1175,666,48,24]}
+{"kind":"notes","id":"nt/gjfcd9","slide":9,"text":""}
+{"kind":"slide","id":"sl/881k3f","slide":10,"title":"CREO VCS","textShapes":12}
+{"kind":"textbox","id":"sh/hk3q5o7q","slide":10,"text":"CREO VCS","textPreview":"CREO VCS","textChars":8,"textLines":1,"bbox":[58,38,260,26]}
+{"kind":"textbox","id":"sh/6xkf6dcb","slide":10,"text":"Indicateurs de valeur à suivre","textPreview":"Indicateurs de valeur à suivre","textChars":30,"textLines":1,"bbox":[58,76,940,86]}
+{"kind":"shape","id":"sh/zed8v6ps","slide":10,"bbox":[58,170,1164,1]}
+{"kind":"shape","id":"sh/obm58z25","slide":10,"bbox":[58,232,350,126]}
+{"kind":"shape","id":"sh/hwfyxobm","slide":10,"bbox":[58,232,6,126]}
+{"kind":"textbox","id":"sh/65wjudg7","slide":10,"text":"-30 à -50%","textPreview":"-30 à -50%","textChars":10,"textLines":1,"bbox":[80,254,306,44]}
+{"kind":"textbox","id":"sh/zqtcj6to","slide":10,"text":"Temps de préparation des revues projet","textPreview":"Temps de préparation des revues projet","textChars":38,"textLines":1,"bbox":[80,306,306,34]}
+{"kind":"shape","id":"sh/sfil0rqd","slide":10,"bbox":[465,232,350,126]}
+{"kind":"shape","id":"sh/h0fepkzu","slide":10,"bbox":[465,232,6,126]}
+{"kind":"textbox","id":"sh/5wjudg7a","slide":10,"text":"En baisse","textPreview":"En baisse","textChars":9,"textLines":1,"bbox":[487,254,306,44]}
+{"kind":"textbox","id":"sh/gbq1oryt","slide":10,"text":"Incidents liés aux mauvaises versions","textPreview":"Incidents liés aux mauvaises versions","textChars":37,"textLines":1,"bbox":[487,306,306,34]}
+{"kind":"shape","id":"sh/nuxc3ylc","slide":10,"bbox":[872,232,350,126]}
+{"kind":"shape","id":"sh/y90je9cv","slide":10,"bbox":[872,232,6,126]}
+{"kind":"textbox","id":"sh/58z25kb6","slide":10,"text":"Objectif 100%","textPreview":"Objectif 100%","textChars":13,"textLines":1,"bbox":[894,254,306,44]}
+{"kind":"textbox","id":"sh/gn29gr2p","slide":10,"text":"Issues avec preuve complète","textPreview":"Issues avec preuve complète","textChars":27,"textLines":1,"bbox":[894,306,306,34]}
+{"kind":"shape","id":"sh/n29gr2p8","slide":10,"bbox":[58,430,1164,112]}
+{"kind":"textbox","id":"sh/yhgn29gr","slide":10,"text":"Mesure simple proposée","textPreview":"Mesure simple proposée","textChars":22,"textLines":1,"bbox":[86,460,300,30]}
+{"kind":"textbox","id":"sh/5kb6xkf6","slide":10,"text":"Après déploiement, suivre chaque mois: nombre d'issues créées/résolues, commits validés, restaurations, exports de dossiers, fichiers liés et écarts détectés en revue.","textPreview":"Après déploiement, suivre chaque mois: nombre d'issues créées/résolues, commits validés, restaurations, exports de dossiers, fichiers lié...","textChars":167,"textLines":1,"bbox":[390,456,760,48]}
+{"kind":"textbox","id":"sh/czed8v6p","slide":10,"text":"Creo VCS | Présentation Direction","textPreview":"Creo VCS | Présentation Direction","textChars":33,"textLines":1,"bbox":[58,666,420,24]}
+{"kind":"textbox","id":"sh/8bat47y1","slide":10,"text":"10","textPreview":"10","textChars":2,"textLines":1,"bbox":[1175,666,48,24]}
+{"kind":"notes","id":"nt/881k3f","slide":10,"text":""}
+{"kind":"slide","id":"sl/pd9ar0","slide":11,"title":"CREO VCS","textShapes":14}
+{"kind":"textbox","id":"sh/2hwfyxob","slide":11,"text":"CREO VCS","textPreview":"CREO VCS","textChars":8,"textLines":1,"bbox":[58,38,260,26]}
+{"kind":"textbox","id":"sh/94fu18jq","slide":11,"text":"Évolution d'architecture","textPreview":"Évolution d'architecture","textChars":24,"textLines":1,"bbox":[58,76,940,86]}
+{"kind":"shape","id":"sh/kjm1cfa9","slide":11,"bbox":[58,170,1164,1]}
+{"kind":"shape","id":"sh/ra5gbq1o","slide":11,"bbox":[58,230,350,138]}
+{"kind":"shape","id":"sh/2p8nqxs7","slide":11,"bbox":[58,230,350,5]}
+{"kind":"textbox","id":"sh/9gr2p8nq","slide":11,"text":"01","textPreview":"01","textChars":2,"textLines":1,"bbox":[76,250,52,38]}
+{"kind":"textbox","id":"sh/gvy90je9","slide":11,"text":"Aujourd'hui","textPreview":"Aujourd'hui","textChars":11,"textLines":1,"bbox":[136,250,250,34]}
+{"kind":"textbox","id":"sh/re1w7mp0","slide":11,"text":"Application desktop + base locale/partagée + coffre fichiers.","textPreview":"Application desktop + base locale/partagée + coffre fichiers.","textChars":61,"textLines":1,"bbox":[136,290,250,54]}
+{"kind":"shape","id":"sh/2t83itgf","slide":11,"bbox":[465,230,350,138]}
+{"kind":"shape","id":"sh/sneloj2t","slide":11,"bbox":[465,230,350,5]}
+{"kind":"textbox","id":"sh/l87ed8ba","slide":11,"text":"02","textPreview":"02","textChars":2,"textLines":1,"bbox":[483,250,52,38]}
+{"kind":"textbox","id":"sh/ahoza1gv","slide":11,"text":"Optimisation","textPreview":"Optimisation","textChars":12,"textLines":1,"bbox":[543,250,250,34]}
+{"kind":"textbox","id":"sh/32lszqtc","slide":11,"text":"Court terme: cache local, requêtes groupées, transactions courtes, index DB.","textPreview":"Court terme: cache local, requêtes groupées, transactions courtes, index DB.","textChars":76,"textLines":1,"bbox":[543,290,250,54]}
+{"kind":"shape","id":"sh/szqtcj6t","slide":11,"bbox":[872,230,350,138]}
+{"kind":"shape","id":"sh/lkjm1cfa","slide":11,"bbox":[872,230,350,5]}
+{"kind":"textbox","id":"sh/at47y1kr","slide":11,"text":"03","textPreview":"03","textChars":2,"textLines":1,"bbox":[890,250,52,38]}
+{"kind":"textbox","id":"sh/3ex0nuxc","slide":11,"text":"Cible LAN","textPreview":"Cible LAN","textChars":9,"textLines":1,"bbox":[950,250,250,34]}
+{"kind":"textbox","id":"sh/w3m94fu1","slide":11,"text":"Serveur applicatif + PostgreSQL/SQL Server + coffre central.","textPreview":"Serveur applicatif + PostgreSQL/SQL Server + coffre central.","textChars":60,"textLines":1,"bbox":[950,290,250,54]}
+{"kind":"textbox","id":"sh/loj2t83i","slide":11,"text":"La cible serveur permet plus de performance, sécurité, audit, multi-utilisateur et intégration Jira/API sans exposer la base directement aux postes.","textPreview":"La cible serveur permet plus de performance, sécurité, audit, multi-utilisateur et intégration Jira/API sans exposer la base directement ...","textChars":148,"textLines":1,"bbox":[86,456,1080,72]}
+{"kind":"textbox","id":"sh/p8nqxs72","slide":11,"text":"Creo VCS | Présentation Direction","textPreview":"Creo VCS | Présentation Direction","textChars":33,"textLines":1,"bbox":[58,666,420,24]}
+{"kind":"textbox","id":"sh/0nuxc3yl","slide":11,"text":"11","textPreview":"11","textChars":2,"textLines":1,"bbox":[1175,666,48,24]}
+{"kind":"notes","id":"nt/pd9ar0","slide":11,"text":""}
+{"kind":"slide","id":"sl/puiy8a","slide":12,"title":"CREO VCS","textShapes":12}
+{"kind":"textbox","id":"sh/c7u54zid","slide":12,"text":"CREO VCS","textPreview":"CREO VCS","textChars":8,"textLines":1,"bbox":[58,38,260,26]}
+{"kind":"textbox","id":"sh/jm1cfa9w","slide":12,"text":"Décision attendue","textPreview":"Décision attendue","textChars":17,"textLines":1,"bbox":[58,76,940,86]}
+{"kind":"shape","id":"sh/u18jqh0f","slide":12,"bbox":[58,170,1164,1]}
+{"kind":"textbox","id":"sh/1032lszq","slide":12,"text":"Valider Creo VCS comme socle de traçabilité mécanique et lancer un pilote contrôlé sur un projet représentatif.","textPreview":"Valider Creo VCS comme socle de traçabilité mécanique et lancer un pilote contrôlé sur un projet représentatif.","textChars":111,"textLines":1,"bbox":[58,214,1040,78]}
+{"kind":"shape","id":"sh/cfa9w3m9","slide":12,"bbox":[58,342,350,160]}
+{"kind":"shape","id":"sh/judg7ads","slide":12,"bbox":[465,342,350,160]}
+{"kind":"shape","id":"sh/u9knih4b","slide":12,"bbox":[872,342,350,160]}
+{"kind":"textbox","id":"sh/54zidony","slide":12,"text":"1. Pilote","textPreview":"1. Pilote","textChars":9,"textLines":1,"bbox":[86,374,260,32]}
+{"kind":"textbox","id":"sh/cj6tovah","slide":12,"text":"Choisir un projet mécanique avec BOM, issues et exports réels.","textPreview":"Choisir un projet mécanique avec BOM, issues et exports réels.","textChars":62,"textLines":1,"bbox":[86,420,280,48]}
+{"kind":"textbox","id":"sh/ex0nuxc3","slide":12,"text":"2. Mesure","textPreview":"2. Mesure","textChars":9,"textLines":1,"bbox":[493,374,260,32]}
+{"kind":"textbox","id":"sh/3itgfmlk","slide":12,"text":"Suivre les indicateurs qualité, délai, traçabilité et adoption.","textPreview":"Suivre les indicateurs qualité, délai, traçabilité et adoption.","textChars":63,"textLines":1,"bbox":[493,420,280,48]}
+{"kind":"textbox","id":"sh/w3m94fu1","slide":12,"text":"3. Industrialisation","textPreview":"3. Industrialisation","textChars":20,"textLines":1,"bbox":[900,374,260,32]}
+{"kind":"textbox","id":"sh/loj2t83i","slide":12,"text":"Décider l'architecture serveur et le périmètre de généralisation.","textPreview":"Décider l'architecture serveur et le périmètre de généralisation.","textChars":65,"textLines":1,"bbox":[900,420,280,48]}
+{"kind":"textbox","id":"sh/e9cvixcz","slide":12,"text":"Message clé: l'application crée de la valeur parce qu'elle transforme les fichiers mécaniques en informations pilotables.","textPreview":"Message clé: l'application crée de la valeur parce qu'elle transforme les fichiers mécaniques en informations pilotables.","textChars":121,"textLines":1,"bbox":[78,568,1080,46]}
+{"kind":"textbox","id":"sh/3q5o7qpg","slide":12,"text":"Creo VCS | Présentation Direction","textPreview":"Creo VCS | Présentation Direction","textChars":33,"textLines":1,"bbox":[58,666,420,24]}
+{"kind":"textbox","id":"sh/wb2hwfyx","slide":12,"text":"12","textPreview":"12","textChars":2,"textLines":1,"bbox":[1175,666,48,24]}
+{"kind":"notes","id":"nt/puiy8a","slide":12,"text":""}

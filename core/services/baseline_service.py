@@ -9,6 +9,7 @@ from core.repositories.baseline_file_repository import BaselineFileRepository
 from core.repositories.bom_children_repository import BomChildrenRepository
 from core.repositories.bom_repository import BomRepository
 from core.services.base_service import BaseService
+from core.services.export_naming import exported_document_filename, safe_filename
 from core.services.part_file_service import PartFileService
 
 
@@ -47,7 +48,7 @@ class BaselineService(BaseService):
         return order
 
     def _safe_filename(self, s: str) -> str:
-        return "".join(ch if ch.isalnum() or ch in "._- ()" else "_" for ch in (s or ""))
+        return safe_filename(s)
 
     def list_baselines(self) -> List[Dict]:
         rows = self.baseline_repo.list_for_project(self.project_id)
@@ -168,8 +169,16 @@ class BaselineService(BaseService):
                 missing.append({"part_id": bf.part_id, "aes_number": aes, "file_type": bf.file_type, "version_id": bf.version_id, "reason": "file_missing", "expected": src})
                 continue
 
-            dst_dir = pdf_dir if str(bf.file_type).upper() == "PDF" else step_dir
-            dst_name = self._safe_filename(f"{aes or bf.part_id}_" + os.path.basename(src))
+            file_type = str(bf.file_type or "").upper()
+            dst_dir = pdf_dir if file_type == "PDF" else step_dir
+            dst_name = exported_document_filename(
+                part=part,
+                file_type=file_type,
+                source_path=src,
+                revision=getattr(ver, "revision", None) or "",
+                project_version_label=getattr(ver, "project_version_label", None) or "",
+                include_date=True,
+            )
             dst_path = os.path.join(dst_dir, dst_name)
             shutil.copy2(src, dst_path)
 

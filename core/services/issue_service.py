@@ -14,6 +14,7 @@ from core.repositories.bom_children_repository import BomChildrenRepository
 from core.repositories.bom_repository import BomRepository
 from core.repositories.issue_repository import IssueRepository
 from core.services.base_service import BaseService
+from core.services.traceability_service import TraceabilityService
 
 
 class IssueService(BaseService):
@@ -22,6 +23,7 @@ class IssueService(BaseService):
         self.repo = repo or IssueRepository()
         self.bom_repo = BomRepository()
         self.children_repo = BomChildrenRepository()
+        self.traceability = TraceabilityService()
 
     def create_issue(self, data: dict, part_ids: Iterable[int]) -> dict:
         title = (data.get("title") or "").strip()
@@ -129,6 +131,12 @@ class IssueService(BaseService):
                 "active_count": len(values["active"]),
                 "total_count": len(values["all"]),
                 "critical_count": len(values["critical"]),
+                "direct_active_count": len(direct.get(part_id, {}).get("active", set())),
+                "direct_total_count": len(direct.get(part_id, {}).get("all", set())),
+                "direct_critical_count": len(direct.get(part_id, {}).get("critical", set())),
+                "inherited_active_count": len(values["active"] - direct.get(part_id, {}).get("active", set())),
+                "inherited_total_count": len(values["all"] - direct.get(part_id, {}).get("all", set())),
+                "inherited_critical_count": len(values["critical"] - direct.get(part_id, {}).get("critical", set())),
             }
             for part_id, values in issue_sets.items()
         }
@@ -163,10 +171,51 @@ class IssueService(BaseService):
         return list(found.values())
 
     def link_to_commit(self, issue_ids: Iterable[int], commit_id: str, resolution_comment=""):
-        self.repo.link_to_commit(issue_ids, commit_id, self.user_id, resolution_comment)
+        self.traceability.link_issue_to_commit(
+            issue_ids,
+            commit_id,
+            relation_type="solves",
+            note=resolution_comment,
+        )
+
+    def link_to_commit_with_relation(self, issue_ids: Iterable[int], commit_id: str,
+                                     relation_type="solves", note=""):
+        self.traceability.link_issue_to_commit(issue_ids, commit_id, relation_type, note)
 
     def issues_for_commit(self, commit_id: str):
         return self.repo.issues_for_commit(commit_id)
+
+    def commit_links_for_issue(self, issue_id: int):
+        return self.traceability.commit_links_for_issue(issue_id)
+
+    def jira_links(self, issue_id: int):
+        return self.traceability.jira_links(issue_id)
+
+    def link_jira(self, issue_id: int, jira_key="", jira_url=""):
+        return self.traceability.link_jira(issue_id, jira_key=jira_key, jira_url=jira_url)
+
+    def engineering_files_for_issue(self, issue_id: int):
+        return self.traceability.engineering_files_for_issue(issue_id)
+
+    def link_issue_to_engineering_file(self, issue_id: int, part_file_id: int,
+                                       version_id=None, role="other", note=""):
+        return self.traceability.link_issue_to_engineering_file(
+            issue_id, part_file_id, version_id, role, note
+        )
+
+    def export_traceability_json(self, destination_path: str, filters=None,
+                                 include_engineering_files=True):
+        return self.traceability.export_issue_traceability_json(
+            destination_path,
+            filters or {},
+            include_engineering_files=include_engineering_files,
+        )
+
+    def export_traceability_package(self, issue_id: int, destination_dir: str):
+        return self.traceability.export_issue_traceability_package(issue_id, destination_dir)
+
+    def get_issue_traceability(self, issue_id: int):
+        return self.traceability.get_issue_traceability(issue_id)
 
     def validate_commit_issues(self, commit_id: str, confirmed_ids: Iterable[int],
                                rejected_ids: Iterable[int], comment=""):

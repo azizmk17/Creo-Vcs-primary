@@ -1,6 +1,7 @@
 import sys
 import os
 import sqlite3
+import re
 
 # Add the parent directory to the Python path so we can import config.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -184,6 +185,7 @@ def _migration_5(conn):
         _ensure_column(conn, "part_file_versions", "lifecycle_state", "lifecycle_state TEXT DEFAULT 'WIP'")
         _ensure_column(conn, "part_file_versions", "released_by", "released_by INTEGER")
         _ensure_column(conn, "part_file_versions", "released_at", "released_at TEXT")
+        _ensure_column(conn, "part_file_versions", "revision", "revision TEXT")
 
     # RBAC: ensure 'master' exists (migration 4 maps it, but doesn't create it)
     if "roles" in [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]:
@@ -491,6 +493,413 @@ def _migration_13(conn):
     )
 
 
+def _migration_14(conn):
+    """Engineering traceability links for Jira, commit groups, and vaulted files."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS issue_jira_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            issue_id INTEGER NOT NULL,
+            jira_key TEXT,
+            jira_url TEXT,
+            jira_summary TEXT,
+            jira_status TEXT,
+            last_checked_at TEXT,
+            created_by INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (issue_id) REFERENCES issues(id),
+            FOREIGN KEY (created_by) REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS issue_file_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            issue_id INTEGER NOT NULL,
+            part_file_id INTEGER NOT NULL,
+            part_file_version_id INTEGER,
+            file_role TEXT NOT NULL DEFAULT 'other',
+            linked_by INTEGER,
+            linked_at TEXT NOT NULL DEFAULT (datetime('now')),
+            note TEXT DEFAULT '',
+            UNIQUE(issue_id, part_file_id, part_file_version_id, file_role),
+            FOREIGN KEY (issue_id) REFERENCES issues(id),
+            FOREIGN KEY (part_file_id) REFERENCES part_files(id),
+            FOREIGN KEY (part_file_version_id) REFERENCES part_file_versions(id),
+            FOREIGN KEY (linked_by) REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS commit_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER,
+            commit_id TEXT NOT NULL,
+            title TEXT,
+            message TEXT,
+            author_id INTEGER,
+            created_at TEXT,
+            status TEXT,
+            reverted_at TEXT,
+            reverted_by INTEGER,
+            revert_note TEXT,
+            UNIQUE(project_id, commit_id),
+            FOREIGN KEY (project_id) REFERENCES projects(id),
+            FOREIGN KEY (author_id) REFERENCES users(id),
+            FOREIGN KEY (reverted_by) REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS commit_file_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            commit_group_id INTEGER NOT NULL,
+            commit_row_id INTEGER NOT NULL,
+            part_id INTEGER,
+            change_type TEXT NOT NULL DEFAULT 'modified',
+            UNIQUE(commit_group_id, commit_row_id),
+            FOREIGN KEY (commit_group_id) REFERENCES commit_groups(id),
+            FOREIGN KEY (commit_row_id) REFERENCES commits(id),
+            FOREIGN KEY (part_id) REFERENCES bom(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_issue_jira_links_issue ON issue_jira_links(issue_id);
+        CREATE INDEX IF NOT EXISTS idx_issue_jira_links_key ON issue_jira_links(jira_key);
+        CREATE INDEX IF NOT EXISTS idx_issue_file_links_issue ON issue_file_links(issue_id);
+        CREATE INDEX IF NOT EXISTS idx_issue_file_links_file ON issue_file_links(part_file_id);
+        CREATE INDEX IF NOT EXISTS idx_commit_groups_commit ON commit_groups(commit_id);
+        CREATE INDEX IF NOT EXISTS idx_commit_file_links_group ON commit_file_links(commit_group_id);
+        """
+    )
+
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "issue_commit_links" in tables:
+        _ensure_column(conn, "issue_commit_links", "relation_type", "relation_type TEXT NOT NULL DEFAULT 'solves'")
+        _ensure_column(conn, "issue_commit_links", "note", "note TEXT DEFAULT ''")
+
+    if "commits" in tables:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO commit_groups(
+                project_id, commit_id, title, message, author_id, created_at, status
+            )
+            SELECT
+                c.project_id,
+                c.commit_id,
+                MAX(c.title),
+                MAX(c.message),
+                MAX(c.committed_by),
+                MIN(c.committed_at),
+                MAX(c.status)
+            FROM commits c
+            WHERE c.commit_id IS NOT NULL AND TRIM(c.commit_id) <> ''
+            GROUP BY c.project_id, c.commit_id
+            """
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO commit_file_links(commit_group_id, commit_row_id, part_id, change_type)
+            SELECT cg.id, c.id, c.part_id, 'modified'
+            FROM commits c
+            JOIN commit_groups cg
+              ON cg.commit_id = c.commit_id
+             AND (cg.project_id IS c.project_id OR cg.project_id = c.project_id)
+            WHERE c.commit_id IS NOT NULL AND TRIM(c.commit_id) <> ''
+            """
+        )
+
+
+def _legacy_note_revision(note: str):
+    text = str(note or "").strip()
+    if not text:
+        return None
+    match = re.fullmatch(
+        r"(?i)(?:(?:rev(?:ision)?\.?\s*[:_-]?\s*)([A-Z]{1,2}[0-9]{0,3})|([A-Z]|[A-Z][0-9]{3}))",
+        text,
+    )
+    if not match:
+        return None
+    return (match.group(1) or match.group(2)).upper()
+
+
+def _migration_15(conn):
+    """Move legacy revision-only part-file version notes into revision column."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    for key, value in (
+        ("app_version", "2.2.0"),
+        ("minimum_app_version", "2.2.0"),
+        ("db_schema_version", "15"),
+    ):
+        conn.execute(
+            "INSERT OR REPLACE INTO app_metadata(key, value) VALUES(?, ?)",
+            (key, value),
+        )
+
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "part_file_versions" not in tables:
+        return
+    _ensure_column(conn, "part_file_versions", "revision", "revision TEXT")
+    rows = conn.execute(
+        """
+        SELECT id, note
+        FROM part_file_versions
+        WHERE (revision IS NULL OR TRIM(revision)='')
+          AND note IS NOT NULL
+          AND TRIM(note) <> ''
+        """
+    ).fetchall()
+    for row in rows:
+        revision = _legacy_note_revision(row["note"])
+        if not revision:
+            continue
+        conn.execute(
+            "UPDATE part_file_versions SET revision=?, note=NULL WHERE id=?",
+            (revision, int(row["id"])),
+        )
+
+
+def _migration_16(conn):
+    """Allow project versions to share the same clean project name."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    for key, value in (
+        ("app_version", "2.2.0"),
+        ("minimum_app_version", "2.2.0"),
+        ("db_schema_version", "16"),
+    ):
+        conn.execute(
+            "INSERT OR REPLACE INTO app_metadata(key, value) VALUES(?, ?)",
+            (key, value),
+        )
+
+    table = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='projects'"
+    ).fetchone()
+    if not table or not table["sql"]:
+        return
+
+    table_sql = str(table["sql"])
+    if "UNIQUE" in table_sql.upper():
+        new_sql = re.sub(
+            r"CREATE\s+TABLE\s+projects\b",
+            "CREATE TABLE projects_new",
+            table_sql,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        new_sql = re.sub(
+            r"\bname\s+TEXT\s+NOT\s+NULL\s+UNIQUE\b",
+            "name TEXT NOT NULL",
+            new_sql,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        new_sql = re.sub(
+            r",\s*UNIQUE\s*\(\s*name\s*\)",
+            "",
+            new_sql,
+            flags=re.IGNORECASE,
+        )
+
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("DROP TABLE IF EXISTS projects_new")
+        conn.execute(new_sql)
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(projects)").fetchall()]
+        col_sql = ", ".join(cols)
+        conn.execute(f"INSERT INTO projects_new ({col_sql}) SELECT {col_sql} FROM projects")
+        conn.execute("DROP TABLE projects")
+        conn.execute("ALTER TABLE projects_new RENAME TO projects")
+        conn.execute("PRAGMA foreign_keys=ON")
+
+    cols = set(_table_columns(conn, "projects"))
+    if {"name", "version_label"}.issubset(cols):
+        conn.execute(
+            """
+            UPDATE projects
+            SET name = SUBSTR(name, 1, LENGTH(name) - LENGTH(version_label) - 2)
+            WHERE version_label IS NOT NULL
+              AND TRIM(version_label) <> ''
+              AND UPPER(name) LIKE '%__' || UPPER(TRIM(version_label))
+            """
+        )
+
+    if {"root_project_id", "version_label"}.issubset(cols):
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_projects_root_version ON projects(root_project_id, version_label)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_projects_root_project_id ON projects(root_project_id)")
+
+
+def _migration_17(conn):
+    """Correct inverted check-in/check-out action names in existing audit rows."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    for key, value in (
+        ("app_version", "2.2.0"),
+        ("minimum_app_version", "2.2.0"),
+        ("db_schema_version", "17"),
+    ):
+        conn.execute(
+            "INSERT OR REPLACE INTO app_metadata(key, value) VALUES(?, ?)",
+            (key, value),
+        )
+
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "lock_logs" in tables:
+        conn.execute(
+            """
+            UPDATE lock_logs
+            SET action = CASE LOWER(action)
+                WHEN 'checkin' THEN 'checkout'
+                WHEN 'checkout' THEN 'checkin'
+                ELSE action
+            END
+            WHERE LOWER(action) IN ('checkin', 'checkout')
+            """
+        )
+
+    if "signature" in tables:
+        conn.execute(
+            """
+            UPDATE signature
+            SET action = CASE LOWER(action)
+                WHEN 'checkin' THEN 'checkout'
+                WHEN 'checkout' THEN 'checkin'
+                ELSE action
+            END
+            WHERE LOWER(action) IN ('checkin', 'checkout')
+              AND id IN (SELECT signature FROM lock_logs WHERE signature IS NOT NULL)
+            """
+        )
+
+
+def _migration_18(conn):
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(bom_children)").fetchall()]
+    if "sort_order" not in cols:
+        conn.execute("ALTER TABLE bom_children ADD COLUMN sort_order INTEGER DEFAULT 0")
+    conn.execute(
+        """
+        UPDATE bom_children
+        SET sort_order = id
+        WHERE sort_order IS NULL OR sort_order = 0
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_bom_children_parent_order ON bom_children(parent_id, sort_order, id)")
+
+
+def _migration_19(conn):
+    """Add project-scoped categories with many-to-many BOM item assignments."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS bom_categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            name TEXT NOT NULL COLLATE NOCASE,
+            created_by INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(project_id, name),
+            FOREIGN KEY (project_id) REFERENCES projects(id),
+            FOREIGN KEY (created_by) REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS bom_item_categories (
+            bom_id INTEGER NOT NULL,
+            category_id INTEGER NOT NULL,
+            assigned_by INTEGER,
+            assigned_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (bom_id, category_id),
+            FOREIGN KEY (bom_id) REFERENCES bom(id),
+            FOREIGN KEY (category_id) REFERENCES bom_categories(id),
+            FOREIGN KEY (assigned_by) REFERENCES users(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_bom_categories_project_name
+            ON bom_categories(project_id, name);
+        CREATE INDEX IF NOT EXISTS idx_bom_item_categories_bom
+            ON bom_item_categories(bom_id);
+        CREATE INDEX IF NOT EXISTS idx_bom_item_categories_category
+            ON bom_item_categories(category_id);
+        """
+    )
+
+
+def _migration_20(conn):
+    """Add a non-engineering folder layer for organizing BOM tree occurrences."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS bom_folders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            parent_bom_id INTEGER,
+            parent_folder_id INTEGER,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_by INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (project_id) REFERENCES projects(id),
+            FOREIGN KEY (parent_bom_id) REFERENCES bom(id),
+            FOREIGN KEY (parent_folder_id) REFERENCES bom_folders(id),
+            FOREIGN KEY (created_by) REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS bom_folder_items (
+            folder_id INTEGER NOT NULL,
+            bom_id INTEGER NOT NULL,
+            assigned_by INTEGER,
+            assigned_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (folder_id, bom_id),
+            FOREIGN KEY (folder_id) REFERENCES bom_folders(id),
+            FOREIGN KEY (bom_id) REFERENCES bom(id),
+            FOREIGN KEY (assigned_by) REFERENCES users(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_bom_folders_project_parent
+            ON bom_folders(project_id, parent_bom_id, parent_folder_id, sort_order, id);
+        CREATE INDEX IF NOT EXISTS idx_bom_folder_items_folder
+            ON bom_folder_items(folder_id);
+        CREATE INDEX IF NOT EXISTS idx_bom_folder_items_bom
+            ON bom_folder_items(bom_id);
+        """
+    )
+
+
+def _migration_21(conn):
+    """Add reusable private and project-shared BOM filter definitions."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS bom_saved_filters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            owner_user_id INTEGER NOT NULL,
+            name TEXT NOT NULL COLLATE NOCASE,
+            definition_json TEXT NOT NULL,
+            is_shared INTEGER NOT NULL DEFAULT 0,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(project_id, owner_user_id, name),
+            FOREIGN KEY (project_id) REFERENCES projects(id),
+            FOREIGN KEY (owner_user_id) REFERENCES users(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_bom_saved_filters_visible
+            ON bom_saved_filters(project_id, is_shared, owner_user_id, sort_order);
+        """
+    )
+
+
 MIGRATIONS = {
     1: """
     CREATE TABLE IF NOT EXISTS users (
@@ -604,6 +1013,7 @@ MIGRATIONS = {
         sha256 TEXT DEFAULT NULL,
         size_bytes INTEGER DEFAULT NULL,
         note TEXT DEFAULT NULL,
+        revision TEXT DEFAULT NULL,
         created_by INTEGER DEFAULT NULL,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         FOREIGN KEY (file_id) REFERENCES part_files(id),
@@ -826,6 +1236,22 @@ WHERE r.name = 'designer' AND p.name = 'manage_issues';
 """,
 
     13: _migration_13,
+
+    14: _migration_14,
+
+    15: _migration_15,
+
+    16: _migration_16,
+
+    17: _migration_17,
+
+    18: _migration_18,
+
+    19: _migration_19,
+
+    20: _migration_20,
+
+    21: _migration_21,
 
 }
 

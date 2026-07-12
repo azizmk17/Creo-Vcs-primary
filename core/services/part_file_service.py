@@ -1,18 +1,20 @@
 import hashlib
 import os
-import shutil
 from typing import List, Optional, Tuple
 
+from core.repositories.bom_repository import BomRepository
 from core.repositories.part_file_repository import PartFileRepository
 from core.session_manager import SessionManager
 from core.services.project_service import ProjectService
 from core.models.part_file_model import PartFile
 from core.models.part_file_version_model import PartFileVersion
+from utils import ensure_dir_exists, safe_copy2, safe_exists, safe_open, safe_remove
 
 
 class PartFileService:
     def __init__(self, repo: Optional[PartFileRepository] = None):
         self.repo = repo or PartFileRepository()
+        self.bom_repo = BomRepository()
         self.session = SessionManager()
         self.project_service = ProjectService()
 
@@ -29,7 +31,7 @@ class PartFileService:
 
     def _hash_file_sha256(self, path: str) -> str:
         h = hashlib.sha256()
-        with open(path, "rb") as f:
+        with safe_open(path, "rb") as f:
             for chunk in iter(lambda: f.read(1024 * 1024), b""):
                 h.update(chunk)
         return h.hexdigest()
@@ -49,6 +51,13 @@ class PartFileService:
             return None, None
         project = self.project_service.get_project_by_id(project_id) or {}
         return project.get("root_project_id"), project.get("version_label")
+
+    def _part_revision(self, part_id: int) -> str:
+        try:
+            part = self.bom_repo.get_by_id(int(part_id))
+            return str(getattr(part, "revision", "") or "").strip().upper()
+        except Exception:
+            return ""
 
     def _working_dir_for_root_label(self, root_project_id: Optional[int], version_label: Optional[str]) -> str:
         try:
@@ -89,25 +98,27 @@ class PartFileService:
         description: str,
         source_path: str,
         note: str = "",
+        revision_override: Optional[str] = None,
     ) -> int:
         if not part_id:
             raise ValueError("part_id is required")
         wd = self._working_dir()
         if not wd:
             raise ValueError("Project working directory is not set")
-        if not source_path or not os.path.exists(source_path):
+        if not source_path or not safe_exists(source_path):
             raise ValueError("Source file does not exist")
 
         created_by = self.session.user_id
         root_project_id, project_version_label = self._project_version_context()
+        revision = self._part_revision(part_id) if revision_override is None else str(revision_override or "")
         file_id = self.repo.create_file(part_id, file_type, display_name, description, created_by=created_by)
 
         version_no = 1
         rel_path = self._version_dest_relpath(part_id, file_id, version_no, source_path)
         abs_path = os.path.join(wd, rel_path)
-        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        ensure_dir_exists(os.path.dirname(abs_path))
 
-        shutil.copy2(source_path, abs_path)
+        safe_copy2(source_path, abs_path)
         sha256 = self._hash_file_sha256(abs_path)
         size_bytes = os.path.getsize(abs_path)
 
@@ -119,6 +130,7 @@ class PartFileService:
             sha256=sha256,
             size_bytes=size_bytes,
             note=note,
+            revision=revision,
             created_by=created_by,
             root_project_id=root_project_id,
             project_version_label=project_version_label,
@@ -133,18 +145,19 @@ class PartFileService:
         wd = self._working_dir()
         if not wd:
             raise ValueError("Project working directory is not set")
-        if not source_path or not os.path.exists(source_path):
+        if not source_path or not safe_exists(source_path):
             raise ValueError("Source file does not exist")
 
         created_by = self.session.user_id
         root_project_id, project_version_label = self._project_version_context()
+        revision = self._part_revision(pf.part_id)
         version_no = self.repo.get_next_version_no(file_id)
 
         rel_path = self._version_dest_relpath(pf.part_id, file_id, version_no, source_path)
         abs_path = os.path.join(wd, rel_path)
-        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        ensure_dir_exists(os.path.dirname(abs_path))
 
-        shutil.copy2(source_path, abs_path)
+        safe_copy2(source_path, abs_path)
         sha256 = self._hash_file_sha256(abs_path)
         size_bytes = os.path.getsize(abs_path)
 
@@ -156,12 +169,98 @@ class PartFileService:
             sha256=sha256,
             size_bytes=size_bytes,
             note=note,
+            revision=revision,
             created_by=created_by,
             root_project_id=root_project_id,
             project_version_label=project_version_label,
         )
         self.repo.set_active_version(file_id, version_id)
         return version_id
+
+    def add_new_version_with_revision(
+        self,
+        file_id: int,
+        source_path: str,
+        note: str = "",
+        revision: Optional[str] = None,
+    ) -> int:
+        pf = self.repo.get_file_by_id(file_id)
+        if not pf:
+            raise ValueError("Attachment not found")
+        wd = self._working_dir()
+        if not wd:
+            raise ValueError("Project working directory is not set")
+        if not source_path or not safe_exists(source_path):
+            raise ValueError("Source file does not exist")
+
+        created_by = self.session.user_id
+        root_project_id, project_version_label = self._project_version_context()
+        version_no = self.repo.get_next_version_no(file_id)
+
+        rel_path = self._version_dest_relpath(pf.part_id, file_id, version_no, source_path)
+        abs_path = os.path.join(wd, rel_path)
+        ensure_dir_exists(os.path.dirname(abs_path))
+
+        safe_copy2(source_path, abs_path)
+        sha256 = self._hash_file_sha256(abs_path)
+        size_bytes = os.path.getsize(abs_path)
+
+        version_id = self.repo.add_version(
+            file_id=file_id,
+            version_no=version_no,
+            original_filename=os.path.basename(source_path),
+            vault_rel_path=rel_path,
+            sha256=sha256,
+            size_bytes=size_bytes,
+            note=note,
+            revision=str(revision or ""),
+            created_by=created_by,
+            root_project_id=root_project_id,
+            project_version_label=project_version_label,
+        )
+        self.repo.set_active_version(file_id, version_id)
+        return version_id
+
+    def upsert_part_file_version(
+        self,
+        part_id: int,
+        file_type: str,
+        source_path: str,
+        note: str = "",
+        revision: Optional[str] = None,
+        display_name: Optional[str] = None,
+        description: str = "",
+    ) -> tuple[int, int]:
+        normalized_type = str(file_type or "").strip().upper()
+        if not normalized_type:
+            raise ValueError("file_type is required")
+
+        existing = None
+        for attachment in self.list_attachments(part_id):
+            if str(attachment.file_type or "").strip().upper() == normalized_type:
+                existing = attachment
+                break
+
+        if existing:
+            version_id = self.add_new_version_with_revision(
+                existing.id,
+                source_path,
+                note=note,
+                revision=revision,
+            )
+            return existing.id, version_id
+
+        file_id = self.create_attachment(
+            part_id=part_id,
+            file_type=normalized_type,
+            display_name=display_name or os.path.splitext(os.path.basename(source_path))[0],
+            description=description,
+            source_path=source_path,
+            note=note,
+            revision_override=revision,
+        )
+        active = self.get_active_version(file_id)
+        return file_id, int(active.id) if active else 0
 
     def list_attachments(self, part_id: int) -> List[PartFile]:
         return self.repo.get_files_for_part(part_id)
@@ -183,13 +282,13 @@ class PartFileService:
         # If it still doesn't exist, try hard fallback to A (covers cases where the row says 'B'
         # but the physical file was copied/stored only in A's vault).
         try:
-            if p and not os.path.exists(p):
+            if p and not safe_exists(p):
                 root_id = getattr(version, "root_project_id", None)
                 if root_id:
                     wd_a = self._working_dir_for_root_label(root_id, "A")
                     if wd_a:
                         p_a = os.path.join(wd_a, version.vault_rel_path)
-                        if os.path.exists(p_a):
+                        if safe_exists(p_a):
                             return p_a
         except Exception:
             pass
@@ -230,8 +329,8 @@ class PartFileService:
         if ver:
             abs_path = self.resolve_version_path(ver)
             try:
-                if abs_path and os.path.exists(abs_path):
-                    os.remove(abs_path)
+                if abs_path and safe_exists(abs_path):
+                    safe_remove(abs_path)
             except Exception:
                 pass
 
@@ -252,9 +351,23 @@ class PartFileService:
         for v in versions:
             abs_path = self.resolve_version_path(v)
             try:
-                if abs_path and os.path.exists(abs_path):
-                    os.remove(abs_path)
+                if abs_path and safe_exists(abs_path):
+                    safe_remove(abs_path)
             except Exception:
                 pass
 
         self.repo.delete_file(file_id)
+
+    def update_version_revision(self, version_id: int, revision: str):
+        self.repo.update_version_metadata(
+            int(version_id),
+            revision=str(revision or "").strip().upper(),
+            update_revision=True,
+        )
+
+    def update_version_note(self, version_id: int, note: str):
+        self.repo.update_version_metadata(
+            int(version_id),
+            note=str(note or "").strip(),
+            update_note=True,
+        )

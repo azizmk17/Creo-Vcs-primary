@@ -1,6 +1,6 @@
 """core/workspace_config.py
 --------------------------
-Startup workspace resolver for CreoVCS.
+Startup workspace resolver for Nexus.
 
 Responsibilities
 ----------------
@@ -189,7 +189,7 @@ def prompt_workspace(parent=None) -> Optional[Path]:
             "Invalid Workspace",
             f"The selected folder does not contain '{_DB_FILENAME}'.\n\n"
             f"Path: {chosen}\n\n"
-            "Please choose a folder that already contains the CreoVCS database.",
+            "Please choose a folder that already contains the Nexus database.",
         )
         logger.warning(
             "workspace_config: selected folder '%s' does not contain %s.",

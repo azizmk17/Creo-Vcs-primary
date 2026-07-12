@@ -8,6 +8,7 @@ class BomRepository:
         self.db_name = db_name
         self._ensure_metadata_columns()
         self._ensure_plm_columns()
+        self._ensure_category_schema()
 
     def get_conn(self):
         conn = sqlite3.connect(self.db_name)
@@ -41,6 +42,39 @@ class BomRepository:
                 if "released_at" not in cols:
                     conn.execute("ALTER TABLE bom ADD COLUMN released_at TEXT")
         except Exception:
+            pass
+
+    def _ensure_category_schema(self):
+        """Keep category storage available when a repository starts before migrations run."""
+        try:
+            with self.get_conn() as conn:
+                conn.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS bom_categories (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        project_id INTEGER NOT NULL,
+                        name TEXT NOT NULL COLLATE NOCASE,
+                        created_by INTEGER,
+                        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        UNIQUE(project_id, name)
+                    );
+                    CREATE TABLE IF NOT EXISTS bom_item_categories (
+                        bom_id INTEGER NOT NULL,
+                        category_id INTEGER NOT NULL,
+                        assigned_by INTEGER,
+                        assigned_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        PRIMARY KEY (bom_id, category_id)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_bom_categories_project_name
+                        ON bom_categories(project_id, name);
+                    CREATE INDEX IF NOT EXISTS idx_bom_item_categories_bom
+                        ON bom_item_categories(bom_id);
+                    CREATE INDEX IF NOT EXISTS idx_bom_item_categories_category
+                        ON bom_item_categories(category_id);
+                    """
+                )
+        except Exception:
+            # Startup migration remains the source of truth; do not block the app here.
             pass
 
     @staticmethod
@@ -161,7 +195,7 @@ class BomRepository:
         project_id: int,
         preferred_user_id: Optional[int] = None,
     ) -> Optional[Bom]:
-        """Project-scoped BOM lookup that prefers the part checked-in by preferred_user_id.
+        """Project-scoped BOM lookup that prefers the part checked out by preferred_user_id.
 
         This avoids selecting the wrong BOM row when the same base_file_name exists more
         than once (e.g., after versioning/duplication).
@@ -186,6 +220,31 @@ class BomRepository:
             if row:
                 return Bom(**row)
             return None
+
+    def get_all_by_base_file_name_for_commit(
+        self,
+        base_file_name: str,
+        project_id: int,
+        preferred_user_id: Optional[int] = None,
+    ) -> List[Bom]:
+        """Return every BOM row in this project that shares the same CAD base file."""
+        with self.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT b.*
+                FROM bom b
+                LEFT JOIN locks l ON l.part_id = b.id
+                WHERE b.base_file_name = ? AND b.project_id = ?
+                ORDER BY
+                    CASE WHEN l.user_id = ? THEN 1 ELSE 0 END DESC,
+                    CASE WHEN l.user_id IS NOT NULL THEN 1 ELSE 0 END DESC,
+                    b.id ASC
+                """,
+                (base_file_name, project_id, preferred_user_id),
+            )
+            rows = cur.fetchall()
+            return [Bom(**row) for row in rows]
         
     def get_by_drawing_file_name(self, base_drw_name: str) -> Optional[Bom]:
         with self.get_conn() as conn:
@@ -231,6 +290,214 @@ class BomRepository:
             rows = cur.fetchall()
             return [Bom(**row) for row in rows]
 
+    def get_project_ids(self, project_id: int) -> List[int]:
+        """Return the lightweight project membership used by the lazy BOM index."""
+        with self.get_conn() as conn:
+            rows = conn.execute(
+                "SELECT id FROM bom WHERE project_id=? ORDER BY id",
+                (int(project_id),),
+            ).fetchall()
+            return [int(row["id"]) for row in rows]
+
+    def get_many(self, project_id: int, bom_ids) -> List[Bom]:
+        """Fetch full BOM rows only for the level currently being displayed."""
+        ids = []
+        seen = set()
+        for raw_id in bom_ids or []:
+            try:
+                bom_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if bom_id not in seen:
+                seen.add(bom_id)
+                ids.append(bom_id)
+        if not ids:
+            return []
+        fetched = []
+        with self.get_conn() as conn:
+            for offset in range(0, len(ids), 800):
+                chunk = ids[offset:offset + 800]
+                placeholders = ",".join("?" for _ in chunk)
+                fetched.extend(conn.execute(
+                    f"SELECT * FROM bom WHERE project_id=? AND id IN ({placeholders})",
+                    [int(project_id), *chunk],
+                ).fetchall())
+        by_id = {int(row["id"]): Bom(**row) for row in fetched}
+        return [by_id[bom_id] for bom_id in ids if bom_id in by_id]
+
+    def search_project(self, project_id: int, query: str, limit: int | None = None) -> List[Bom]:
+        """Search in SQLite so typing does not deserialize the whole BOM."""
+        value = str(query or "").strip()
+        sql = """
+                SELECT * FROM bom
+                WHERE project_id=?
+                  AND (
+                    instr(lower(COALESCE(aes_number, '')), lower(?)) > 0 OR
+                    instr(lower(COALESCE(name, '')), lower(?)) > 0 OR
+                    instr(lower(COALESCE(part_number, '')), lower(?)) > 0
+                  )
+                ORDER BY id
+              """
+        params = [int(project_id), value, value, value]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(1, int(limit)))
+        with self.get_conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            return [Bom(**row) for row in rows]
+
+    # -------------------------------
+    # PROJECT CATEGORIES
+    # -------------------------------
+    @staticmethod
+    def _clean_category_name(name: str) -> str:
+        value = " ".join(str(name or "").split())
+        if not value:
+            raise ValueError("Category name is required.")
+        if len(value) > 80:
+            raise ValueError("Category name must be 80 characters or fewer.")
+        return value
+
+    def list_categories(self, project_id: int) -> List[dict]:
+        with self.get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT c.id, c.project_id, c.name, c.created_by, c.created_at,
+                       COUNT(ic.bom_id) AS item_count
+                FROM bom_categories c
+                LEFT JOIN bom_item_categories ic ON ic.category_id=c.id
+                WHERE c.project_id=?
+                GROUP BY c.id
+                ORDER BY lower(c.name), c.id
+                """,
+                (int(project_id),),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_categories_for_bom(self, bom_id: int) -> List[str]:
+        with self.get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT c.name
+                FROM bom_item_categories ic
+                JOIN bom_categories c ON c.id=ic.category_id
+                WHERE ic.bom_id=?
+                ORDER BY lower(c.name), c.id
+                """,
+                (int(bom_id),),
+            ).fetchall()
+            return [str(row["name"]) for row in rows]
+
+    def get_categories_for_boms(self, bom_ids) -> dict:
+        ids = sorted({int(bom_id) for bom_id in (bom_ids or []) if bom_id is not None})
+        if not ids:
+            return {}
+        fetched = []
+        with self.get_conn() as conn:
+            for offset in range(0, len(ids), 800):
+                chunk = ids[offset:offset + 800]
+                placeholders = ",".join("?" for _ in chunk)
+                fetched.extend(conn.execute(
+                    f"""
+                    SELECT ic.bom_id, c.name
+                    FROM bom_item_categories ic
+                    JOIN bom_categories c ON c.id=ic.category_id
+                    WHERE ic.bom_id IN ({placeholders})
+                    ORDER BY lower(c.name), c.id
+                    """,
+                    chunk,
+                ).fetchall())
+        result = {bom_id: [] for bom_id in ids}
+        for row in fetched:
+            result.setdefault(int(row["bom_id"]), []).append(str(row["name"]))
+        return result
+
+    def set_categories_for_bom(self, bom_id: int, project_id: int, category_names, assigned_by=None) -> List[str]:
+        cleaned_names = []
+        seen = set()
+        for raw_name in category_names or []:
+            name = self._clean_category_name(raw_name)
+            key = name.casefold()
+            if key not in seen:
+                seen.add(key)
+                cleaned_names.append(name)
+
+        with self.get_conn() as conn:
+            part = conn.execute(
+                "SELECT id FROM bom WHERE id=? AND project_id=?",
+                (int(bom_id), int(project_id)),
+            ).fetchone()
+            if not part:
+                raise ValueError("BOM item was not found in the current project.")
+
+            conn.execute("DELETE FROM bom_item_categories WHERE bom_id=?", (int(bom_id),))
+            for name in cleaned_names:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO bom_categories(project_id, name, created_by)
+                    VALUES(?,?,?)
+                    """,
+                    (int(project_id), name, assigned_by),
+                )
+                category = conn.execute(
+                    "SELECT id, name FROM bom_categories WHERE project_id=? AND name=? COLLATE NOCASE",
+                    (int(project_id), name),
+                ).fetchone()
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO bom_item_categories(bom_id, category_id, assigned_by)
+                    VALUES(?,?,?)
+                    """,
+                    (int(bom_id), int(category["id"]), assigned_by),
+                )
+
+        return self.get_categories_for_bom(int(bom_id))
+
+    def get_category_usage(self, project_id: int, category_id: int) -> dict:
+        with self.get_conn() as conn:
+            category = conn.execute(
+                "SELECT id, project_id, name FROM bom_categories WHERE id=? AND project_id=?",
+                (int(category_id), int(project_id)),
+            ).fetchone()
+            if not category:
+                raise ValueError("Category was not found in the current project.")
+            parts = conn.execute(
+                """
+                SELECT b.id, b.name, b.aes_number, b.part_number, b.type
+                FROM bom_item_categories ic
+                JOIN bom b ON b.id=ic.bom_id
+                WHERE ic.category_id=? AND b.project_id=?
+                ORDER BY lower(COALESCE(b.aes_number, '')), lower(b.name), b.id
+                """,
+                (int(category_id), int(project_id)),
+            ).fetchall()
+            return {"category": dict(category), "parts": [dict(row) for row in parts]}
+
+    def delete_category(self, project_id: int, category_id: int) -> dict:
+        with self.get_conn() as conn:
+            category = conn.execute(
+                "SELECT id, project_id, name FROM bom_categories WHERE id=? AND project_id=?",
+                (int(category_id), int(project_id)),
+            ).fetchone()
+            if not category:
+                raise ValueError("Category was not found in the current project.")
+            parts = conn.execute(
+                """
+                SELECT b.id, b.name, b.aes_number, b.part_number, b.type
+                FROM bom_item_categories ic
+                JOIN bom b ON b.id=ic.bom_id
+                WHERE ic.category_id=? AND b.project_id=?
+                ORDER BY lower(COALESCE(b.aes_number, '')), lower(b.name), b.id
+                """,
+                (int(category_id), int(project_id)),
+            ).fetchall()
+            conn.execute("DELETE FROM bom_item_categories WHERE category_id=?", (int(category_id),))
+            conn.execute(
+                "DELETE FROM bom_categories WHERE id=? AND project_id=?",
+                (int(category_id), int(project_id)),
+            )
+            return {"category": dict(category), "parts": [dict(row) for row in parts]}
+
     # -------------------------------
     # UPDATE
     # -------------------------------
@@ -268,7 +535,7 @@ class BomRepository:
             cur = conn.cursor()
             cur.execute("""
                 UPDATE bom
-                SET locked = 1
+                SET locked = 0
                 WHERE id=?
             """, (
                 id,
@@ -279,7 +546,7 @@ class BomRepository:
             cur = conn.cursor()
             cur.execute("""
                 UPDATE bom
-                SET locked = 0
+                SET locked = 1
                 WHERE id=?
             """, (
                 id,
@@ -291,6 +558,32 @@ class BomRepository:
     def delete(self, bom_id: int):
         with self.get_conn() as conn:
             cur = conn.cursor()
+            cur.execute("DELETE FROM bom_item_categories WHERE bom_id=?", (bom_id,))
+            try:
+                cur.execute("DELETE FROM bom_folder_items WHERE bom_id=?", (bom_id,))
+                folder_ids = []
+
+                def collect_folder(folder_id: int):
+                    folder_ids.append(int(folder_id))
+                    rows = cur.execute(
+                        "SELECT id FROM bom_folders WHERE parent_folder_id=?", (int(folder_id),)
+                    ).fetchall()
+                    for row in rows:
+                        collect_folder(int(row["id"]))
+
+                roots = cur.execute(
+                    "SELECT id FROM bom_folders WHERE parent_bom_id=?", (int(bom_id),)
+                ).fetchall()
+                for row in roots:
+                    collect_folder(int(row["id"]))
+                if folder_ids:
+                    placeholders = ",".join("?" for _ in folder_ids)
+                    cur.execute(
+                        f"DELETE FROM bom_folder_items WHERE folder_id IN ({placeholders})", folder_ids
+                    )
+                    cur.execute(f"DELETE FROM bom_folders WHERE id IN ({placeholders})", folder_ids)
+            except sqlite3.OperationalError:
+                pass
             cur.execute("DELETE FROM bom WHERE id=?", (bom_id,))
 
     

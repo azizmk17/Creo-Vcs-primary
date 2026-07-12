@@ -1,5 +1,5 @@
 # creovcs.spec
-# PyInstaller spec for CreoVCS v2.0
+# PyInstaller spec for Nexus v2.0
 #
 # BUILD WORKFLOW
 # --------------
@@ -23,7 +23,7 @@ ROOT      = os.path.dirname(os.path.abspath(SPEC))
 OBFDIR    = os.path.join(ROOT, 'dist_obf')
 ASSETS    = os.path.join(ROOT, 'assets', 'pictures')
 QSS       = os.path.join(ROOT, 'modern_theme.qss')
-ICON      = os.path.join(ROOT, 'assets', 'pictures', 'creovcs_logo-main.ico')
+ICON      = os.path.join(ROOT, 'assets', 'pictures', 'nexus_logo.ico')
 
 # ---------------------------------------------------------------------------
 # PyArmor runtime — glob because the folder name contains a random suffix
@@ -154,6 +154,9 @@ hidden = [
     'cryptography.hazmat.primitives.asymmetric.ed25519',
     'cryptography.hazmat.backends',
     'cryptography.exceptions',
+    'openpyxl',
+    'openpyxl.styles',
+    'openpyxl.utils',
 
     # ── Windows-only stdlib (used by machine.py for machine-ID binding) ───
     'winreg',
@@ -211,7 +214,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='CreoVCS',
+    name='Nexus',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

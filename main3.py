@@ -1,10 +1,9 @@
 import sys
-from PyQt5.QtWidgets import QLabel, QDialog , QInputDialog, QApplication, QMainWindow, QSystemTrayIcon, QStackedWidget, QAction, QToolBar, QMessageBox, QComboBox, QGraphicsBlurEffect, QFileDialog
-from PyQt5.QtCore import Qt, QTimer, QPropertyAnimation, pyqtSignal, QObject, QThread
+from PyQt5.QtWidgets import QLabel, QInputDialog, QApplication, QMainWindow, QSystemTrayIcon, QStackedWidget, QAction, QToolBar, QMessageBox, QComboBox, QFileDialog, QProgressBar
+from PyQt5.QtCore import Qt, QTimer, QPropertyAnimation, pyqtSignal, QObject, QThread, QEventLoop
 from PyQt5.QtGui import QPainter, QColor, QPen, QPixmap, QFont, QIcon
-from PyQt5.QtWidgets import QWidget, QVBoxLayout
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QPushButton
 import math
-import random
 import os
 
 
@@ -19,6 +18,12 @@ def _resource_path(relative: str) -> str:
     return os.path.join(base, relative)
 
 
+APP_NAME = "Nexus"
+APP_ICON_PATH = "assets/pictures/nexus_logo.ico"
+APP_LOADER_LOGO_PATH = "assets/pictures/nexus_logo_glow.png"
+APP_TOOLBAR_LOGO_PATH = "assets/pictures/nexus_logo_glow.png"
+
+
 def _run_migrations_safely():
     try:
         from setup.migrations import migrate
@@ -30,13 +35,7 @@ def _run_migrations_safely():
 
 
 
-#import pages
-from pages.bom_page import BomPage
-from pages.commit_page import CommitPage
-from pages.issue_page import EngineeringIssuePage
-from pages.diag_page import DiagPage
-from pages.admin_page import AdminPage
-from pages.snapshot_page import SnapshotPage
+# Import the startup screen eagerly; heavy application pages are loaded after login.
 from pages.login_page import LoginPage
 from pages.dialogs.progress_dialog import ProgressDialog
 
@@ -52,203 +51,96 @@ from core.repositories.user_repository import UserRepository
 from core.services.project_service import ProjectService
 from core.services.ui_permission import UIPermissionHelper
 from core.session_manager import SessionManager
+from core.startup_gate import MINIMUM_STARTUP_LOADER_MS, StartupGate
 
 
 class AdvancedSpinner(QWidget):
     def __init__(self, logo_path=None, parent=None):
         super().__init__(parent)
-        self.setFixedSize(300, 300)  # bigger spinner
+        self.setFixedSize(180, 180)
         self.angle = 0
-        self.timer = QTimer()
+        self.timer = QTimer(self)
         self.timer.timeout.connect(self.rotate)
-        self.timer.start(16)  # ~60fps
+        self.timer.start(33)
 
-        # Load logo
-        self.logo = QPixmap(logo_path).scaled(120, 120, Qt.KeepAspectRatio, Qt.SmoothTransformation) if logo_path else None
-
-        # Floating particles
-        self.particles = []
-        for _ in range(30):  # more particles for bigger size
-            self.particles.append({
-                "angle": random.uniform(0, 360),
-                "radius": random.uniform(120, 150),
-                "size": random.uniform(3, 6),
-                "speed": random.uniform(0.5, 1.2)
-            })
+        self.logo = QPixmap(logo_path).scaled(
+            128, 128, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        ) if logo_path else None
 
     def rotate(self):
-        self.angle = (self.angle + 4) % 360
-        for p in self.particles:
-            p["angle"] = (p["angle"] + p["speed"]) % 360
+        self.angle = (self.angle + 7) % 360
         self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         center = self.rect().center()
-        radius = min(self.width(), self.height()) / 2 - 30
+        radius = min(self.width(), self.height()) / 2 - 18
 
-        # Gradient rotating trail
-        for i in range(15):  # more points
-            color = QColor.fromHsv((self.angle + i*15) % 360, 200, 255)
-            color.setAlphaF(i / 15)
-            painter.setPen(QPen(color, 8, Qt.SolidLine, Qt.RoundCap))
-            angle_rad = math.radians((self.angle + i * 24) % 360)
+        for i in range(10):
+            color = QColor(37, 99, 235)
+            color.setAlpha(35 + i * 20)
+            painter.setPen(QPen(color, 6, Qt.SolidLine, Qt.RoundCap))
+            angle_rad = math.radians((self.angle + i * 28) % 360)
             x = center.x() + math.cos(angle_rad) * radius
             y = center.y() + math.sin(angle_rad) * radius
             painter.drawPoint(int(x), int(y))
 
-        # Floating particles
-        for p in self.particles:
-            angle_rad = math.radians(p["angle"])
-            x = center.x() + math.cos(angle_rad) * p["radius"]
-            y = center.y() + math.sin(angle_rad) * p["radius"]
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(100, 200, 255, 150))
-            painter.drawEllipse(int(x), int(y), int(p["size"]), int(p["size"]))
-
-        # Pulsing and glowing logo (slower pulse)
         if self.logo:
-            scale = 1 + 0.03 * math.sin(math.radians(self.angle*1.5))
-            w, h = self.logo.width() * scale, self.logo.height() * scale
-            logo_scaled = self.logo.scaled(int(w), int(h), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            logo_rect = logo_scaled.rect()
+            logo_rect = self.logo.rect()
             logo_rect.moveCenter(center)
-
-            glow_color = QColor(50, 150, 255, 100)
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(glow_color)
-            painter.drawEllipse(logo_rect.center(), int(w/1.5), int(h/1.5))
-
-            painter.drawPixmap(logo_rect, logo_scaled)
-
+            painter.drawPixmap(logo_rect, self.logo)
 
 class AdvancedLoader(QWidget):
-    def __init__(self, logo_path=None):
-        super().__init__()
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setFixedSize(480, 480)  # bigger window
+    def __init__(self, logo_path=None, parent=None):
+        super().__init__(parent)
+        self.setObjectName("startupLoader")
 
-        # Frosted glass background
-        self.background = QWidget(self)
-        self.background.setStyleSheet("""
-            background-color: rgba(30, 30, 30, 180);
-            border-radius: 30px;
-        """)
-        self.background.setGeometry(0, 0, 480, 480)
-        blur = QGraphicsBlurEffect()
-        blur.setBlurRadius(20)
-        self.background.setGraphicsEffect(blur)
-
-        layout = QVBoxLayout()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(40, 40, 40, 40)
         layout.setAlignment(Qt.AlignCenter)
-        layout.setSpacing(20)
+        layout.setSpacing(14)
 
-        # Spinner
         self.spinner = AdvancedSpinner(logo_path)
-        layout.addWidget(self.spinner)
+        layout.addWidget(self.spinner, 0, Qt.AlignCenter)
 
-        # Animated loading text with dots
-        self.loading_label = QLabel("Loading VCS", self)
+        self.loading_label = QLabel(f"Preparing {APP_NAME}", self)
         self.loading_label.setAlignment(Qt.AlignCenter)
-        self.loading_label.setStyleSheet("color: white; font: bold 18px;")
-        self.loading_label.setFont(QFont("Segoe UI", 16))
+        self.loading_label.setObjectName("loaderTitle")
+        self.loading_label.setFont(QFont("Segoe UI", 18, QFont.Bold))
         layout.addWidget(self.loading_label)
 
-        self.setLayout(layout)
+        self.detail_label = QLabel("Checking application data...", self)
+        self.detail_label.setAlignment(Qt.AlignCenter)
+        self.detail_label.setObjectName("loaderDetail")
+        layout.addWidget(self.detail_label)
 
-        # Fade-in animation
-        self.fade_in = QPropertyAnimation(self, b"windowOpacity")
-        self.fade_in.setDuration(500)
-        self.fade_in.setStartValue(0)
-        self.fade_in.setEndValue(1)
-        self.fade_in.start()
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedWidth(320)
+        self.progress.setFixedHeight(5)
+        layout.addWidget(self.progress, 0, Qt.AlignCenter)
 
-        # Animate loading dots
-        self.dot_count = 0
-        self.dot_timer = QTimer()
-        self.dot_timer.timeout.connect(self.animate_dots)
-        self.dot_timer.start(500)  # slower dot animation
+        self.setStyleSheet(
+            """
+            QWidget#startupLoader { background: #f3f6fa; }
+            QLabel#loaderTitle { color: #16263d; }
+            QLabel#loaderDetail { color: #66758a; font-size: 13px; }
+            QProgressBar {
+                border: none;
+                border-radius: 2px;
+                background: #dbe4ef;
+            }
+            QProgressBar::chunk {
+                border-radius: 2px;
+                background: #2563eb;
+            }
+            """
+        )
 
-        # Minimum splash duration (show loader first, then UI).
-        self._min_splash_ms = 2000
-
-        # Run migrations in background; don't delay UI.
-        QTimer.singleShot(0, self._start_migrations)
-
-        # Show UI after a minimum delay.
-        QTimer.singleShot(self._min_splash_ms, self.open_main)
-
-        self._closing = False
-        self._migrate_thread = None
-        self._migrate_worker = None
-
-    def _start_migrations(self):
-        try:
-            if self._migrate_thread is not None:
-                return
-        except Exception:
-            pass
-
-        self._migrate_thread = QThread(self)
-        self._migrate_worker = _MigrateWorker()
-        self._migrate_worker.moveToThread(self._migrate_thread)
-        self._migrate_thread.started.connect(self._migrate_worker.run)
-        self._migrate_worker.finished.connect(self._migrate_thread.quit)
-        self._migrate_worker.finished.connect(self._migrate_worker.deleteLater)
-        self._migrate_thread.finished.connect(self._migrate_thread.deleteLater)
-        self._migrate_thread.start()
-
-    def animate_dots(self):
-        self.dot_count = (self.dot_count + 1) % 4
-        self.loading_label.setText("Loading VCS" + "." * self.dot_count)
-
-    def finish_loading(self):
-        if getattr(self, "_closing", False):
-            return
-        self._closing = True
-        self.fade_out = QPropertyAnimation(self, b"windowOpacity")
-        self.fade_out.setDuration(500)
-        self.fade_out.setStartValue(1)
-        self.fade_out.setEndValue(0)
-        self.fade_out.finished.connect(self.close)
-        self.fade_out.start()
-
-    def open_main(self):
-        # Create/show the main window while the loader remains visible.
-        try:
-            self.main_page = BomGUI()
-            self.main_page.show()
-        except Exception:
-            # If something goes wrong, still close the loader.
-            try:
-                self.close()
-            except Exception:
-                pass
-            raise
-
-        should_wait_for_bom = False
-        try:
-            session = getattr(self.main_page, "session", None)
-            should_wait_for_bom = bool(session and getattr(session, "project_id", None))
-        except Exception:
-            should_wait_for_bom = False
-
-        if should_wait_for_bom:
-            # Keep loader until the BOM tree finishes its initial load.
-            try:
-                bom_page = getattr(self.main_page, "bom_page", None)
-                if bom_page is not None and hasattr(bom_page, "initial_tree_ready"):
-                    bom_page.initial_tree_ready.connect(self.finish_loading)
-            except Exception:
-                pass
-
-            # Fallback: never block forever.
-            QTimer.singleShot(8000, self.finish_loading)
-        else:
-            # No project loaded (or login needed): don't block the UI.
-            QTimer.singleShot(0, self.finish_loading)
+    def set_status(self, message):
+        self.detail_label.setText(message)
 
 
 class _MigrateWorker(QObject):
@@ -257,6 +149,100 @@ class _MigrateWorker(QObject):
     def run(self):
         _run_migrations_safely()
         self.finished.emit()
+
+
+class StartupWindow(QMainWindow):
+    """Hosts login and startup progress in one stable, full-size window."""
+
+    def __init__(self, logo_path=None):
+        super().__init__()
+        self.setWindowTitle(APP_NAME)
+        self.resize(1400, 900)
+        self.setWindowIcon(QIcon(_resource_path(APP_ICON_PATH)))
+
+        self.pages = QStackedWidget()
+        self.setCentralWidget(self.pages)
+        self.login_page = LoginPage()
+        self.loader_page = AdvancedLoader(logo_path)
+        self.pages.addWidget(self.login_page)
+        self.pages.addWidget(self.loader_page)
+        self.pages.setCurrentWidget(self.login_page)
+
+        self.main_page = None
+        self._migrate_thread = None
+        self._migrate_worker = None
+        self._main_shown = False
+        self._startup_gate = StartupGate()
+        self._minimum_loader_timer = QTimer(self)
+        self._minimum_loader_timer.setSingleShot(True)
+        self._minimum_loader_timer.setTimerType(Qt.PreciseTimer)
+        self._minimum_loader_timer.timeout.connect(self._on_minimum_loader_elapsed)
+        self.login_page.login_succeeded.connect(self.begin_loading)
+
+    def begin_loading(self):
+        self.pages.setCurrentWidget(self.loader_page)
+        self._startup_gate.reset()
+        self.loader_page.set_status("Checking database migrations...")
+        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+        # Measure the minimum from the first painted loader frame.
+        self._minimum_loader_timer.start(MINIMUM_STARTUP_LOADER_MS)
+
+        self._migrate_thread = QThread(self)
+        self._migrate_worker = _MigrateWorker()
+        self._migrate_worker.moveToThread(self._migrate_thread)
+        self._migrate_thread.started.connect(self._migrate_worker.run)
+        self._migrate_worker.finished.connect(self._migrate_thread.quit)
+        self._migrate_worker.finished.connect(self._migrate_worker.deleteLater)
+        self._migrate_thread.finished.connect(self._migrate_thread.deleteLater)
+        self._migrate_thread.finished.connect(self._build_main_window)
+        self._migrate_thread.start()
+
+    def _set_loading_status(self, message):
+        self.loader_page.set_status(message)
+        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+
+    def _build_main_window(self):
+        self._set_loading_status("Preparing application services...")
+        try:
+            self.main_page = BomGUI(startup_progress=self._set_loading_status)
+        except Exception as exc:
+            self._minimum_loader_timer.stop()
+            self._startup_gate.reset()
+            QMessageBox.critical(self, "Startup Error", f"{APP_NAME} could not start:\n\n{exc}")
+            self.pages.setCurrentWidget(self.login_page)
+            self.login_page._set_busy(False)
+            raise
+
+        self._set_loading_status("Loading the initial BOM...")
+        if not getattr(self.main_page.session, "project_id", None):
+            self._mark_page_ready()
+            return
+        bom_page = self.main_page.bom_page
+        bom_page.initial_tree_ready.connect(self._mark_page_ready)
+        # The page may have become ready while BomGUI was being built and
+        # processing startup events, before this signal was connected.
+        if bool(bom_page.initial_tree_is_ready):
+            self._mark_page_ready()
+
+    def _on_minimum_loader_elapsed(self):
+        if self._startup_gate.mark_minimum_elapsed():
+            self.show_main_window()
+
+    def _mark_page_ready(self):
+        self.loader_page.set_status("Application ready...")
+        if self._startup_gate.mark_page_ready():
+            self.show_main_window()
+
+    def show_main_window(self):
+        if self._main_shown or self.main_page is None or not self._startup_gate.released:
+            return
+        self._main_shown = True
+        self.main_page.setGeometry(self.geometry())
+        if self.isMaximized():
+            self.main_page.showMaximized()
+        else:
+            self.main_page.show()
+        self.close()
 
 
 class Notifier(QObject):
@@ -276,11 +262,11 @@ _PRODUCTION_PUBLIC_KEY = "fc941ecde885df70bfdcd71498d80fa8cfa7fe340c40c2292bbfc2
 class BomGUI(QMainWindow):
     """Modern BOM Management Application with Toolbar Navigation"""
 
-    def __init__(self):
+    def __init__(self, startup_progress=None):
         super().__init__()
-        self.setWindowTitle("BOM Manager - CreoVCS")
+        self.setWindowTitle(f"BOM Manager - {APP_NAME}")
         self.resize(1400, 900)
-        self.setWindowIcon(QIcon(_resource_path("assets/pictures/creovcs_logo-main.ico")))
+        self.setWindowIcon(QIcon(_resource_path(APP_ICON_PATH)))
 
         self.session = SessionManager()
         self.user_repo = UserRepository()
@@ -289,6 +275,7 @@ class BomGUI(QMainWindow):
         self.project_service = ProjectService()
 
         self._project_combo_initializing = False
+        self._projects_for_user = []
         self._ensure_valid_current_project()
 
         # Toolbar with navigation
@@ -297,7 +284,7 @@ class BomGUI(QMainWindow):
         # Status bar
         self.statusBar().showMessage("Ready")
 
-        self._build_ui()
+        self._build_ui(startup_progress=startup_progress)
 
     def _ensure_valid_current_project(self):
         """If the session points to a missing project directory, clear it and continue startup."""
@@ -353,18 +340,30 @@ class BomGUI(QMainWindow):
         # --- 4️⃣ Refresh display ---
         self.update()
 
-    def _build_ui(self):
+    def _build_ui(self, startup_progress=None):
          # Central stacked pages
         self.pages = QStackedWidget()
         self.setCentralWidget(self.pages)
 
+        def startup_stage(message):
+            if startup_progress:
+                startup_progress(message)
+
         # Add pages
+        startup_stage("Loading BOM workspace...")
+        from pages.bom_page import BomPage
         self.bom_page = BomPage(self.bom_service)
+        startup_stage("Loading commit workspace...")
+        from pages.commit_page import CommitPage
         self.commit_page = CommitPage(self.bom_service)
+        startup_stage("Loading engineering issues...")
+        from pages.issue_page import EngineeringIssuePage
         self.issue_page = EngineeringIssuePage()
-        self.diag_page = DiagPage()
-        self.admin_page = AdminPage()
-        self.snap_page = SnapshotPage()
+        startup_stage("Preparing secondary tools...")
+        self.diag_page = self._lazy_page_placeholder("Diagnostic")
+        self.admin_page = self._lazy_page_placeholder("Admin")
+        self.snap_page = self._lazy_page_placeholder("Snapshots")
+        startup_stage("Connecting application modules...")
         self.pages.addWidget(self.bom_page)
         self.pages.addWidget(self.commit_page)
         self.pages.addWidget(self.issue_page)
@@ -408,8 +407,17 @@ class BomGUI(QMainWindow):
         # Version update notification — runs after the window is fully visible.
         QTimer.singleShot(500, self._check_version_notification)
 
+    def _lazy_page_placeholder(self, label):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setAlignment(Qt.AlignCenter)
+        msg = QLabel(f"{label} will load when opened.")
+        msg.setStyleSheet("font-size: 14px; color: #66758a;")
+        layout.addWidget(msg)
+        return page
+
     def _check_version_notification(self):
-        """Show a popup dialog if a newer CreoVCS version is available in the DB."""
+        """Show a popup dialog if a newer Nexus version is available in the DB."""
         try:
             import os as _os
             from core.licensing.version_check import check_version_notification
@@ -435,6 +443,16 @@ class BomGUI(QMainWindow):
         toolbar = QToolBar("Main Toolbar")
         toolbar.setMovable(False)
         self.addToolBar(Qt.TopToolBarArea, toolbar)
+
+        logo_label = QLabel()
+        logo = QPixmap(_resource_path(APP_TOOLBAR_LOGO_PATH))
+        if not logo.isNull():
+            logo_label.setPixmap(logo.scaled(34, 34, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        logo_label.setFixedSize(42, 36)
+        logo_label.setAlignment(Qt.AlignCenter)
+        logo_label.setToolTip(APP_NAME)
+        logo_label.setStyleSheet("padding: 0 4px;")
+        toolbar.addWidget(logo_label)
 
         # Navigation buttons
         bom_action = QAction("BOM", self)
@@ -490,60 +508,183 @@ class BomGUI(QMainWindow):
 
         toolbar.addSeparator()
 
-        # === Project Selector Combo ===
+        # === Project / Version Selectors ===
         self.project_combo = QComboBox()
-        projects = self.project_service.get_projects_for_user(self.session.user_id)
-        if not projects:
-            self.project_combo.addItem("No Projects")
-            self.project_combo.setEnabled(False)
-        else:
-            self.project_combo.setEnabled(True)
+        self.project_combo.currentIndexChanged.connect(self._on_project_root_changed)
+        self.project_combo.setMinimumWidth(210)
+        self.project_combo.setMaximumWidth(270)
 
-            # If no current project (or it was cleared), show a placeholder.
-            if not self.session.project_id:
-                self.project_combo.addItem("Select a project...", None)
+        self.project_version_combo = QComboBox()
+        self.project_version_combo.currentIndexChanged.connect(self.save_current_project)
+        self.project_version_combo.setMinimumWidth(90)
+        self.project_version_combo.setMaximumWidth(130)
 
-            for project in projects:
-                # New schema: project may include root_name + version_label
-                pid = project.get("id")
-                name = project.get("name")
-                root_name = project.get("root_name")
-                version_label = project.get("version_label")
-                if root_name and version_label:
-                    label = f"{root_name} ({version_label})"
-                else:
-                    label = str(name or pid)
-                self.project_combo.addItem(label, pid)
-
-            # Set selection to current project if present.
-            if self.session.project_id:
-                idx = self.project_combo.findData(self.session.project_id)
-                if idx >= 0:
-                    self.project_combo.setCurrentIndex(idx)
-            else:
-                try:
-                    self.project_combo.setCurrentIndex(0)
-                except Exception:
-                    pass
-
-        self.project_combo.currentIndexChanged.connect(self.save_current_project)
-        toolbar.addWidget(QLabel("  Project: "))
+        project_caption = QLabel("Project")
+        project_caption.setStyleSheet("color: #e5e7eb; font-weight: 700; padding-left: 6px;")
+        toolbar.addWidget(project_caption)
         toolbar.addWidget(self.project_combo)
+
+        version_caption = QLabel("Version")
+        version_caption.setStyleSheet("color: #e5e7eb; font-weight: 700; padding-left: 6px;")
+        toolbar.addWidget(version_caption)
+        toolbar.addWidget(self.project_version_combo)
+
+        new_version_button = QPushButton("Create New Version")
+        new_version_button.setCursor(Qt.PointingHandCursor)
+        new_version_button.setStyleSheet("""
+            QPushButton {
+                min-height: 26px;
+                padding: 3px 10px;
+                border-radius: 5px;
+                background: #ffffff;
+                border: 1px solid #cfd6df;
+                color: #111827;
+                font-weight: 700;
+            }
+            QPushButton:hover { background: #f3f5f7; }
+        """)
+        new_version_button.clicked.connect(self.show_new_version_dialog)
+        toolbar.addWidget(new_version_button)
+        toolbar.addSeparator()
 
         
         # Create and store the project label
-        current_project_name = "None"
-        if self.session.project_id:
-            p = self.project_service.get_project_by_id(self.session.project_id) or {}
-            current_project_name = p.get("name") or str(self.session.project_id)
-
-        self.project_label = QLabel(f"  Current Project: {current_project_name}  ")
+        self.project_label = QLabel("Current: None")
+        self.project_label.setMinimumWidth(160)
+        self.project_label.setMaximumWidth(260)
+        self.project_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.project_label.setStyleSheet("color: #ffffff; font-weight: 700; padding: 0 8px;")
         toolbar.addWidget(self.project_label)
+        self.refresh_project_selector(select_project_id=self.session.project_id, reload_on_change=False)
 
-        # Add button to toolbar
-        new_version_action = QAction("New Version", self)
-        new_version_action.triggered.connect(self.show_new_version_dialog)
-        toolbar.addAction(new_version_action)
+    def _project_root_id(self, project: dict):
+        root_id = project.get("root_project_id") or project.get("id")
+        try:
+            return int(root_id) if root_id is not None else None
+        except Exception:
+            return None
+
+    def _clean_project_display_name(self, name: str, version_label: str = "") -> str:
+        text = str(name or "").strip()
+        version = str(version_label or "").strip()
+        if version and text.upper().endswith(f"__{version.upper()}"):
+            text = text[:-(len(version) + 2)].rstrip()
+        return text
+
+    def _project_display_name(self, project: dict) -> str:
+        root_name = self._clean_project_display_name(project.get("root_name") or "", "")
+        if root_name:
+            return root_name
+        return self._clean_project_display_name(project.get("name") or project.get("id"), project.get("version_label") or "")
+
+    def _version_sort_key(self, project: dict):
+        label = str(project.get("version_label") or "A").strip().upper()
+        n = 0
+        for ch in label:
+            if not ch.isalpha():
+                return (999999, label)
+            n = n * 26 + (ord(ch) - ord("A") + 1)
+        return (n or 1, label)
+
+    def _projects_for_root(self, root_id):
+        try:
+            root_id = int(root_id)
+        except Exception:
+            return []
+        return sorted(
+            [p for p in self._projects_for_user if self._project_root_id(p) == root_id],
+            key=self._version_sort_key,
+        )
+
+    def refresh_project_selector(self, select_project_id=None, reload_on_change: bool = False):
+        try:
+            self._projects_for_user = self.project_service.get_projects_for_user(self.session.user_id) or []
+        except Exception:
+            self._projects_for_user = []
+
+        try:
+            self._project_combo_initializing = True
+            self.project_combo.clear()
+            self.project_version_combo.clear()
+
+            if not self._projects_for_user:
+                self.project_combo.addItem("No Projects", None)
+                self.project_combo.setEnabled(False)
+                self.project_version_combo.addItem("-", None)
+                self.project_version_combo.setEnabled(False)
+                self.refresh_project_label()
+                return
+
+            self.project_combo.setEnabled(True)
+            self.project_version_combo.setEnabled(True)
+            if not select_project_id:
+                self.project_combo.addItem("Select a project...", None)
+
+            roots = {}
+            for project in self._projects_for_user:
+                root_id = self._project_root_id(project)
+                if root_id is not None and root_id not in roots:
+                    roots[root_id] = self._project_display_name(project)
+
+            for root_id, label in sorted(roots.items(), key=lambda item: str(item[1]).lower()):
+                self.project_combo.addItem(str(label or root_id), root_id)
+
+            selected_project = None
+            if select_project_id:
+                for project in self._projects_for_user:
+                    if int(project.get("id")) == int(select_project_id):
+                        selected_project = project
+                        break
+
+            selected_root_id = self._project_root_id(selected_project) if selected_project else None
+            if selected_root_id is not None:
+                idx = self.project_combo.findData(selected_root_id)
+                if idx >= 0:
+                    self.project_combo.setCurrentIndex(idx)
+                    self._populate_project_version_combo(selected_root_id, select_project_id)
+            elif self.project_combo.count() > 0:
+                self.project_combo.setCurrentIndex(0)
+                self._populate_project_version_combo(self.project_combo.currentData(), None)
+            self.refresh_project_label()
+        finally:
+            self._project_combo_initializing = False
+
+        if reload_on_change:
+            self.reload_main_window()
+
+    def _populate_project_version_combo(self, root_id, select_project_id=None):
+        self.project_version_combo.clear()
+        if root_id is None:
+            self.project_version_combo.addItem("-", None)
+            self.project_version_combo.setEnabled(False)
+            return
+
+        versions = self._projects_for_root(root_id)
+        self.project_version_combo.setEnabled(bool(versions))
+        for project in versions:
+            label = str(project.get("version_label") or "A").strip() or "A"
+            state = str(project.get("version_state") or "").strip()
+            display = f"{label} - {state}" if state else label
+            self.project_version_combo.addItem(display, project.get("id"))
+
+        if select_project_id:
+            idx = self.project_version_combo.findData(int(select_project_id))
+            if idx >= 0:
+                self.project_version_combo.setCurrentIndex(idx)
+                return
+        if self.project_version_combo.count() > 0:
+            self.project_version_combo.setCurrentIndex(0)
+
+    def _on_project_root_changed(self):
+        if getattr(self, "_project_combo_initializing", False):
+            return
+        try:
+            self._project_combo_initializing = True
+            root_id = self.project_combo.currentData()
+            self._populate_project_version_combo(root_id, None)
+        finally:
+            self._project_combo_initializing = False
+        self.save_current_project()
 
     def show_new_version_dialog(self):
         if not self.session.project_id:
@@ -624,6 +765,13 @@ class BomGUI(QMainWindow):
             except Exception:
                 pass
             QMessageBox.information(self, "Success", f"New version created. New project ID: {new_project_id}")
+            self.session.update_project(int(new_project_id))
+            try:
+                if getattr(self.session, "user_id", None):
+                    self.user_repo.set_last_project_id(self.session.user_id, int(new_project_id))
+            except Exception:
+                pass
+            self.refresh_project_selector(select_project_id=int(new_project_id))
             self.reload_main_window()
 
         def _on_failed(err: str):
@@ -649,7 +797,7 @@ class BomGUI(QMainWindow):
         if getattr(self, "_project_combo_initializing", False):
             return
 
-        pid = self.project_combo.currentData()
+        pid = self.project_version_combo.currentData() if hasattr(self, "project_version_combo") else self.project_combo.currentData()
 
         # Placeholder / "no project"
         if pid is None:
@@ -669,7 +817,7 @@ class BomGUI(QMainWindow):
 
         if not pid:
             # fallback to old behavior (name-based)
-            project = self.project_combo.currentText()
+            project = self.project_version_combo.currentText() if hasattr(self, "project_version_combo") else self.project_combo.currentText()
             pid = self.project_service.get_project_id(project)
 
         # Validate working directory before switching.
@@ -705,6 +853,10 @@ class BomGUI(QMainWindow):
                 placeholder_idx = self.project_combo.findData(None)
                 if placeholder_idx >= 0:
                     self.project_combo.setCurrentIndex(placeholder_idx)
+                if hasattr(self, "project_version_combo"):
+                    self.project_version_combo.clear()
+                    self.project_version_combo.addItem("-", None)
+                    self.project_version_combo.setEnabled(False)
             finally:
                 self._project_combo_initializing = False
 
@@ -712,28 +864,61 @@ class BomGUI(QMainWindow):
             self.reload_main_window()
             return
 
-        self.statusBar().showMessage(f"Project set to: {self.project_combo.currentText()}")
         self.session.update_project(pid)
         try:
             if getattr(self.session, "user_id", None):
                 self.user_repo.set_last_project_id(self.session.user_id, pid)
         except Exception:
             pass
+        self.refresh_project_label()
+        self.statusBar().showMessage(f"Project set to: {self.project_label.text().replace('Current: ', '')}")
         self.reload_main_window()
     
     def refresh_project_label(self):
         p = self.project_service.get_project_by_id(self.session.project_id) or {}
-        name = p.get("name") or str(self.session.project_id)
-        ver = p.get("version_label")
-        if ver:
-            self.project_label.setText(f"  Current Project: {name} ({ver})  ")
+        if not p:
+            label = "None"
         else:
-            self.project_label.setText(f"  Current Project: {name}  ")
+            label = self._clean_project_display_name(p.get("name") or str(self.session.project_id), p.get("version_label") or "")
+        self.project_label.setText(f"Current: {label}")
 
     def switch_page(self, index):
+        self._ensure_lazy_page(index)
         self.pages.setCurrentIndex(index)
         page_names = ["BOM", "Commit", "Issue Center", "Diagnostic", "Admin", "Snapshot"]
         self.statusBar().showMessage(f"Switched to {page_names[index]} page")
+
+    def _ensure_lazy_page(self, index):
+        if index == 3 and not getattr(self, "_diag_loaded", False):
+            self.statusBar().showMessage("Loading Diagnostic page...")
+            QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+            from pages.diag_page import DiagPage
+            page = DiagPage()
+            self.pages.removeWidget(self.diag_page)
+            self.diag_page.deleteLater()
+            self.diag_page = page
+            self.pages.insertWidget(3, self.diag_page)
+            self._diag_loaded = True
+        elif index == 4 and not getattr(self, "_admin_loaded", False):
+            self.statusBar().showMessage("Loading Admin page...")
+            QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+            from pages.admin_page import AdminPage
+            page = AdminPage()
+            self.pages.removeWidget(self.admin_page)
+            self.admin_page.deleteLater()
+            self.admin_page = page
+            self.pages.insertWidget(4, self.admin_page)
+            self._admin_loaded = True
+        elif index == 5 and not getattr(self, "_snap_loaded", False):
+            self.statusBar().showMessage("Loading Snapshot page...")
+            QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+            from pages.snapshot_page import SnapshotPage
+            page = SnapshotPage()
+            self.pages.removeWidget(self.snap_page)
+            self.snap_page.deleteLater()
+            self.snap_page = page
+            self.pages.insertWidget(5, self.snap_page)
+            self._snap_loaded = True
 
     def open_issues_for_part(self, part_id):
         self.issue_page.open_for_part(int(part_id))
@@ -837,7 +1022,8 @@ class BomGUI(QMainWindow):
             QToolBar {
                 background: #1f2937;  /* dark slate */
                 border: none;
-                padding: 6px;
+                padding: 7px 10px;
+                spacing: 8px;
             }
 
             QToolButton {
@@ -979,8 +1165,10 @@ class BomGUI(QMainWindow):
 if __name__ == "__main__":
 
     app = QApplication(sys.argv)
-    logo_path = _resource_path("assets/pictures/logo.png")
+    logo_path = _resource_path(APP_LOADER_LOGO_PATH)
     app.setStyle("Fusion")
+    # Keep standard controls at the compact density used by desktop CAD tools.
+    app.setFont(QFont("Segoe UI", 8))
 
     # ------------------------------------------------------------------
     # Workspace resolution — must run before any DB access so that
@@ -1000,7 +1188,7 @@ if __name__ == "__main__":
             None,
             "Workspace Required",
             "No workspace folder was selected.\n\n"
-            f"CreoVCS needs a shared folder that contains '{_cfg_mod._DB_FILENAME}'.\n"
+            f"{APP_NAME} needs a shared folder that contains '{_cfg_mod._DB_FILENAME}'.\n"
             "The application cannot start without it.",
         )
         sys.exit(1)
@@ -1047,25 +1235,15 @@ if __name__ == "__main__":
         QMessageBox.critical(
             None,
             "License Error",
-            f"CreoVCS cannot start:\n\n{_lic_exc}\n\n"
+            f"{APP_NAME} cannot start:\n\n{_lic_exc}\n\n"
             "Contact your administrator to obtain a valid license.",
         )
         sys.exit(1)
     # ------------------------------------------------------------------
 
-    session = SessionManager()
-
-
-    login_dialog = LoginPage()
-    if login_dialog.exec_() == QDialog.Accepted:  # waits until dialog is closed
-        loader = AdvancedLoader(logo_path)
-        loader.show()
-        sys.exit(app.exec_())
-        # window = BomGUI()
-        # window.show()
-        # sys.exit(app.exec_())
-    else:
-        sys.exit(0) 
+    startup_window = StartupWindow(logo_path)
+    startup_window.showMaximized()
+    sys.exit(app.exec_())
 
 
     

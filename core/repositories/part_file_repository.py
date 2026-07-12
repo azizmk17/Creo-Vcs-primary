@@ -1,4 +1,5 @@
 import sqlite3
+import re
 from typing import List, Optional
 
 from config import DB_NAME
@@ -43,6 +44,7 @@ class PartFileRepository:
                     sha256 TEXT DEFAULT NULL,
                     size_bytes INTEGER DEFAULT NULL,
                     note TEXT DEFAULT NULL,
+                    revision TEXT DEFAULT NULL,
                     created_by INTEGER DEFAULT NULL,
                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
                     lifecycle_state TEXT DEFAULT 'WIP',
@@ -71,8 +73,60 @@ class PartFileRepository:
                     conn.execute("ALTER TABLE part_file_versions ADD COLUMN root_project_id INTEGER")
                 if "project_version_label" not in cols:
                     conn.execute("ALTER TABLE part_file_versions ADD COLUMN project_version_label TEXT")
+                if "revision" not in cols:
+                    conn.execute("ALTER TABLE part_file_versions ADD COLUMN revision TEXT")
+                self._migrate_revision_notes_once(conn)
             except Exception:
                 pass
+
+    @staticmethod
+    def _revision_from_legacy_note(note: str) -> Optional[str]:
+        text = str(note or "").strip()
+        if not text:
+            return None
+        match = re.fullmatch(
+            r"(?i)(?:(?:rev(?:ision)?\.?\s*[:_-]?\s*)([A-Z]{1,2}[0-9]{0,3})|([A-Z]|[A-Z][0-9]{3}))",
+            text,
+        )
+        if not match:
+            return None
+        return (match.group(1) or match.group(2)).upper()
+
+    def _migrate_revision_notes_once(self, conn):
+        """Move legacy revision-only notes into the dedicated revision column once."""
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        marker = "part_file_versions_note_to_revision_v1"
+        done = conn.execute("SELECT value FROM app_metadata WHERE key=?", (marker,)).fetchone()
+        if done:
+            return
+        rows = conn.execute(
+            """
+            SELECT id, note
+            FROM part_file_versions
+            WHERE (revision IS NULL OR TRIM(revision)='')
+              AND note IS NOT NULL
+              AND TRIM(note) <> ''
+            """
+        ).fetchall()
+        for row in rows:
+            revision = self._revision_from_legacy_note(row["note"])
+            if not revision:
+                continue
+            conn.execute(
+                "UPDATE part_file_versions SET revision=?, note=NULL WHERE id=?",
+                (revision, int(row["id"])),
+            )
+        conn.execute(
+            "INSERT OR REPLACE INTO app_metadata(key, value) VALUES(?, datetime('now'))",
+            (marker,),
+        )
 
     # -----------------
     # Files
@@ -151,6 +205,7 @@ class PartFileRepository:
         sha256: Optional[str] = None,
         size_bytes: Optional[int] = None,
         note: str = "",
+        revision: str = "",
         created_by: Optional[int] = None,
         root_project_id: Optional[int] = None,
         project_version_label: Optional[str] = None,
@@ -166,14 +221,16 @@ class PartFileRepository:
                 cols = []
 
             if "root_project_id" in cols and "project_version_label" in cols:
+                revision_sql = ", revision" if "revision" in cols else ""
+                revision_placeholder = ", ?" if "revision" in cols else ""
                 cur.execute(
-                    """
+                    f"""
                     INSERT INTO part_file_versions (
                         file_id, version_no, original_filename, vault_rel_path, sha256, size_bytes, note, created_by,
-                        lifecycle_state, root_project_id, project_version_label
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        lifecycle_state, root_project_id, project_version_label{revision_sql}
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?{revision_placeholder})
                     """,
-                    (
+                    tuple([
                         file_id,
                         version_no,
                         original_filename,
@@ -185,16 +242,18 @@ class PartFileRepository:
                         "WIP",
                         root_project_id,
                         project_version_label,
-                    ),
+                    ] + ([revision if revision is not None else None] if "revision" in cols else [])),
                 )
             else:
+                revision_sql = ", revision" if "revision" in cols else ""
+                revision_placeholder = ", ?" if "revision" in cols else ""
                 cur.execute(
-                    """
+                    f"""
                     INSERT INTO part_file_versions (
-                        file_id, version_no, original_filename, vault_rel_path, sha256, size_bytes, note, created_by, lifecycle_state
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        file_id, version_no, original_filename, vault_rel_path, sha256, size_bytes, note, created_by, lifecycle_state{revision_sql}
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?{revision_placeholder})
                     """,
-                    (
+                    tuple([
                         file_id,
                         version_no,
                         original_filename,
@@ -204,7 +263,7 @@ class PartFileRepository:
                         note or None,
                         created_by,
                         "WIP",
-                    ),
+                    ] + ([revision if revision is not None else None] if "revision" in cols else [])),
                 )
 
             conn.commit()
@@ -232,5 +291,32 @@ class PartFileRepository:
             conn.execute(
                 "UPDATE part_files SET active_version_id = NULL WHERE id = ? AND active_version_id = ?",
                 (file_id, version_id),
+            )
+            conn.commit()
+
+    def update_version_metadata(
+        self,
+        version_id: int,
+        *,
+        revision: Optional[str] = None,
+        note: Optional[str] = None,
+        update_revision: bool = False,
+        update_note: bool = False,
+    ):
+        assignments = []
+        params = []
+        if update_revision:
+            assignments.append("revision = ?")
+            params.append(revision if revision is not None else "")
+        if update_note:
+            assignments.append("note = ?")
+            params.append(note if note is not None else "")
+        if not assignments:
+            return
+        params.append(int(version_id))
+        with self.get_conn() as conn:
+            conn.execute(
+                f"UPDATE part_file_versions SET {', '.join(assignments)} WHERE id = ?",
+                tuple(params),
             )
             conn.commit()
