@@ -35,7 +35,6 @@ from core.services.traceability_service import TraceabilityService
 from core.repositories.commit_repository import CommitRepository
 from core.services.commit_service import CommitService
 from pages.dialogs.package_parts_dialog import PackagePartsDialog
-from pages.dialogs.addChild_dialog import AddChildDialog
 from pages.dialogs.windchill_compare_dialog import WindchillCompareSetupDialog
 from pages.pdf_viewer_widget import PdfViewerWidget
 from utils import safe_exists, safe_startfile
@@ -89,6 +88,76 @@ class BomTreeWidget(QTreeWidget):
         self.setDropIndicatorShown(True)
         self.setDragDropMode(QAbstractItemView.InternalMove)
         self.setDefaultDropAction(Qt.MoveAction)
+        self._branch_spinner_angle = 0
+        self._loading_branch_items = set()
+        self._branch_spinner_timer = QTimer(self)
+        self._branch_spinner_timer.setInterval(45)
+        self._branch_spinner_timer.timeout.connect(self._advance_branch_spinners)
+
+    def setItemLoading(self, item: QTreeWidgetItem, loading: bool) -> None:
+        if item is None:
+            return
+        item.setData(0, BOM_TREE_LOADING_ROLE, bool(loading))
+        item_key = id(item)
+        if loading:
+            self._loading_branch_items.add(item_key)
+            if not self._branch_spinner_timer.isActive():
+                self._branch_spinner_timer.start()
+        else:
+            self._loading_branch_items.discard(item_key)
+            if not self._loading_branch_items:
+                self._branch_spinner_timer.stop()
+        if loading:
+            self.viewport().repaint()
+        else:
+            self.viewport().update()
+
+    def resetLoadingIndicators(self) -> None:
+        self._loading_branch_items.clear()
+        self._branch_spinner_timer.stop()
+        self.viewport().update()
+
+    def _advance_branch_spinners(self) -> None:
+        self._branch_spinner_angle = (self._branch_spinner_angle + 30) % 360
+        self.viewport().update()
+
+    def drawBranches(self, painter: QPainter, rect: QRect, index) -> None:
+        super().drawBranches(painter, rect, index)
+        try:
+            item = self.itemFromIndex(index)
+            if item is None or not item.data(0, BOM_TREE_LOADING_ROLE):
+                return
+
+            size = 10
+            center_x = rect.right() - max(5, self.indentation() // 2)
+            spinner_rect = QRect(
+                center_x - size // 2,
+                rect.center().y() - size // 2,
+                size,
+                size,
+            )
+            if item.isSelected():
+                background = self.palette().brush(QPalette.Highlight)
+            elif self.alternatingRowColors() and index.row() % 2:
+                background = self.palette().brush(QPalette.AlternateBase)
+            else:
+                background = self.palette().brush(QPalette.Base)
+
+            painter.save()
+            painter.fillRect(spinner_rect.adjusted(-2, -2, 2, 2), background)
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            pen = QPen(QColor("#2563eb"), 1.7)
+            pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawArc(
+                spinner_rect,
+                int(self._branch_spinner_angle * 16),
+                int(245 * 16),
+            )
+            painter.restore()
+        except Exception:
+            return
 
     def dropEvent(self, event):
         target = self.itemAt(event.pos())
@@ -104,10 +173,16 @@ class BomTreeWidget(QTreeWidget):
 
         target_id = target.data(0, Qt.UserRole)
         target_parent = target.parent()
-        target_parent_id = target_parent.data(0, Qt.UserRole) if target_parent is not None else None
         if target_parent is None:
             event.ignore()
             return
+        engineering_parent = target_parent
+        while engineering_parent is not None and engineering_parent.data(0, Qt.UserRole) is None:
+            engineering_parent = engineering_parent.parent()
+        target_parent_id = (
+            engineering_parent.data(0, Qt.UserRole)
+            if engineering_parent is not None else None
+        )
         if any(item.parent() is not target_parent for item in selected):
             event.ignore()
             return
@@ -120,7 +195,7 @@ class BomTreeWidget(QTreeWidget):
                 selected_ids.append(int(item.data(0, Qt.UserRole)))
             except Exception:
                 pass
-        if not selected_ids or target_id is None:
+        if len(selected_ids) != len(selected) or target_id is None or target_parent_id is None:
             event.ignore()
             return
 
@@ -129,7 +204,7 @@ class BomTreeWidget(QTreeWidget):
         else:
             where = "below"
 
-        self.reorderRequested.emit(selected_ids, int(target_id), int(target_parent_id or -1), where)
+        self.reorderRequested.emit(selected_ids, int(target_id), int(target_parent_id), where)
         event.acceptProposedAction()
 
 
@@ -175,6 +250,11 @@ BOM_TREE_INTEGRITY_ROLE = Qt.UserRole + 37
 BOM_TREE_ISSUE_ROLE = Qt.UserRole + 38
 BOM_TREE_CATEGORY_ROLE = Qt.UserRole + 39
 BOM_TREE_FOLDER_ROLE = Qt.UserRole + 40
+BOM_TREE_CHILDREN_LOADED_ROLE = Qt.UserRole + 41
+BOM_TREE_PATH_ROLE = Qt.UserRole + 42
+BOM_TREE_PLACEHOLDER_ROLE = Qt.UserRole + 43
+BOM_TREE_LOADING_ROLE = Qt.UserRole + 44
+BOM_TREE_REPLACE_CHILDREN_ROLE = Qt.UserRole + 45
 
 _BOM_TYPE_ICON_CACHE = {}
 
@@ -1579,7 +1659,7 @@ class _TreeLoadWorker(QObject):
         try:
             if self._cancelled:
                 return
-            tree_data = self._bom_service.get_bom_tree(self._project_id) or {}
+            tree_data = self._bom_service.get_bom_lazy_tree(self._project_id) or {}
 
             missing_map: dict[int, set] = {}
             try:
@@ -1597,6 +1677,41 @@ class _TreeLoadWorker(QObject):
             self.finished.emit(self._seq, tree_data, missing_map)
         except Exception as e:
             self.failed.emit(self._seq, str(e))
+
+
+class _LazyChildrenWorker(QObject):
+    finished = pyqtSignal(int, object)
+    failed = pyqtSignal(int, str)
+    done = pyqtSignal()
+
+    def __init__(self, request_id: int, bom_service, project_id: int, parent_id: int, parent_path: str):
+        super().__init__()
+        self._request_id = int(request_id)
+        self._bom_service = bom_service
+        self._project_id = int(project_id)
+        self._parent_id = int(parent_id)
+        self._parent_path = str(parent_path or "")
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        try:
+            if self._cancelled:
+                return
+            nodes = self._bom_service.get_bom_lazy_children(
+                self._project_id,
+                self._parent_id,
+                self._parent_path,
+            ) or []
+            if self._cancelled:
+                return
+            self.finished.emit(self._request_id, nodes)
+        except Exception as exc:
+            self.failed.emit(self._request_id, str(exc))
+        finally:
+            self.done.emit()
 
 
 class _SearchWorker(QObject):
@@ -1700,6 +1815,9 @@ class BomPage(QWidget):
         self._search_worker = None
         self._diag_thread = None
         self._diag_worker = None
+        self._lazy_level_request_seq = 0
+        self._lazy_level_requests = {}
+        self._retired_lazy_level_requests = []
 
         self._tree_build_seq = 0
         self._tree_build_queue = deque()
@@ -1707,6 +1825,10 @@ class BomPage(QWidget):
         self._tree_build_timer = QTimer(self)
         self._tree_build_timer.setInterval(0)
         self._tree_build_timer.timeout.connect(self._tree_build_step)
+        self._indicator_refresh_queue = deque()
+        self._indicator_refresh_timer = QTimer(self)
+        self._indicator_refresh_timer.setInterval(0)
+        self._indicator_refresh_timer.timeout.connect(self._indicator_refresh_step)
 
         self._search_build_seq = 0
         self._search_build_queue = deque()
@@ -1719,6 +1841,10 @@ class BomPage(QWidget):
         self._cached_tree_data = None
         self._cached_missing_map = None
         self._bom_row_numbers = {}
+        self._bom_folder_row_numbers = {}
+        self._bom_folder_path_rows = {}
+        self._lazy_tree_active = True
+        self._lazy_tree_materialized = False
         self._in_search_mode = False     # True while _search_tree (index 2) is visible
         self._advanced_filter_flat_mode = False
         self._bom_advanced_filters = self._default_bom_advanced_filters()
@@ -1760,6 +1886,7 @@ class BomPage(QWidget):
             pass
 
     def _cancel_background_work(self) -> None:
+        self._cancel_lazy_level_requests(wait=True)
         for worker in (getattr(self, "_tree_worker", None), getattr(self, "_search_worker", None), getattr(self, "_diag_worker", None)):
             try:
                 if worker is not None:
@@ -1782,6 +1909,79 @@ class BomPage(QWidget):
             self._search_build_timer.stop()
         except Exception:
             pass
+        try:
+            self._indicator_refresh_timer.stop()
+            self._indicator_refresh_queue.clear()
+        except Exception:
+            pass
+
+    def _cancel_lazy_level_requests(self, wait: bool = False) -> None:
+        requests = list((getattr(self, "_lazy_level_requests", {}) or {}).values())
+        self._lazy_level_requests = {}
+        if wait:
+            requests.extend(getattr(self, "_retired_lazy_level_requests", []) or [])
+            self._retired_lazy_level_requests = []
+        for request in requests:
+            item = request.get("item")
+            try:
+                self.tree.setItemLoading(item, False)
+            except Exception:
+                pass
+            try:
+                request["worker"].cancel()
+            except Exception:
+                pass
+            try:
+                request["thread"].quit()
+            except Exception:
+                pass
+            if wait:
+                try:
+                    request["thread"].wait(1500)
+                except Exception:
+                    pass
+            elif request not in self._retired_lazy_level_requests:
+                self._retired_lazy_level_requests.append(request)
+                try:
+                    request["thread"].finished.connect(
+                        lambda _request=request: self._forget_retired_lazy_request(_request)
+                    )
+                except Exception:
+                    pass
+        try:
+            self.tree.resetLoadingIndicators()
+        except Exception:
+            pass
+
+    def _forget_retired_lazy_request(self, request: dict) -> None:
+        try:
+            self._retired_lazy_level_requests.remove(request)
+        except (ValueError, AttributeError):
+            pass
+
+    def _cancel_lazy_requests_for_parts(self, part_ids) -> None:
+        wanted = {int(value) for value in (part_ids or [])}
+        for request_id, request in list((getattr(self, "_lazy_level_requests", {}) or {}).items()):
+            if int(request.get("part_id") or -1) not in wanted:
+                continue
+            self._lazy_level_requests.pop(int(request_id), None)
+            try:
+                self.tree.setItemLoading(request.get("item"), False)
+            except Exception:
+                pass
+            try:
+                request["worker"].cancel()
+                request["thread"].quit()
+            except Exception:
+                pass
+            if request not in self._retired_lazy_level_requests:
+                self._retired_lazy_level_requests.append(request)
+                try:
+                    request["thread"].finished.connect(
+                        lambda _request=request: self._forget_retired_lazy_request(_request)
+                    )
+                except Exception:
+                    pass
 
     def _set_tree_loading(self, loading: bool) -> None:
         try:
@@ -1816,12 +2016,9 @@ class BomPage(QWidget):
             self.hide_alert()
 
     def _start_initial_diagnostics_and_load(self) -> None:
-        # Run sync_bom_files + check_working_directory in a background thread.
-        try:
-            self._set_tree_loading(True)
-        except Exception:
-            pass
-
+        # Display the lazy root level immediately. Diagnostics are independent and
+        # update badges later; disk scanning must never gate BOM navigation.
+        self.load_tree()
         try:
             if self._diag_worker is not None:
                 self._diag_worker.cancel()
@@ -1871,17 +2068,32 @@ class BomPage(QWidget):
         except Exception:
             pass
 
-        # Now load the tree with diagnostics info.
-        self.load_tree()
+        self._refresh_loaded_integrity_indicators()
 
     def _on_initial_diag_failed(self, _err: str) -> None:
-        # Still proceed with a tree load; don't block the UI.
         try:
             self.missing_files = []
             self.missing_ids = set()
         except Exception:
             pass
-        self.load_tree()
+
+    def _refresh_loaded_integrity_indicators(self) -> None:
+        self._invalidate_doc_indicator()
+        for tree in (getattr(self, "tree", None), getattr(self, "_search_tree", None)):
+            if tree is None:
+                continue
+            for item in self._iter_tree_items(tree):
+                if self._is_folder_tree_item(item) or self._is_lazy_placeholder(item):
+                    continue
+                part_id = item.data(0, Qt.UserRole)
+                item.setData(
+                    BOM_COL_INTEGRITY,
+                    BOM_TREE_INTEGRITY_ROLE,
+                    _integrity_payload(part_id, self.missing_files, self.missing_ids),
+                )
+                self._indicator_refresh_queue.append((item, part_id))
+        if self._indicator_refresh_queue and not self._indicator_refresh_timer.isActive():
+            self._indicator_refresh_timer.start()
 
 
 
@@ -2013,6 +2225,7 @@ class BomPage(QWidget):
         except Exception:
             pass
         self.tree.itemClicked.connect(self.on_tree_item_clicked)
+        self.tree.itemExpanded.connect(self._on_bom_item_expanded)
         try:
             self.tree.itemDoubleClicked.connect(self._on_tree_item_double_clicked)
         except Exception:
@@ -2802,7 +3015,22 @@ class BomPage(QWidget):
         delete_action = QAction("Delete Part", self)
         delete_action.triggered.connect(lambda: self.delete_part(item_id))
         add_child_action = QAction("Add Child", self)
-        add_child_action.triggered.connect(lambda: self.add_child(item_id))
+        add_child_action.triggered.connect(
+            lambda _checked=False, parent_item=item: self.add_child(parent_item)
+        )
+        selected_relation_items = [
+            selected for selected in tree.selectedItems()
+            if selected is not None
+            and not self._is_folder_tree_item(selected)
+            and not self._is_lazy_placeholder(selected)
+            and selected.data(0, Qt.UserRole) is not None
+        ]
+        if item not in selected_relation_items:
+            selected_relation_items = [item]
+        add_to_parent_action = QAction("Add to Parent", self)
+        add_to_parent_action.triggered.connect(
+            lambda _checked=False, selected=list(selected_relation_items): self.add_selected_to_parent(selected)
+        )
         add_folder_action = QAction("Add Folder Here", self)
         add_folder_action.triggered.connect(lambda: self.add_bom_folder(parent_item=item))
         add_dwg_action = QAction("Associate Drawing", self)
@@ -2814,9 +3042,11 @@ class BomPage(QWidget):
         if self.perm.can("manage_parts"):
             menu.addAction(edit_action)
             menu.addAction(delete_action)
-            menu.addAction(add_child_action)
             if str(item.text(BOM_COL_TYPE) or "").strip().lower() in {"asm", "assembly"}:
+                menu.addAction(add_child_action)
                 menu.addAction(add_folder_action)
+            if selected_relation_items:
+                menu.addAction(add_to_parent_action)
         menu.addAction(add_dwg_action)
 
         try:
@@ -2863,65 +3093,21 @@ class BomPage(QWidget):
                     relation_parent = self.bom_service.get_part_details(int(relation_parent_id)) or {}
                     relation_parent_name = str(relation_parent.get("name") or relation_parent_id)
             if relation_parent_id is not None and self.perm.can("manage_parts"):
-                remove_child_action = QAction("Remove Child", self)
-
-                def _remove_child():
-                    parent_id = relation_parent_id
-                    child_id = item.data(0, Qt.UserRole)
-                    if not parent_id or not child_id:
-                        return
-                    # Confirm
-                    reply = QMessageBox.question(
+                same_parent_items = [
+                    selected for selected in selected_relation_items
+                    if self._direct_relation_parent_for_item(selected) == int(relation_parent_id)
+                ]
+                if len(same_parent_items) == len(selected_relation_items):
+                    remove_child_action = QAction(
+                        "Remove Selected Children" if len(same_parent_items) > 1 else "Remove Child",
                         self,
-                        "Confirm Remove",
-                        f"Remove child {item.text(BOM_COL_NAME)} from parent {relation_parent_name}?",
-                        QMessageBox.Yes | QMessageBox.No,
                     )
-                    if reply != QMessageBox.Yes:
-                        return
-
-                    # Count occurrences of this child id in the full tree
-                    try:
-                        occ = 0
-                        def _traverse(it):
-                            nonlocal occ
-                            try:
-                                if int(it.data(0, Qt.UserRole)) == int(child_id):
-                                    occ += 1
-                            except Exception:
-                                pass
-                            for k in range(it.childCount()):
-                                _traverse(it.child(k))
-
-                        for t in range(self.tree.topLevelItemCount()):
-                            _traverse(self.tree.topLevelItem(t))
-                    except Exception:
-                        occ = 0
-
-                    # If this is the last occurrence, block removal
-                    if occ <= 1:
-                        QMessageBox.critical(self, "Cannot Remove", "Cannot remove this child because it is the last occurrence in the BOM.")
-                        return
-
-                    # Call service to remove relation (try common method names)
-                    try:
-                        if hasattr(self.bom_service, "remove_child_by_id"):
-                            self.bom_service.remove_child_by_id(parent_id, child_id)
-                        elif hasattr(self.bom_service, "remove_child"):
-                            self.bom_service.remove_child(parent_id, child_id)
-                        else:
-                            raise AttributeError("remove child API not found on bom_service")
-                        self._remove_child_relation_from_trees(int(parent_id), int(child_id))
-                        QMessageBox.information(self, "Removed", "Child removed from parent.")
-                        try:
-                            self.display_details(int(parent_id))
-                        except Exception:
-                            pass
-                    except Exception as e:
-                        QMessageBox.critical(self, "Error", f"Failed to remove child:\n{e}")
-
-                remove_child_action.triggered.connect(_remove_child)
-                menu.addAction(remove_child_action)
+                    remove_child_action.triggered.connect(
+                        lambda _checked=False, parent_id=int(relation_parent_id),
+                               parent_name=str(relation_parent_name), selected=list(same_parent_items):
+                            self.remove_selected_children(parent_id, parent_name, selected)
+                    )
+                    menu.addAction(remove_child_action)
         except Exception:
             pass
 
@@ -3381,6 +3567,10 @@ class BomPage(QWidget):
         if self._is_default_bom_advanced_filter():
             self.clear_bom_tree_filter()
             return
+        # Advanced predicates must inspect the full BOM. Materialize only when the
+        # user explicitly filters; normal startup and browsing remain level-lazy.
+        if not getattr(self, "_in_search_mode", False):
+            self._materialize_all_lazy_branches()
         if not bool(self._bom_advanced_filters.get("show_parent_matches", True)):
             total_visible = self._apply_bom_tree_filter_flat(self._bom_advanced_filters)
             self._update_advanced_filter_button_state(total_visible)
@@ -4369,26 +4559,278 @@ class BomPage(QWidget):
             QMessageBox.critical(self, "Compare", f"Failed to open structure compare:\n{e}")
 
 
-    def add_child(self):
+    def add_child(self, parent_item=None):
+        """Select a parent, then select a child directly from the BOM/search view."""
+        if not self.perm.can("manage_parts"):
+            return QMessageBox.warning(self, "Permission", "You do not have permission to add child relations.")
+        if isinstance(parent_item, bool) or not isinstance(parent_item, QTreeWidgetItem):
+            parent_item = None
+        if parent_item is not None and (
+            self._is_folder_tree_item(parent_item)
+            or str(parent_item.text(BOM_COL_TYPE) or "").strip().lower() not in {"asm", "assembly"}
+        ):
+            return QMessageBox.warning(self, "Add Child", "Only an assembly can contain child items.")
+
+        if parent_item is None:
+            state = {"phase": "select_parent", "selections": []}
+            message = "Select the parent assembly in the BOM. You can use Search to locate it. Press Esc to cancel."
+        else:
+            state = {
+                "phase": "select_child",
+                "target_parent_id": int(parent_item.data(0, Qt.UserRole)),
+                "target_parent_name": str(parent_item.text(BOM_COL_NAME) or ""),
+                "selections": [],
+            }
+            message = (
+                f"Parent selected: {state['target_parent_name']}. Select a child in the BOM; "
+                "use Search if needed. Press Esc to cancel."
+            )
+        self._start_relation_selection_mode(state, message)
+
+    def add_selected_to_parent(self, selected_items) -> None:
+        """Keep selected child occurrences and wait for a target parent in the BOM."""
+        if not self.perm.can("manage_parts"):
+            return QMessageBox.warning(self, "Permission", "You do not have permission to change BOM relations.")
+        selections = []
+        for item in selected_items or []:
+            payload = self._relation_selection_for_item(item)
+            if payload is not None:
+                selections.append(payload)
+        if not selections:
+            return QMessageBox.warning(self, "Add to Parent", "Select one or more BOM items first.")
+        state = {"phase": "select_target_parent", "selections": selections}
+        count = len(selections)
+        self._start_relation_selection_mode(
+            state,
+            f"{count} item{'s' if count != 1 else ''} selected. Select the target parent assembly in the BOM; "
+            "use Search if needed. Press Esc to cancel.",
+        )
+
+    def _start_relation_selection_mode(self, state: dict, message: str) -> None:
+        self._exit_relation_selection_mode(clear_status=False)
+        self._relation_selection_state = dict(state or {})
+        for tree in (self.tree, self._search_tree):
+            try:
+                tree.itemClicked.connect(self._on_relation_selection_clicked)
+            except Exception:
+                pass
+        self.setCursor(Qt.PointingHandCursor)
+        self.window().statusBar().showMessage(message)
+
+    def _exit_relation_selection_mode(self, clear_status: bool = True) -> None:
+        for tree in (getattr(self, "tree", None), getattr(self, "_search_tree", None)):
+            if tree is None:
+                continue
+            try:
+                tree.itemClicked.disconnect(self._on_relation_selection_clicked)
+            except Exception:
+                pass
+        self._relation_selection_state = None
+        self.setCursor(Qt.ArrowCursor)
+        if clear_status:
+            try:
+                self.window().statusBar().showMessage("Relation operation cancelled.")
+            except Exception:
+                pass
+
+    def _relation_selection_for_item(self, item: QTreeWidgetItem) -> dict | None:
+        if item is None or self._is_folder_tree_item(item) or self._is_lazy_placeholder(item):
+            return None
+        try:
+            child_id = int(item.data(0, Qt.UserRole))
+        except (TypeError, ValueError):
+            return None
+        payload = {
+            "child_id": child_id,
+            "child_name": str(item.text(BOM_COL_NAME) or item.text(0) or child_id),
+            "source_parent_id": None,
+            "source_options": [],
+        }
+        if item.treeWidget() is self.tree:
+            payload["source_parent_id"] = self._direct_relation_parent_for_item(item)
+            return payload
+
+        try:
+            sources = self.bom_service.relation_sources_for_part(child_id) or []
+        except Exception:
+            sources = []
+        if len(sources) == 1:
+            payload["source_parent_id"] = int(sources[0]["parent_id"])
+        elif len(sources) > 1:
+            payload["source_options"] = list(sources)
+        return payload
+
+    def _direct_relation_parent_for_item(self, item: QTreeWidgetItem) -> int | None:
+        if item is None or item.treeWidget() is not self.tree:
+            return None
+        parent = item.parent()
+        while parent is not None and self._is_folder_tree_item(parent):
+            parent = parent.parent()
+        if parent is None or parent.data(0, Qt.UserRole) is None:
+            return None
+        try:
+            return int(parent.data(0, Qt.UserRole))
+        except (TypeError, ValueError):
+            return None
+
+    def _on_relation_selection_clicked(self, item: QTreeWidgetItem, _column: int = 0) -> None:
+        state = getattr(self, "_relation_selection_state", None)
+        if not state:
+            return
+        phase = str(state.get("phase") or "")
+        if phase in {"select_parent", "select_target_parent"}:
+            if self._is_folder_tree_item(item):
+                self.window().statusBar().showMessage("Select an assembly, not an organizational folder.")
+                return
+            if str(item.text(BOM_COL_TYPE) or "").strip().lower() not in {"asm", "assembly"}:
+                self.window().statusBar().showMessage("The target parent must be an assembly.")
+                return
+            target_parent_id = int(item.data(0, Qt.UserRole))
+            target_parent_name = str(item.text(BOM_COL_NAME) or "")
+            if phase == "select_parent":
+                state["phase"] = "select_child"
+                state["target_parent_id"] = target_parent_id
+                state["target_parent_name"] = target_parent_name
+                self.window().statusBar().showMessage(
+                    f"Parent selected: {target_parent_name}. Select a child in the BOM; use Search if needed. "
+                    "Press Esc to cancel."
+                )
+                return
+            self._finish_relation_selection(target_parent_id, target_parent_name, state.get("selections") or [])
+            return
+
+        if phase == "select_child":
+            selection = self._relation_selection_for_item(item)
+            if selection is None:
+                return
+            self._finish_relation_selection(
+                int(state["target_parent_id"]),
+                str(state.get("target_parent_name") or ""),
+                [selection],
+            )
+
+    def _ask_relation_action(self, count: int, target_name: str) -> str | None:
+        box = QMessageBox(self)
+        box.setWindowTitle("Add to Parent")
+        box.setIcon(QMessageBox.Question)
+        box.setText(
+            f"Add {count} selected item{'s' if count != 1 else ''} to {target_name}?"
+        )
+        box.setInformativeText("Copy keeps the current occurrence. Move transfers it to the selected parent.")
+        copy_button = box.addButton("Copy", QMessageBox.AcceptRole)
+        move_button = box.addButton("Move", QMessageBox.ActionRole)
+        box.addButton(QMessageBox.Cancel)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is copy_button:
+            return "copy"
+        if clicked is move_button:
+            return "move"
+        return None
+
+    def _resolve_relation_sources(self, selections: list[dict], action: str) -> list[dict] | None:
+        resolved = []
+        for selection in selections:
+            row = dict(selection)
+            options = list(row.pop("source_options", []) or [])
+            row.pop("child_name", None)
+            if options:
+                labels = []
+                by_label = {}
+                for option in options:
+                    aes = str(option.get("parent_aes_number") or "").strip()
+                    name = str(option.get("parent_name") or "").strip()
+                    quantity = int(option.get("quantity") or 1)
+                    label = f"{aes} - {name} (Qty {quantity})" if aes else f"{name} (Qty {quantity})"
+                    labels.append(label)
+                    by_label[label] = option
+                selected_label, ok = QInputDialog.getItem(
+                    self,
+                    "Select Direct Occurrence",
+                    f"Choose the source occurrence to {action}:",
+                    labels,
+                    0,
+                    False,
+                )
+                if not ok:
+                    return None
+                row["source_parent_id"] = int(by_label[selected_label]["parent_id"])
+            resolved.append(row)
+        return resolved
+
+    def _finish_relation_selection(
+        self,
+        target_parent_id: int,
+        target_parent_name: str,
+        selections: list[dict],
+    ) -> None:
+        action = self._ask_relation_action(len(selections), target_parent_name)
+        if action is None:
+            self._exit_relation_selection_mode()
+            return
+        resolved = self._resolve_relation_sources(selections, action)
+        if resolved is None:
+            return
+        try:
+            result = self.bom_service.apply_child_relation_operation(
+                int(target_parent_id), resolved, action
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "BOM Structure", str(exc))
+            return
+
+        changed = len(result.get("child_ids") or [])
+        skipped = len(result.get("skipped_child_ids") or [])
+        verb = "moved" if action == "move" else "copied"
+        result["message"] = f"{changed} item{'s' if changed != 1 else ''} {verb}."
+        if skipped:
+            result["message"] += f" {skipped} already under the selected parent were skipped."
+        self._exit_relation_selection_mode(clear_status=False)
+        self._apply_child_relation_result(result)
+
+    def _start_interactive_add_child(self, parent_item=None):
         """Start interactive add-child mode (select parent → child → confirm)."""
         if not self.perm.can("manage_parts"):
             return QMessageBox.warning(self, "Permission", "You do not have permission to add child relations.")
-        self.parent_item = None
+        if isinstance(parent_item, bool):
+            parent_item = None
+        if parent_item is not None and not isinstance(parent_item, QTreeWidgetItem):
+            parent_item = None
+        if getattr(self, "add_child_mode", False):
+            self._exit_add_child_mode()
+
+        selection_tree = parent_item.treeWidget() if parent_item is not None else self._current_tree_for_filtering()
+        if selection_tree is None:
+            selection_tree = self.tree
+        if parent_item is not None:
+            if self._is_folder_tree_item(parent_item):
+                return QMessageBox.warning(self, "Add Child", "An organizational folder cannot be a BOM parent.")
+            part_type = str(parent_item.text(BOM_COL_TYPE) or "").strip().lower()
+            if part_type not in {"asm", "assembly"}:
+                return QMessageBox.warning(self, "Add Child", "Only an assembly can contain child items.")
+
+        self.parent_item = parent_item
         self.child_item = None
         self.add_child_mode = True
+        self._add_child_selection_tree = selection_tree
 
         # 🔹 Keep your existing design — just give a temporary focus cue
-        pal = self.tree.palette()
+        pal = selection_tree.palette()
         self._original_base_color = pal.color(QPalette.Base)
         pal.setColor(QPalette.Base, QColor(230, 245, 255))  # very light blue background
-        self.tree.setPalette(pal)
+        selection_tree.setPalette(pal)
 
         # Cursor + status hint
         self.setCursor(Qt.PointingHandCursor)
         self.window().statusBar().showMessage("🔹 Select the parent part in the tree (Press Esc to cancel)...")
 
+        if parent_item is not None:
+            self.window().statusBar().showMessage(
+                f"Parent selected: {parent_item.text(BOM_COL_NAME)} | Now select the child part (Press Esc to cancel)..."
+            )
+
         # Connect handlers
-        self.tree.itemClicked.connect(self._on_tree_click_for_add_child)
+        selection_tree.itemClicked.connect(self._on_tree_click_for_add_child)
 
 
     def _on_tree_click_for_add_child(self, item):
@@ -4399,7 +4841,7 @@ class BomPage(QWidget):
         # Step 1: select parent
         if self.parent_item is None:
             part_type = item.text(BOM_COL_TYPE).strip().lower()
-            if part_type != "asm":
+            if part_type not in {"asm", "assembly"}:
                 self.window().statusBar().showMessage("⚠️ Selected part is not an ASM. Please select a valid assembly.")
                 return  # Don’t continue
 
@@ -4447,23 +4889,32 @@ class BomPage(QWidget):
 
     def _exit_add_child_mode(self):
         """Clean up state, visuals, and connections."""
-        if hasattr(self, "tree") and self.tree:
+        selection_tree = getattr(self, "_add_child_selection_tree", None)
+        if selection_tree is not None:
             try:
-                self.tree.itemClicked.disconnect(self._on_tree_click_for_add_child)
+                selection_tree.itemClicked.disconnect(self._on_tree_click_for_add_child)
             except Exception:
                 pass
-            
+            try:
+                palette = selection_tree.palette()
+                palette.setColor(QPalette.Base, self._original_base_color)
+                selection_tree.setPalette(palette)
+            except Exception:
+                pass
 
         self.setCursor(Qt.ArrowCursor)
         #self.window().statusBar().clearMessage()
         self.parent_item = None
         self.child_item = None
         self.add_child_mode = False
+        self._add_child_selection_tree = None
 
 
     def keyPressEvent(self, event: QKeyEvent):
         """Handle ESC to cancel add-child mode."""
-        if getattr(self, "add_child_mode", False) and event.key() == Qt.Key_Escape:
+        if getattr(self, "_relation_selection_state", None) and event.key() == Qt.Key_Escape:
+            self._exit_relation_selection_mode()
+        elif getattr(self, "add_child_mode", False) and event.key() == Qt.Key_Escape:
             self.window().statusBar().showMessage("Add-child operation cancelled.")
             self._exit_add_child_mode()
         else:
@@ -4711,10 +5162,34 @@ class BomPage(QWidget):
         item = QTreeWidgetItem(["", str(folder.get("name") or "Folder"), "", "", "", "", "", ""])
         item.setData(0, Qt.UserRole, None)
         item.setData(0, BOM_TREE_FOLDER_ROLE, int(folder["id"]))
+        item.setData(0, BOM_TREE_PATH_ROLE, str(folder.get("_tree_path") or ""))
         item.setData(0, BOM_TREE_IS_ASSEMBLY_ROLE, True)
+        item.setData(0, BOM_TREE_CHILDREN_LOADED_ROLE, True)
         item.setIcon(BOM_COL_NAME, _bom_type_icon("folder"))
         item.setToolTip(BOM_COL_NAME, "Organizational folder")
+        folder_id = int(folder["id"])
+        row_no = (getattr(self, "_bom_folder_path_rows", {}) or {}).get(str(folder.get("_tree_path") or ""), "")
+        if not row_no:
+            row_no = (getattr(self, "_bom_folder_row_numbers", {}) or {}).get(folder_id, "")
+        item.setText(BOM_COL_ROW, str(row_no or ""))
+        item.setTextAlignment(BOM_COL_ROW, Qt.AlignCenter)
         return item
+
+    @staticmethod
+    def _is_lazy_placeholder(item: QTreeWidgetItem | None) -> bool:
+        return bool(item is not None and item.data(0, BOM_TREE_PLACEHOLDER_ROLE))
+
+    def _ensure_lazy_placeholder(self, item: QTreeWidgetItem) -> None:
+        if not item.data(0, BOM_TREE_IS_ASSEMBLY_ROLE):
+            return
+        if item.data(0, BOM_TREE_CHILDREN_LOADED_ROLE):
+            return
+        if item.childCount() and self._is_lazy_placeholder(item.child(0)):
+            return
+        placeholder = QTreeWidgetItem(["", "Loading...", "", "", "", "", "", ""])
+        placeholder.setData(0, BOM_TREE_PLACEHOLDER_ROLE, True)
+        placeholder.setDisabled(True)
+        item.addChild(placeholder)
 
     @staticmethod
     def _container_count(container) -> int:
@@ -4774,7 +5249,7 @@ class BomPage(QWidget):
             return [self.tree]
         return self._find_tree_items(int(parent_bom_id), self.tree)
 
-    def _render_folder_context(self, parent_bom_id, folders: list[dict]) -> None:
+    def _render_folder_context(self, parent_bom_id, folders: list[dict], containers=None) -> None:
         context_folders = [
             folder for folder in folders
             if folder.get("effective_parent_bom_id") == parent_bom_id
@@ -4794,17 +5269,34 @@ class BomPage(QWidget):
             values.sort(key=lambda row: (int(row.get("sort_order") or 0), int(row["id"])))
 
         def add_folder(folder: dict, display_parent, base_container) -> None:
-            folder_item = self._make_folder_tree_item(folder)
+            display_path = ""
+            if not isinstance(display_parent, QTreeWidget):
+                display_path = str(display_parent.data(0, BOM_TREE_PATH_ROLE) or "")
+            folder_path = f"{display_path}/f{int(folder['id'])}" if display_path else f"f{int(folder['id'])}"
+            folder_item = self._make_folder_tree_item(dict(folder, _tree_path=folder_path))
             self._container_add(display_parent, folder_item)
-            for part_id in folder.get("item_ids") or []:
+            assigned_ids = {int(value) for value in (folder.get("item_ids") or [])}
+            ordered_assigned_ids = []
+            for index in range(self._container_count(base_container)):
+                candidate = self._container_item(base_container, index)
+                if self._is_folder_tree_item(candidate):
+                    continue
+                try:
+                    candidate_id = int(candidate.data(0, Qt.UserRole))
+                except (TypeError, ValueError):
+                    continue
+                if candidate_id in assigned_ids:
+                    ordered_assigned_ids.append(candidate_id)
+            for part_id in ordered_assigned_ids:
                 bom_item = self._take_direct_bom_item(base_container, int(part_id))
                 if bom_item is not None:
                     folder_item.addChild(bom_item)
             for child_folder in children_by_folder.get(int(folder["id"]), []):
                 add_folder(child_folder, folder_item, base_container)
-            folder_item.setExpanded(True)
+            folder_item.setExpanded(False)
 
-        for base_container in self._folder_context_containers(parent_bom_id):
+        base_containers = containers if containers is not None else self._folder_context_containers(parent_bom_id)
+        for base_container in base_containers:
             for folder in roots:
                 add_folder(folder, base_container, base_container)
 
@@ -4827,12 +5319,22 @@ class BomPage(QWidget):
         except Exception:
             folders = []
         self._bom_folders_cache = list(folders)
-        self._render_folder_context(parent_bom_id, folders)
+        render_containers = containers
+        if getattr(self, "_lazy_tree_active", False) and parent_bom_id is not None:
+            render_containers = [
+                container for container in containers
+                if container.data(0, BOM_TREE_CHILDREN_LOADED_ROLE)
+            ]
+        if render_containers:
+            self._render_folder_context(parent_bom_id, folders, containers=render_containers)
         self._renumber_full_bom_tree_rows()
         self._sync_search_tree_row_numbers()
 
     def _apply_tree_item_data(self, item: QTreeWidgetItem, info: dict) -> None:
         part_id = info.get("id")
+        existing_path = str(item.data(0, BOM_TREE_PATH_ROLE) or "")
+        existing_loaded = item.data(0, BOM_TREE_CHILDREN_LOADED_ROLE)
+        existing_is_assembly = bool(item.data(0, BOM_TREE_IS_ASSEMBLY_ROLE))
         issues = self._issues_for_part(part_id)
         locked_txt = ""
         if info.get("locked"):
@@ -4846,8 +5348,18 @@ class BomPage(QWidget):
         item.setTextAlignment(BOM_COL_ROW, Qt.AlignCenter)
         item.setText(BOM_COL_NAME, str(info.get("name", "") or ""))
         item.setData(0, BOM_TREE_INWORK_ROLE, locked_txt)
-        is_asm = bool((info.get("children") or [])) or item.childCount() > 0
+        has_lazy_metadata = "_has_children" in info
+        is_asm = (
+            bool(info.get("_has_children"))
+            if has_lazy_metadata
+            else existing_is_assembly or bool((info.get("children") or [])) or item.childCount() > 0
+        )
         item.setData(0, BOM_TREE_IS_ASSEMBLY_ROLE, is_asm)
+        item.setData(0, BOM_TREE_PATH_ROLE, str(info.get("_tree_path") or existing_path))
+        loaded_state = not bool(info.get("_has_children")) if has_lazy_metadata else existing_loaded
+        if loaded_state is None:
+            loaded_state = True
+        item.setData(0, BOM_TREE_CHILDREN_LOADED_ROLE, bool(loaded_state))
         issue_summary = self._issue_summary_cache.get(int(part_id), {}) if part_id is not None else {}
         item.setData(0, BOM_TREE_ISSUE_ROLE, issue_summary)
         category_names = info.get("category_names", info.get("categories", []))
@@ -4863,6 +5375,18 @@ class BomPage(QWidget):
         item.setData(0, Qt.UserRole, part_id)
 
         try:
+            if info.get("_defer_indicators"):
+                empty_summary = {
+                    "pdf": {"state": "absent", "tooltip": "PDF: checking..."},
+                    "step": {"state": "absent", "tooltip": "STEP: checking..."},
+                }
+                item.setData(BOM_COL_FILES, BOM_TREE_FILES_ROLE, _file_badges_payload(part_id, issues, empty_summary))
+                item.setData(BOM_COL_INTEGRITY, BOM_TREE_INTEGRITY_ROLE, _integrity_payload(part_id, self.missing_files, self.missing_ids))
+                item.setIcon(BOM_COL_NAME, _bom_type_icon(info.get("type")))
+                self._indicator_refresh_queue.append((item, part_id))
+                if not self._indicator_refresh_timer.isActive():
+                    self._indicator_refresh_timer.start()
+                return
             summary = self._indicator_summary_for_part(part_id, issues)
             item.setData(BOM_COL_FILES, BOM_TREE_FILES_ROLE, _file_badges_payload(part_id, issues, summary))
             item.setData(BOM_COL_INTEGRITY, BOM_TREE_INTEGRITY_ROLE, _integrity_payload(part_id, self.missing_files, self.missing_ids))
@@ -4942,6 +5466,35 @@ class BomPage(QWidget):
         self._sync_search_tree_row_numbers()
 
     def _renumber_full_bom_tree_rows(self) -> None:
+        if getattr(self, "_lazy_tree_active", False):
+            try:
+                numbering = self.bom_service.get_bom_lazy_numbering(int(self.session.project_id))
+                self._bom_row_numbers = dict(numbering.get("row_numbers") or {})
+                self._bom_folder_row_numbers = dict(numbering.get("folder_rows") or {})
+                self._bom_folder_path_rows = dict(numbering.get("folder_path_rows") or {})
+                self._bom_folders_cache = list(numbering.get("folders") or [])
+                path_rows = numbering.get("path_rows") or {}
+                for item in self._iter_tree_items(self.tree):
+                    if self._is_lazy_placeholder(item):
+                        continue
+                    folder_id = item.data(0, BOM_TREE_FOLDER_ROLE)
+                    if folder_id:
+                        path = str(item.data(0, BOM_TREE_PATH_ROLE) or "")
+                        row_no = self._bom_folder_path_rows.get(path, self._bom_folder_row_numbers.get(int(folder_id), ""))
+                    else:
+                        path = str(item.data(0, BOM_TREE_PATH_ROLE) or "")
+                        row_no = path_rows.get(path, "")
+                        if not row_no:
+                            try:
+                                rows = self._bom_row_numbers.get(int(item.data(0, Qt.UserRole)), [])
+                                row_no = rows[0] if rows else ""
+                            except Exception:
+                                row_no = ""
+                    item.setText(BOM_COL_ROW, str(row_no or ""))
+                    item.setTextAlignment(BOM_COL_ROW, Qt.AlignCenter)
+                return
+            except Exception:
+                pass
         self._renumber_tree_rows(getattr(self, "tree", None), update_full_map=True)
 
     def _full_bom_row_text_for_part(self, part_id) -> str:
@@ -5063,6 +5616,17 @@ class BomPage(QWidget):
             return {}
         info = dict(info)
         info["children"] = []
+        if getattr(self, "_lazy_tree_active", False):
+            try:
+                numbering = self.bom_service.get_bom_lazy_numbering(int(self.session.project_id))
+                path = str(int(part_id))
+                info["_tree_path"] = path
+                info["_tree_row_number"] = (numbering.get("path_rows") or {}).get(path, "")
+                info["_has_children"] = False
+                info["_defer_indicators"] = True
+                self._bom_row_numbers = dict(numbering.get("row_numbers") or {})
+            except Exception:
+                pass
 
         try:
             if not self._find_tree_items(int(part_id), self.tree):
@@ -5124,9 +5688,34 @@ class BomPage(QWidget):
             pass
         try:
             for parent_item in self._find_tree_items(int(parent_id), tree_widget):
+                if (
+                    tree_widget is self.tree
+                    and getattr(self, "_lazy_tree_active", False)
+                    and not parent_item.data(0, BOM_TREE_CHILDREN_LOADED_ROLE)
+                ):
+                    # The database is already updated. Let the first expansion fetch
+                    # the complete direct level once instead of inserting a duplicate.
+                    continue
                 if self._child_exists_under_item(parent_item, child_id):
                     continue
-                self._add_node_to_tree(tree_widget, child_node, parent_item)
+                node = dict(child_node)
+                if (
+                    tree_widget is self.tree
+                    and getattr(self, "_lazy_tree_active", False)
+                    and parent_item.data(0, BOM_TREE_CHILDREN_LOADED_ROLE)
+                ):
+                    parent_path = str(parent_item.data(0, BOM_TREE_PATH_ROLE) or "")
+                    child_path = f"{parent_path}/{child_id}" if parent_path else str(child_id)
+                    try:
+                        numbering = self.bom_service.get_bom_lazy_numbering(int(self.session.project_id))
+                        node["_tree_path"] = child_path
+                        node["_tree_row_number"] = (numbering.get("path_rows") or {}).get(child_path, "")
+                        node["_has_children"] = child_id in (numbering.get("has_children") or set())
+                    except Exception:
+                        pass
+                    node["_defer_indicators"] = True
+                new_item = self._add_node_to_tree(tree_widget, node, parent_item)
+                self._ensure_lazy_placeholder(new_item)
                 parent_item.setExpanded(True)
                 added += 1
         finally:
@@ -5185,6 +5774,26 @@ class BomPage(QWidget):
                         removed += 1
                     except Exception:
                         pass
+                if (
+                    tree_widget is self.tree
+                    and getattr(self, "_lazy_tree_active", False)
+                    and parent_item.data(0, BOM_TREE_CHILDREN_LOADED_ROLE)
+                ):
+                    has_engineering_child = False
+                    for index in range(parent_item.childCount()):
+                        candidate = parent_item.child(index)
+                        if self._is_lazy_placeholder(candidate):
+                            continue
+                        if self._is_folder_tree_item(candidate):
+                            if candidate.childCount() > 0:
+                                has_engineering_child = True
+                                break
+                            continue
+                        has_engineering_child = True
+                        break
+                    parent_item.setData(0, BOM_TREE_IS_ASSEMBLY_ROLE, has_engineering_child)
+                    if not has_engineering_child:
+                        parent_item.setData(0, BOM_TREE_CHILDREN_LOADED_ROLE, True)
         finally:
             try:
                 tree_widget.setUpdatesEnabled(True)
@@ -5204,6 +5813,272 @@ class BomPage(QWidget):
         self._renumber_full_bom_tree_rows()
         self._sync_search_tree_row_numbers()
 
+    def remove_selected_children(
+        self,
+        parent_id: int,
+        parent_name: str,
+        selected_items,
+    ) -> None:
+        child_ids = []
+        child_names = []
+        for item in selected_items or []:
+            try:
+                child_id = int(item.data(0, Qt.UserRole))
+            except (TypeError, ValueError):
+                continue
+            if child_id in child_ids:
+                continue
+            child_ids.append(child_id)
+            child_names.append(str(item.text(BOM_COL_NAME) or child_id))
+        if not child_ids:
+            return
+
+        count = len(child_ids)
+        preview = "\n".join(f"- {name}" for name in child_names[:10])
+        if count > 10:
+            preview += f"\n- ... and {count - 10} more"
+        reply = QMessageBox.question(
+            self,
+            "Remove Child Relations",
+            f"Remove {count} selected child{'ren' if count != 1 else ''} from {parent_name}?\n\n"
+            f"{preview}\n\n"
+            "This does not delete any BOM item. If an item has no other parent, it will be moved to the top level.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        pending_paths = set(getattr(self, "_pending_relation_expanded_paths", set()) or set())
+        pending_part_ids = set(getattr(self, "_pending_relation_expanded_part_ids", set()) or set())
+
+        def capture(item: QTreeWidgetItem, selected_subtree: bool = False) -> None:
+            if item is None or self._is_lazy_placeholder(item):
+                return
+            try:
+                item_id = int(item.data(0, Qt.UserRole))
+            except (TypeError, ValueError):
+                item_id = None
+            in_selected_subtree = selected_subtree or (item_id in child_ids if item_id is not None else False)
+            if item.isExpanded():
+                path = str(item.data(0, BOM_TREE_PATH_ROLE) or "")
+                if path:
+                    pending_paths.add(path)
+                if in_selected_subtree and item_id is not None:
+                    pending_part_ids.add(item_id)
+            for index in range(item.childCount()):
+                capture(item.child(index), in_selected_subtree)
+
+        for parent_item in self._find_tree_items(int(parent_id), self.tree):
+            for index in range(parent_item.childCount()):
+                capture(parent_item.child(index))
+        self._pending_relation_expanded_paths = pending_paths
+        self._pending_relation_expanded_part_ids = pending_part_ids
+
+        try:
+            result = self.bom_service.remove_children_from_parent(int(parent_id), child_ids)
+        except Exception as exc:
+            QMessageBox.critical(self, "Remove Child", f"Failed to remove selected children:\n{exc}")
+            return
+
+        self._cancel_lazy_requests_for_parts({int(parent_id)})
+        try:
+            self._bom_folders_cache = list(self.bom_service.list_bom_folders() or [])
+        except Exception:
+            pass
+        try:
+            numbering = self.bom_service.get_bom_lazy_numbering(int(self.session.project_id))
+            has_children = set(numbering.get("has_children") or set())
+            path_rows = dict(numbering.get("path_rows") or {})
+            self._bom_row_numbers = dict(numbering.get("row_numbers") or {})
+            self._bom_folder_row_numbers = dict(numbering.get("folder_rows") or {})
+            self._bom_folder_path_rows = dict(numbering.get("folder_path_rows") or {})
+        except Exception:
+            has_children = {int(parent_id)}
+            path_rows = {}
+
+        for parent_item in self._find_tree_items(int(parent_id), self.tree):
+            parent_item.setData(0, BOM_TREE_IS_ASSEMBLY_ROLE, int(parent_id) in has_children)
+            parent_item.setData(0, BOM_TREE_CHILDREN_LOADED_ROLE, False)
+            parent_item.setData(0, BOM_TREE_REPLACE_CHILDREN_ROLE, True)
+            self._load_lazy_children_for_item(parent_item, asynchronous=True, expand_after=False)
+
+        self._renumber_full_bom_tree_rows()
+        for child_id in result.get("moved_to_root_ids") or []:
+            root_path = str(int(child_id))
+            if any(
+                str(existing.data(0, BOM_TREE_PATH_ROLE) or "") == root_path
+                for existing in self._find_tree_items(int(child_id), self.tree)
+            ):
+                continue
+            info = self.bom_service.get_part_details(int(child_id)) or {}
+            if not info:
+                continue
+            info = dict(info)
+            info["children"] = []
+            info["_tree_path"] = root_path
+            info["_tree_row_number"] = path_rows.get(root_path, "")
+            info["_has_children"] = int(child_id) in has_children
+            info["_defer_indicators"] = True
+            root_item = self._make_tree_item(info)
+            target_row = int(info.get("_tree_row_number") or 0)
+            insert_at = self.tree.topLevelItemCount()
+            for index in range(self.tree.topLevelItemCount()):
+                try:
+                    existing_row = int(self.tree.topLevelItem(index).text(BOM_COL_ROW) or 0)
+                except (TypeError, ValueError):
+                    existing_row = 0
+                if existing_row and target_row and existing_row > target_row:
+                    insert_at = index
+                    break
+            self.tree.insertTopLevelItem(insert_at, root_item)
+            self._ensure_lazy_placeholder(root_item)
+            if int(child_id) in self._pending_relation_expanded_part_ids:
+                self._pending_relation_expanded_part_ids.discard(int(child_id))
+                root_item.setExpanded(True)
+
+        self._renumber_full_bom_tree_rows()
+        self._sync_search_tree_row_numbers()
+        try:
+            self.tree.viewport().update()
+            self.display_details(int(parent_id))
+        except Exception:
+            pass
+
+        moved_items = result.get("moved_to_root_items") or []
+        if moved_items:
+            moved_names = "\n".join(
+                f"- {row.get('aes_number') + ' - ' if row.get('aes_number') else ''}{row.get('name') or row.get('id')}"
+                for row in moved_items
+            )
+            QMessageBox.warning(
+                self,
+                "Moved to Top Level",
+                "The following items had no other parent and were moved to the top level. "
+                "They were not deleted:\n\n" + moved_names,
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Children Removed",
+                f"{count} child relation{'s' if count != 1 else ''} removed. The items still exist elsewhere in the BOM.",
+            )
+
+    def _apply_child_relation_result(self, result: dict) -> None:
+        """Refresh changed relation contexts without altering expansion state."""
+        if not result:
+            return
+        parent_ids = {int(result.get("target_parent_id"))}
+        parent_ids.update(int(value) for value in (result.get("source_parent_ids") or []))
+        changed_child_ids = {int(value) for value in (result.get("child_ids") or [])}
+
+        pending_paths = set(getattr(self, "_pending_relation_expanded_paths", set()) or set())
+        pending_part_ids = set(getattr(self, "_pending_relation_expanded_part_ids", set()) or set())
+
+        def capture_expanded(item: QTreeWidgetItem, moving_subtree: bool = False) -> None:
+            if item is None or self._is_lazy_placeholder(item):
+                return
+            try:
+                item_id = int(item.data(0, Qt.UserRole))
+            except (TypeError, ValueError):
+                item_id = None
+            in_moving_subtree = moving_subtree or (item_id in changed_child_ids if item_id is not None else False)
+            if item.isExpanded():
+                path = str(item.data(0, BOM_TREE_PATH_ROLE) or "")
+                if path:
+                    pending_paths.add(path)
+                if in_moving_subtree and item_id is not None:
+                    pending_part_ids.add(item_id)
+            for child_index in range(item.childCount()):
+                capture_expanded(item.child(child_index), in_moving_subtree)
+
+        for parent_id in parent_ids:
+            for parent_item in self._find_tree_items(parent_id, self.tree):
+                for child_index in range(parent_item.childCount()):
+                    capture_expanded(parent_item.child(child_index))
+        if result.get("had_root_sources"):
+            for child_id in changed_child_ids:
+                for root_item in self._find_tree_items(child_id, self.tree):
+                    if str(root_item.data(0, BOM_TREE_PATH_ROLE) or "") == str(child_id):
+                        capture_expanded(root_item, True)
+
+        self._pending_relation_expanded_paths = pending_paths
+        self._pending_relation_expanded_part_ids = pending_part_ids
+        self._cancel_lazy_requests_for_parts(parent_ids)
+
+        if result.get("had_root_sources"):
+            for child_id in (result.get("child_ids") or []):
+                for item in list(self._find_tree_items(int(child_id), self.tree)):
+                    if str(item.data(0, BOM_TREE_PATH_ROLE) or "") != str(int(child_id)):
+                        continue
+                    visual_parent = item.parent()
+                    if visual_parent is not None:
+                        visual_parent.removeChild(item)
+                    else:
+                        index = self.tree.indexOfTopLevelItem(item)
+                        if index >= 0:
+                            self.tree.takeTopLevelItem(index)
+
+        try:
+            self._bom_folders_cache = list(self.bom_service.list_bom_folders() or [])
+        except Exception:
+            pass
+        try:
+            numbering = self.bom_service.get_bom_lazy_numbering(int(self.session.project_id))
+            has_children = set(numbering.get("has_children") or set())
+        except Exception:
+            has_children = set(parent_ids)
+
+        for parent_id in parent_ids:
+            for item in self._find_tree_items(int(parent_id), self.tree):
+                if self._is_folder_tree_item(item):
+                    continue
+                item.setData(0, BOM_TREE_IS_ASSEMBLY_ROLE, parent_id in has_children)
+                item.setData(0, BOM_TREE_CHILDREN_LOADED_ROLE, False)
+                item.setData(0, BOM_TREE_REPLACE_CHILDREN_ROLE, True)
+                if parent_id in has_children and item.childCount() == 0:
+                    self._ensure_lazy_placeholder(item)
+                self._load_lazy_children_for_item(
+                    item, asynchronous=True, expand_after=False
+                )
+
+        self._renumber_full_bom_tree_rows()
+        self._sync_search_tree_row_numbers()
+        try:
+            self.tree.viewport().update()
+        except Exception:
+            pass
+
+        message = str(result.get("message") or "BOM structure updated.")
+        try:
+            self.window().statusBar().showMessage(message)
+        except Exception:
+            pass
+
+    def _restore_pending_relation_expansions(self, parent_item: QTreeWidgetItem) -> None:
+        pending_paths = getattr(self, "_pending_relation_expanded_paths", set()) or set()
+        pending_part_ids = getattr(self, "_pending_relation_expanded_part_ids", set()) or set()
+
+        def restore(item: QTreeWidgetItem) -> None:
+            if item is None or self._is_lazy_placeholder(item):
+                return
+            path = str(item.data(0, BOM_TREE_PATH_ROLE) or "")
+            try:
+                part_id = int(item.data(0, Qt.UserRole))
+            except (TypeError, ValueError):
+                part_id = None
+            should_expand = path in pending_paths or (part_id is not None and part_id in pending_part_ids)
+            if should_expand:
+                pending_paths.discard(path)
+                if part_id is not None:
+                    pending_part_ids.discard(part_id)
+                item.setExpanded(True)
+            if self._is_folder_tree_item(item):
+                for index in range(item.childCount()):
+                    restore(item.child(index))
+
+        for index in range(parent_item.childCount()):
+            restore(parent_item.child(index))
+
     def _selected_sibling_reorder_context(self):
         selected = [item for item in self.tree.selectedItems() if item is not None]
         if not selected:
@@ -5212,15 +6087,20 @@ class BomPage(QWidget):
         if not selected:
             raise ValueError("Select one or more BOM items to reorder.")
 
-        parent = selected[0].parent()
-        if parent is None:
+        visual_parent = selected[0].parent()
+        if visual_parent is None:
             raise ValueError("Top-level BOM items cannot be reordered here because they are not child associations.")
-        parent_id = int(parent.data(0, Qt.UserRole))
         for item in selected:
-            if item.parent() is not parent:
+            if item.parent() is not visual_parent:
                 raise ValueError("Reorder works only for items under the same parent assembly.")
+        engineering_parent = visual_parent
+        while engineering_parent is not None and engineering_parent.data(0, Qt.UserRole) is None:
+            engineering_parent = engineering_parent.parent()
+        if engineering_parent is None or engineering_parent.data(0, Qt.UserRole) is None:
+            raise ValueError("The engineering parent for this visual group was not found.")
+        parent_id = int(engineering_parent.data(0, Qt.UserRole))
         selected_ids = [int(item.data(0, Qt.UserRole)) for item in selected]
-        current_order = [int(parent.child(i).data(0, Qt.UserRole)) for i in range(parent.childCount())]
+        current_order = [int(value) for value in self.bom_service.ordered_child_ids(parent_id)]
         selected_set = set(selected_ids)
         selected_in_order = [cid for cid in current_order if cid in selected_set]
         if not selected_in_order:
@@ -5242,32 +6122,37 @@ class BomPage(QWidget):
         if tree_widget is None:
             return
         order = [int(x) for x in ordered_child_ids]
-        order_set = set(order)
+        order_positions = {child_id: index for index, child_id in enumerate(order)}
         try:
             tree_widget.setUpdatesEnabled(False)
         except Exception:
             pass
         try:
             for parent_item in self._find_tree_items(int(parent_id), tree_widget):
-                buckets = defaultdict(list)
-                extras = []
-                while parent_item.childCount():
-                    child = parent_item.takeChild(0)
-                    try:
-                        cid = int(child.data(0, Qt.UserRole))
-                    except Exception:
-                        extras.append(child)
-                        continue
-                    if cid in order_set:
-                        buckets[cid].append(child)
-                    else:
-                        extras.append(child)
-                for cid in order:
-                    for child in buckets.get(cid, []):
-                        parent_item.addChild(child)
-                for child in extras:
-                    parent_item.addChild(child)
-                parent_item.setExpanded(True)
+                def sort_visual_container(container: QTreeWidgetItem) -> None:
+                    children = [container.takeChild(0) for _ in range(container.childCount())]
+                    sortable_positions = []
+                    sortable_items = []
+                    for index, child in enumerate(children):
+                        try:
+                            child_id = int(child.data(0, Qt.UserRole))
+                        except (TypeError, ValueError):
+                            child_id = None
+                        if child_id in order_positions:
+                            sortable_positions.append(index)
+                            sortable_items.append(child)
+                    sortable_items.sort(
+                        key=lambda child: order_positions[int(child.data(0, Qt.UserRole))]
+                    )
+                    for index, child in zip(sortable_positions, sortable_items):
+                        children[index] = child
+                    for child in children:
+                        container.addChild(child)
+                    for child in children:
+                        if self._is_folder_tree_item(child):
+                            sort_visual_container(child)
+
+                sort_visual_container(parent_item)
         finally:
             try:
                 tree_widget.setUpdatesEnabled(True)
@@ -5333,43 +6218,14 @@ class BomPage(QWidget):
         try:
             if int(target_parent_id) < 0:
                 raise ValueError("Top-level BOM items cannot be reordered here.")
-            target_item = None
-            for parent_item in self._find_tree_items(int(target_parent_id), self.tree):
-                for idx in range(parent_item.childCount()):
-                    child = parent_item.child(idx)
-                    try:
-                        if int(child.data(0, Qt.UserRole)) == int(target_id):
-                            target_item = child
-                            break
-                    except Exception:
-                        continue
-                if target_item is not None:
-                    break
-            if target_item is None:
-                raise ValueError("Drop target was not found.")
-            parent = target_item.parent()
-            if parent is None:
-                raise ValueError("Top-level BOM items cannot be reordered here.")
-
-            selected_items = []
             selected_set = {int(x) for x in selected_ids or []}
-            for idx in range(parent.childCount()):
-                child = parent.child(idx)
-                try:
-                    cid = int(child.data(0, Qt.UserRole))
-                except Exception:
-                    continue
-                if cid in selected_set:
-                    selected_items.append(child)
-
-            if not selected_items:
-                raise ValueError("Drag reorder works only between siblings under the same parent assembly.")
-            if any(item.parent() is not parent for item in selected_items):
-                raise ValueError("Drag reorder works only between siblings under the same parent assembly.")
             if int(target_id) in selected_set:
                 return
-
-            current_order = [int(parent.child(i).data(0, Qt.UserRole)) for i in range(parent.childCount())]
+            current_order = [
+                int(value) for value in self.bom_service.ordered_child_ids(int(target_parent_id))
+            ]
+            if int(target_id) not in current_order or not selected_set.issubset(set(current_order)):
+                raise ValueError("Drag reorder works only between siblings under the same parent assembly.")
             selected_in_order = [cid for cid in current_order if cid in selected_set]
             remaining = [cid for cid in current_order if cid not in selected_set]
             target_index = remaining.index(int(target_id))
@@ -5378,8 +6234,7 @@ class BomPage(QWidget):
             new_order = remaining[:target_index] + selected_in_order + remaining[target_index:]
             if new_order == current_order:
                 return
-            parent_id = int(parent.data(0, Qt.UserRole))
-            self._apply_reordered_children(parent_id, new_order)
+            self._apply_reordered_children(int(target_parent_id), new_order)
             self.window().statusBar().showMessage("BOM child order updated.")
         except Exception as e:
             QMessageBox.warning(self, "Reorder", str(e))
@@ -5982,6 +6837,7 @@ class BomPage(QWidget):
 
     def load_tree(self):
         # Show spinner immediately, then fetch tree data in a background thread.
+        self._cancel_lazy_level_requests()
         self._tree_load_seq += 1
         seq = self._tree_load_seq
 
@@ -6052,6 +6908,16 @@ class BomPage(QWidget):
         self._tree_build_missing_map = missing_map or {}
         self._last_tree_node_count = 0
         self._invalidate_doc_indicator()
+        self._indicator_refresh_timer.stop()
+        self._indicator_refresh_queue.clear()
+        self._lazy_tree_active = "roots" in (tree_data or {})
+        self._lazy_tree_materialized = False
+        self._pending_relation_expanded_paths = set()
+        self._pending_relation_expanded_part_ids = set()
+        self._bom_row_numbers = dict((tree_data or {}).get("row_numbers") or {})
+        self._bom_folder_row_numbers = dict((tree_data or {}).get("folder_rows") or {})
+        self._bom_folder_path_rows = dict((tree_data or {}).get("folder_path_rows") or {})
+        self._bom_folders_cache = list((tree_data or {}).get("folders") or [])
 
         # cache for restore after search
         try:
@@ -6068,8 +6934,8 @@ class BomPage(QWidget):
 
         self._tree_build_queue = deque()
         try:
-            # preserve dict order
-            for _k, info in (tree_data or {}).items():
+            roots = (tree_data or {}).get("roots") if self._lazy_tree_active else (tree_data or {}).values()
+            for info in (roots or []):
                 self._tree_build_queue.append((None, info))
         except Exception:
             self._tree_build_queue = deque()
@@ -6094,70 +6960,20 @@ class BomPage(QWidget):
                 pass
             return
 
-        missing_map = getattr(self, "_tree_build_missing_map", {}) or {}
         start = time.perf_counter()
         processed = 0
         try:
             while self._tree_build_queue and processed < 50 and (time.perf_counter() - start) < 0.01:
                 parent_item, info = self._tree_build_queue.popleft()
-                part_id = info.get("id")
-                try:
-                    issues = missing_map.get(int(part_id), set()) if part_id is not None else set()
-                except Exception:
-                    issues = set()
-
-                locked_txt = ""
-                if info.get("locked"):
-                    who = str(info.get("locked_by_username") or "").strip()
-                    locked_txt = f"In Work ({who})" if who else "In Work"
-
-                item = QTreeWidgetItem(
-                    [
-                        "",
-                        info.get("name", ""),
-                        "",
-                        info.get("aes_number", ""),
-                        info.get("type", ""),
-                        str(info.get("revision", "") or ""),
-                        info.get("status", ""),
-                        "",
-                    ]
-                )
-                item.setData(0, BOM_TREE_INWORK_ROLE, locked_txt)
-                item.setData(0, BOM_TREE_IS_ASSEMBLY_ROLE, bool((info.get("children") or [])))
-                issue_summary = self._issue_summary_cache.get(int(part_id), {}) if part_id is not None else {}
-                item.setData(0, BOM_TREE_ISSUE_ROLE, issue_summary)
-                category_names = info.get("category_names", info.get("categories", []))
-                if isinstance(category_names, str):
-                    category_names = [category_names] if category_names.strip() else []
-                item.setData(0, BOM_TREE_CATEGORY_ROLE, list(category_names or []))
-                try:
-                    summary = self._indicator_summary_for_part(part_id, issues)
-                    item.setData(BOM_COL_FILES, BOM_TREE_FILES_ROLE, _file_badges_payload(part_id, issues, summary))
-                    item.setData(BOM_COL_INTEGRITY, BOM_TREE_INTEGRITY_ROLE, _integrity_payload(part_id, self.missing_files, self.missing_ids))
-                    item.setIcon(BOM_COL_NAME, _bom_type_icon(info.get("type")))
-                    _tips0 = ([locked_txt] if locked_txt else []) + [
-                        str(summary["pdf"].get("tooltip", "PDF: unknown")),
-                        str(summary["step"].get("tooltip", "STEP: unknown")),
-                    ]
-                    if int(issue_summary.get("active_count") or 0):
-                        _tips0.insert(0, f"{int(issue_summary['active_count'])} active issues linked to this part")
-                    elif int(issue_summary.get("total_count") or 0):
-                        _tips0.insert(0, "All issues linked to this part are resolved")
-                    item.setToolTip(BOM_COL_NAME, "\n".join(_tips0))
-                    item.setToolTip(BOM_COL_FILES, "\n".join([
-                        str(summary["pdf"].get("tooltip", "PDF: unknown")),
-                        str(summary["step"].get("tooltip", "STEP: unknown")),
-                    ]))
-                except Exception:
-                    pass
-
-                item.setData(0, Qt.UserRole, info.get("id"))
+                item = self._make_tree_item(info)
 
                 if parent_item is None:
                     self.tree.addTopLevelItem(item)
                 else:
                     parent_item.addChild(item)
+
+                if self._lazy_tree_active:
+                    self._ensure_lazy_placeholder(item)
 
                 children = info.get("children", [])
                 if children:
@@ -6177,8 +6993,11 @@ class BomPage(QWidget):
                 except Exception:
                     pass
                 try:
-                    self._apply_organizational_folders()
-                    self._renumber_full_bom_tree_rows()
+                    if self._lazy_tree_active:
+                        self._render_folder_context(None, self._bom_folders_cache)
+                    else:
+                        self._apply_organizational_folders()
+                        self._renumber_full_bom_tree_rows()
                     self._sync_search_tree_row_numbers()
                 except Exception:
                     pass
@@ -6215,7 +7034,7 @@ class BomPage(QWidget):
         # Legacy internal method name kept for compatibility; now sync-calls the builder.
         if not project_id:
             return
-        tree_data = self.bom_service.get_bom_tree(project_id) or {}
+        tree_data = self.bom_service.get_bom_lazy_tree(project_id) or {}
         missing_map = {}
         try:
             for bom_id, issue_type, _filename in (self.missing_files or []):
@@ -6248,6 +7067,219 @@ class BomPage(QWidget):
         except Exception:
             pass
 
+    def _on_bom_item_expanded(self, item: QTreeWidgetItem) -> None:
+        if not getattr(self, "_lazy_tree_active", False):
+            return
+        if (
+            item is None
+            or self._is_folder_tree_item(item)
+            or self._is_lazy_placeholder(item)
+            or item.data(0, BOM_TREE_CHILDREN_LOADED_ROLE)
+        ):
+            return
+
+        # Keep the branch visually closed while its direct level is fetched. This
+        # prevents the empty-row flash and lets the branch indicator host the spinner.
+        previous_signal_state = self.tree.blockSignals(True)
+        try:
+            item.setExpanded(False)
+        finally:
+            self.tree.blockSignals(previous_signal_state)
+        self._load_lazy_children_for_item(item, asynchronous=True, expand_after=True)
+
+    def _load_lazy_children_for_item(
+        self,
+        item: QTreeWidgetItem,
+        asynchronous: bool = True,
+        expand_after: bool = False,
+    ) -> None:
+        if item is None or self._is_folder_tree_item(item) or self._is_lazy_placeholder(item):
+            return
+        if item.data(0, BOM_TREE_CHILDREN_LOADED_ROLE):
+            return
+        if item.data(0, BOM_TREE_LOADING_ROLE):
+            return
+        try:
+            part_id = int(item.data(0, Qt.UserRole))
+        except (TypeError, ValueError):
+            return
+
+        parent_path = str(item.data(0, BOM_TREE_PATH_ROLE) or "")
+        if asynchronous:
+            self._start_lazy_children_request(item, part_id, parent_path, expand_after)
+            return
+
+        try:
+            nodes = self.bom_service.get_bom_lazy_children(
+                int(self.session.project_id), part_id,
+                parent_path,
+            ) or []
+            self._apply_lazy_children_result(item, part_id, nodes, expand_after=expand_after)
+        except Exception as exc:
+            item.setData(0, BOM_TREE_CHILDREN_LOADED_ROLE, False)
+            self._ensure_lazy_placeholder(item)
+            self.show_alert(f"Could not load this BOM level: {exc}", "error")
+
+    def _start_lazy_children_request(
+        self,
+        item: QTreeWidgetItem,
+        part_id: int,
+        parent_path: str,
+        expand_after: bool,
+    ) -> None:
+        self._lazy_level_request_seq += 1
+        request_id = int(self._lazy_level_request_seq)
+        worker = _LazyChildrenWorker(
+            request_id,
+            self.bom_service,
+            int(self.session.project_id),
+            int(part_id),
+            parent_path,
+        )
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        self._lazy_level_requests[request_id] = {
+            "worker": worker,
+            "thread": thread,
+            "item": item,
+            "part_id": int(part_id),
+            "parent_path": str(parent_path),
+            "expand_after": bool(expand_after),
+        }
+        self.tree.setItemLoading(item, True)
+
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_lazy_children_loaded)
+        worker.failed.connect(self._on_lazy_children_failed)
+        worker.done.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _lazy_request_item_is_current(self, request: dict) -> bool:
+        item = request.get("item")
+        try:
+            return (
+                item is not None
+                and item.treeWidget() is self.tree
+                and int(item.data(0, Qt.UserRole)) == int(request.get("part_id"))
+                and str(item.data(0, BOM_TREE_PATH_ROLE) or "") == str(request.get("parent_path") or "")
+            )
+        except Exception:
+            return False
+
+    def _on_lazy_children_loaded(self, request_id: int, nodes: object) -> None:
+        request = self._lazy_level_requests.pop(int(request_id), None)
+        if not request:
+            return
+        item = request.get("item")
+        if not self._lazy_request_item_is_current(request):
+            try:
+                self.tree.setItemLoading(item, False)
+            except Exception:
+                pass
+            return
+        expand_after = bool(request.get("expand_after"))
+        loaded_nodes = list(nodes or [])
+        try:
+            self._apply_lazy_children_result(
+                item,
+                int(request["part_id"]),
+                loaded_nodes,
+                expand_after=False,
+            )
+        except Exception as exc:
+            item.setData(0, BOM_TREE_CHILDREN_LOADED_ROLE, False)
+            self._ensure_lazy_placeholder(item)
+            self.show_alert(f"Could not display this BOM level: {exc}", "error")
+            loaded_nodes = []
+        finally:
+            try:
+                self.tree.setItemLoading(item, False)
+            except Exception:
+                pass
+        if expand_after and item.treeWidget() is self.tree and loaded_nodes:
+            item.setExpanded(True)
+
+    def _on_lazy_children_failed(self, request_id: int, error: str) -> None:
+        request = self._lazy_level_requests.pop(int(request_id), None)
+        if not request:
+            return
+        item = request.get("item")
+        try:
+            self.tree.setItemLoading(item, False)
+        except Exception:
+            pass
+        if not self._lazy_request_item_is_current(request):
+            return
+        item.setData(0, BOM_TREE_CHILDREN_LOADED_ROLE, False)
+        self._ensure_lazy_placeholder(item)
+        self.show_alert(f"Could not load this BOM level: {error}", "error")
+
+    def _apply_lazy_children_result(
+        self,
+        item: QTreeWidgetItem,
+        part_id: int,
+        nodes: list,
+        expand_after: bool = False,
+    ) -> None:
+        self.tree.setUpdatesEnabled(False)
+        try:
+            item.setData(0, BOM_TREE_CHILDREN_LOADED_ROLE, True)
+            if item.data(0, BOM_TREE_REPLACE_CHILDREN_ROLE):
+                while item.childCount():
+                    item.takeChild(0)
+                item.setData(0, BOM_TREE_REPLACE_CHILDREN_ROLE, False)
+            for index in range(item.childCount() - 1, -1, -1):
+                if self._is_lazy_placeholder(item.child(index)):
+                    item.takeChild(index)
+            for node in nodes:
+                try:
+                    child_id = int(node.get("id"))
+                except (TypeError, ValueError):
+                    child_id = None
+                if child_id is not None and self._child_exists_under_item(item, child_id):
+                    continue
+                child = self._make_tree_item(node)
+                item.addChild(child)
+                self._ensure_lazy_placeholder(child)
+            self._render_folder_context(part_id, self._bom_folders_cache, containers=[item])
+            item.setData(0, BOM_TREE_IS_ASSEMBLY_ROLE, bool(nodes))
+            self._restore_pending_relation_expansions(item)
+        finally:
+            try:
+                self.tree.setUpdatesEnabled(True)
+                self.tree.viewport().update()
+            except Exception:
+                pass
+        if expand_after and item.treeWidget() is self.tree and bool(nodes):
+            item.setExpanded(True)
+
+    def _materialize_all_lazy_branches(self) -> None:
+        if not getattr(self, "_lazy_tree_active", False) or getattr(self, "_lazy_tree_materialized", False):
+            return
+        self._cancel_lazy_level_requests()
+
+        def visit(item: QTreeWidgetItem):
+            if self._is_folder_tree_item(item):
+                for index in range(item.childCount()):
+                    visit(item.child(index))
+                return
+            if self._is_lazy_placeholder(item):
+                return
+            self._load_lazy_children_for_item(item, asynchronous=False, expand_after=False)
+            for index in range(item.childCount()):
+                visit(item.child(index))
+
+        self.tree.setUpdatesEnabled(False)
+        try:
+            for index in range(self.tree.topLevelItemCount()):
+                visit(self.tree.topLevelItem(index))
+            self._lazy_tree_materialized = True
+        finally:
+            self.tree.setUpdatesEnabled(True)
+            self.tree.viewport().update()
+
     def on_tree_item_clicked(self, item, column):
         folder_id = item.data(0, BOM_TREE_FOLDER_ROLE) if item is not None else None
         if folder_id:
@@ -6274,6 +7306,46 @@ class BomPage(QWidget):
         self._set_engineering_item_actions_enabled(False)
         try:
             self.tabs.setCurrentIndex(0)
+        except Exception:
+            pass
+
+    def _indicator_refresh_step(self) -> None:
+        start = time.perf_counter()
+        processed = 0
+        while self._indicator_refresh_queue and processed < 8 and (time.perf_counter() - start) < 0.008:
+            item, part_id = self._indicator_refresh_queue.popleft()
+            try:
+                if item.treeWidget() is None:
+                    continue
+                issues = self._issues_for_part(part_id)
+                summary = self._indicator_summary_for_part(part_id, issues)
+                item.setData(BOM_COL_FILES, BOM_TREE_FILES_ROLE, _file_badges_payload(part_id, issues, summary))
+                item.setData(BOM_COL_INTEGRITY, BOM_TREE_INTEGRITY_ROLE, _integrity_payload(part_id, self.missing_files, self.missing_ids))
+                item.setToolTip(BOM_COL_FILES, "\n".join([
+                    str(summary["pdf"].get("tooltip", "PDF: unknown")),
+                    str(summary["step"].get("tooltip", "STEP: unknown")),
+                ]))
+                name_tips = []
+                locked_text = str(item.data(0, BOM_TREE_INWORK_ROLE) or "")
+                if locked_text:
+                    name_tips.append(locked_text)
+                issue_summary = item.data(0, BOM_TREE_ISSUE_ROLE) or {}
+                active_count = int(issue_summary.get("active_count") or 0)
+                if active_count:
+                    name_tips.append(f"{active_count} active issue(s) linked to this part")
+                name_tips.extend([
+                    str(summary["pdf"].get("tooltip", "PDF: unknown")),
+                    str(summary["step"].get("tooltip", "STEP: unknown")),
+                ])
+                item.setToolTip(BOM_COL_NAME, "\n".join(name_tips))
+            except Exception:
+                pass
+            processed += 1
+        if not self._indicator_refresh_queue:
+            self._indicator_refresh_timer.stop()
+        try:
+            self.tree.viewport().update()
+            self._search_tree.viewport().update()
         except Exception:
             pass
 

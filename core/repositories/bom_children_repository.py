@@ -121,6 +121,142 @@ class BomChildrenRepository:
             rows = cur.fetchall()
             return [BomChild(**dict(r)) for r in rows]
 
+    def get_structure_rows(self, project_id: int) -> list[dict]:
+        """Return relation IDs only; this is intentionally cheaper than BOM rows."""
+        with self.get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT bc.parent_id, bc.child_id,
+                       COALESCE(bc.sort_order, bc.id) AS sort_order
+                FROM bom_children bc
+                JOIN bom parent ON parent.id=bc.parent_id
+                JOIN bom child ON child.id=bc.child_id
+                WHERE parent.project_id=? AND child.project_id=?
+                ORDER BY bc.parent_id, COALESCE(bc.sort_order, bc.id), bc.id
+                """,
+                (int(project_id), int(project_id)),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def search_occurrences(self, project_id: int, query: str = "", limit: int | None = None) -> list[dict]:
+        """Return searchable direct BOM occurrences, including roots."""
+        value = str(query or "").strip()
+        sql = """
+                SELECT b.id AS child_id,
+                       b.name,
+                       b.aes_number,
+                       b.part_number,
+                       b.type,
+                       bc.parent_id,
+                       parent.name AS parent_name,
+                       parent.aes_number AS parent_aes_number,
+                       COALESCE(bc.quantity, 1) AS quantity
+                FROM bom b
+                LEFT JOIN bom_children bc ON bc.child_id=b.id
+                LEFT JOIN bom parent ON parent.id=bc.parent_id
+                WHERE b.project_id=?
+                  AND (parent.id IS NULL OR parent.project_id=?)
+                  AND (
+                    instr(lower(COALESCE(b.name, '')), lower(?)) > 0 OR
+                    instr(lower(COALESCE(b.aes_number, '')), lower(?)) > 0 OR
+                    instr(lower(COALESCE(b.part_number, '')), lower(?)) > 0 OR
+                    instr(lower(COALESCE(parent.name, '')), lower(?)) > 0 OR
+                    instr(lower(COALESCE(parent.aes_number, '')), lower(?)) > 0
+                  )
+                ORDER BY lower(COALESCE(b.aes_number, '')), lower(b.name),
+                         lower(COALESCE(parent.aes_number, '')), bc.id
+              """
+        params = [int(project_id), int(project_id), value, value, value, value, value]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(1, int(limit)))
+        with self.get_conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            return [dict(row) for row in rows]
+
+    def apply_child_relations(self, target_parent_id: int, selections, mode: str) -> dict:
+        """Atomically copy or move direct occurrences to a target parent."""
+        action = str(mode or "").strip().lower()
+        if action not in {"copy", "move"}:
+            raise ValueError("Relation action must be Copy or Move.")
+
+        normalized = []
+        seen = set()
+        for selection in selections or []:
+            child_id = int(selection.get("child_id"))
+            source_value = selection.get("source_parent_id")
+            source_parent_id = int(source_value) if source_value is not None else None
+            key = (child_id, source_parent_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append((child_id, source_parent_id))
+        if not normalized:
+            raise ValueError("Select at least one child occurrence.")
+
+        affected_sources = set()
+        changed_children = set()
+        skipped = []
+        with self.get_conn() as conn:
+            for child_id, source_parent_id in normalized:
+                if action == "move" and source_parent_id == int(target_parent_id):
+                    skipped.append(child_id)
+                    continue
+
+                quantity = 1
+                if source_parent_id is not None:
+                    source = conn.execute(
+                        """
+                        SELECT quantity FROM bom_children
+                        WHERE parent_id=? AND child_id=?
+                        """,
+                        (int(source_parent_id), int(child_id)),
+                    ).fetchone()
+                    if not source:
+                        raise ValueError(f"The selected source relation for item {child_id} no longer exists.")
+                    quantity = max(1, int(source["quantity"] or 1))
+
+                target = conn.execute(
+                    """
+                    SELECT id, quantity FROM bom_children
+                    WHERE parent_id=? AND child_id=?
+                    """,
+                    (int(target_parent_id), int(child_id)),
+                ).fetchone()
+                if target:
+                    conn.execute(
+                        "UPDATE bom_children SET quantity=? WHERE id=?",
+                        (int(target["quantity"] or 0) + quantity, int(target["id"])),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO bom_children(parent_id, child_id, quantity, sort_order)
+                        VALUES(?,?,?,?)
+                        """,
+                        (
+                            int(target_parent_id), int(child_id), quantity,
+                            self._next_sort_order(conn, int(target_parent_id)),
+                        ),
+                    )
+
+                if action == "move" and source_parent_id is not None:
+                    conn.execute(
+                        "DELETE FROM bom_children WHERE parent_id=? AND child_id=?",
+                        (int(source_parent_id), int(child_id)),
+                    )
+                    affected_sources.add(int(source_parent_id))
+                changed_children.add(int(child_id))
+
+        return {
+            "mode": action,
+            "target_parent_id": int(target_parent_id),
+            "child_ids": sorted(changed_children),
+            "source_parent_ids": sorted(affected_sources),
+            "skipped_child_ids": skipped,
+            "had_root_sources": any(source is None for _child, source in normalized),
+        }
+
     def set_child_order(self, parent_id: int, ordered_child_ids: list[int]) -> bool:
         ordered = []
         seen = set()
@@ -185,6 +321,65 @@ class BomChildrenRepository:
                 DELETE FROM bom_children
                 WHERE parent_id=? AND child_id=?
             """, (parent_id, child_id))
+
+    def remove_children_from_parent(self, project_id: int, parent_id: int, child_ids) -> dict:
+        """Remove selected direct relations and report children that become roots."""
+        ids = []
+        seen = set()
+        for value in child_ids or []:
+            child_id = int(value)
+            if child_id not in seen:
+                seen.add(child_id)
+                ids.append(child_id)
+        if not ids:
+            raise ValueError("Select at least one child relation to remove.")
+
+        placeholders = ",".join("?" for _ in ids)
+        with self.get_conn() as conn:
+            parent = conn.execute(
+                "SELECT id FROM bom WHERE id=? AND project_id=?",
+                (int(parent_id), int(project_id)),
+            ).fetchone()
+            if not parent:
+                raise ValueError("The parent assembly was not found in the current project.")
+            relations = conn.execute(
+                f"""
+                SELECT bc.child_id
+                FROM bom_children bc
+                JOIN bom child ON child.id=bc.child_id
+                WHERE bc.parent_id=? AND bc.child_id IN ({placeholders})
+                  AND child.project_id=?
+                """,
+                [int(parent_id), *ids, int(project_id)],
+            ).fetchall()
+            existing_ids = {int(row["child_id"]) for row in relations}
+            missing = [child_id for child_id in ids if child_id not in existing_ids]
+            if missing:
+                raise ValueError("One or more selected items are no longer direct children of this parent.")
+
+            conn.execute(
+                f"DELETE FROM bom_children WHERE parent_id=? AND child_id IN ({placeholders})",
+                [int(parent_id), *ids],
+            )
+            moved_to_root = []
+            for child_id in ids:
+                remaining = conn.execute(
+                    """
+                    SELECT 1
+                    FROM bom_children bc
+                    JOIN bom parent ON parent.id=bc.parent_id
+                    WHERE bc.child_id=? AND parent.project_id=?
+                    LIMIT 1
+                    """,
+                    (int(child_id), int(project_id)),
+                ).fetchone()
+                if not remaining:
+                    moved_to_root.append(int(child_id))
+        return {
+            "parent_id": int(parent_id),
+            "removed_child_ids": ids,
+            "moved_to_root_ids": moved_to_root,
+        }
 
     def delete_by_parent(self, part_id: int):
         with self.get_conn() as conn:

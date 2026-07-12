@@ -290,6 +290,62 @@ class BomRepository:
             rows = cur.fetchall()
             return [Bom(**row) for row in rows]
 
+    def get_project_ids(self, project_id: int) -> List[int]:
+        """Return the lightweight project membership used by the lazy BOM index."""
+        with self.get_conn() as conn:
+            rows = conn.execute(
+                "SELECT id FROM bom WHERE project_id=? ORDER BY id",
+                (int(project_id),),
+            ).fetchall()
+            return [int(row["id"]) for row in rows]
+
+    def get_many(self, project_id: int, bom_ids) -> List[Bom]:
+        """Fetch full BOM rows only for the level currently being displayed."""
+        ids = []
+        seen = set()
+        for raw_id in bom_ids or []:
+            try:
+                bom_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if bom_id not in seen:
+                seen.add(bom_id)
+                ids.append(bom_id)
+        if not ids:
+            return []
+        fetched = []
+        with self.get_conn() as conn:
+            for offset in range(0, len(ids), 800):
+                chunk = ids[offset:offset + 800]
+                placeholders = ",".join("?" for _ in chunk)
+                fetched.extend(conn.execute(
+                    f"SELECT * FROM bom WHERE project_id=? AND id IN ({placeholders})",
+                    [int(project_id), *chunk],
+                ).fetchall())
+        by_id = {int(row["id"]): Bom(**row) for row in fetched}
+        return [by_id[bom_id] for bom_id in ids if bom_id in by_id]
+
+    def search_project(self, project_id: int, query: str, limit: int | None = None) -> List[Bom]:
+        """Search in SQLite so typing does not deserialize the whole BOM."""
+        value = str(query or "").strip()
+        sql = """
+                SELECT * FROM bom
+                WHERE project_id=?
+                  AND (
+                    instr(lower(COALESCE(aes_number, '')), lower(?)) > 0 OR
+                    instr(lower(COALESCE(name, '')), lower(?)) > 0 OR
+                    instr(lower(COALESCE(part_number, '')), lower(?)) > 0
+                  )
+                ORDER BY id
+              """
+        params = [int(project_id), value, value, value]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(1, int(limit)))
+        with self.get_conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            return [Bom(**row) for row in rows]
+
     # -------------------------------
     # PROJECT CATEGORIES
     # -------------------------------
@@ -336,20 +392,23 @@ class BomRepository:
         ids = sorted({int(bom_id) for bom_id in (bom_ids or []) if bom_id is not None})
         if not ids:
             return {}
-        placeholders = ",".join("?" for _ in ids)
+        fetched = []
         with self.get_conn() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT ic.bom_id, c.name
-                FROM bom_item_categories ic
-                JOIN bom_categories c ON c.id=ic.category_id
-                WHERE ic.bom_id IN ({placeholders})
-                ORDER BY lower(c.name), c.id
-                """,
-                ids,
-            ).fetchall()
+            for offset in range(0, len(ids), 800):
+                chunk = ids[offset:offset + 800]
+                placeholders = ",".join("?" for _ in chunk)
+                fetched.extend(conn.execute(
+                    f"""
+                    SELECT ic.bom_id, c.name
+                    FROM bom_item_categories ic
+                    JOIN bom_categories c ON c.id=ic.category_id
+                    WHERE ic.bom_id IN ({placeholders})
+                    ORDER BY lower(c.name), c.id
+                    """,
+                    chunk,
+                ).fetchall())
         result = {bom_id: [] for bom_id in ids}
-        for row in rows:
+        for row in fetched:
             result.setdefault(int(row["bom_id"]), []).append(str(row["name"]))
         return result
 
