@@ -8,6 +8,7 @@ from core.repositories.baseline_repository import BaselineRepository
 from core.repositories.baseline_file_repository import BaselineFileRepository
 from core.repositories.bom_children_repository import BomChildrenRepository
 from core.repositories.bom_repository import BomRepository
+from core.repositories.bom_revision_repository import BomRevisionRepository
 from core.services.base_service import BaseService
 from core.services.export_naming import exported_document_filename, safe_filename
 from core.services.part_file_service import PartFileService
@@ -27,6 +28,7 @@ class BaselineService(BaseService):
         self.baseline_file_repo = baseline_file_repo or BaselineFileRepository()
         self.bom_repo = bom_repo or BomRepository()
         self.children_repo = bom_children_repo or BomChildrenRepository()
+        self.revision_repo = BomRevisionRepository()
         self.part_file_service = part_file_service or PartFileService()
 
     def _collect_part_ids_recursive(self, root_part_id: int) -> List[int]:
@@ -91,6 +93,7 @@ class BaselineService(BaseService):
 
         for pid in expanded:
             attachments = self.part_file_service.list_attachments(pid)
+            object_context = self.revision_repo.get_current_context(int(pid))
 
             def pick(file_type: str):
                 for att in attachments:
@@ -104,7 +107,14 @@ class BaselineService(BaseService):
 
             for ft in ("PDF", "STEP"):
                 file_id, version_id, state = pick(ft)
-                self.baseline_file_repo.add(baseline_id, pid, ft, file_id, version_id)
+                self.baseline_file_repo.add(
+                    baseline_id,
+                    pid,
+                    ft,
+                    file_id,
+                    version_id,
+                    object_iteration_id=object_context.get("current_iteration_id"),
+                )
                 created_rows += 1
 
                 if not version_id:
@@ -189,6 +199,13 @@ class BaselineService(BaseService):
                     "file_type": bf.file_type,
                     "file_id": bf.file_id,
                     "version_id": bf.version_id,
+                    "object_iteration_id": getattr(bf, "object_iteration_id", None),
+                    "object_version": (
+                        self.revision_repo.get_iteration_context(
+                            int(getattr(bf, "object_iteration_id"))
+                        ).get("version_label")
+                        if getattr(bf, "object_iteration_id", None) else ""
+                    ),
                     "src": src,
                     "dst": dst_path,
                 }

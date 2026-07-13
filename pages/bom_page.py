@@ -260,6 +260,10 @@ BOM_TREE_PATH_ROLE = Qt.UserRole + 42
 BOM_TREE_PLACEHOLDER_ROLE = Qt.UserRole + 43
 BOM_TREE_LOADING_ROLE = Qt.UserRole + 44
 BOM_TREE_REPLACE_CHILDREN_ROLE = Qt.UserRole + 45
+BOM_TREE_BINDING_UPDATE_ROLE = Qt.UserRole + 46
+STRUCTURE_CURRENT_ITERATION_ROLE = Qt.UserRole + 60
+STRUCTURE_BOUND_ITERATION_ROLE = Qt.UserRole + 61
+STRUCTURE_LATEST_ITERATION_ROLE = Qt.UserRole + 62
 
 _BOM_TYPE_ICON_CACHE = {}
 
@@ -544,6 +548,7 @@ class _BomTreeNameDelegate(QStyledItemDelegate):
         inherited_active_count = int(issue_summary.get("inherited_active_count") or 0)
         direct_total_count = int(issue_summary.get("direct_total_count", total_count) or 0)
         inherited_total_count = int(issue_summary.get("inherited_total_count") or 0)
+        binding_update_count = int(item.data(0, BOM_TREE_BINDING_UPDATE_ROLE) or 0)
         widget = opt.widget or self._tree
         style = widget.style()
 
@@ -574,6 +579,8 @@ class _BomTreeNameDelegate(QStyledItemDelegate):
                 issue_badges.append(("●", QColor("#2e7d32")))
             elif inherited_total_count:
                 issue_badges.append(("+", QColor("#2563eb")))
+        if binding_update_count:
+            issue_badges.append((f"v+{binding_update_count}", QColor("#b45309")))
 
         painter.save()
         painter.setFont(name_font)
@@ -847,6 +854,9 @@ _EVENT_STYLES = {
     "COMMIT":               {"icon": "📦", "color": "#0078d7", "bg": "#e6f2ff", "label": "Commit"},
     "CHECKIN":              {"icon": "🔓", "color": "#16a34a", "bg": "#dcfce7", "label": "Check In"},
     "CHECKOUT":             {"icon": "🔒", "color": "#ea580c", "bg": "#ffedd5", "label": "Check Out"},
+    "UNDO_CHECKOUT":        {"icon": "U", "color": "#64748b", "bg": "#f1f5f9", "label": "Undo Checkout"},
+    "OBJECT_ITERATION":     {"icon": "I", "color": "#0369a1", "bg": "#e0f2fe", "label": "Iteration"},
+    "REVISION_CREATED":     {"icon": "R", "color": "#0f766e", "bg": "#ccfbf1", "label": "New Revision"},
     "PART_RELEASED":        {"icon": "🚀", "color": "#7c3aed", "bg": "#ede9fe", "label": "Released"},
     "ATTACHMENT_VERSION":   {"icon": "📎", "color": "#0891b2", "bg": "#e0f2fe", "label": "Attachment"},
     "ATTACHMENT_RELEASED":  {"icon": "✅", "color": "#059669", "bg": "#d1fae5", "label": "Attach Released"},
@@ -2221,13 +2231,13 @@ class BomPage(QWidget):
             self.tree.itemEntered.connect(self._on_tree_item_entered)
         except Exception:
             pass
-        self.tree.setHeaderLabels(["#", "Name", "Files", "AES Number", "Type", "Rev", "Status", "Integrity"])
+        self.tree.setHeaderLabels(["#", "Name", "Files", "AES Number", "Type", "Rev/Iter", "Status", "Integrity"])
         self.tree.setColumnWidth(BOM_COL_ROW, 38)
         self.tree.setColumnWidth(BOM_COL_NAME, 280)
         self.tree.setColumnWidth(BOM_COL_FILES, 100)
         self.tree.setColumnWidth(BOM_COL_AES, 90)
         self.tree.setColumnWidth(BOM_COL_TYPE, 60)
-        self.tree.setColumnWidth(BOM_COL_REV, 45)
+        self.tree.setColumnWidth(BOM_COL_REV, 65)
         self.tree.setColumnWidth(BOM_COL_STATUS, 90)
         self.tree.setColumnWidth(BOM_COL_INTEGRITY, 55)
         try:
@@ -2271,13 +2281,13 @@ class BomPage(QWidget):
             self._search_tree.itemEntered.connect(self._on_tree_item_entered)
         except Exception:
             pass
-        self._search_tree.setHeaderLabels(["#", "Name", "Files", "AES Number", "Type", "Rev", "Status", "Integrity"])
+        self._search_tree.setHeaderLabels(["#", "Name", "Files", "AES Number", "Type", "Rev/Iter", "Status", "Integrity"])
         self._search_tree.setColumnWidth(BOM_COL_ROW, 38)
         self._search_tree.setColumnWidth(BOM_COL_NAME, 280)
         self._search_tree.setColumnWidth(BOM_COL_FILES, 100)
         self._search_tree.setColumnWidth(BOM_COL_AES, 90)
         self._search_tree.setColumnWidth(BOM_COL_TYPE, 60)
-        self._search_tree.setColumnWidth(BOM_COL_REV, 45)
+        self._search_tree.setColumnWidth(BOM_COL_REV, 65)
         self._search_tree.setColumnWidth(BOM_COL_STATUS, 90)
         self._search_tree.setColumnWidth(BOM_COL_INTEGRITY, 55)
         try:
@@ -2485,7 +2495,7 @@ class BomPage(QWidget):
             ("part_number", "Part Number", ("part_number",)),
             ("drawing", "DRW Number", ("drawing_number",)),
             ("type", "Type", ("type",)),
-            ("revision", "Revision", ("revision",)),
+            ("revision", "Revision / Iteration", ("current_version", "revision")),
             ("state", "Lifecycle", ("status", "state", "lifecycle_state")),
             ("material", "Material", ("material",)),
             ("categories", "Categories", ("categories",)),
@@ -2574,9 +2584,20 @@ class BomPage(QWidget):
         self.where_used_tree = self._create_structure_relation_tree()
         self.uses_tree.itemDoubleClicked.connect(self._open_structure_tree_item)
         self.where_used_tree.itemDoubleClicked.connect(self._open_structure_tree_item)
+        for relation_tree in (self.uses_tree, self.where_used_tree):
+            relation_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+            relation_tree.customContextMenuRequested.connect(self._show_structure_context_menu)
         self.structure_views.addTab(self.uses_tree, "Uses")
         self.structure_views.addTab(self.where_used_tree, "Where Used")
         structure_layout.addWidget(self.structure_views, 1)
+        structure_actions = QHBoxLayout()
+        self.update_child_versions_btn = QPushButton("Update Child Versions")
+        self.update_child_versions_btn.setObjectName("neutral")
+        self.update_child_versions_btn.clicked.connect(self.update_child_versions)
+        self.update_child_versions_btn.setEnabled(False)
+        structure_actions.addStretch()
+        structure_actions.addWidget(self.update_child_versions_btn)
+        structure_layout.addLayout(structure_actions)
         self.tabs.addTab(structure_tab, "Structure")
 
         # Notes tab
@@ -2709,7 +2730,7 @@ class BomPage(QWidget):
         self.remove_attachment_btn.setEnabled(_can_release)
         self.create_baseline_btn.setEnabled(_can_release)
 
-        self.release_version_btn = QPushButton("Release Version")
+        self.release_version_btn = QPushButton("Release File Version")
         self.release_version_btn.setObjectName("primary")
         self.release_version_btn.clicked.connect(self.release_selected_version)
         self.release_version_btn.setEnabled(_can_release)
@@ -2742,7 +2763,9 @@ class BomPage(QWidget):
 
         # Actions
         action_group = QGroupBox("Actions")
-        action_layout = QHBoxLayout(action_group)
+        action_layout = QVBoxLayout(action_group)
+        edit_actions = QHBoxLayout()
+        lifecycle_actions = QHBoxLayout()
         self.add_part_btn = QPushButton("Add Part")
         self.add_part_btn.setObjectName("primary")
         self.add_part_btn.clicked.connect(self.add_part)
@@ -2755,9 +2778,9 @@ class BomPage(QWidget):
         self.delete_part_btn = QPushButton("Delete Part")
         self.delete_part_btn.setObjectName("danger")
         self.delete_part_btn.clicked.connect(self.delete_part)
-        self.checkin_part_btn = QPushButton("Check In")
-        self.checkin_part_btn.setObjectName("neutral")
-        self.checkin_part_btn.clicked.connect(self.checkin_part)
+        self.undo_checkout_btn = QPushButton("Undo Checkout")
+        self.undo_checkout_btn.setObjectName("neutral")
+        self.undo_checkout_btn.clicked.connect(self.undo_checkout)
         self.checkout_part_btn = QPushButton("Check Out")
         self.checkout_part_btn.setObjectName("neutral")
         self.checkout_part_btn.clicked.connect(self.checkout_part)
@@ -2775,20 +2798,28 @@ class BomPage(QWidget):
         self.delete_part_btn.setEnabled(_can_manage)
         self.add_child_btn.setEnabled(_can_manage)
 
-        self.set_revision_btn = QPushButton("Set Revision")
+        self.set_revision_btn = QPushButton("Create New Revision")
         self.set_revision_btn.setObjectName("neutral")
         self.set_revision_btn.clicked.connect(self.set_part_revision)
         self.set_revision_btn.setEnabled(self.perm.can("set_revision"))
+        self.release_revision_btn = QPushButton("Release Revision")
+        self.release_revision_btn.setObjectName("neutral")
+        self.release_revision_btn.clicked.connect(self.release_part_revision)
+        self.release_revision_btn.setEnabled(self.perm.can("set_revision"))
 
-        action_layout.addWidget(self.add_part_btn)
-        action_layout.addWidget(self.add_folder_btn)
-        action_layout.addWidget(self.edit_part_btn)
-        action_layout.addWidget(self.delete_part_btn)
-        action_layout.addWidget(self.checkout_part_btn)
-        action_layout.addWidget(self.checkin_part_btn)
-        action_layout.addWidget(self.add_child_btn)
-        action_layout.addWidget(self.compare_structure_btn)
-        action_layout.addWidget(self.set_revision_btn)
+        edit_actions.addWidget(self.add_part_btn)
+        edit_actions.addWidget(self.add_folder_btn)
+        edit_actions.addWidget(self.edit_part_btn)
+        edit_actions.addWidget(self.delete_part_btn)
+        edit_actions.addWidget(self.add_child_btn)
+        edit_actions.addWidget(self.compare_structure_btn)
+        lifecycle_actions.addWidget(self.checkout_part_btn)
+        lifecycle_actions.addWidget(self.undo_checkout_btn)
+        lifecycle_actions.addStretch()
+        lifecycle_actions.addWidget(self.set_revision_btn)
+        lifecycle_actions.addWidget(self.release_revision_btn)
+        action_layout.addLayout(edit_actions)
+        action_layout.addLayout(lifecycle_actions)
         right_layout.addWidget(action_group)
 
         splitter.addWidget(left_widget)
@@ -2988,6 +3019,14 @@ class BomPage(QWidget):
         open_step_act.triggered.connect(lambda _=False, pid=item_id: self.open_part_step(int(pid)))
         view_action = QAction("View Item Details", self)
         view_action.triggered.connect(lambda: self.display_details(item_id))
+        current_version = str(item.text(BOM_COL_REV) or "").strip()
+        view_cad_files_action = QAction(
+            f"View Latest CAD Files ({current_version})" if current_version else "View Latest CAD Files",
+            self,
+        )
+        view_cad_files_action.triggered.connect(
+            lambda _=False, pid=item_id: self._show_latest_bom_cad_files(int(pid))
+        )
         compare_action = QAction("Compare to Part Structure", self)
         compare_action.triggered.connect(lambda _=False, pid=item_id: self.compare_part_structure(int(pid)))
         refresh_files_act = QAction("Refresh Files", self)
@@ -2997,6 +3036,7 @@ class BomPage(QWidget):
         menu.addAction(open_pdf_act)
         menu.addAction(open_step_act)
         menu.addAction(view_action)
+        menu.addAction(view_cad_files_action)
         menu.addAction(compare_action)
         menu.addSeparator()
         menu.addAction(refresh_files_act)
@@ -3958,6 +3998,7 @@ class BomPage(QWidget):
             (0, BOM_TREE_IS_ASSEMBLY_ROLE),
             (0, BOM_TREE_ISSUE_ROLE),
             (0, BOM_TREE_CATEGORY_ROLE),
+            (0, BOM_TREE_BINDING_UPDATE_ROLE),
             (BOM_COL_FILES, BOM_TREE_FILES_ROLE),
             (BOM_COL_INTEGRITY, BOM_TREE_INTEGRITY_ROLE),
         ):
@@ -4097,14 +4138,26 @@ class BomPage(QWidget):
 
         # Write controls: also require release_files permission
         can_release = self.perm.can("release_files")
+        released = False
+        if enabled and getattr(self, "current_part_id", None):
+            try:
+                details = self.bom_service.get_part_details(int(self.current_part_id)) or {}
+                state = str(details.get("revision_state") or details.get("lifecycle_state") or "")
+                released = state.strip().lower() == "released"
+            except Exception:
+                released = False
         for w in (
             getattr(self, "add_attachment_btn", None),
             getattr(self, "add_version_btn", None),
             getattr(self, "set_active_btn", None),
             getattr(self, "remove_attachment_btn", None),
+            getattr(self, "delete_version_btn", None),
+        ):
+            if w is not None:
+                w.setEnabled(bool(enabled) and can_release and not released)
+        for w in (
             getattr(self, "create_baseline_btn", None),
             getattr(self, "release_version_btn", None),
-            getattr(self, "delete_version_btn", None),
         ):
             if w is not None:
                 w.setEnabled(bool(enabled) and can_release)
@@ -4374,8 +4427,6 @@ class BomPage(QWidget):
 
         try:
             self.part_file_service.release_version(version_id)
-            if getattr(self, "current_part_id", None):
-                self.bom_service.release_part(self.current_part_id)
             self.refresh_files_tab()
             self.on_attachment_selected()
             if getattr(self, "current_part_id", None):
@@ -4396,18 +4447,64 @@ class BomPage(QWidget):
         except Exception:
             current = ""
 
-        revision, ok = QInputDialog.getText(self, "Set Revision", "Revision (A, B, ...):", text=current)
+        revision, ok = QInputDialog.getText(
+            self,
+            "Create New Revision",
+            "New revision code (examples: B, A1, A010):",
+        )
         if not ok:
             return
         revision = (revision or "").strip().upper()
-        if not revision.isalpha():
-            return QMessageBox.warning(self, "Invalid", "Revision must be alphabetic (A, B, ...).")
+        note, ok = QInputDialog.getMultiLineText(
+            self,
+            "Create New Revision",
+            f"Reason for creating revision {revision} from {current or 'the released revision'}:",
+        )
+        if not ok:
+            return
 
         try:
-            self.bom_service.set_revision(self.current_part_id, revision)
+            created = self.bom_service.create_revision(self.current_part_id, revision, note=note)
+            self._refresh_lock_family_rows(int(self.current_part_id))
             self.display_details(self.current_part_id)
+            QMessageBox.information(
+                self,
+                "New Revision",
+                f"Created {created.get('version_label') or revision + '.1'} from the released configuration.",
+            )
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to set revision:\n{e}")
+            QMessageBox.critical(self, "New Revision", f"Failed to create revision:\n{e}")
+
+    def release_part_revision(self):
+        if not getattr(self, "current_part_id", None):
+            return
+        if not self.perm.can("set_revision"):
+            return QMessageBox.warning(self, "Permission", "You do not have permission to release revisions.")
+        details = self.bom_service.get_part_details(int(self.current_part_id)) or {}
+        version = str(details.get("current_version") or details.get("revision") or "")
+        note, ok = QInputDialog.getMultiLineText(
+            self,
+            "Release Revision",
+            f"Release note for {version}:",
+        )
+        if not ok:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Release Revision",
+            f"Release {version}? The revision and its exact child configuration will become immutable.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            self.bom_service.release_part(int(self.current_part_id), note=note)
+            self._refresh_lock_family_rows(int(self.current_part_id))
+            self.display_details(int(self.current_part_id))
+            QMessageBox.information(self, "Release Revision", f"{version} is now released.")
+        except Exception as exc:
+            QMessageBox.critical(self, "Release Revision", str(exc))
 
     def add_attachment(self):
         if not self.perm.can("release_files"):
@@ -5853,10 +5950,12 @@ class BomPage(QWidget):
         if isinstance(category_names, str):
             category_names = [category_names] if category_names.strip() else []
         item.setData(0, BOM_TREE_CATEGORY_ROLE, list(category_names or []))
+        binding_update_count = int(info.get("binding_update_count") or 0)
+        item.setData(0, BOM_TREE_BINDING_UPDATE_ROLE, binding_update_count)
         item.setText(BOM_COL_FILES, "")
         item.setText(BOM_COL_AES, str(info.get("aes_number", "") or ""))
         item.setText(BOM_COL_TYPE, str(info.get("type", "") or ""))
-        item.setText(BOM_COL_REV, str(info.get("revision", "") or ""))
+        item.setText(BOM_COL_REV, str(info.get("current_version") or info.get("revision", "") or ""))
         item.setText(BOM_COL_STATUS, str(info.get("status", "") or ""))
         item.setText(BOM_COL_INTEGRITY, "")
         item.setData(0, Qt.UserRole, part_id)
@@ -5891,6 +5990,10 @@ class BomPage(QWidget):
                 tips0.append(f"{inherited_active} inherited active issue(s) from child parts")
             elif int(issue_summary.get("total_count") or 0):
                 tips0.append("All issues linked to this part are resolved")
+            if binding_update_count:
+                tips0.append(
+                    f"{binding_update_count} direct child version update(s) available"
+                )
             tips0.append(str(summary["pdf"].get("tooltip", "PDF: unknown")))
             tips0.append(str(summary["step"].get("tooltip", "STEP: unknown")))
             item.setToolTip(BOM_COL_NAME, "\n".join(tips0))
@@ -6754,7 +6857,12 @@ class BomPage(QWidget):
     def refresh_parts_after_merge(self, part_ids) -> None:
         """Refresh only BOM rows affected by a successful merge."""
         refreshed = set()
-        for part_id in (part_ids or []):
+        requested = list(part_ids or [])
+        try:
+            requested.extend(self.bom_service.direct_parent_ids(requested))
+        except Exception:
+            pass
+        for part_id in requested:
             try:
                 pid = int(part_id)
             except Exception:
@@ -6957,81 +7065,68 @@ class BomPage(QWidget):
         except Exception:
             pass
 
-    def _refresh_lock_family_rows(self, part_id: int):
+    def _refresh_loaded_part_branch(self, part_id: int) -> None:
+        self._refresh_part_in_tree(int(part_id))
+        if not getattr(self, "_lazy_tree_active", False):
+            return
+        for item in list(self._find_tree_items(int(part_id), self.tree)):
+            if not item.data(0, BOM_TREE_CHILDREN_LOADED_ROLE):
+                continue
+            parent_path = str(item.data(0, BOM_TREE_PATH_ROLE) or "")
+            expanded = bool(item.isExpanded())
+            nodes = self.bom_service.get_bom_lazy_children(
+                int(self.session.project_id), int(part_id), parent_path
+            ) or []
+            item.setData(0, BOM_TREE_REPLACE_CHILDREN_ROLE, True)
+            self._apply_lazy_children_result(item, int(part_id), nodes, expand_after=False)
+            item.setExpanded(expanded and bool(nodes))
+
+    def _refresh_lock_family_rows(self, part_id: int, refresh_loaded_branches: bool = False):
         try:
             part_ids = self.bom_service.part_ids_sharing_base_file(int(part_id)) or [int(part_id)]
         except Exception:
             part_ids = [int(part_id)]
         for pid in part_ids:
-            self._refresh_current_tree_item_lock_state(int(pid))
+            if refresh_loaded_branches:
+                self._refresh_loaded_part_branch(int(pid))
+            else:
+                self._refresh_current_tree_item_lock_state(int(pid))
             self._invalidate_doc_indicator(int(pid))
+        if refresh_loaded_branches:
+            self._renumber_full_bom_tree_rows()
+            self._sync_search_tree_row_numbers()
+        return part_ids
 
-    def checkin_part(self, part_id=None):
+    def undo_checkout(self, part_id=None):
         if not part_id:
             if not self.current_part_id:
-                QMessageBox.warning(self, "No Selection", "Please select a part to check in.")
+                QMessageBox.warning(self, "No Selection", "Please select a checked-out item.")
                 return
             part_id = self.current_part_id
+        answer = QMessageBox.question(
+            self,
+            "Undo Checkout",
+            "Discard the working BOM attributes and structure and release this checkout?\n\n"
+            "This does not create an iteration and is not a check-in.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
         try:
-            as_user_id = None
-            # Master/Admin can check in a part on behalf of a project-assigned user.
-            if self.perm.can("merge") and self.session.project_id:
-                users = self.project_service.get_users_for_project(self.session.project_id) or []
-                # Build choices: username (email)
-                choices = []
-                choice_to_id = {}
-                for u in users:
-                    try:
-                        label = str(u.get("username") or "").strip()
-                        email = str(u.get("email") or "").strip()
-                        uid = int(u.get("id"))
-                    except Exception:
-                        continue
-                    if not label:
-                        continue
-                    if email:
-                        display = f"{label} ({email})"
-                    else:
-                        display = label
-                    choices.append(display)
-                    choice_to_id[display] = uid
-
-                if choices:
-                    # default to current session user if present
-                    default_choice = None
-                    for disp, uid in choice_to_id.items():
-                        if self.session.user_id is not None and int(uid) == int(self.session.user_id):
-                            default_choice = disp
-                            break
-                    if default_choice is None:
-                        default_choice = choices[0]
-
-                    selected, ok = QInputDialog.getItem(
-                        self,
-                        "Check In As",
-                        "Check in this part as:",
-                        choices,
-                        choices.index(default_choice) if default_choice in choices else 0,
-                        False,
-                    )
-                    if not ok:
-                        return
-                    as_user_id = choice_to_id.get(selected)
-
-            self.bom_service.checkin_part(part_id, as_user_id=as_user_id)
-            QMessageBox.information(self, "Success", "Part checked in successfully.")
-            self._refresh_lock_family_rows(int(part_id))
-            self._refresh_current_tree_item_indicator()
+            self.bom_service.undo_checkout(int(part_id))
+            QMessageBox.information(self, "Undo Checkout", "Checkout undone. No iteration was created.")
+            self._refresh_lock_family_rows(int(part_id), refresh_loaded_branches=True)
             try:
                 self.display_details(int(part_id))
             except Exception:
                 pass
         except ValueError as e:
-            QMessageBox.warning(self, "Check In Failed", str(e))
+            QMessageBox.warning(self, "Undo Checkout", str(e))
         except PermissionError as e:
             QMessageBox.warning(self, "Permission", str(e))
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to check in part: {str(e)}")
+            QMessageBox.critical(self, "Undo Checkout", f"Failed to undo checkout: {str(e)}")
 
     def checkout_part(self, part_id=None):
         if not part_id:
@@ -7039,6 +7134,32 @@ class BomPage(QWidget):
                 QMessageBox.warning(self, "No Selection", "Please select a part to check out.")
                 return
             part_id = self.current_part_id
+
+        details = self.bom_service.get_part_details(int(part_id)) or {}
+        state = str(
+            details.get("revision_state") or details.get("lifecycle_state") or ""
+        ).strip().lower()
+        released_revision_code = None
+        if state == "released":
+            current_version = str(details.get("current_version") or details.get("revision") or "")
+            try:
+                suggested_revision = self.bom_service.suggest_next_revision(int(part_id))
+            except Exception:
+                suggested_revision = ""
+            released_revision_code, ok = QInputDialog.getText(
+                self,
+                "Check Out Released Item",
+                f"{current_version} is Released and will remain immutable.\n"
+                "The next completed commit (check-in) will create revision:",
+                QLineEdit.Normal,
+                suggested_revision,
+            )
+            if not ok:
+                return
+            released_revision_code = str(released_revision_code or "").strip()
+            if not released_revision_code:
+                QMessageBox.warning(self, "Check Out", "Enter the revision to create on commit.")
+                return
 
         as_user_id = None
         # Master/Admin can check out as a project-assigned user.
@@ -7081,15 +7202,26 @@ class BomPage(QWidget):
                     return
                 as_user_id = choice_to_id.get(selected)
 
+        confirmation = (
+            f"Check out Released {details.get('current_version') or details.get('revision')} for work?\n\n"
+            f"The Released iteration will not change. The next completed commit will create "
+            f"{released_revision_code}.1."
+            if released_revision_code else
+            f"Are you sure you want to check out part {part_id}? This part will be blocked for work."
+        )
         reply = QMessageBox.question(
             self,
             "Confirm Check Out",
-            f"Are you sure you want to check out part {part_id}? This part will be blocked for work.",
+            confirmation,
             QMessageBox.Yes | QMessageBox.No
         )
         if reply == QMessageBox.Yes:
             try:
-                self.bom_service.checkout_part(part_id, as_user_id=as_user_id)
+                self.bom_service.checkout_part(
+                    part_id,
+                    as_user_id=as_user_id,
+                    released_revision_code=released_revision_code,
+                )
                 QMessageBox.information(self, "Success", "Part checked out successfully.")
                 self._refresh_lock_family_rows(int(part_id))
                 self._refresh_current_tree_item_indicator()
@@ -7797,8 +7929,16 @@ class BomPage(QWidget):
         self.delete_part_btn.setEnabled(bool(enabled and can_manage))
         self.add_child_btn.setEnabled(bool(enabled and can_manage))
         self.checkout_part_btn.setEnabled(bool(enabled))
-        self.checkin_part_btn.setEnabled(bool(enabled))
+        self.undo_checkout_btn.setEnabled(bool(enabled))
         self.set_revision_btn.setEnabled(bool(enabled and self.perm.can("set_revision")))
+        self.release_revision_btn.setEnabled(bool(enabled and self.perm.can("set_revision")))
+        try:
+            details = getattr(self, "_current_part_details", {}) or {}
+            self.update_child_versions_btn.setEnabled(
+                bool(enabled) and str(details.get("type") or "").lower() in {"asm", "assembly"}
+            )
+        except Exception:
+            pass
 
     def _show_folder_selection(self, item: QTreeWidgetItem, folder_id: int) -> None:
         self.clear_details()
@@ -7861,8 +8001,11 @@ class BomPage(QWidget):
 
     def _create_structure_relation_tree(self) -> QTreeWidget:
         tree = QTreeWidget()
-        tree.setColumnCount(7)
-        tree.setHeaderLabels(["Name", "AES Number", "Relation", "Qty", "Type", "Revision", "Lifecycle"])
+        tree.setColumnCount(10)
+        tree.setHeaderLabels([
+            "Name", "AES Number", "Relation", "Qty", "Type", "Current",
+            "Bound", "Latest", "Binding", "Lifecycle",
+        ])
         tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
         tree.setSelectionBehavior(QAbstractItemView.SelectRows)
         tree.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -7873,7 +8016,7 @@ class BomPage(QWidget):
         tree.setRootIsDecorated(True)
         header = tree.header()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
-        for column in range(1, 7):
+        for column in range(1, 10):
             header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
         return tree
 
@@ -7892,10 +8035,18 @@ class BomPage(QWidget):
             str(node.get("relation") or ""),
             "" if quantity is None else str(quantity),
             str(node.get("type") or ""),
-            str(node.get("revision") or ""),
+            str(node.get("current_version") or node.get("revision") or ""),
+            str(node.get("bound_version") or ""),
+            str(node.get("latest_version") or ""),
+            str(node.get("binding_status") or ""),
             str(node.get("lifecycle_state") or node.get("status") or ""),
         ])
         item.setData(0, Qt.UserRole, node.get("id"))
+        item.setData(0, Qt.UserRole + 1, node.get("usage_id"))
+        item.setData(0, Qt.UserRole + 2, node.get("relation_parent_id"))
+        item.setData(0, STRUCTURE_CURRENT_ITERATION_ROLE, node.get("current_iteration_id"))
+        item.setData(0, STRUCTURE_BOUND_ITERATION_ROLE, node.get("bound_iteration_id"))
+        item.setData(0, STRUCTURE_LATEST_ITERATION_ROLE, node.get("latest_iteration_id"))
         item.setIcon(0, _bom_type_icon(node.get("type")))
         if node.get("cycle"):
             item.setToolTip(0, "Circular structure reference")
@@ -7928,6 +8079,167 @@ class BomPage(QWidget):
         )
         self.structure_views.setTabText(0, f"Uses ({uses_count})")
         self.structure_views.setTabText(1, f"Where Used ({where_used_count})")
+        try:
+            details = getattr(self, "_current_part_details", {}) or {}
+            self._update_lifecycle_action_states(details)
+        except Exception:
+            self.update_child_versions_btn.setEnabled(False)
+
+    def update_child_versions(self):
+        if not getattr(self, "current_part_id", None):
+            return
+        try:
+            rows = self.bom_service.get_child_version_status(int(self.current_part_id)) or []
+        except Exception as exc:
+            QMessageBox.warning(self, "Child Versions", str(exc))
+            return
+        outdated = [row for row in rows if not row.get("is_latest")]
+        if not outdated:
+            QMessageBox.information(self, "Child Versions", "All direct children already use their latest iterations.")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Update Child Versions")
+        dialog.resize(720, 420)
+        layout = QVBoxLayout(dialog)
+        info = QLabel(
+            "Select direct children to adopt in the checked-out assembly. "
+            "The new bindings become permanent only when the assembly is committed."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        table = QTableWidget(len(rows), 5)
+        table.setHorizontalHeaderLabels(["Child", "Bound", "Latest", "Status", "Source"])
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for column in range(1, 5):
+            table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        for row_index, row in enumerate(rows):
+            child_label = str(row.get("aes_number") or row.get("part_number") or "").strip()
+            name = str(row.get("name") or "").strip()
+            if child_label and name:
+                child_label = f"{child_label} - {name}"
+            else:
+                child_label = child_label or name
+            values = [
+                child_label,
+                str(row.get("bound_version") or ""),
+                str(row.get("latest_version") or ""),
+                "Current" if row.get("is_latest") else "Update available",
+                str(row.get("binding_source") or ""),
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.UserRole, int(row["child_bom_id"]))
+                table.setItem(row_index, column, item)
+                if not row.get("is_latest"):
+                    item.setSelected(True)
+        layout.addWidget(table)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Update Selected")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        selected_ids = []
+        for index in table.selectionModel().selectedRows():
+            item = table.item(index.row(), 0)
+            if item is not None:
+                selected_ids.append(int(item.data(Qt.UserRole)))
+        if not selected_ids:
+            QMessageBox.warning(self, "Child Versions", "Select at least one child.")
+            return
+        try:
+            changed = self.bom_service.update_children_to_latest(
+                int(self.current_part_id), selected_ids
+            )
+            self._refresh_part_in_tree(int(self.current_part_id))
+            self.display_details(int(self.current_part_id))
+            QMessageBox.information(
+                self, "Child Versions", f"Updated {len(changed)} child binding(s) in the working assembly."
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Child Versions", str(exc))
+
+    def _show_latest_bom_cad_files(self, part_id: int) -> None:
+        try:
+            details = self.bom_service.get_part_details(int(part_id)) or {}
+            iteration_id = details.get("current_iteration_id")
+            if not iteration_id:
+                raise ValueError("This item has no current iteration.")
+            self._show_iteration_cad_files(
+                int(iteration_id), "Latest", str(details.get("current_version") or "")
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "CAD Files", str(exc))
+
+    def _show_iteration_cad_files(
+        self, iteration_id: int, relation_label: str, displayed_version: str = ""
+    ) -> None:
+        files = self.bom_service.get_iteration_cad_files(int(iteration_id)) or {}
+        if not files:
+            QMessageBox.warning(self, "CAD Files", "The selected iteration was not found.")
+            return
+        version = str(files.get("version_label") or displayed_version or "").strip()
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"{relation_label} CAD Files - {version}".strip(" -"))
+        dialog.resize(560, 210)
+        layout = QVBoxLayout(dialog)
+        heading = QLabel(f"{relation_label} iteration: {version or iteration_id}")
+        heading.setStyleSheet("font-weight:700;")
+        layout.addWidget(heading)
+        table = QTableWidget(2, 2)
+        table.setHorizontalHeaderLabels(["File Role", "Captured Creo File"])
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        rows = (
+            ("Native CAD", str(files.get("filename") or "Not captured")),
+            ("Drawing", str(files.get("drawing") or "Not captured")),
+        )
+        for row_index, values in enumerate(rows):
+            for column, value in enumerate(values):
+                table.setItem(row_index, column, QTableWidgetItem(value))
+        layout.addWidget(table)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec_()
+
+    def _show_structure_context_menu(self, position) -> None:
+        tree = self.sender()
+        if not isinstance(tree, QTreeWidget):
+            return
+        item = tree.itemAt(position)
+        if item is None:
+            return
+        menu = QMenu(tree)
+        entries = (
+            ("Current", STRUCTURE_CURRENT_ITERATION_ROLE, item.text(5)),
+            ("Bound", STRUCTURE_BOUND_ITERATION_ROLE, item.text(6)),
+            ("Latest", STRUCTURE_LATEST_ITERATION_ROLE, item.text(7)),
+        )
+        for label, role, version in entries:
+            iteration_id = item.data(0, role)
+            if iteration_id is None:
+                continue
+            action = menu.addAction(
+                f"View {label} CAD Files ({version})" if str(version or "").strip()
+                else f"View {label} CAD Files"
+            )
+            action.triggered.connect(
+                lambda _=False, iid=int(iteration_id), relation=label, ver=str(version or ""):
+                self._show_iteration_cad_files(iid, relation, ver)
+            )
+        if menu.actions():
+            menu.exec_(tree.viewport().mapToGlobal(position))
 
     def _open_structure_tree_item(self, item: QTreeWidgetItem, _column: int) -> None:
         part_id = item.data(0, Qt.UserRole) if item is not None else None
@@ -8057,12 +8369,15 @@ class BomPage(QWidget):
         aes_number = self._details_value(self._current_part_details, ("aes_number",))
         part_number = self._details_value(self._current_part_details, ("part_number",))
         part_type = self._details_value(self._current_part_details, ("type",))
+        current_version = self._details_value(self._current_part_details, ("current_version", "revision"))
         if aes_number:
             identity_parts.append(f"AES {aes_number}")
         if part_number:
             identity_parts.append(f"Part {part_number}")
         if part_type:
             identity_parts.append(part_type.upper())
+        if current_version:
+            identity_parts.append(f"Version {current_version}")
         self.details_identity_label.setText(
             "  |  ".join(identity_parts)
             if identity_parts else "Select a row in the BOM structure to view its summary."
@@ -8082,6 +8397,31 @@ class BomPage(QWidget):
             field_label.show()
             value_label.show()
             value_label.setText(value)
+        self._update_lifecycle_action_states(self._current_part_details)
+
+    def _update_lifecycle_action_states(self, details: dict) -> None:
+        has_item = bool(details and getattr(self, "current_part_id", None))
+        locked = bool(details.get("locked")) if has_item else False
+        state = str(
+            details.get("revision_state") or details.get("lifecycle_state") or ""
+        ).strip().lower()
+        released = state == "released"
+        obsolete = state == "obsolete"
+        pending_revision = str(details.get("pending_revision_code") or "").strip()
+        editable_checkout = not released or bool(pending_revision)
+        is_assembly = str(details.get("type") or "").strip().lower() in {"asm", "assembly"}
+        can_manage = self.perm.can("manage_parts")
+        can_revision = self.perm.can("set_revision")
+        self.checkout_part_btn.setEnabled(has_item and not locked and not obsolete)
+        self.undo_checkout_btn.setEnabled(has_item and locked)
+        self.edit_part_btn.setEnabled(has_item and locked and can_manage and editable_checkout)
+        self.delete_part_btn.setEnabled(has_item and can_manage and editable_checkout)
+        self.add_child_btn.setEnabled(has_item and locked and can_manage and is_assembly and editable_checkout)
+        self.update_child_versions_btn.setEnabled(has_item and locked and is_assembly and editable_checkout)
+        self.set_revision_btn.setEnabled(
+            has_item and not locked and released and not pending_revision and can_revision
+        )
+        self.release_revision_btn.setEnabled(has_item and not locked and not released and can_revision)
 
     def _edit_current_part_categories(self) -> None:
         part_id = getattr(self, "current_part_id", None)

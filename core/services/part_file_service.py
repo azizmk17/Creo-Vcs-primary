@@ -18,6 +18,20 @@ class PartFileService:
         self.session = SessionManager()
         self.project_service = ProjectService()
 
+    def _assert_part_revision_mutable(self, part_id: int) -> None:
+        part = self.bom_repo.get_by_id(int(part_id))
+        if not part:
+            raise ValueError("BOM item was not found.")
+        state = str(
+            getattr(part, "lifecycle_state", "") or getattr(part, "status", "")
+        ).strip().lower()
+        if state == "released":
+            revision = str(getattr(part, "revision", "") or "").strip()
+            raise ValueError(
+                f"Revision {revision} is released and its associated files are immutable. "
+                "Create a new revision first."
+            )
+
     def _working_dir(self) -> str:
         project_id = self.session.project_id
         if not project_id:
@@ -102,6 +116,7 @@ class PartFileService:
     ) -> int:
         if not part_id:
             raise ValueError("part_id is required")
+        self._assert_part_revision_mutable(int(part_id))
         wd = self._working_dir()
         if not wd:
             raise ValueError("Project working directory is not set")
@@ -142,6 +157,7 @@ class PartFileService:
         pf = self.repo.get_file_by_id(file_id)
         if not pf:
             raise ValueError("Attachment not found")
+        self._assert_part_revision_mutable(int(pf.part_id))
         wd = self._working_dir()
         if not wd:
             raise ValueError("Project working directory is not set")
@@ -187,6 +203,7 @@ class PartFileService:
         pf = self.repo.get_file_by_id(file_id)
         if not pf:
             raise ValueError("Attachment not found")
+        self._assert_part_revision_mutable(int(pf.part_id))
         wd = self._working_dir()
         if not wd:
             raise ValueError("Project working directory is not set")
@@ -269,6 +286,10 @@ class PartFileService:
         return self.repo.get_versions(file_id)
 
     def set_active_version(self, file_id: int, version_id: int):
+        part_file = self.repo.get_file_by_id(int(file_id))
+        if not part_file:
+            raise ValueError("Attachment not found")
+        self._assert_part_revision_mutable(int(part_file.part_id))
         self.repo.set_active_version(file_id, version_id)
 
     def resolve_version_path(self, version: PartFileVersion) -> str:
@@ -325,8 +346,11 @@ class PartFileService:
         pf = self.repo.get_file_by_id(file_id)
         if not pf:
             return
+        self._assert_part_revision_mutable(int(pf.part_id))
         ver = self.repo.get_version_by_id(version_id)
         if ver:
+            if str(getattr(ver, "lifecycle_state", "") or "").strip().lower() == "released":
+                raise ValueError("Released attachment versions are immutable and cannot be deleted.")
             abs_path = self.resolve_version_path(ver)
             try:
                 if abs_path and safe_exists(abs_path):
@@ -346,8 +370,17 @@ class PartFileService:
                 self.repo.set_active_version(file_id, versions[0].id)
 
     def delete_attachment(self, file_id: int):
+        part_file = self.repo.get_file_by_id(int(file_id))
+        if not part_file:
+            return
+        self._assert_part_revision_mutable(int(part_file.part_id))
         # delete files on disk (best-effort)
         versions = self.repo.get_versions(file_id)
+        if any(
+            str(getattr(version, "lifecycle_state", "") or "").strip().lower() == "released"
+            for version in versions
+        ):
+            raise ValueError("An attachment containing released versions cannot be deleted.")
         for v in versions:
             abs_path = self.resolve_version_path(v)
             try:
@@ -359,6 +392,12 @@ class PartFileService:
         self.repo.delete_file(file_id)
 
     def update_version_revision(self, version_id: int, revision: str):
+        version = self.repo.get_version_by_id(int(version_id))
+        if version and str(getattr(version, "lifecycle_state", "") or "").strip().lower() == "released":
+            raise ValueError("Released attachment version metadata is immutable.")
+        part_file = self.repo.get_file_by_id(int(version.file_id)) if version else None
+        if part_file:
+            self._assert_part_revision_mutable(int(part_file.part_id))
         self.repo.update_version_metadata(
             int(version_id),
             revision=str(revision or "").strip().upper(),
@@ -366,6 +405,12 @@ class PartFileService:
         )
 
     def update_version_note(self, version_id: int, note: str):
+        version = self.repo.get_version_by_id(int(version_id))
+        if version and str(getattr(version, "lifecycle_state", "") or "").strip().lower() == "released":
+            raise ValueError("Released attachment version metadata is immutable.")
+        part_file = self.repo.get_file_by_id(int(version.file_id)) if version else None
+        if part_file:
+            self._assert_part_revision_mutable(int(part_file.part_id))
         self.repo.update_version_metadata(
             int(version_id),
             note=str(note or "").strip(),

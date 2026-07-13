@@ -41,6 +41,8 @@ class BomRepository:
                     conn.execute("ALTER TABLE bom ADD COLUMN released_by INTEGER")
                 if "released_at" not in cols:
                     conn.execute("ALTER TABLE bom ADD COLUMN released_at TEXT")
+                if "pending_revision_code" not in cols:
+                    conn.execute("ALTER TABLE bom ADD COLUMN pending_revision_code TEXT")
         except Exception:
             pass
 

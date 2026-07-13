@@ -27,6 +27,19 @@ class LockRepository:
                 part_id, user_id, "checkin", sqlite3.datetime.datetime.now().isoformat(), signature
             ))
             return True
+
+    def undo_checkout(self, part_id, user_id, signature) -> bool:
+        """Release a checkout without recording a check-in event."""
+        with self.get_conn() as conn:
+            conn.execute("DELETE FROM locks WHERE part_id = ?", (int(part_id),))
+            conn.execute(
+                """
+                INSERT INTO lock_logs (part_id, user_id, action, timestamp, signature)
+                VALUES (?, ?, 'undo_checkout', ?, ?)
+                """,
+                (int(part_id), int(user_id), sqlite3.datetime.datetime.now().isoformat(), signature),
+            )
+            return True
         
     def checkout(self, part_id, user_id, signature) -> bool:
         with self.get_conn() as conn:

@@ -536,6 +536,7 @@ class MergeService(BaseService):
                 merged_entries.append({
                     "item_id": commit.part_id,
                     "commit_id": commit.id,
+                    "source_commit_id": getattr(commit, "commit_id", None),
                     "part_type": commit.type,
                     "new_filename": result["new_filename"],
                     "new_version": result["new_version"],
@@ -582,7 +583,12 @@ class MergeService(BaseService):
             # Check in the part after merge: release the checkout lock if it exists.
             lock = self.lock_repo.get_lock_by_part(item['item_id'])
             if lock:
-                self.bom_service.checkin_by_part_id(item['item_id'], lock.user_id)
+                self.bom_service.checkin_by_part_id(
+                    item['item_id'],
+                    lock.user_id,
+                    note=message,
+                    source_commit_id=str(item.get('source_commit_id') or item.get('commit_id') or ''),
+                )
                 print(f"Checked in lock for part ID {item['item_id']} by user ID {lock.user_id}")
 
         

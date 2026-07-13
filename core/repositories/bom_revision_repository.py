@@ -1,0 +1,1160 @@
+import json
+import re
+import sqlite3
+
+from config import DB_NAME
+
+
+class BomRevisionRepository:
+    """Object-level revisions, iterations, and exact assembly configurations."""
+
+    _REVISION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$")
+    _SNAPSHOT_FIELDS = (
+        "type", "name", "part_number", "drawing_number", "aes_number",
+        "filename", "drawing", "base_file_name", "base_drw_name", "material",
+        "weight", "notes", "pdf_path", "step_path",
+    )
+
+    def __init__(self, db_name=DB_NAME):
+        self.db_name = db_name
+        self._ensure_schema()
+
+    def get_conn(self):
+        conn = sqlite3.connect(self.db_name)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    @classmethod
+    def normalize_revision_code(cls, value: str) -> str:
+        code = str(value or "").strip().upper()
+        if not code:
+            raise ValueError("Revision code is required.")
+        if not cls._REVISION_PATTERN.fullmatch(code):
+            raise ValueError(
+                "Revision code must start with a letter or number and may contain letters, "
+                "numbers, dots, underscores, or hyphens (for example A, A1, or A010)."
+            )
+        return code
+
+    @classmethod
+    def suggest_next_revision_code(cls, value: str) -> str:
+        """Suggest a revision while allowing the user to override local conventions."""
+        code = cls.normalize_revision_code(value or "A")
+        if code.isalpha():
+            digits = [ord(char) - ord("A") for char in code]
+            carry = 1
+            for index in range(len(digits) - 1, -1, -1):
+                digits[index] += carry
+                if digits[index] >= 26:
+                    digits[index] = 0
+                else:
+                    carry = 0
+                    break
+            if carry:
+                digits.insert(0, 0)
+            return "".join(chr(value + ord("A")) for value in digits)
+
+        match = re.fullmatch(r"(.*?)(\d+)", code)
+        if match:
+            prefix, raw_number = match.groups()
+            number = int(raw_number)
+            step = 10 if len(raw_number) >= 2 and number and number % 10 == 0 else 1
+            return f"{prefix}{number + step:0{len(raw_number)}d}"
+        return f"{code}1"
+
+    def _ensure_schema(self) -> None:
+        with self.get_conn() as conn:
+            tables = {
+                str(row[0])
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            }
+            if "bom" not in tables:
+                return
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(bom)").fetchall()}
+            if "current_revision_id" not in columns:
+                conn.execute("ALTER TABLE bom ADD COLUMN current_revision_id INTEGER")
+            if "current_iteration_id" not in columns:
+                conn.execute("ALTER TABLE bom ADD COLUMN current_iteration_id INTEGER")
+            if "pending_revision_code" not in columns:
+                conn.execute("ALTER TABLE bom ADD COLUMN pending_revision_code TEXT")
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS bom_revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    bom_id INTEGER NOT NULL,
+                    revision_code TEXT NOT NULL COLLATE NOCASE,
+                    state TEXT NOT NULL DEFAULT 'In Work',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    created_by INTEGER,
+                    released_at TEXT,
+                    released_by INTEGER,
+                    release_note TEXT,
+                    UNIQUE(bom_id, revision_code)
+                );
+                CREATE TABLE IF NOT EXISTS bom_iterations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    revision_id INTEGER NOT NULL,
+                    iteration_number INTEGER NOT NULL,
+                    checkin_note TEXT,
+                    source_commit_id TEXT,
+                    object_data_json TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    created_by INTEGER,
+                    UNIQUE(revision_id, iteration_number)
+                );
+                CREATE TABLE IF NOT EXISTS bom_iteration_bindings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    parent_iteration_id INTEGER NOT NULL,
+                    usage_id INTEGER,
+                    child_bom_id INTEGER NOT NULL,
+                    child_revision_id INTEGER NOT NULL,
+                    child_iteration_id INTEGER NOT NULL,
+                    quantity INTEGER NOT NULL DEFAULT 1,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(parent_iteration_id, usage_id)
+                );
+                CREATE TABLE IF NOT EXISTS bom_working_bindings (
+                    parent_bom_id INTEGER NOT NULL,
+                    usage_id INTEGER NOT NULL,
+                    child_bom_id INTEGER NOT NULL,
+                    child_revision_id INTEGER NOT NULL,
+                    child_iteration_id INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_by INTEGER,
+                    PRIMARY KEY(parent_bom_id, usage_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_bom_revisions_bom
+                    ON bom_revisions(bom_id, id);
+                CREATE INDEX IF NOT EXISTS idx_bom_iterations_revision
+                    ON bom_iterations(revision_id, iteration_number);
+                CREATE INDEX IF NOT EXISTS idx_bom_iteration_bindings_parent
+                    ON bom_iteration_bindings(parent_iteration_id, sort_order, id);
+                CREATE INDEX IF NOT EXISTS idx_bom_iteration_bindings_child
+                    ON bom_iteration_bindings(child_bom_id, child_iteration_id);
+                CREATE INDEX IF NOT EXISTS idx_bom_working_bindings_parent
+                    ON bom_working_bindings(parent_bom_id, usage_id);
+                """
+            )
+            iteration_columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(bom_iterations)").fetchall()
+            }
+            if "source_commit_id" not in iteration_columns:
+                conn.execute("ALTER TABLE bom_iterations ADD COLUMN source_commit_id TEXT")
+            if "object_data_json" not in iteration_columns:
+                conn.execute("ALTER TABLE bom_iterations ADD COLUMN object_data_json TEXT")
+            iteration_columns = self._iteration_columns_conn(conn)
+            if "commit_id" in iteration_columns:
+                conn.execute(
+                    """
+                    UPDATE bom_iterations
+                    SET source_commit_id=CAST(commit_id AS TEXT)
+                    WHERE source_commit_id IS NULL AND commit_id IS NOT NULL
+                    """
+                )
+            self._backfill_missing(conn)
+
+    @staticmethod
+    def _iteration_columns_conn(conn) -> set:
+        return {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(bom_iterations)").fetchall()
+        }
+
+    def _insert_iteration_conn(
+        self,
+        conn,
+        revision_id: int,
+        iteration_number: int,
+        *,
+        checkin_note=None,
+        source_commit_id=None,
+        object_data_json=None,
+        created_by=None,
+        ignore_existing: bool = False,
+    ) -> int:
+        columns = self._iteration_columns_conn(conn)
+        values = {
+            "revision_id": int(revision_id),
+            "iteration_number": int(iteration_number),
+            "checkin_note": checkin_note,
+            "source_commit_id": source_commit_id,
+            "object_data_json": object_data_json,
+            "created_by": created_by,
+        }
+        # The pre-v22 PLM prototype required this column. Keep it populated so
+        # existing databases can be upgraded without rebuilding their history.
+        if "folder_path" in columns:
+            values["folder_path"] = ""
+        names = [name for name in values if name in columns]
+        placeholders = ",".join("?" for _ in names)
+        insert_verb = "INSERT OR IGNORE" if ignore_existing else "INSERT"
+        cursor = conn.execute(
+            f"{insert_verb} INTO bom_iterations({','.join(names)}) VALUES({placeholders})",
+            tuple(values[name] for name in names),
+        )
+        if cursor.lastrowid:
+            return int(cursor.lastrowid)
+        row = conn.execute(
+            """
+            SELECT id FROM bom_iterations
+            WHERE revision_id=? AND iteration_number=?
+            """,
+            (int(revision_id), int(iteration_number)),
+        ).fetchone()
+        if not row:
+            raise RuntimeError(
+                f"Could not create iteration {iteration_number} for revision {revision_id}."
+            )
+        return int(row[0])
+
+    def _object_snapshot_conn(self, conn, bom_id: int) -> str:
+        columns = ", ".join(self._SNAPSHOT_FIELDS)
+        row = conn.execute(f"SELECT {columns} FROM bom WHERE id=?", (int(bom_id),)).fetchone()
+        if not row:
+            raise ValueError("BOM item was not found.")
+        return json.dumps(dict(row), ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+    def _ensure_bom_conn(self, conn, bom_id: int, created_by=None) -> dict:
+        row = conn.execute(
+            """
+            SELECT id, revision, lifecycle_state, status,
+                   current_revision_id, current_iteration_id
+            FROM bom WHERE id=?
+            """,
+            (int(bom_id),),
+        ).fetchone()
+        if not row:
+            raise ValueError("BOM item was not found.")
+
+        current = self._current_context_conn(conn, int(bom_id), allow_missing=True)
+        if current:
+            return current
+
+        code = str(row["revision"] or "A").strip().upper() or "A"
+        lifecycle = str(row["lifecycle_state"] or row["status"] or "").lower()
+        state = "Released" if "release" in lifecycle else "In Work"
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO bom_revisions(bom_id, revision_code, state, created_by)
+            VALUES(?,?,?,?)
+            """,
+            (int(bom_id), code, state, created_by),
+        )
+        revision_id = int(conn.execute(
+            "SELECT id FROM bom_revisions WHERE bom_id=? AND revision_code=? COLLATE NOCASE",
+            (int(bom_id), code),
+        ).fetchone()[0])
+        self._insert_iteration_conn(
+            conn,
+            revision_id,
+            1,
+            object_data_json=self._object_snapshot_conn(conn, int(bom_id)),
+            created_by=created_by,
+            ignore_existing=True,
+        )
+        iteration_id = int(conn.execute(
+            "SELECT id FROM bom_iterations WHERE revision_id=? AND iteration_number=1",
+            (revision_id,),
+        ).fetchone()[0])
+        conn.execute(
+            """
+            UPDATE bom_iterations
+            SET object_data_json=COALESCE(object_data_json, ?)
+            WHERE id=?
+            """,
+            (self._object_snapshot_conn(conn, int(bom_id)), iteration_id),
+        )
+        conn.execute(
+            "UPDATE bom SET current_revision_id=?, current_iteration_id=? WHERE id=?",
+            (revision_id, iteration_id, int(bom_id)),
+        )
+        return self._current_context_conn(conn, int(bom_id))
+
+    def _backfill_missing(self, conn) -> None:
+        rows = conn.execute(
+            """
+            SELECT b.id
+            FROM bom b
+            LEFT JOIN bom_revisions r ON r.id=b.current_revision_id AND r.bom_id=b.id
+            LEFT JOIN bom_iterations i ON i.id=b.current_iteration_id AND i.revision_id=r.id
+            WHERE b.current_revision_id IS NULL OR b.current_iteration_id IS NULL
+               OR r.id IS NULL OR i.id IS NULL
+            ORDER BY b.id
+            """
+        ).fetchall()
+        initialized_ids = []
+        for row in rows:
+            bom_id = int(row["id"])
+            self._ensure_bom_conn(conn, bom_id)
+            initialized_ids.append(bom_id)
+        if not initialized_ids:
+            return
+        placeholders = ",".join("?" for _ in initialized_ids)
+        for row in conn.execute(
+            f"""
+            SELECT bc.id AS usage_id, bc.parent_id, bc.child_id,
+                   COALESCE(bc.quantity, 1) AS quantity,
+                   COALESCE(bc.sort_order, bc.id) AS sort_order,
+                   parent.current_iteration_id AS parent_iteration_id,
+                   child.current_revision_id AS child_revision_id,
+                   child.current_iteration_id AS child_iteration_id
+            FROM bom_children bc
+            JOIN bom parent ON parent.id=bc.parent_id
+            JOIN bom child ON child.id=bc.child_id
+            WHERE bc.parent_id IN ({placeholders})
+            """,
+            initialized_ids,
+        ).fetchall():
+            if not row["parent_iteration_id"] or not row["child_iteration_id"]:
+                continue
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO bom_iteration_bindings(
+                    parent_iteration_id, usage_id, child_bom_id, child_revision_id,
+                    child_iteration_id, quantity, sort_order
+                ) VALUES(?,?,?,?,?,?,?)
+                """,
+                (
+                    int(row["parent_iteration_id"]), int(row["usage_id"]), int(row["child_id"]),
+                    int(row["child_revision_id"]), int(row["child_iteration_id"]),
+                    max(1, int(row["quantity"] or 1)), int(row["sort_order"] or 0),
+                ),
+            )
+
+    def ensure_bom(self, bom_id: int, created_by=None) -> dict:
+        with self.get_conn() as conn:
+            return self._ensure_bom_conn(conn, int(bom_id), created_by=created_by)
+
+    def _current_context_conn(self, conn, bom_id: int, allow_missing: bool = False) -> dict:
+        row = conn.execute(
+            """
+            SELECT b.id AS bom_id, b.current_revision_id, b.current_iteration_id,
+                   b.pending_revision_code,
+                   r.revision_code, r.state, r.created_at AS revision_created_at,
+                   r.created_by AS revision_created_by, r.released_at, r.released_by,
+                   r.release_note, i.iteration_number, i.checkin_note,
+                   i.source_commit_id, i.object_data_json,
+                   i.created_at AS iteration_created_at,
+                   i.created_by AS iteration_created_by
+            FROM bom b
+            LEFT JOIN bom_revisions r ON r.id=b.current_revision_id AND r.bom_id=b.id
+            LEFT JOIN bom_iterations i ON i.id=b.current_iteration_id AND i.revision_id=r.id
+            WHERE b.id=?
+            """,
+            (int(bom_id),),
+        ).fetchone()
+        if (
+            not row
+            or row["current_revision_id"] is None
+            or row["current_iteration_id"] is None
+            or row["revision_code"] is None
+            or row["iteration_number"] is None
+        ):
+            if allow_missing:
+                return {}
+            raise ValueError("BOM item has no current revision/iteration.")
+        result = dict(row)
+        result["version_label"] = f"{result['revision_code']}.{int(result['iteration_number'])}"
+        return result
+
+    def get_current_context(self, bom_id: int) -> dict:
+        with self.get_conn() as conn:
+            self._ensure_bom_conn(conn, int(bom_id))
+            return self._current_context_conn(conn, int(bom_id))
+
+    def get_current_contexts_for_project(self, project_id: int) -> dict[int, dict]:
+        with self.get_conn() as conn:
+            rows = conn.execute("SELECT id FROM bom WHERE project_id=?", (int(project_id),)).fetchall()
+        return self.get_current_contexts(int(row["id"]) for row in rows)
+
+    def get_current_contexts(self, bom_ids) -> dict[int, dict]:
+        ids = sorted({int(value) for value in (bom_ids or []) if value is not None})
+        if not ids:
+            return {}
+        with self.get_conn() as conn:
+            result = {}
+            for offset in range(0, len(ids), 800):
+                chunk = ids[offset:offset + 800]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT b.id AS bom_id, b.current_revision_id, b.current_iteration_id,
+                           b.pending_revision_code,
+                           r.revision_code, r.state, r.created_at AS revision_created_at,
+                           r.created_by AS revision_created_by, r.released_at, r.released_by,
+                           r.release_note, i.iteration_number, i.checkin_note,
+                           i.source_commit_id, i.object_data_json,
+                           i.created_at AS iteration_created_at,
+                           i.created_by AS iteration_created_by
+                    FROM bom b
+                    LEFT JOIN bom_revisions r ON r.id=b.current_revision_id AND r.bom_id=b.id
+                    LEFT JOIN bom_iterations i ON i.id=b.current_iteration_id AND i.revision_id=r.id
+                    WHERE b.id IN ({placeholders})
+                    """,
+                    chunk,
+                ).fetchall()
+                for row in rows:
+                    bom_id = int(row["bom_id"])
+                    if row["revision_code"] is None or row["iteration_number"] is None:
+                        continue
+                    context = dict(row)
+                    context["version_label"] = (
+                        f"{context['revision_code']}.{int(context['iteration_number'])}"
+                    )
+                    result[bom_id] = context
+            for bom_id in ids:
+                if bom_id not in result:
+                    result[bom_id] = self._ensure_bom_conn(conn, bom_id)
+            return result
+
+    def list_revisions(self, bom_id: int) -> list[dict]:
+        with self.get_conn() as conn:
+            self._ensure_bom_conn(conn, int(bom_id))
+            rows = conn.execute(
+                """
+                SELECT r.*, COUNT(i.id) AS iteration_count,
+                       MAX(i.iteration_number) AS latest_iteration_number
+                FROM bom_revisions r
+                LEFT JOIN bom_iterations i ON i.revision_id=r.id
+                WHERE r.bom_id=?
+                GROUP BY r.id ORDER BY r.id
+                """,
+                (int(bom_id),),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_iterations(self, bom_id: int, revision_id=None) -> list[dict]:
+        with self.get_conn() as conn:
+            self._ensure_bom_conn(conn, int(bom_id))
+            sql = """
+                SELECT i.*, r.bom_id, r.revision_code, r.state,
+                       r.released_at, r.released_by,
+                       r.revision_code || '.' || i.iteration_number AS version_label
+                FROM bom_iterations i
+                JOIN bom_revisions r ON r.id=i.revision_id
+                WHERE r.bom_id=?
+            """
+            params = [int(bom_id)]
+            if revision_id is not None:
+                sql += " AND r.id=?"
+                params.append(int(revision_id))
+            sql += " ORDER BY r.id DESC, i.iteration_number DESC"
+            return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+    def get_iteration_context(self, iteration_id: int) -> dict:
+        with self.get_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT i.*, r.bom_id, r.revision_code, r.state,
+                       r.revision_code || '.' || i.iteration_number AS version_label
+                FROM bom_iterations i
+                JOIN bom_revisions r ON r.id=i.revision_id
+                WHERE i.id=?
+                """,
+                (int(iteration_id),),
+            ).fetchone()
+            return dict(row) if row else {}
+
+    def get_iteration_cad_files(self, iteration_id: int) -> dict:
+        context = self.get_iteration_context(int(iteration_id))
+        if not context:
+            return {}
+        try:
+            snapshot = json.loads(str(context.get("object_data_json") or "{}"))
+        except Exception:
+            snapshot = {}
+        return {
+            "iteration_id": int(iteration_id),
+            "bom_id": context.get("bom_id"),
+            "version_label": context.get("version_label") or "",
+            "state": context.get("state") or "",
+            "filename": str(snapshot.get("filename") or "").strip(),
+            "drawing": str(snapshot.get("drawing") or "").strip(),
+            "base_file_name": str(snapshot.get("base_file_name") or "").strip(),
+            "base_drw_name": str(snapshot.get("base_drw_name") or "").strip(),
+            "created_at": context.get("created_at"),
+        }
+
+    def validate_released_checkout(self, bom_id: int, revision_code: str) -> dict:
+        code = self.normalize_revision_code(revision_code)
+        with self.get_conn() as conn:
+            current = self._ensure_bom_conn(conn, int(bom_id))
+            if str(current.get("state") or "").strip().lower() != "released":
+                raise ValueError(f"{current['version_label']} is not Released.")
+            exists = conn.execute(
+                "SELECT 1 FROM bom_revisions WHERE bom_id=? AND revision_code=? COLLATE NOCASE",
+                (int(bom_id), code),
+            ).fetchone()
+            if exists:
+                raise ValueError(f"Revision {code} already exists for this item.")
+            current["pending_revision_code"] = code
+            return current
+
+    def prepare_released_checkout(self, bom_id: int, revision_code: str) -> dict:
+        code = self.normalize_revision_code(revision_code)
+        with self.get_conn() as conn:
+            current = self._ensure_bom_conn(conn, int(bom_id))
+            if str(current.get("state") or "").strip().lower() != "released":
+                raise ValueError(f"{current['version_label']} is not Released.")
+            exists = conn.execute(
+                "SELECT 1 FROM bom_revisions WHERE bom_id=? AND revision_code=? COLLATE NOCASE",
+                (int(bom_id), code),
+            ).fetchone()
+            if exists:
+                raise ValueError(f"Revision {code} already exists for this item.")
+            conn.execute(
+                "UPDATE bom SET pending_revision_code=?, modified=datetime('now') WHERE id=?",
+                (code, int(bom_id)),
+            )
+            current["pending_revision_code"] = code
+            return current
+
+    def assert_mutable(self, bom_id: int) -> dict:
+        context = self.get_current_context(int(bom_id))
+        if str(context.get("state") or "").strip().lower() == "released":
+            raise ValueError(
+                f"{context['version_label']} is released and immutable. Create a new revision before modifying it."
+            )
+        if str(context.get("state") or "").strip().lower() == "obsolete":
+            raise ValueError("Obsolete revisions cannot be modified.")
+        return context
+
+    def assert_checkout_mutable(self, bom_id: int) -> dict:
+        context = self.get_current_context(int(bom_id))
+        state = str(context.get("state") or "").strip().lower()
+        if state == "obsolete":
+            raise ValueError("Obsolete revisions cannot be modified.")
+        if state == "released" and not str(context.get("pending_revision_code") or "").strip():
+            raise ValueError(
+                f"{context['version_label']} is Released. Start a new-revision checkout before modifying it."
+            )
+        return context
+
+    @staticmethod
+    def _valid_child_binding_conn(conn, child_bom_id: int, revision_id, iteration_id):
+        if revision_id is None or iteration_id is None:
+            return None
+        row = conn.execute(
+            """
+            SELECT r.id AS revision_id, i.id AS iteration_id
+            FROM bom_revisions r
+            JOIN bom_iterations i ON i.revision_id=r.id
+            WHERE r.bom_id=? AND r.id=? AND i.id=?
+            """,
+            (int(child_bom_id), int(revision_id), int(iteration_id)),
+        ).fetchone()
+        return (int(row["revision_id"]), int(row["iteration_id"])) if row else None
+
+    def _resolve_binding_conn(self, conn, parent_bom_id: int, usage_id: int, child_bom_id: int, preferred=None):
+        row = conn.execute(
+            """
+            SELECT child_revision_id, child_iteration_id
+            FROM bom_working_bindings WHERE parent_bom_id=? AND usage_id=?
+            """,
+            (int(parent_bom_id), int(usage_id)),
+        ).fetchone()
+        if row:
+            valid = self._valid_child_binding_conn(
+                conn, child_bom_id, row["child_revision_id"], row["child_iteration_id"]
+            )
+            if valid:
+                return valid
+
+        if preferred:
+            valid = self._valid_child_binding_conn(conn, child_bom_id, preferred[0], preferred[1])
+            if valid:
+                return valid
+
+        parent = self._current_context_conn(conn, int(parent_bom_id))
+        row = conn.execute(
+            """
+            SELECT child_revision_id, child_iteration_id
+            FROM bom_iteration_bindings
+            WHERE parent_iteration_id=? AND usage_id=?
+            """,
+            (int(parent["current_iteration_id"]), int(usage_id)),
+        ).fetchone()
+        if not row:
+            row = conn.execute(
+                """
+                SELECT child_revision_id, child_iteration_id
+                FROM bom_iteration_bindings
+                WHERE parent_iteration_id=? AND child_bom_id=?
+                ORDER BY id LIMIT 1
+                """,
+                (int(parent["current_iteration_id"]), int(child_bom_id)),
+            ).fetchone()
+        if row:
+            valid = self._valid_child_binding_conn(
+                conn, child_bom_id, row["child_revision_id"], row["child_iteration_id"]
+            )
+            if valid:
+                return valid
+
+        child = self._ensure_bom_conn(conn, int(child_bom_id))
+        return int(child["current_revision_id"]), int(child["current_iteration_id"])
+
+    def initialize_checkout(self, bom_id: int, user_id: int) -> None:
+        with self.get_conn() as conn:
+            self._ensure_bom_conn(conn, int(bom_id), created_by=user_id)
+            current = self._current_context_conn(conn, int(bom_id))
+            state = str(current["state"]).lower()
+            if state == "obsolete":
+                raise ValueError(
+                    f"{current['version_label']} is {current['state']} and cannot be checked out."
+                )
+            if state == "released" and not str(current.get("pending_revision_code") or "").strip():
+                raise ValueError(
+                    f"{current['version_label']} is Released. A target revision is required for checkout."
+                )
+            conn.execute("DELETE FROM bom_working_bindings WHERE parent_bom_id=?", (int(bom_id),))
+            rows = conn.execute(
+                "SELECT id, child_id FROM bom_children WHERE parent_id=? ORDER BY COALESCE(sort_order,id), id",
+                (int(bom_id),),
+            ).fetchall()
+            for row in rows:
+                revision_id, iteration_id = self._resolve_binding_conn(
+                    conn, int(bom_id), int(row["id"]), int(row["child_id"])
+                )
+                conn.execute(
+                    """
+                    INSERT INTO bom_working_bindings(
+                        parent_bom_id, usage_id, child_bom_id, child_revision_id,
+                        child_iteration_id, updated_by
+                    ) VALUES(?,?,?,?,?,?)
+                    """,
+                    (
+                        int(bom_id), int(row["id"]), int(row["child_id"]),
+                        revision_id, iteration_id, int(user_id),
+                    ),
+                )
+
+    def discard_checkout(self, bom_id: int) -> None:
+        with self.get_conn() as conn:
+            conn.execute("DELETE FROM bom_working_bindings WHERE parent_bom_id=?", (int(bom_id),))
+            conn.execute(
+                "UPDATE bom SET pending_revision_code=NULL WHERE id=?", (int(bom_id),)
+            )
+
+    def restore_checked_in_state(self, bom_id: int) -> dict:
+        """Restore object attributes and direct structure from the current immutable iteration."""
+        with self.get_conn() as conn:
+            current = self._ensure_bom_conn(conn, int(bom_id))
+            raw_snapshot = current.get("object_data_json")
+            try:
+                snapshot = json.loads(str(raw_snapshot or "{}"))
+            except Exception:
+                snapshot = {}
+            assignments = []
+            values = []
+            for field in self._SNAPSHOT_FIELDS:
+                if field in snapshot:
+                    assignments.append(f"{field}=?")
+                    values.append(snapshot.get(field))
+            assignments.append("pending_revision_code=NULL")
+            conn.execute(
+                f"UPDATE bom SET {', '.join(assignments)}, modified=datetime('now') WHERE id=?",
+                [*values, int(bom_id)],
+            )
+
+            bindings = conn.execute(
+                """
+                SELECT usage_id, child_bom_id, quantity, sort_order
+                FROM bom_iteration_bindings
+                WHERE parent_iteration_id=?
+                ORDER BY sort_order, id
+                """,
+                (int(current["current_iteration_id"]),),
+            ).fetchall()
+            conn.execute("DELETE FROM bom_children WHERE parent_id=?", (int(bom_id),))
+            for binding in bindings:
+                usage_id = binding["usage_id"]
+                inserted = False
+                if usage_id is not None:
+                    try:
+                        conn.execute(
+                            """
+                            INSERT INTO bom_children(id, parent_id, child_id, quantity, sort_order)
+                            VALUES(?,?,?,?,?)
+                            """,
+                            (
+                                int(usage_id), int(bom_id), int(binding["child_bom_id"]),
+                                max(1, int(binding["quantity"] or 1)), int(binding["sort_order"] or 0),
+                            ),
+                        )
+                        inserted = True
+                    except sqlite3.IntegrityError:
+                        inserted = False
+                if not inserted:
+                    conn.execute(
+                        """
+                        INSERT INTO bom_children(parent_id, child_id, quantity, sort_order)
+                        VALUES(?,?,?,?)
+                        """,
+                        (
+                            int(bom_id), int(binding["child_bom_id"]),
+                            max(1, int(binding["quantity"] or 1)), int(binding["sort_order"] or 0),
+                        ),
+                    )
+            conn.execute("DELETE FROM bom_working_bindings WHERE parent_bom_id=?", (int(bom_id),))
+            return self._current_context_conn(conn, int(bom_id))
+
+    def get_effective_child_binding(self, parent_bom_id: int, child_bom_id: int):
+        with self.get_conn() as conn:
+            relation = conn.execute(
+                "SELECT id FROM bom_children WHERE parent_id=? AND child_id=?",
+                (int(parent_bom_id), int(child_bom_id)),
+            ).fetchone()
+            if not relation:
+                return None
+            return self._resolve_binding_conn(
+                conn, int(parent_bom_id), int(relation["id"]), int(child_bom_id)
+            )
+
+    def sync_working_bindings(self, parent_bom_id: int, user_id: int, preferred_by_child=None) -> None:
+        preferred_by_child = preferred_by_child or {}
+        with self.get_conn() as conn:
+            self._ensure_bom_conn(conn, int(parent_bom_id), created_by=user_id)
+            current_usage_ids = []
+            rows = conn.execute(
+                "SELECT id, child_id FROM bom_children WHERE parent_id=? ORDER BY COALESCE(sort_order,id), id",
+                (int(parent_bom_id),),
+            ).fetchall()
+            for row in rows:
+                usage_id = int(row["id"])
+                child_bom_id = int(row["child_id"])
+                current_usage_ids.append(usage_id)
+                revision_id, iteration_id = self._resolve_binding_conn(
+                    conn,
+                    int(parent_bom_id),
+                    usage_id,
+                    child_bom_id,
+                    preferred=preferred_by_child.get(child_bom_id),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO bom_working_bindings(
+                        parent_bom_id, usage_id, child_bom_id, child_revision_id,
+                        child_iteration_id, updated_by
+                    ) VALUES(?,?,?,?,?,?)
+                    ON CONFLICT(parent_bom_id, usage_id) DO UPDATE SET
+                        child_bom_id=excluded.child_bom_id,
+                        child_revision_id=excluded.child_revision_id,
+                        child_iteration_id=excluded.child_iteration_id,
+                        updated_at=datetime('now'), updated_by=excluded.updated_by
+                    """,
+                    (
+                        int(parent_bom_id), usage_id, child_bom_id,
+                        revision_id, iteration_id, int(user_id),
+                    ),
+                )
+            if current_usage_ids:
+                placeholders = ",".join("?" for _ in current_usage_ids)
+                conn.execute(
+                    f"DELETE FROM bom_working_bindings WHERE parent_bom_id=? AND usage_id NOT IN ({placeholders})",
+                    [int(parent_bom_id), *current_usage_ids],
+                )
+            else:
+                conn.execute("DELETE FROM bom_working_bindings WHERE parent_bom_id=?", (int(parent_bom_id),))
+
+    def update_children_to_latest(self, parent_bom_id: int, child_bom_ids, user_id: int) -> list[int]:
+        wanted = sorted({int(value) for value in (child_bom_ids or [])})
+        if not wanted:
+            raise ValueError("Select at least one direct child to update.")
+        with self.get_conn() as conn:
+            self._ensure_bom_conn(conn, int(parent_bom_id), created_by=user_id)
+            changed = []
+            for child_bom_id in wanted:
+                child = self._ensure_bom_conn(conn, child_bom_id, created_by=user_id)
+                relations = conn.execute(
+                    "SELECT id FROM bom_children WHERE parent_id=? AND child_id=?",
+                    (int(parent_bom_id), child_bom_id),
+                ).fetchall()
+                if not relations:
+                    raise ValueError(f"Item {child_bom_id} is not a direct child of this assembly.")
+                for relation in relations:
+                    conn.execute(
+                        """
+                        INSERT INTO bom_working_bindings(
+                            parent_bom_id, usage_id, child_bom_id, child_revision_id,
+                            child_iteration_id, updated_by
+                        ) VALUES(?,?,?,?,?,?)
+                        ON CONFLICT(parent_bom_id, usage_id) DO UPDATE SET
+                            child_revision_id=excluded.child_revision_id,
+                            child_iteration_id=excluded.child_iteration_id,
+                            updated_at=datetime('now'), updated_by=excluded.updated_by
+                        """,
+                        (
+                            int(parent_bom_id), int(relation["id"]), child_bom_id,
+                            int(child["current_revision_id"]), int(child["current_iteration_id"]),
+                            int(user_id),
+                        ),
+                    )
+                changed.append(child_bom_id)
+            return changed
+
+    def _capture_iteration_bindings_conn(self, conn, bom_id: int, iteration_id: int) -> None:
+        relations = conn.execute(
+            """
+            SELECT id, child_id, COALESCE(quantity,1) AS quantity,
+                   COALESCE(sort_order,id) AS sort_order
+            FROM bom_children WHERE parent_id=?
+            ORDER BY COALESCE(sort_order,id), id
+            """,
+            (int(bom_id),),
+        ).fetchall()
+        for relation in relations:
+            revision_id, child_iteration_id = self._resolve_binding_conn(
+                conn, int(bom_id), int(relation["id"]), int(relation["child_id"])
+            )
+            conn.execute(
+                """
+                INSERT INTO bom_iteration_bindings(
+                    parent_iteration_id, usage_id, child_bom_id, child_revision_id,
+                    child_iteration_id, quantity, sort_order
+                ) VALUES(?,?,?,?,?,?,?)
+                """,
+                (
+                    int(iteration_id), int(relation["id"]), int(relation["child_id"]),
+                    revision_id, child_iteration_id,
+                    max(1, int(relation["quantity"] or 1)), int(relation["sort_order"] or 0),
+                ),
+            )
+
+    def record_checkin(self, bom_id: int, user_id: int, note: str = "", source_commit_id=None) -> dict:
+        with self.get_conn() as conn:
+            current = self._ensure_bom_conn(conn, int(bom_id), created_by=user_id)
+            state = str(current["state"]).strip().lower()
+            pending_code = str(current.get("pending_revision_code") or "").strip()
+            if state == "obsolete":
+                raise ValueError(f"{current['version_label']} is immutable and cannot be checked in.")
+            if state == "released" and not pending_code:
+                raise ValueError(
+                    f"{current['version_label']} is Released and has no new-revision checkout."
+                )
+
+            revision_id = int(current["current_revision_id"])
+            next_number = 1
+            if state == "released":
+                pending_code = self.normalize_revision_code(pending_code)
+                exists = conn.execute(
+                    "SELECT 1 FROM bom_revisions WHERE bom_id=? AND revision_code=? COLLATE NOCASE",
+                    (int(bom_id), pending_code),
+                ).fetchone()
+                if exists:
+                    raise ValueError(f"Revision {pending_code} already exists for this item.")
+                revision_id = int(conn.execute(
+                    """
+                    INSERT INTO bom_revisions(bom_id, revision_code, state, created_by)
+                    VALUES(?,?, 'In Work', ?)
+                    """,
+                    (int(bom_id), pending_code, int(user_id)),
+                ).lastrowid)
+            else:
+                next_number = int(conn.execute(
+                    "SELECT COALESCE(MAX(iteration_number),0)+1 FROM bom_iterations WHERE revision_id=?",
+                    (revision_id,),
+                ).fetchone()[0])
+
+            iteration_id = self._insert_iteration_conn(
+                conn,
+                revision_id,
+                next_number,
+                checkin_note=str(note or "").strip() or (
+                    f"Created from Released {current['version_label']}" if state == "released" else None
+                ),
+                source_commit_id=str(source_commit_id or "").strip() or None,
+                object_data_json=self._object_snapshot_conn(conn, int(bom_id)),
+                created_by=int(user_id),
+            )
+            self._capture_iteration_bindings_conn(conn, int(bom_id), iteration_id)
+            if state == "released":
+                conn.execute(
+                    """
+                    UPDATE bom
+                    SET revision=?, lifecycle_state='WIP', status='Design',
+                        released_at=NULL, released_by=NULL,
+                        current_revision_id=?, current_iteration_id=?,
+                        pending_revision_code=NULL, modified=datetime('now')
+                    WHERE id=?
+                    """,
+                    (pending_code, revision_id, iteration_id, int(bom_id)),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE bom SET current_iteration_id=?, pending_revision_code=NULL,
+                                   modified=datetime('now')
+                    WHERE id=?
+                    """,
+                    (iteration_id, int(bom_id)),
+                )
+            conn.execute("DELETE FROM bom_working_bindings WHERE parent_bom_id=?", (int(bom_id),))
+            return self._current_context_conn(conn, int(bom_id))
+
+    def create_revision(self, bom_id: int, revision_code: str, user_id: int, note: str = "") -> dict:
+        code = self.normalize_revision_code(revision_code)
+        with self.get_conn() as conn:
+            current = self._ensure_bom_conn(conn, int(bom_id), created_by=user_id)
+            if str(current["state"]).strip().lower() != "released":
+                raise ValueError(
+                    f"Current version {current['version_label']} must be released before creating a new revision."
+                )
+            exists = conn.execute(
+                "SELECT 1 FROM bom_revisions WHERE bom_id=? AND revision_code=? COLLATE NOCASE",
+                (int(bom_id), code),
+            ).fetchone()
+            if exists:
+                raise ValueError(f"Revision {code} already exists for this item.")
+            revision_id = int(conn.execute(
+                """
+                INSERT INTO bom_revisions(bom_id, revision_code, state, created_by)
+                VALUES(?,?, 'In Work', ?)
+                """,
+                (int(bom_id), code, int(user_id)),
+            ).lastrowid)
+            iteration_id = self._insert_iteration_conn(
+                conn,
+                revision_id,
+                1,
+                checkin_note=str(note or "").strip() or "Created from released revision",
+                object_data_json=self._object_snapshot_conn(conn, int(bom_id)),
+                created_by=int(user_id),
+            )
+            source_bindings = conn.execute(
+                """
+                SELECT usage_id, child_bom_id, child_revision_id, child_iteration_id,
+                       quantity, sort_order
+                FROM bom_iteration_bindings
+                WHERE parent_iteration_id=? ORDER BY sort_order, id
+                """,
+                (int(current["current_iteration_id"]),),
+            ).fetchall()
+            for binding in source_bindings:
+                conn.execute(
+                    """
+                    INSERT INTO bom_iteration_bindings(
+                        parent_iteration_id, usage_id, child_bom_id, child_revision_id,
+                        child_iteration_id, quantity, sort_order
+                    ) VALUES(?,?,?,?,?,?,?)
+                    """,
+                    (
+                        iteration_id, binding["usage_id"], int(binding["child_bom_id"]),
+                        int(binding["child_revision_id"]), int(binding["child_iteration_id"]),
+                        int(binding["quantity"] or 1), int(binding["sort_order"] or 0),
+                    ),
+                )
+            conn.execute(
+                """
+                UPDATE bom
+                SET revision=?, lifecycle_state='WIP', status='Design',
+                    released_at=NULL, released_by=NULL,
+                    current_revision_id=?, current_iteration_id=?,
+                    pending_revision_code=NULL, modified=datetime('now')
+                WHERE id=?
+                """,
+                (code, revision_id, iteration_id, int(bom_id)),
+            )
+            return self._current_context_conn(conn, int(bom_id))
+
+    def release_current_revision(self, bom_id: int, user_id: int, note: str = "") -> dict:
+        with self.get_conn() as conn:
+            current = self._ensure_bom_conn(conn, int(bom_id), created_by=user_id)
+            if str(current["state"]).strip().lower() == "released":
+                raise ValueError(f"Revision {current['revision_code']} is already released.")
+            conn.execute(
+                """
+                UPDATE bom_revisions
+                SET state='Released', released_at=datetime('now'), released_by=?, release_note=?
+                WHERE id=?
+                """,
+                (int(user_id), str(note or "").strip() or None, int(current["current_revision_id"])),
+            )
+            conn.execute(
+                """
+                UPDATE bom
+                SET revision=?, lifecycle_state='Released', status='Released',
+                    released_at=datetime('now'), released_by=?,
+                    pending_revision_code=NULL, modified=datetime('now')
+                WHERE id=?
+                """,
+                (str(current["revision_code"]), int(user_id), int(bom_id)),
+            )
+            conn.execute("DELETE FROM bom_working_bindings WHERE parent_bom_id=?", (int(bom_id),))
+            return self._current_context_conn(conn, int(bom_id))
+
+    def list_child_version_status(self, parent_bom_id: int) -> list[dict]:
+        with self.get_conn() as conn:
+            self._ensure_bom_conn(conn, int(parent_bom_id))
+            for child in conn.execute(
+                "SELECT child_id FROM bom_children WHERE parent_id=?",
+                (int(parent_bom_id),),
+            ).fetchall():
+                self._ensure_bom_conn(conn, int(child["child_id"]))
+            rows = conn.execute(
+                """
+                SELECT bc.id AS usage_id, bc.parent_id, bc.child_id AS child_bom_id,
+                       COALESCE(bc.quantity,1) AS quantity,
+                       COALESCE(bc.sort_order,bc.id) AS sort_order,
+                       child.name, child.aes_number, child.part_number, child.type,
+                       COALESCE(wb.child_revision_id, ib.child_revision_id, child.current_revision_id) AS bound_revision_id,
+                       COALESCE(wb.child_iteration_id, ib.child_iteration_id, child.current_iteration_id) AS bound_iteration_id,
+                       bound_rev.revision_code AS bound_revision,
+                       bound_it.iteration_number AS bound_iteration,
+                       child.current_revision_id AS latest_revision_id,
+                       child.current_iteration_id AS latest_iteration_id,
+                       latest_rev.revision_code AS latest_revision,
+                       latest_it.iteration_number AS latest_iteration,
+                       CASE WHEN wb.usage_id IS NOT NULL THEN 'Working' ELSE 'Checked In' END AS binding_source
+                FROM bom_children bc
+                JOIN bom parent ON parent.id=bc.parent_id
+                JOIN bom child ON child.id=bc.child_id
+                LEFT JOIN bom_working_bindings wb
+                    ON wb.parent_bom_id=bc.parent_id AND wb.usage_id=bc.id
+                LEFT JOIN bom_iteration_bindings ib
+                    ON ib.parent_iteration_id=parent.current_iteration_id AND ib.usage_id=bc.id
+                LEFT JOIN bom_revisions bound_rev
+                    ON bound_rev.id=COALESCE(wb.child_revision_id, ib.child_revision_id, child.current_revision_id)
+                LEFT JOIN bom_iterations bound_it
+                    ON bound_it.id=COALESCE(wb.child_iteration_id, ib.child_iteration_id, child.current_iteration_id)
+                LEFT JOIN bom_revisions latest_rev ON latest_rev.id=child.current_revision_id
+                LEFT JOIN bom_iterations latest_it ON latest_it.id=child.current_iteration_id
+                WHERE bc.parent_id=?
+                ORDER BY COALESCE(bc.sort_order,bc.id), bc.id
+                """,
+                (int(parent_bom_id),),
+            ).fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                item["bound_version"] = (
+                    f"{item['bound_revision']}.{int(item['bound_iteration'])}"
+                    if item.get("bound_revision") is not None and item.get("bound_iteration") is not None else ""
+                )
+                item["latest_version"] = (
+                    f"{item['latest_revision']}.{int(item['latest_iteration'])}"
+                    if item.get("latest_revision") is not None and item.get("latest_iteration") is not None else ""
+                )
+                item["is_latest"] = (
+                    item.get("bound_iteration_id") is not None
+                    and int(item["bound_iteration_id"]) == int(item.get("latest_iteration_id") or 0)
+                )
+                result.append(item)
+            return result
+
+    def get_project_binding_status(self, project_id: int) -> dict[int, dict]:
+        with self.get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT bc.id AS usage_id, bc.parent_id, bc.child_id AS child_bom_id,
+                       COALESCE(bc.quantity,1) AS quantity,
+                       COALESCE(bc.sort_order,bc.id) AS sort_order,
+                       COALESCE(wb.child_iteration_id, ib.child_iteration_id, child.current_iteration_id) AS bound_iteration_id,
+                       bound_rev.revision_code AS bound_revision,
+                       bound_it.iteration_number AS bound_iteration,
+                       child.current_iteration_id AS latest_iteration_id,
+                       latest_rev.revision_code AS latest_revision,
+                       latest_it.iteration_number AS latest_iteration,
+                       CASE WHEN wb.usage_id IS NOT NULL THEN 'Working' ELSE 'Checked In' END AS binding_source
+                FROM bom_children bc
+                JOIN bom parent ON parent.id=bc.parent_id
+                JOIN bom child ON child.id=bc.child_id
+                LEFT JOIN bom_working_bindings wb
+                    ON wb.parent_bom_id=bc.parent_id AND wb.usage_id=bc.id
+                LEFT JOIN bom_iteration_bindings ib
+                    ON ib.parent_iteration_id=parent.current_iteration_id AND ib.usage_id=bc.id
+                LEFT JOIN bom_revisions bound_rev
+                    ON bound_rev.id=COALESCE(wb.child_revision_id, ib.child_revision_id, child.current_revision_id)
+                LEFT JOIN bom_iterations bound_it
+                    ON bound_it.id=COALESCE(wb.child_iteration_id, ib.child_iteration_id, child.current_iteration_id)
+                LEFT JOIN bom_revisions latest_rev ON latest_rev.id=child.current_revision_id
+                LEFT JOIN bom_iterations latest_it ON latest_it.id=child.current_iteration_id
+                WHERE parent.project_id=? AND child.project_id=?
+                ORDER BY bc.parent_id, COALESCE(bc.sort_order,bc.id), bc.id
+                """,
+                (int(project_id), int(project_id)),
+            ).fetchall()
+        result = {}
+        for row in rows:
+            item = dict(row)
+            item["bound_version"] = (
+                f"{item['bound_revision']}.{int(item['bound_iteration'])}"
+                if item.get("bound_revision") is not None and item.get("bound_iteration") is not None else ""
+            )
+            item["latest_version"] = (
+                f"{item['latest_revision']}.{int(item['latest_iteration'])}"
+                if item.get("latest_revision") is not None and item.get("latest_iteration") is not None else ""
+            )
+            item["is_latest"] = (
+                item.get("bound_iteration_id") is not None
+                and int(item["bound_iteration_id"]) == int(item.get("latest_iteration_id") or 0)
+            )
+            result[int(item["usage_id"])] = item
+        return result
+
+    def get_parent_binding_update_counts(self, project_id: int) -> dict[int, int]:
+        counts = {}
+        for item in self.get_project_binding_status(int(project_id)).values():
+            if item.get("is_latest"):
+                continue
+            parent_id = int(item["parent_id"])
+            counts[parent_id] = counts.get(parent_id, 0) + 1
+        return counts
+
+    def count_parent_binding_updates(self, parent_bom_id: int) -> int:
+        return sum(
+            1 for item in self.list_child_version_status(int(parent_bom_id))
+            if not item.get("is_latest")
+        )
+
+    def project_configuration_snapshot(self, project_id: int) -> dict:
+        """Return the checked-in object and exact-binding configuration for snapshots."""
+        contexts = self.get_current_contexts_for_project(int(project_id))
+        with self.get_conn() as conn:
+            object_rows = conn.execute(
+                """
+                SELECT id, aes_number, part_number, name, type
+                FROM bom WHERE project_id=? ORDER BY id
+                """,
+                (int(project_id),),
+            ).fetchall()
+            objects = []
+            for row in object_rows:
+                item = dict(row)
+                context = contexts.get(int(item["id"]), {})
+                item.update({
+                    "revision_id": context.get("current_revision_id"),
+                    "iteration_id": context.get("current_iteration_id"),
+                    "version": context.get("version_label"),
+                    "state": context.get("state"),
+                })
+                objects.append(item)
+            binding_rows = conn.execute(
+                """
+                SELECT parent.id AS parent_bom_id, parent.aes_number AS parent_aes_number,
+                       parent.current_iteration_id AS parent_iteration_id,
+                       ib.usage_id, ib.child_bom_id, child.aes_number AS child_aes_number,
+                       ib.child_revision_id, ib.child_iteration_id,
+                       child_rev.revision_code AS child_revision,
+                       child_it.iteration_number AS child_iteration,
+                       ib.quantity, ib.sort_order
+                FROM bom parent
+                JOIN bom_iteration_bindings ib
+                    ON ib.parent_iteration_id=parent.current_iteration_id
+                JOIN bom child ON child.id=ib.child_bom_id
+                JOIN bom_revisions child_rev ON child_rev.id=ib.child_revision_id
+                JOIN bom_iterations child_it ON child_it.id=ib.child_iteration_id
+                WHERE parent.project_id=?
+                ORDER BY parent.id, ib.sort_order, ib.id
+                """,
+                (int(project_id),),
+            ).fetchall()
+            bindings = []
+            for row in binding_rows:
+                item = dict(row)
+                item["child_version"] = (
+                    f"{item['child_revision']}.{int(item['child_iteration'])}"
+                )
+                bindings.append(item)
+        return {"objects": objects, "bindings": bindings}

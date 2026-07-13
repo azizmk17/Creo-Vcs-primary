@@ -475,7 +475,12 @@ class ProjectRepository:
                         "bom",
                         bom_cols,
                         rdict,
-                        overrides={"project_id": new_project_id},
+                        overrides={
+                            "project_id": new_project_id,
+                            "current_revision_id": None,
+                            "current_iteration_id": None,
+                            "pending_revision_code": None,
+                        },
                         id_col="id",
                     )
                     if old_id is not None:
@@ -490,6 +495,7 @@ class ProjectRepository:
                             pass
 
                 # Duplicate BOM relations (only those between duplicated parts)
+                relation_id_map = {}
                 if bom_id_map:
                     rel_cols = self._table_columns(conn, "bom_children")
                     rel_rows = conn.execute("SELECT * FROM bom_children").fetchall()
@@ -503,7 +509,11 @@ class ProjectRepository:
                         c = d.get("child_id")
                         if p in old_ids and c in old_ids:
                             overrides = {"parent_id": bom_id_map[int(p)], "child_id": bom_id_map[int(c)]}
-                            self._insert_row_from_row(conn, "bom_children", rel_cols, d, overrides=overrides, id_col="id")
+                            new_relation_id = self._insert_row_from_row(
+                                conn, "bom_children", rel_cols, d, overrides=overrides, id_col="id"
+                            )
+                            if d.get("id") is not None:
+                                relation_id_map[int(d["id"])] = int(new_relation_id)
 
                         if callable(progress_cb) and total_rels:
                             try:
@@ -512,6 +522,8 @@ class ProjectRepository:
                                 progress_cb(pct, "Copying BOM relations...")
                             except Exception:
                                 pass
+
+                self._duplicate_bom_revision_configuration(conn, bom_id_map, relation_id_map)
 
                 # Preserve issue identity and traceability across the new project revision.
                 self._duplicate_issue_part_links(conn, bom_id_map)
@@ -620,6 +632,98 @@ class ProjectRepository:
             except Exception:
                 conn.rollback()
                 raise
+
+    def _duplicate_bom_revision_configuration(self, conn, bom_id_map, relation_id_map):
+        """Copy object history and remap every exact child binding to the new project version."""
+        tables = set(self._list_tables(conn))
+        required = {"bom_revisions", "bom_iterations", "bom_iteration_bindings"}
+        if not bom_id_map or not required.issubset(tables):
+            return
+
+        revision_cols = self._table_columns(conn, "bom_revisions")
+        iteration_cols = self._table_columns(conn, "bom_iterations")
+        binding_cols = self._table_columns(conn, "bom_iteration_bindings")
+        revision_id_map = {}
+        iteration_id_map = {}
+
+        for old_bom_id, new_bom_id in bom_id_map.items():
+            revisions = conn.execute(
+                "SELECT * FROM bom_revisions WHERE bom_id=? ORDER BY id",
+                (int(old_bom_id),),
+            ).fetchall()
+            for revision_row in revisions:
+                revision = dict(revision_row)
+                old_revision_id = int(revision["id"])
+                new_revision_id = int(self._insert_row_from_row(
+                    conn,
+                    "bom_revisions",
+                    revision_cols,
+                    revision,
+                    overrides={"bom_id": int(new_bom_id)},
+                    id_col="id",
+                ))
+                revision_id_map[old_revision_id] = new_revision_id
+                iterations = conn.execute(
+                    "SELECT * FROM bom_iterations WHERE revision_id=? ORDER BY iteration_number, id",
+                    (old_revision_id,),
+                ).fetchall()
+                for iteration_row in iterations:
+                    iteration = dict(iteration_row)
+                    old_iteration_id = int(iteration["id"])
+                    new_iteration_id = int(self._insert_row_from_row(
+                        conn,
+                        "bom_iterations",
+                        iteration_cols,
+                        iteration,
+                        overrides={"revision_id": new_revision_id},
+                        id_col="id",
+                    ))
+                    iteration_id_map[old_iteration_id] = new_iteration_id
+
+        if iteration_id_map:
+            placeholders = ",".join("?" for _ in iteration_id_map)
+            bindings = conn.execute(
+                f"SELECT * FROM bom_iteration_bindings WHERE parent_iteration_id IN ({placeholders}) ORDER BY id",
+                list(iteration_id_map.keys()),
+            ).fetchall()
+            for binding_row in bindings:
+                binding = dict(binding_row)
+                child_bom_id = bom_id_map.get(int(binding["child_bom_id"]))
+                child_revision_id = revision_id_map.get(int(binding["child_revision_id"]))
+                child_iteration_id = iteration_id_map.get(int(binding["child_iteration_id"]))
+                parent_iteration_id = iteration_id_map.get(int(binding["parent_iteration_id"]))
+                if None in (child_bom_id, child_revision_id, child_iteration_id, parent_iteration_id):
+                    continue
+                old_usage_id = binding.get("usage_id")
+                new_usage_id = relation_id_map.get(int(old_usage_id)) if old_usage_id is not None else None
+                self._insert_row_from_row(
+                    conn,
+                    "bom_iteration_bindings",
+                    binding_cols,
+                    binding,
+                    overrides={
+                        "parent_iteration_id": int(parent_iteration_id),
+                        "usage_id": new_usage_id,
+                        "child_bom_id": int(child_bom_id),
+                        "child_revision_id": int(child_revision_id),
+                        "child_iteration_id": int(child_iteration_id),
+                    },
+                    id_col="id",
+                )
+
+        for old_bom_id, new_bom_id in bom_id_map.items():
+            source = conn.execute(
+                "SELECT current_revision_id, current_iteration_id FROM bom WHERE id=?",
+                (int(old_bom_id),),
+            ).fetchone()
+            if not source:
+                continue
+            new_revision_id = revision_id_map.get(int(source["current_revision_id"] or 0))
+            new_iteration_id = iteration_id_map.get(int(source["current_iteration_id"] or 0))
+            conn.execute(
+                "UPDATE bom SET current_revision_id=?, current_iteration_id=? WHERE id=?",
+                (new_revision_id, new_iteration_id, int(new_bom_id)),
+            )
 
     def _list_tables(self, conn):
         rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()

@@ -11,6 +11,7 @@ from core.repositories.signature_repository import SignatureRepository
 from core.repositories.permission_repository import PermissionRepository
 from core.repositories.bom_folder_repository import BomFolderRepository
 from core.repositories.bom_filter_repository import BomFilterRepository
+from core.repositories.bom_revision_repository import BomRevisionRepository
 from core.session_manager import SessionManager
 from config import DB_NAME
 
@@ -27,11 +28,27 @@ class BomService(BaseService):
         self.permission_repo = PermissionRepository()
         self.folder_repo = BomFolderRepository()
         self.filter_repo = BomFilterRepository()
+        self.revision_repo = BomRevisionRepository()
         self.session = SessionManager()
         self._tree_cache: dict = {}    # project_id -> tree dict
         self._tree_dirty: set = set()  # project_ids that need re-fetch
         self._lazy_index_cache: dict = {}
         print(self.user_id)
+
+    def _assert_checked_out_for_change(self, part_id: int, action: str = "modify this item"):
+        """Require a mutable revision and an owned (or administratively controlled) lock."""
+        context = self.revision_repo.assert_checkout_mutable(int(part_id))
+        lock = self.lock_repo.get_by_part(int(part_id))
+        if not lock:
+            raise ValueError(f"Check out {context['version_label']} before you {action}.")
+        actor = int(self.user_id) if self.user_id is not None else None
+        if actor is None:
+            raise PermissionError("You must be logged in.")
+        if int(lock.user_id) != actor and not self.permission_repo.user_has_permission(
+            actor, "merge", self.session.project_id
+        ):
+            raise ValueError("This item is checked out by another user.")
+        return context
 
     # -------------------------------
     # SAVED BOM FILTERS
@@ -156,6 +173,8 @@ class BomService(BaseService):
             project_id=self.session.project_id
         )
         result = self.bom_repo.insert(bom_item)
+        if isinstance(result, int):
+            self.revision_repo.ensure_bom(int(result), created_by=self.user_id)
         self._tree_dirty.add(int(self.session.project_id))
         return result
 
@@ -169,6 +188,7 @@ class BomService(BaseService):
         part = self.bom_repo.get_by_id(part_id)
         if not part:
             return False
+        self._assert_checked_out_for_change(int(part.id), "edit its attributes")
             
         # Update part fields
         for key, value in part_data.items():
@@ -189,6 +209,11 @@ class BomService(BaseService):
         part = self.bom_repo.get_by_id(part_id)
         if not part:
             return False
+        context = self.revision_repo.get_current_context(int(part.id))
+        if str(context.get("state") or "").strip().lower() == "released":
+            raise ValueError(
+                "Released BOM items cannot be deleted. Create or obsolete a controlled revision instead."
+            )
             
         # First remove any child relationships
         self.children_repo.delete_by_parent(part.id)
@@ -211,9 +236,11 @@ class BomService(BaseService):
         child = self.bom_repo.get_by_id(child_id)
         if not parent or not child:
             return -1
-        
+        self._assert_checked_out_for_change(int(parent.id), "change its structure")
 
         result = self.children_repo.insert(parent.id, child.id)
+        self.revision_repo.ensure_bom(int(child.id), created_by=self.user_id)
+        self.revision_repo.sync_working_bindings(int(parent.id), int(self.user_id))
         self._tree_dirty.add(int(self.session.project_id))
         return result
     
@@ -237,11 +264,23 @@ class BomService(BaseService):
 
     # CHECKIN PART
     # -------------------------------
-    def checkin_part(self, part_id: str, as_user_id: int | None = None):
+    def checkin_part(
+        self,
+        part_id: str,
+        as_user_id: int | None = None,
+        note: str = "",
+        source_commit_id: str | None = None,
+    ):
+        if not source_commit_id:
+            raise ValueError(
+                "Check-in is created only by committing the checked-out item. Use Undo Checkout to discard work."
+            )
         part = self.bom_repo.get_by_id(part_id)
         if not part:
             raise ValueError("Part not found")
         related_parts = self._parts_sharing_base_file(part)
+        for related in related_parts:
+            self.revision_repo.assert_checkout_mutable(int(related.id))
         locked_by_part = {
             int(p.id): self.lock_repo.get_by_part(int(p.id))
             for p in related_parts
@@ -270,20 +309,50 @@ class BomService(BaseService):
             signature = self.signature_repo.add_signature(
                 "checkin",
                 effective_user_id,
-                note="Checked in shared CAD family part" if len(related_parts) > 1 else "Checked in part",
+                note=str(note or "").strip() or (
+                    "Checked in shared CAD family part" if len(related_parts) > 1 else "Checked in part"
+                ),
             )
             success = self.lock_repo.checkin(related_id, effective_user_id, signature)
             if not success:
                 raise ValueError("Failed to check in part")
             self.bom_repo.checkin_bom(related_id)
+        for related in related_parts:
+            self.revision_repo.record_checkin(
+                int(related.id),
+                effective_user_id,
+                note=note,
+                source_commit_id=source_commit_id,
+            )
         self._tree_dirty.add(int(self.session.project_id))
         return True
 
-    def checkout_part(self, part_id: str, as_user_id: int | None = None):
+    def checkout_part(
+        self,
+        part_id: str,
+        as_user_id: int | None = None,
+        released_revision_code: str | None = None,
+    ):
         part = self.bom_repo.get_by_id(part_id)
         if not part:
             raise ValueError("Part not found")
         related_parts = self._parts_sharing_base_file(part)
+        contexts = {}
+        for related in related_parts:
+            related_id = int(related.id)
+            context = self.revision_repo.get_current_context(related_id)
+            contexts[related_id] = context
+            state = str(context.get("state") or "").strip().lower()
+            if state == "released":
+                if not str(released_revision_code or "").strip():
+                    raise ValueError(
+                        f"{context['version_label']} is Released. Enter the revision to create on commit."
+                    )
+                self.revision_repo.validate_released_checkout(
+                    related_id, str(released_revision_code)
+                )
+            else:
+                self.revision_repo.assert_mutable(related_id)
         existing_locks = [
             self.lock_repo.get_by_part(int(p.id))
             for p in related_parts
@@ -304,23 +373,45 @@ class BomService(BaseService):
 
         for related in related_parts:
             related_id = int(related.id)
+            released_checkout = (
+                str(contexts[related_id].get("state") or "").strip().lower() == "released"
+            )
             signature = self.signature_repo.add_signature(
                 "checkout",
                 effective_user_id,
-                note="Checked out shared CAD family part" if len(related_parts) > 1 else "Checked out part",
+                note=(
+                    f"Checked out Released item for revision {released_revision_code}"
+                    if released_checkout else
+                    ("Checked out shared CAD family part" if len(related_parts) > 1 else "Checked out part")
+                ),
             )
             success = self.lock_repo.checkout(related_id, effective_user_id, signature)
             if not success:
                 raise ValueError("Failed to check out part")
             self.bom_repo.checkout_bom(related_id)
+            if released_checkout:
+                self.revision_repo.prepare_released_checkout(
+                    related_id, str(released_revision_code)
+                )
+            self.revision_repo.initialize_checkout(related_id, effective_user_id)
         self._tree_dirty.add(int(self.session.project_id))
         return True
 
-    def checkin_by_part_id(self, part_id: int, user_id: int):
+    def checkin_by_part_id(
+        self,
+        part_id: int,
+        user_id: int,
+        note: str = "",
+        source_commit_id: str | None = None,
+    ):
+        if not source_commit_id:
+            raise ValueError("A commit reference is required to check in an item.")
         part = self.bom_repo.get_by_id(int(part_id))
         if not part:
             raise ValueError("Part not found")
         related_parts = self._parts_sharing_base_file(part)
+        for related in related_parts:
+            self.revision_repo.assert_checkout_mutable(int(related.id))
         locked_by_part = {
             int(p.id): self.lock_repo.get_by_part(int(p.id))
             for p in related_parts
@@ -337,17 +428,85 @@ class BomService(BaseService):
             signature = self.signature_repo.add_signature(
                 "checkin",
                 user_id,
-                note="Checked in shared CAD family part" if len(related_parts) > 1 else "Checked in part",
+                note=str(note or "").strip() or (
+                    "Checked in shared CAD family part" if len(related_parts) > 1 else "Checked in part"
+                ),
             )
             success = self.lock_repo.checkin(related_id, user_id, signature)
             if not success:
                 raise ValueError("Failed to check in part")
             self.bom_repo.checkin_bom(related_id)
+        for related in related_parts:
+            self.revision_repo.record_checkin(
+                int(related.id), int(user_id), note=note, source_commit_id=source_commit_id
+            )
+        self._tree_dirty.add(int(self.session.project_id))
+        return True
+
+    def undo_checkout(self, part_id: int, as_user_id: int | None = None) -> bool:
+        part = self.bom_repo.get_by_id(int(part_id))
+        if not part:
+            raise ValueError("Part not found")
+        related_parts = self._parts_sharing_base_file(part)
+        locks = {
+            int(related.id): self.lock_repo.get_by_part(int(related.id))
+            for related in related_parts
+        }
+        active = [lock for lock in locks.values() if lock]
+        if not active:
+            raise ValueError("Part is not checked out.")
+        actor = int(self.user_id) if self.user_id is not None else None
+        if actor is None:
+            raise PermissionError("You must be logged in.")
+        for lock in active:
+            if int(lock.user_id) != actor and not self.permission_repo.user_has_permission(
+                actor, "merge", self.session.project_id
+            ):
+                raise ValueError("Part is checked out by another user.")
+        effective_user_id = int(as_user_id) if as_user_id is not None else actor
+
+        # Restore first. If restoration fails, keep the lock so no partial working
+        # configuration is exposed as checked in.
+        for related in related_parts:
+            self.revision_repo.restore_checked_in_state(int(related.id))
+        for related in related_parts:
+            related_id = int(related.id)
+            lock = locks.get(related_id)
+            if not lock:
+                self.bom_repo.checkin_bom(related_id)
+                continue
+            signature = self.signature_repo.add_signature(
+                "undo_checkout", effective_user_id, note="Checkout undone; working changes discarded"
+            )
+            self.lock_repo.undo_checkout(related_id, effective_user_id, signature)
+            self.bom_repo.checkin_bom(related_id)
         self._tree_dirty.add(int(self.session.project_id))
         return True
 
     def checkout_by_part_id(self, part_id: int, user_id: int):
-        return self.checkin_by_part_id(part_id, user_id)
+        part = self.bom_repo.get_by_id(int(part_id))
+        if not part:
+            raise ValueError("Part not found")
+        for related in self._parts_sharing_base_file(part):
+            context = self.revision_repo.get_current_context(int(related.id))
+            released = str(context.get("state") or "").strip().lower() == "released"
+            target_revision = None
+            if released:
+                target_revision = self.revision_repo.suggest_next_revision_code(
+                    str(context.get("revision_code") or "A")
+                )
+                self.revision_repo.validate_released_checkout(int(related.id), target_revision)
+            else:
+                self.revision_repo.assert_mutable(int(related.id))
+            signature = self.signature_repo.add_signature("checkout", int(user_id), note="Checked out part")
+            if not self.lock_repo.checkout(int(related.id), int(user_id), signature):
+                raise ValueError("Failed to check out part")
+            self.bom_repo.checkout_bom(int(related.id))
+            if released:
+                self.revision_repo.prepare_released_checkout(int(related.id), target_revision)
+            self.revision_repo.initialize_checkout(int(related.id), int(user_id))
+        self._tree_dirty.add(int(self.session.project_id))
+        return True
 
     # -------------------------------
     # GET CHILDREN OF A PART
@@ -547,21 +706,82 @@ class BomService(BaseService):
                 user_cache[uid] = (rowu[0] if rowu else "")
                 return user_cache[uid]
 
-            for pr in part_rows:
-                ts = pr.get("released_at")
-                if ts:
-                    pid = int(pr.get("project_id") or 0)
+            tables = {
+                str(row["name"])
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            }
+            if {"bom_revisions", "bom_iterations"}.issubset(tables):
+                revision_rows = conn.execute(
+                    f"""
+                    SELECT r.*, b.project_id
+                    FROM bom_revisions r
+                    JOIN bom b ON b.id=r.bom_id
+                    WHERE r.bom_id IN ({','.join(['?'] * len(part_ids))})
+                    ORDER BY r.id
+                    """,
+                    tuple(part_ids),
+                ).fetchall()
+                for revision_row in revision_rows:
+                    revision = dict(revision_row)
+                    pid = int(revision.get("project_id") or 0)
                     info = project_map.get(pid, {"project_name": "", "project_version": ""})
-                    events.append(
-                        {
-                            "timestamp": ts,
+                    if revision.get("released_at"):
+                        events.append({
+                            "timestamp": revision.get("released_at"),
                             "event": "PART_RELEASED",
-                            "user": username_for(pr.get("released_by")),
+                            "user": username_for(revision.get("released_by")),
                             "project": info.get("project_name", ""),
                             "version": info.get("project_version", ""),
-                            "details": f"Revision {pr.get('revision') or ''}".strip(),
-                        }
-                    )
+                            "details": (
+                                f"Revision {revision.get('revision_code') or ''} | "
+                                f"{revision.get('release_note') or ''}"
+                            ).strip(" |"),
+                        })
+                iteration_rows = conn.execute(
+                    f"""
+                    SELECT i.*, r.revision_code, r.bom_id, b.project_id, u.username
+                    FROM bom_iterations i
+                    JOIN bom_revisions r ON r.id=i.revision_id
+                    JOIN bom b ON b.id=r.bom_id
+                    LEFT JOIN users u ON u.id=i.created_by
+                    WHERE r.bom_id IN ({','.join(['?'] * len(part_ids))})
+                    ORDER BY i.created_at DESC, i.id DESC
+                    """,
+                    tuple(part_ids),
+                ).fetchall()
+                for iteration_row in iteration_rows:
+                    iteration = dict(iteration_row)
+                    pid = int(iteration.get("project_id") or 0)
+                    info = project_map.get(pid, {"project_name": "", "project_version": ""})
+                    iteration_number = int(iteration.get("iteration_number") or 1)
+                    version_label = f"{iteration.get('revision_code')}.{iteration_number}"
+                    events.append({
+                        "timestamp": iteration.get("created_at"),
+                        "event": "REVISION_CREATED" if iteration_number == 1 else "OBJECT_ITERATION",
+                        "user": iteration.get("username") or "",
+                        "project": info.get("project_name", ""),
+                        "version": info.get("project_version", ""),
+                        "details": (
+                            f"{version_label} | {iteration.get('checkin_note') or ''}"
+                        ).strip(" |"),
+                        "commit_id": iteration.get("source_commit_id"),
+                    })
+            else:
+                for pr in part_rows:
+                    ts = pr.get("released_at")
+                    if ts:
+                        pid = int(pr.get("project_id") or 0)
+                        info = project_map.get(pid, {"project_name": "", "project_version": ""})
+                        events.append(
+                            {
+                                "timestamp": ts,
+                                "event": "PART_RELEASED",
+                                "user": username_for(pr.get("released_by")),
+                                "project": info.get("project_name", ""),
+                                "version": info.get("project_version", ""),
+                                "details": f"Revision {pr.get('revision') or ''}".strip(),
+                            }
+                        )
 
             # Commits affecting this part (across the family via part_ids)
             try:
@@ -625,10 +845,16 @@ class BomService(BaseService):
                     d = dict(r)
                     pid = int(d.get("project_id") or 0)
                     info = project_map.get(pid, {"project_name": "", "project_version": ""})
+                    action = str(d.get("action") or "").strip().lower()
+                    event_name = {
+                        "checkin": "CHECKIN",
+                        "checkout": "CHECKOUT",
+                        "undo_checkout": "UNDO_CHECKOUT",
+                    }.get(action, action.upper() or "LOCK_EVENT")
                     events.append(
                         {
                             "timestamp": d.get("timestamp"),
-                            "event": ("CHECKIN" if str(d.get("action")).lower() == "checkin" else "CHECKOUT"),
+                            "event": event_name,
                             "user": (d.get("username") or ""),
                             "project": info.get("project_name", ""),
                             "version": info.get("project_version", ""),
@@ -754,9 +980,20 @@ class BomService(BaseService):
             lock_owner = {}
         results = []
         category_map = self.bom_repo.get_categories_for_boms(part.id for part in all_parts)
+        version_map = self.revision_repo.get_current_contexts(part.id for part in all_parts)
+        try:
+            binding_updates = self.revision_repo.get_parent_binding_update_counts(
+                int(self.session.project_id)
+            )
+        except Exception:
+            binding_updates = {}
         for part in all_parts:
             d = part.__dict__.copy()
+            version = version_map.get(int(part.id), {})
+            d["current_version"] = version.get("version_label") or d.get("revision")
+            d["iteration_number"] = version.get("iteration_number")
             d["category_names"] = list(category_map.get(int(part.id), []))
+            d["binding_update_count"] = int(binding_updates.get(int(part.id), 0))
             if d.get("locked"):
                 d["locked_by_username"] = lock_owner.get(int(d.get("id")))
             results.append(d)
@@ -838,6 +1075,7 @@ class BomService(BaseService):
             raise ValueError("The target parent was not found in the current project.")
         if str(target.type or "").strip().lower() not in {"asm", "assembly"}:
             raise ValueError("Only an assembly can contain child items.")
+        self._assert_checked_out_for_change(int(target_parent_id), "change its structure")
 
         normalized = []
         for selection in selections or []:
@@ -858,6 +1096,28 @@ class BomService(BaseService):
                 "A top-level component cannot be copied because top-level membership is derived from having no parent. "
                 "Use Move to place it under the target assembly."
             )
+
+        affected_parent_ids = {int(target_parent_id)}
+        if action == "move":
+            affected_parent_ids.update(
+                int(row["source_parent_id"])
+                for row in normalized
+                if row.get("source_parent_id") is not None
+                and int(row["source_parent_id"]) != int(target_parent_id)
+            )
+        for affected_parent_id in sorted(affected_parent_ids):
+            self._assert_checked_out_for_change(affected_parent_id, "change its structure")
+
+        preferred_by_child = {}
+        for row in normalized:
+            source_parent_id = row.get("source_parent_id")
+            if source_parent_id is None:
+                continue
+            binding = self.revision_repo.get_effective_child_binding(
+                int(source_parent_id), int(row["child_id"])
+            )
+            if binding:
+                preferred_by_child[int(row["child_id"])] = binding
 
         children_by_parent = defaultdict(list)
         for row in self.children_repo.get_structure_rows(int(self.session.project_id)):
@@ -885,6 +1145,11 @@ class BomService(BaseService):
         result = self.children_repo.apply_child_relations(
             int(target_parent_id), normalized, action
         )
+        self.revision_repo.sync_working_bindings(
+            int(target_parent_id), int(self.user_id), preferred_by_child=preferred_by_child
+        )
+        for source_parent_id in result.get("source_parent_ids") or []:
+            self.revision_repo.sync_working_bindings(int(source_parent_id), int(self.user_id))
         if action == "move":
             for selection in normalized:
                 source_parent_id = selection.get("source_parent_id")
@@ -1001,6 +1266,11 @@ class BomService(BaseService):
                 roots.append(part_id)
                 walk_item(part_id, ())
 
+        try:
+            binding_update_counts = self.revision_repo.get_parent_binding_update_counts(pid)
+        except Exception:
+            binding_update_counts = {}
+
         index = {
             "project_id": pid,
             "roots": roots,
@@ -1010,6 +1280,7 @@ class BomService(BaseService):
             "folder_rows": folder_rows,
             "folder_path_rows": folder_path_rows,
             "folders": folders,
+            "binding_update_counts": binding_update_counts,
         }
         self._lazy_index_cache[pid] = index
         self._tree_cache.pop(pid, None)
@@ -1022,6 +1293,7 @@ class BomService(BaseService):
         path_prefix = tuple(int(value) for value in (parent_path or ()))
         parts = self.bom_repo.get_many(pid, ids)
         categories = self.bom_repo.get_categories_for_boms(part.id for part in parts)
+        versions = self.revision_repo.get_current_contexts(part.id for part in parts)
         try:
             lock_owner = self.lock_repo.get_lock_owners_for_project(pid)
         except Exception:
@@ -1032,6 +1304,12 @@ class BomService(BaseService):
             path = path_prefix + (int(part.id),)
             node["children"] = []
             node["category_names"] = list(categories.get(int(part.id), []))
+            version = versions.get(int(part.id), {})
+            node["current_version"] = version.get("version_label") or node.get("revision")
+            node["iteration_number"] = version.get("iteration_number")
+            node["binding_update_count"] = int(
+                (index.get("binding_update_counts") or {}).get(int(part.id), 0)
+            )
             node["_tree_path"] = self._path_key(path)
             node["_tree_row_number"] = index["path_rows"].get(node["_tree_path"], "")
             node["_has_children"] = bool(index["children"].get(int(part.id))) and int(part.id) not in path_prefix
@@ -1082,11 +1360,16 @@ class BomService(BaseService):
 
         # Get all parts for the project
         all_parts = {b.id: b for b in self.bom_repo.get_all(project_id)}
+        version_map = self.revision_repo.get_current_contexts(all_parts.keys())
         category_map = self.bom_repo.get_categories_for_boms(all_parts.keys())
         try:
             lock_owner = self.lock_repo.get_lock_owners_for_project(int(project_id))
         except Exception:
             lock_owner = {}
+        try:
+            binding_updates = self.revision_repo.get_parent_binding_update_counts(int(project_id))
+        except Exception:
+            binding_updates = {}
         children_map = {}
 
         # Get relationships filtered to this project (avoids cross-project full-table scan)
@@ -1108,6 +1391,10 @@ class BomService(BaseService):
 
             part = all_parts[part_id]
             node = part.__dict__.copy()
+            version = version_map.get(int(part_id), {})
+            node["current_version"] = version.get("version_label") or node.get("revision")
+            node["iteration_number"] = version.get("iteration_number")
+            node["binding_update_count"] = int(binding_updates.get(int(part_id), 0))
             node["categories"] = list(category_map.get(int(part_id), []))
             node["children"] = []
 
@@ -1144,6 +1431,24 @@ class BomService(BaseService):
             return {}
 
         d = part.__dict__.copy()
+        try:
+            version_context = self.revision_repo.get_current_context(int(part_id))
+        except Exception:
+            version_context = {}
+        d["current_revision_id"] = version_context.get("current_revision_id")
+        d["current_iteration_id"] = version_context.get("current_iteration_id")
+        d["iteration_number"] = version_context.get("iteration_number")
+        d["current_version"] = version_context.get("version_label") or str(d.get("revision") or "")
+        d["revision_state"] = version_context.get("state") or d.get("lifecycle_state")
+        if str(d.get("type") or "").strip().lower() in {"asm", "assembly"}:
+            try:
+                d["binding_update_count"] = self.revision_repo.count_parent_binding_updates(
+                    int(part_id)
+                )
+            except Exception:
+                d["binding_update_count"] = 0
+        else:
+            d["binding_update_count"] = 0
         category_names = self.bom_repo.get_categories_for_bom(int(part_id))
         d["category_names"] = list(category_names)
         d["categories"] = ", ".join(category_names)
@@ -1155,16 +1460,87 @@ class BomService(BaseService):
             pass
         return d
 
+    def suggest_next_revision(self, part_id: int) -> str:
+        context = self.revision_repo.get_current_context(int(part_id))
+        return self.revision_repo.suggest_next_revision_code(
+            str(context.get("revision_code") or "A")
+        )
+
+    def get_iteration_cad_files(self, iteration_id: int) -> Dict:
+        return self.revision_repo.get_iteration_cad_files(int(iteration_id))
+
     # -------------------------------
     # PLM-lite: Revision / Release
     # -------------------------------
     def set_revision(self, part_id: int, revision: str):
-        self.bom_repo.set_revision(part_id, revision)
+        return self.create_revision(part_id, revision)
 
-    def release_part(self, part_id: int):
+    def create_revision(self, part_id: int, revision: str, note: str = "") -> Dict:
+        part = self.bom_repo.get_by_id(int(part_id))
+        if not part:
+            raise ValueError("Part not found")
+        related_parts = self._parts_sharing_base_file(part)
+        revision_code = self.revision_repo.normalize_revision_code(revision)
+        if any(self.lock_repo.get_by_part(int(related.id)) for related in related_parts):
+            raise ValueError("Check in the shared CAD item before creating a new revision.")
+        for related in related_parts:
+            context = self.revision_repo.get_current_context(int(related.id))
+            if str(context.get("state") or "").strip().lower() != "released":
+                raise ValueError(
+                    f"{context.get('version_label') or related.id} must be released before creating a new revision."
+                )
+            if any(
+                str(row.get("revision_code") or "").casefold() == revision_code.casefold()
+                for row in self.revision_repo.list_revisions(int(related.id))
+            ):
+                raise ValueError(f"Revision {revision_code} already exists for {related.name}.")
+        created = None
+        for related in related_parts:
+            result = self.revision_repo.create_revision(
+                int(related.id), revision_code, int(self.user_id), note=note
+            )
+            if int(related.id) == int(part_id):
+                created = result
+        self._tree_dirty.add(int(self.session.project_id))
+        return created or self.revision_repo.get_current_context(int(part_id))
+
+    def release_part(self, part_id: int, note: str = ""):
         from core.services.issue_service import IssueService
-        IssueService().assert_no_critical_issues([int(part_id)], operation="release", include_children=True)
-        self.bom_repo.release_part(part_id, released_by=self.user_id)
+        part = self.bom_repo.get_by_id(int(part_id))
+        if not part:
+            raise ValueError("Part not found")
+        related_parts = self._parts_sharing_base_file(part)
+        related_ids = [int(related.id) for related in related_parts]
+        if any(self.lock_repo.get_by_part(related_id) for related_id in related_ids):
+            raise ValueError("Check in the item before releasing its revision.")
+        for related_id in related_ids:
+            context = self.revision_repo.get_current_context(related_id)
+            if str(context.get("state") or "").strip().lower() == "released":
+                raise ValueError(f"{context.get('version_label')} is already released.")
+        IssueService().assert_no_critical_issues(related_ids, operation="release", include_children=True)
+        released = None
+        for related_id in related_ids:
+            result = self.revision_repo.release_current_revision(
+                related_id, int(self.user_id), note=note
+            )
+            if related_id == int(part_id):
+                released = result
+        self._tree_dirty.add(int(self.session.project_id))
+        return released
+
+    def list_part_iterations(self, part_id: int) -> List[Dict]:
+        return self.revision_repo.list_iterations(int(part_id))
+
+    def get_child_version_status(self, parent_id: int) -> List[Dict]:
+        return self.revision_repo.list_child_version_status(int(parent_id))
+
+    def update_children_to_latest(self, parent_id: int, child_ids) -> List[int]:
+        self._assert_checked_out_for_change(int(parent_id), "update child versions")
+        changed = self.revision_repo.update_children_to_latest(
+            int(parent_id), child_ids, int(self.user_id)
+        )
+        self._tree_dirty.add(int(self.session.project_id))
+        return changed
 
     # -------------------------------
     # REMOVE CHILD RELATIONSHIP
@@ -1177,9 +1553,11 @@ class BomService(BaseService):
         """Remove direct relations; last occurrences become top-level BOM items."""
         if not self.session.project_id:
             raise ValueError("Select a project before changing the BOM structure.")
+        self._assert_checked_out_for_change(int(parent_id), "change its structure")
         result = self.children_repo.remove_children_from_parent(
             int(self.session.project_id), int(parent_id), child_ids
         )
+        self.revision_repo.sync_working_bindings(int(parent_id), int(self.user_id))
         for child_id in result.get("removed_child_ids") or []:
             try:
                 self.folder_repo.unassign_from_context(
@@ -1210,6 +1588,7 @@ class BomService(BaseService):
             raise ValueError("Parent not found")
         if str(getattr(parent, "type", "") or "").lower() != "asm":
             raise ValueError("Only assembly children can be reordered.")
+        self._assert_checked_out_for_change(int(parent_id), "reorder its structure")
         current = self.children_repo.ordered_child_ids(int(parent_id))
         if set(map(int, current)) != set(map(int, ordered_child_ids or [])):
             raise ValueError("Reorder must keep the same child associations.")
@@ -1220,6 +1599,19 @@ class BomService(BaseService):
     def ordered_child_ids(self, parent_id: int) -> List[int]:
         return self.children_repo.ordered_child_ids(int(parent_id))
 
+    def direct_parent_ids(self, child_ids) -> List[int]:
+        parents = set()
+        project_id = int(self.session.project_id) if self.session.project_id else None
+        for child_id in {int(value) for value in (child_ids or [])}:
+            for relation in self.children_repo.get_parents(child_id) or []:
+                parent_id = int(relation.parent_id)
+                if project_id is not None:
+                    parent = self.bom_repo.get_by_id(parent_id)
+                    if not parent or int(parent.project_id or 0) != project_id:
+                        continue
+                parents.add(parent_id)
+        return sorted(parents)
+
     def get_structure_context(self, part_id: int) -> Dict:
         """Return recursive Uses and direct Where Used relations for one BOM item."""
         selected = self.bom_repo.get_by_id(int(part_id))
@@ -1228,16 +1620,22 @@ class BomService(BaseService):
 
         project_id = int(getattr(selected, "project_id", None) or self.session.project_id)
         parts = {int(part.id): part for part in self.bom_repo.get_all(project_id)}
+        version_contexts = self.revision_repo.get_current_contexts(parts.keys())
         relations = self.children_repo.get_all_for_project(project_id)
+        try:
+            binding_status = self.revision_repo.get_project_binding_status(project_id)
+        except Exception:
+            binding_status = {}
         children_map = {}
         parents_map = {}
         for relation in relations:
+            usage_id = int(relation.id)
             parent_id = int(relation.parent_id)
             child_id = int(relation.child_id)
             quantity = int(getattr(relation, "quantity", 1) or 1)
             sort_order = int(getattr(relation, "sort_order", 0) or 0)
-            children_map.setdefault(parent_id, []).append((sort_order, child_id, quantity))
-            parents_map.setdefault(child_id, []).append((parent_id, quantity))
+            children_map.setdefault(parent_id, []).append((sort_order, child_id, quantity, usage_id))
+            parents_map.setdefault(child_id, []).append((parent_id, quantity, usage_id))
 
         for values in children_map.values():
             values.sort(key=lambda row: (row[0], row[1]))
@@ -1250,7 +1648,14 @@ class BomService(BaseService):
                 )
             )
 
-        def part_node(node_id: int, relation_label: str, quantity=None, cycle=False) -> Dict:
+        def part_node(
+            node_id: int,
+            relation_label: str,
+            quantity=None,
+            cycle=False,
+            usage_id=None,
+            relation_parent_id=None,
+        ) -> Dict:
             part = parts.get(int(node_id))
             if not part:
                 return {}
@@ -1259,8 +1664,21 @@ class BomService(BaseService):
                 "relation": relation_label,
                 "quantity": quantity,
                 "cycle": bool(cycle),
+                "usage_id": usage_id,
+                "relation_parent_id": relation_parent_id,
                 "children": [],
             })
+            version = version_contexts.get(int(node_id), {})
+            node["current_version"] = version.get("version_label") or node.get("revision")
+            node["current_iteration_id"] = version.get("current_iteration_id")
+            status = binding_status.get(int(usage_id)) if usage_id is not None else None
+            if status:
+                node["bound_version"] = status.get("bound_version")
+                node["latest_version"] = status.get("latest_version")
+                node["bound_iteration_id"] = status.get("bound_iteration_id")
+                node["latest_iteration_id"] = status.get("latest_iteration_id")
+                node["binding_status"] = "Current" if status.get("is_latest") else "Update available"
+                node["binding_source"] = status.get("binding_source")
             return node
 
         def build_uses(node_id: int, path: set) -> Dict:
@@ -1269,14 +1687,28 @@ class BomService(BaseService):
                 return {}
             next_path = set(path)
             next_path.add(int(node_id))
-            for _order, child_id, quantity in children_map.get(int(node_id), []):
+            for _order, child_id, quantity, usage_id in children_map.get(int(node_id), []):
                 if child_id in next_path:
-                    child = part_node(child_id, "Cycle", quantity, cycle=True)
+                    child = part_node(
+                        child_id, "Cycle", quantity, cycle=True,
+                        usage_id=usage_id, relation_parent_id=int(node_id),
+                    )
                 else:
                     child = build_uses(child_id, next_path)
                     if child:
                         child["relation"] = "Uses"
                         child["quantity"] = quantity
+                        child["usage_id"] = usage_id
+                        child["relation_parent_id"] = int(node_id)
+                        status = binding_status.get(int(usage_id), {})
+                        child["bound_version"] = status.get("bound_version")
+                        child["latest_version"] = status.get("latest_version")
+                        child["bound_iteration_id"] = status.get("bound_iteration_id")
+                        child["latest_iteration_id"] = status.get("latest_iteration_id")
+                        child["binding_status"] = (
+                            "Current" if status.get("is_latest") else "Update available"
+                        ) if status else ""
+                        child["binding_source"] = status.get("binding_source")
                 if child:
                     node["children"].append(child)
             return node
@@ -1285,8 +1717,11 @@ class BomService(BaseService):
             node = part_node(node_id, "Selected Item")
             if not node:
                 return {}
-            for parent_id, quantity in parents_map.get(int(node_id), []):
-                parent = part_node(parent_id, "Used By", quantity)
+            for parent_id, quantity, usage_id in parents_map.get(int(node_id), []):
+                parent = part_node(
+                    parent_id, "Used By", quantity,
+                    usage_id=usage_id, relation_parent_id=parent_id,
+                )
                 if parent:
                     node["children"].append(parent)
             return node

@@ -2,6 +2,7 @@ import sys
 import os
 import sqlite3
 import re
+import json
 
 # Add the parent directory to the Python path so we can import config.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -900,6 +901,198 @@ def _migration_21(conn):
     )
 
 
+def _migration_22(conn):
+    """Add object revisions, automatic iterations, and exact assembly bindings."""
+    _ensure_column(conn, "bom", "current_revision_id", "current_revision_id INTEGER")
+    _ensure_column(conn, "bom", "current_iteration_id", "current_iteration_id INTEGER")
+    _ensure_column(conn, "baseline_files", "object_iteration_id", "object_iteration_id INTEGER")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS bom_revisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bom_id INTEGER NOT NULL,
+            revision_code TEXT NOT NULL COLLATE NOCASE,
+            state TEXT NOT NULL DEFAULT 'In Work',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            created_by INTEGER,
+            released_at TEXT,
+            released_by INTEGER,
+            release_note TEXT,
+            UNIQUE(bom_id, revision_code),
+            FOREIGN KEY (bom_id) REFERENCES bom(id),
+            FOREIGN KEY (created_by) REFERENCES users(id),
+            FOREIGN KEY (released_by) REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS bom_iterations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            revision_id INTEGER NOT NULL,
+            iteration_number INTEGER NOT NULL,
+            checkin_note TEXT,
+            source_commit_id TEXT,
+            object_data_json TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            created_by INTEGER,
+            UNIQUE(revision_id, iteration_number),
+            FOREIGN KEY (revision_id) REFERENCES bom_revisions(id),
+            FOREIGN KEY (created_by) REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS bom_iteration_bindings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            parent_iteration_id INTEGER NOT NULL,
+            usage_id INTEGER,
+            child_bom_id INTEGER NOT NULL,
+            child_revision_id INTEGER NOT NULL,
+            child_iteration_id INTEGER NOT NULL,
+            quantity INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(parent_iteration_id, usage_id),
+            FOREIGN KEY (parent_iteration_id) REFERENCES bom_iterations(id),
+            FOREIGN KEY (child_bom_id) REFERENCES bom(id),
+            FOREIGN KEY (child_revision_id) REFERENCES bom_revisions(id),
+            FOREIGN KEY (child_iteration_id) REFERENCES bom_iterations(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS bom_working_bindings (
+            parent_bom_id INTEGER NOT NULL,
+            usage_id INTEGER NOT NULL,
+            child_bom_id INTEGER NOT NULL,
+            child_revision_id INTEGER NOT NULL,
+            child_iteration_id INTEGER NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_by INTEGER,
+            PRIMARY KEY(parent_bom_id, usage_id),
+            FOREIGN KEY (parent_bom_id) REFERENCES bom(id),
+            FOREIGN KEY (child_bom_id) REFERENCES bom(id),
+            FOREIGN KEY (child_revision_id) REFERENCES bom_revisions(id),
+            FOREIGN KEY (child_iteration_id) REFERENCES bom_iterations(id),
+            FOREIGN KEY (updated_by) REFERENCES users(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_bom_revisions_bom
+            ON bom_revisions(bom_id, id);
+        CREATE INDEX IF NOT EXISTS idx_bom_iterations_revision
+            ON bom_iterations(revision_id, iteration_number);
+        CREATE INDEX IF NOT EXISTS idx_bom_iteration_bindings_parent
+            ON bom_iteration_bindings(parent_iteration_id, sort_order, id);
+        CREATE INDEX IF NOT EXISTS idx_bom_iteration_bindings_child
+            ON bom_iteration_bindings(child_bom_id, child_iteration_id);
+        CREATE INDEX IF NOT EXISTS idx_bom_working_bindings_parent
+            ON bom_working_bindings(parent_bom_id, usage_id);
+        """
+    )
+    _ensure_column(conn, "bom_iterations", "source_commit_id", "source_commit_id TEXT")
+    _ensure_column(conn, "bom_iterations", "object_data_json", "object_data_json TEXT")
+    iteration_columns = set(_table_columns(conn, "bom_iterations"))
+    if "commit_id" in iteration_columns and "source_commit_id" in iteration_columns:
+        conn.execute(
+            """
+            UPDATE bom_iterations
+            SET source_commit_id=CAST(commit_id AS TEXT)
+            WHERE source_commit_id IS NULL AND commit_id IS NOT NULL
+            """
+        )
+
+    # Legacy rows have no reconstructable object-iteration history. Preserve the
+    # current visible revision as iteration 1, then snapshot the current structure.
+    rows = conn.execute(
+        """
+        SELECT id, COALESCE(NULLIF(TRIM(revision), ''), 'A') AS revision_code,
+               lifecycle_state, status
+        FROM bom ORDER BY id
+        """
+    ).fetchall()
+    for row in rows:
+        bom_id = int(row[0])
+        revision_code = str(row[1] or "A").strip() or "A"
+        lifecycle = str(row[2] or row[3] or "").strip().lower()
+        state = "Released" if "release" in lifecycle else "In Work"
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO bom_revisions(bom_id, revision_code, state)
+            VALUES(?,?,?)
+            """,
+            (bom_id, revision_code, state),
+        )
+        revision_id = int(conn.execute(
+            "SELECT id FROM bom_revisions WHERE bom_id=? AND revision_code=? COLLATE NOCASE",
+            (bom_id, revision_code),
+        ).fetchone()[0])
+        object_data = dict(conn.execute(
+            """
+            SELECT type, name, part_number, drawing_number, aes_number, filename, drawing,
+                   base_file_name, base_drw_name, material, weight, notes, pdf_path, step_path
+            FROM bom WHERE id=?
+            """,
+            (bom_id,),
+        ).fetchone())
+        object_json = json.dumps(object_data, ensure_ascii=True, sort_keys=True)
+        insert_columns = ["revision_id", "iteration_number", "object_data_json"]
+        insert_values = [revision_id, 1, object_json]
+        if "folder_path" in iteration_columns:
+            insert_columns.append("folder_path")
+            insert_values.append("")
+        conn.execute(
+            f"""
+            INSERT OR IGNORE INTO bom_iterations({','.join(insert_columns)})
+            VALUES({','.join('?' for _ in insert_columns)})
+            """,
+            insert_values,
+        )
+        iteration_row = conn.execute(
+            "SELECT id FROM bom_iterations WHERE revision_id=? AND iteration_number=1",
+            (revision_id,),
+        ).fetchone()
+        if not iteration_row:
+            raise RuntimeError(
+                f"Could not initialize iteration 1 for BOM {bom_id}, revision {revision_code}."
+            )
+        iteration_id = int(iteration_row[0])
+        conn.execute(
+            """
+            UPDATE bom_iterations
+            SET object_data_json=COALESCE(object_data_json, ?)
+            WHERE id=?
+            """,
+            (object_json, iteration_id),
+        )
+        conn.execute(
+            "UPDATE bom SET current_revision_id=?, current_iteration_id=? WHERE id=?",
+            (revision_id, iteration_id, bom_id),
+        )
+
+    relations = conn.execute(
+        """
+        SELECT bc.id, bc.parent_id, bc.child_id, COALESCE(bc.quantity, 1),
+               COALESCE(bc.sort_order, bc.id), parent.current_iteration_id,
+               child.current_revision_id, child.current_iteration_id
+        FROM bom_children bc
+        JOIN bom parent ON parent.id=bc.parent_id
+        JOIN bom child ON child.id=bc.child_id
+        ORDER BY bc.parent_id, COALESCE(bc.sort_order, bc.id), bc.id
+        """
+    ).fetchall()
+    for row in relations:
+        if row[5] is None or row[6] is None or row[7] is None:
+            continue
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO bom_iteration_bindings(
+                parent_iteration_id, usage_id, child_bom_id, child_revision_id,
+                child_iteration_id, quantity, sort_order
+            ) VALUES(?,?,?,?,?,?,?)
+            """,
+            (int(row[5]), int(row[0]), int(row[2]), int(row[6]), int(row[7]), int(row[3]), int(row[4])),
+        )
+
+
+def _migration_23(conn):
+    """Track a deferred new revision when a Released object is checked out."""
+    _ensure_column(conn, "bom", "pending_revision_code", "pending_revision_code TEXT")
+
+
 MIGRATIONS = {
     1: """
     CREATE TABLE IF NOT EXISTS users (
@@ -1252,6 +1445,10 @@ WHERE r.name = 'designer' AND p.name = 'manage_issues';
     20: _migration_20,
 
     21: _migration_21,
+
+    22: _migration_22,
+
+    23: _migration_23,
 
 }
 

@@ -27,3 +27,6 @@ class Bom:
     modified: Optional[str] = None
     project_id: int = None
     locked: int = 0
+    current_revision_id: Optional[int] = None
+    current_iteration_id: Optional[int] = None
+    pending_revision_code: Optional[str] = None

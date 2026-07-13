@@ -10,3 +10,4 @@ class BaselineFile:
     file_type: str  # PDF | STEP
     file_id: Optional[int] = None
     version_id: Optional[int] = None
+    object_iteration_id: Optional[int] = None

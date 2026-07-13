@@ -290,16 +290,6 @@ class CommitService(BaseService):
             raise ValueError("Unknown designer user")
         designer_id = designer_user.id
 
-        project_version_label = None
-        try:
-            proj = self.project_service.get_project_by_id(self.session.project_id) if self.session.project_id else None
-            if isinstance(proj, dict):
-                lbl = (proj.get("version_label") or "").strip().upper()
-                if lbl and lbl.isalpha():
-                    project_version_label = lbl
-        except Exception:
-            project_version_label = None
-
         if not uncommitted_parts:
             raise ValueError("No files staged for commit.")
 
@@ -513,13 +503,6 @@ class CommitService(BaseService):
                     step_face_map_path=step_meta.get("step_face_map_path"),
                 )
                 inserted_any = True
-
-            if project_version_label:
-                for item in commit_plan:
-                    try:
-                        self.bom_repo.set_revision(item["part_id"], project_version_label)
-                    except Exception:
-                        pass
 
             self.traceability_service.repo.backfill_commit_groups()
             if resolved_issue_ids:
