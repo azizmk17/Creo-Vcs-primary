@@ -476,6 +476,181 @@ class BomRevisionRepository:
             "created_at": context.get("created_at"),
         }
 
+    @staticmethod
+    def _snapshot_object_data(raw_snapshot) -> dict:
+        try:
+            snapshot = json.loads(str(raw_snapshot or "{}"))
+        except Exception:
+            snapshot = {}
+        return snapshot if isinstance(snapshot, dict) else {}
+
+    def _iteration_bindings_conn(self, conn, iteration_id: int) -> list[dict]:
+        rows = conn.execute(
+            """
+            SELECT ib.id AS binding_id, ib.usage_id, ib.child_bom_id,
+                   ib.child_revision_id, ib.child_iteration_id,
+                   COALESCE(ib.quantity,1) AS quantity,
+                   COALESCE(ib.sort_order,ib.id) AS sort_order,
+                   child.name, child.aes_number, child.part_number, child.type,
+                   child_rev.revision_code AS child_revision,
+                   child_it.iteration_number AS child_iteration,
+                   child_it.object_data_json AS child_object_data_json
+            FROM bom_iteration_bindings ib
+            LEFT JOIN bom child ON child.id=ib.child_bom_id
+            JOIN bom_revisions child_rev ON child_rev.id=ib.child_revision_id
+            JOIN bom_iterations child_it ON child_it.id=ib.child_iteration_id
+            WHERE ib.parent_iteration_id=?
+            ORDER BY COALESCE(ib.sort_order,ib.id), ib.id
+            """,
+            (int(iteration_id),),
+        ).fetchall()
+        fallback_occurrences = {}
+        result = []
+        for position, row in enumerate(rows, start=1):
+            item = dict(row)
+            usage_id = item.get("usage_id")
+            child_id = int(item["child_bom_id"])
+            if usage_id is not None:
+                occurrence_key = f"usage:{int(usage_id)}"
+            else:
+                occurrence_number = fallback_occurrences.get(child_id, 0) + 1
+                fallback_occurrences[child_id] = occurrence_number
+                occurrence_key = f"legacy:{child_id}:{occurrence_number}"
+            snapshot = self._snapshot_object_data(item.pop("child_object_data_json", None))
+            for field in ("name", "aes_number", "part_number", "type"):
+                if field in snapshot:
+                    item[field] = str(snapshot.get(field) or "").strip()
+            filename = str(snapshot.get("filename") or "").strip()
+            drawing = str(snapshot.get("drawing") or "").strip()
+            item.update({
+                "occurrence_key": occurrence_key,
+                "position": position,
+                "child_version": (
+                    f"{item['child_revision']}.{int(item['child_iteration'])}"
+                ),
+                "filename": filename,
+                "drawing": drawing,
+            })
+            result.append(item)
+        return result
+
+    def compare_assembly_iterations(
+        self, bom_id: int, left_iteration_id: int, right_iteration_id: int
+    ) -> dict:
+        with self.get_conn() as conn:
+            self._ensure_bom_conn(conn, int(bom_id))
+            assembly = conn.execute(
+                "SELECT id, name, aes_number, part_number, type FROM bom WHERE id=?",
+                (int(bom_id),),
+            ).fetchone()
+            if not assembly:
+                raise ValueError("Assembly was not found.")
+            if str(assembly["type"] or "").strip().lower() not in {"asm", "assembly"}:
+                raise ValueError("Assembly iteration comparison is available only for assemblies.")
+
+            def iteration_context(iteration_id: int) -> dict:
+                row = conn.execute(
+                    """
+                    SELECT i.id, i.revision_id, i.iteration_number, i.created_at,
+                           i.created_by, i.checkin_note, i.source_commit_id,
+                           r.bom_id, r.revision_code, r.state,
+                           r.revision_code || '.' || i.iteration_number AS version_label
+                    FROM bom_iterations i
+                    JOIN bom_revisions r ON r.id=i.revision_id
+                    WHERE i.id=?
+                    """,
+                    (int(iteration_id),),
+                ).fetchone()
+                if not row or int(row["bom_id"]) != int(bom_id):
+                    raise ValueError("Both selected iterations must belong to this assembly.")
+                return dict(row)
+
+            left_context = iteration_context(int(left_iteration_id))
+            right_context = iteration_context(int(right_iteration_id))
+            left_rows = self._iteration_bindings_conn(conn, int(left_iteration_id))
+            right_rows = self._iteration_bindings_conn(conn, int(right_iteration_id))
+
+        left_by_key = {row["occurrence_key"]: row for row in left_rows}
+        right_by_key = {row["occurrence_key"]: row for row in right_rows}
+        ordered_keys = [row["occurrence_key"] for row in left_rows]
+        ordered_keys.extend(
+            row["occurrence_key"] for row in right_rows
+            if row["occurrence_key"] not in left_by_key
+        )
+
+        compared = []
+        summary = {
+            "total": 0,
+            "changed": 0,
+            "unchanged": 0,
+            "added": 0,
+            "removed": 0,
+            "version_changed": 0,
+            "quantity_changed": 0,
+            "order_changed": 0,
+            "component_changed": 0,
+        }
+        for key in ordered_keys:
+            left = left_by_key.get(key)
+            right = right_by_key.get(key)
+            change_types = []
+            if left is None:
+                change_types.append("added")
+                change_label = "Added"
+            elif right is None:
+                change_types.append("removed")
+                change_label = "Removed"
+            else:
+                labels = []
+                component_changed = int(left["child_bom_id"]) != int(right["child_bom_id"])
+                if component_changed:
+                    change_types.append("component_changed")
+                    labels.append("Component")
+                if (
+                    not component_changed
+                    and int(left["child_iteration_id"]) != int(right["child_iteration_id"])
+                ):
+                    change_types.append("version_changed")
+                    labels.append("Child version")
+                if int(left["quantity"] or 1) != int(right["quantity"] or 1):
+                    change_types.append("quantity_changed")
+                    labels.append("Quantity")
+                if int(left["position"] or 0) != int(right["position"] or 0):
+                    change_types.append("order_changed")
+                    labels.append("Order")
+                change_label = ", ".join(labels) if labels else "Unchanged"
+
+            summary["total"] += 1
+            if change_types:
+                summary["changed"] += 1
+                for change_type in change_types:
+                    summary[change_type] += 1
+            else:
+                summary["unchanged"] += 1
+            display = right or left or {}
+            compared.append({
+                "occurrence_key": key,
+                "usage_id": display.get("usage_id"),
+                "change": change_label,
+                "change_types": change_types,
+                "name": display.get("name") or "",
+                "aes_number": display.get("aes_number") or "",
+                "part_number": display.get("part_number") or "",
+                "type": display.get("type") or "",
+                "left": left,
+                "right": right,
+            })
+
+        return {
+            "assembly": dict(assembly),
+            "left": left_context,
+            "right": right_context,
+            "rows": compared,
+            "summary": summary,
+            "left_binding_count": len(left_rows),
+            "right_binding_count": len(right_rows),
+        }
+
     def validate_released_checkout(self, bom_id: int, revision_code: str) -> dict:
         code = self.normalize_revision_code(revision_code)
         with self.get_conn() as conn:

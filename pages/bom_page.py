@@ -40,6 +40,7 @@ from core.bom_filter import (
 from core.repositories.commit_repository import CommitRepository
 from core.services.commit_service import CommitService
 from pages.dialogs.package_parts_dialog import PackagePartsDialog
+from pages.dialogs.assembly_iteration_compare_dialog import AssemblyIterationCompareDialog
 from pages.dialogs.windchill_compare_dialog import WindchillCompareSetupDialog
 from pages.pdf_viewer_widget import PdfViewerWidget
 from utils import safe_exists, safe_startfile
@@ -2591,11 +2592,16 @@ class BomPage(QWidget):
         self.structure_views.addTab(self.where_used_tree, "Where Used")
         structure_layout.addWidget(self.structure_views, 1)
         structure_actions = QHBoxLayout()
+        self.compare_iterations_btn = QPushButton("Compare Iterations")
+        self.compare_iterations_btn.setObjectName("neutral")
+        self.compare_iterations_btn.clicked.connect(self.compare_assembly_iterations)
+        self.compare_iterations_btn.setEnabled(False)
         self.update_child_versions_btn = QPushButton("Update Child Versions")
         self.update_child_versions_btn.setObjectName("neutral")
         self.update_child_versions_btn.clicked.connect(self.update_child_versions)
         self.update_child_versions_btn.setEnabled(False)
         structure_actions.addStretch()
+        structure_actions.addWidget(self.compare_iterations_btn)
         structure_actions.addWidget(self.update_child_versions_btn)
         structure_layout.addLayout(structure_actions)
         self.tabs.addTab(structure_tab, "Structure")
@@ -3027,6 +3033,10 @@ class BomPage(QWidget):
         view_cad_files_action.triggered.connect(
             lambda _=False, pid=item_id: self._show_latest_bom_cad_files(int(pid))
         )
+        compare_iterations_action = QAction("Compare Assembly Iterations...", self)
+        compare_iterations_action.triggered.connect(
+            lambda _=False, pid=item_id: self.compare_assembly_iterations(int(pid))
+        )
         compare_action = QAction("Compare to Part Structure", self)
         compare_action.triggered.connect(lambda _=False, pid=item_id: self.compare_part_structure(int(pid)))
         refresh_files_act = QAction("Refresh Files", self)
@@ -3037,6 +3047,8 @@ class BomPage(QWidget):
         menu.addAction(open_step_act)
         menu.addAction(view_action)
         menu.addAction(view_cad_files_action)
+        if str(item.text(BOM_COL_TYPE) or "").strip().lower() in {"asm", "assembly"}:
+            menu.addAction(compare_iterations_action)
         menu.addAction(compare_action)
         menu.addSeparator()
         menu.addAction(refresh_files_act)
@@ -5137,6 +5149,44 @@ class BomPage(QWidget):
             dlg.exec_()
         except Exception as e:
             QMessageBox.critical(self, "Compare", f"Failed to open structure compare:\n{e}")
+
+    def compare_assembly_iterations(self, part_id=None):
+        """Open the immutable occurrence comparison for one assembly."""
+        if isinstance(part_id, bool):
+            part_id = None
+        part_id = part_id or getattr(self, "current_part_id", None)
+        if not part_id:
+            return QMessageBox.warning(
+                self, "Compare Assembly Iterations", "Select an assembly first."
+            )
+        try:
+            details = self.bom_service.get_part_details(int(part_id)) or {}
+            if str(details.get("type") or "").strip().lower() not in {"asm", "assembly"}:
+                return QMessageBox.warning(
+                    self,
+                    "Compare Assembly Iterations",
+                    "Iteration comparison is available only for assemblies.",
+                )
+            iterations = self.bom_service.list_part_iterations(int(part_id)) or []
+            if len(iterations) < 2:
+                return QMessageBox.information(
+                    self,
+                    "Compare Assembly Iterations",
+                    "This assembly needs at least two checked-in iterations before they can be compared.",
+                )
+            dialog = AssemblyIterationCompareDialog(
+                self,
+                self.bom_service,
+                int(part_id),
+                cad_file_opener=self._show_iteration_cad_files,
+            )
+            dialog.exec_()
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Compare Assembly Iterations",
+                f"Failed to compare assembly iterations:\n{exc}",
+            )
 
 
     def add_child(self, parent_item=None):
@@ -7934,6 +7984,9 @@ class BomPage(QWidget):
         self.release_revision_btn.setEnabled(bool(enabled and self.perm.can("set_revision")))
         try:
             details = getattr(self, "_current_part_details", {}) or {}
+            self.compare_iterations_btn.setEnabled(
+                bool(enabled) and str(details.get("type") or "").lower() in {"asm", "assembly"}
+            )
             self.update_child_versions_btn.setEnabled(
                 bool(enabled) and str(details.get("type") or "").lower() in {"asm", "assembly"}
             )
@@ -8083,6 +8136,7 @@ class BomPage(QWidget):
             details = getattr(self, "_current_part_details", {}) or {}
             self._update_lifecycle_action_states(details)
         except Exception:
+            self.compare_iterations_btn.setEnabled(False)
             self.update_child_versions_btn.setEnabled(False)
 
     def update_child_versions(self):
@@ -8237,6 +8291,15 @@ class BomPage(QWidget):
             action.triggered.connect(
                 lambda _=False, iid=int(iteration_id), relation=label, ver=str(version or ""):
                 self._show_iteration_cad_files(iid, relation, ver)
+            )
+        part_id = item.data(0, Qt.UserRole)
+        is_assembly = str(item.text(4) or "").strip().lower() in {"asm", "assembly"}
+        if part_id is not None and is_assembly:
+            if menu.actions():
+                menu.addSeparator()
+            compare_action = menu.addAction("Compare Assembly Iterations...")
+            compare_action.triggered.connect(
+                lambda _=False, pid=int(part_id): self.compare_assembly_iterations(pid)
             )
         if menu.actions():
             menu.exec_(tree.viewport().mapToGlobal(position))
@@ -8417,6 +8480,7 @@ class BomPage(QWidget):
         self.edit_part_btn.setEnabled(has_item and locked and can_manage and editable_checkout)
         self.delete_part_btn.setEnabled(has_item and can_manage and editable_checkout)
         self.add_child_btn.setEnabled(has_item and locked and can_manage and is_assembly and editable_checkout)
+        self.compare_iterations_btn.setEnabled(has_item and is_assembly)
         self.update_child_versions_btn.setEnabled(has_item and locked and is_assembly and editable_checkout)
         self.set_revision_btn.setEnabled(
             has_item and not locked and released and not pending_revision and can_revision

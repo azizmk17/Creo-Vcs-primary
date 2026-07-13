@@ -1531,6 +1531,13 @@ class BomService(BaseService):
     def list_part_iterations(self, part_id: int) -> List[Dict]:
         return self.revision_repo.list_iterations(int(part_id))
 
+    def compare_assembly_iterations(
+        self, part_id: int, left_iteration_id: int, right_iteration_id: int
+    ) -> Dict:
+        return self.revision_repo.compare_assembly_iterations(
+            int(part_id), int(left_iteration_id), int(right_iteration_id)
+        )
+
     def get_child_version_status(self, parent_id: int) -> List[Dict]:
         return self.revision_repo.list_child_version_status(int(parent_id))
 

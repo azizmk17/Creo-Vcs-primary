@@ -91,6 +91,69 @@ class BomRevisionRepositoryTests(unittest.TestCase):
         self.assertEqual(parent["version_label"], "A.2")
         self.assertEqual(self.repo.list_child_version_status(1)[0]["bound_version"], "A.2")
 
+    def test_compare_assembly_iterations_reports_exact_occurrence_changes(self):
+        left_iteration_id = self.repo.get_current_context(1)["current_iteration_id"]
+        with self.repo.get_conn() as conn:
+            conn.execute(
+                "UPDATE bom SET name='Child Updated', filename='child.prt.2' WHERE id=2"
+            )
+        self.repo.record_checkin(2, 7, "Child version", "commit-child")
+        self.repo.initialize_checkout(1, 7)
+        with self.repo.get_conn() as conn:
+            conn.execute(
+                "UPDATE bom_children SET quantity=3, sort_order=20 WHERE parent_id=1 AND child_id=2"
+            )
+            conn.execute(
+                "INSERT INTO bom_children(parent_id,child_id,quantity,sort_order) VALUES(1,3,1,5)"
+            )
+        self.repo.sync_working_bindings(1, 7)
+        self.repo.update_children_to_latest(1, [2], 7)
+        right = self.repo.record_checkin(1, 7, "Assembly configuration", "commit-parent")
+
+        comparison = self.repo.compare_assembly_iterations(
+            1, int(left_iteration_id), int(right["current_iteration_id"])
+        )
+
+        self.assertEqual(comparison["left"]["version_label"], "A.1")
+        self.assertEqual(comparison["right"]["version_label"], "A.2")
+        self.assertEqual(comparison["summary"]["changed"], 2)
+        self.assertEqual(comparison["summary"]["added"], 1)
+        self.assertEqual(comparison["summary"]["version_changed"], 1)
+        self.assertEqual(comparison["summary"]["quantity_changed"], 1)
+        self.assertEqual(comparison["summary"]["order_changed"], 1)
+        by_aes = {row["aes_number"]: row for row in comparison["rows"]}
+        self.assertEqual(by_aes["P01"]["left"]["child_version"], "A.1")
+        self.assertEqual(by_aes["P01"]["right"]["child_version"], "A.2")
+        self.assertEqual(by_aes["P01"]["left"]["name"], "Child")
+        self.assertEqual(by_aes["P01"]["right"]["name"], "Child Updated")
+        self.assertEqual(by_aes["P01"]["left"]["filename"], "")
+        self.assertEqual(by_aes["P01"]["right"]["filename"], "child.prt.2")
+        self.assertEqual(
+            set(by_aes["P01"]["change_types"]),
+            {"version_changed", "quantity_changed", "order_changed"},
+        )
+        self.assertEqual(by_aes["P02"]["change"], "Added")
+
+    def test_compare_assembly_iterations_keeps_repeated_component_occurrences_separate(self):
+        left_iteration_id = self.repo.get_current_context(1)["current_iteration_id"]
+        self.repo.initialize_checkout(1, 7)
+        with self.repo.get_conn() as conn:
+            conn.execute(
+                "INSERT INTO bom_children(parent_id,child_id,quantity,sort_order) VALUES(1,2,1,20)"
+            )
+        self.repo.sync_working_bindings(1, 7)
+        right = self.repo.record_checkin(1, 7, "Second child occurrence", "commit-parent")
+
+        comparison = self.repo.compare_assembly_iterations(
+            1, int(left_iteration_id), int(right["current_iteration_id"])
+        )
+
+        child_rows = [row for row in comparison["rows"] if row["aes_number"] == "P01"]
+        self.assertEqual(len(child_rows), 2)
+        self.assertEqual(comparison["summary"]["added"], 1)
+        self.assertEqual(comparison["summary"]["unchanged"], 1)
+        self.assertEqual(len({row["occurrence_key"] for row in child_rows}), 2)
+
     def test_release_is_immutable_and_new_revision_copies_configuration(self):
         self.repo.release_current_revision(1, 7, "Approved")
         with self.assertRaises(ValueError):

@@ -230,6 +230,31 @@ Structure row provides separate **Current**, **Bound**, and **Latest** CAD-file 
 These commands resolve immutable iteration snapshots; they do not substitute filenames
 from the current working BOM row.
 
+### Compare assembly iterations
+
+Select an assembly and use **Compare Iterations** in the Structure tab, or right-click
+an assembly in either the BOM or Structure tree and choose **Compare Assembly
+Iterations**. Select any two checked-in assembly iterations, for example `D.5` on the
+left and `D.6` on the right.
+
+The comparison is read-only and works at the direct-usage level. It reports:
+
+- Added and removed child occurrences
+- A different component assigned to an existing usage
+- Exact child revision/iteration changes, such as `B.3 -> B.4`
+- Quantity changes
+- Visible assembly-order changes
+- The native Creo and drawing filenames captured by each child iteration
+
+Every `bom_children` usage is compared independently. If the same family-table member
+or part appears more than once, each occurrence remains a separate row rather than
+being combined by filename or BOM ID. Right-click a comparison row to inspect the
+captured CAD filenames on either side.
+
+Only configurations stored in `bom_iteration_bindings` can be compared exactly. Nexus
+cannot reconstruct a pre-migration historical configuration that was never recorded;
+the dialog identifies a side that has no captured bindings.
+
 ## Creo Family Tables and Shared Native Files
 
 Nexus already groups BOM rows that share the same base Creo native filename. Checkout,
@@ -339,3 +364,6 @@ revision/iteration model.
 10. New revision accepts the configured drawing-revision format and starts at `.1`.
 11. Creating a project version remaps bindings to the copied BOM IDs.
 12. Creo `.prt.N`, `.asm.N`, and `.drw.N` numbers remain independent of PLM iteration.
+13. Comparing two assembly iterations reports each direct usage independently, including
+    child-version, quantity, and visible order differences.
+14. Repeated usages of the same child remain separate comparison rows.
