@@ -41,6 +41,8 @@ class CommitRepository:
                     cur.execute("ALTER TABLE commits ADD COLUMN step_error TEXT")
                 if not has_column("commits", "step_face_map_path"):
                     cur.execute("ALTER TABLE commits ADD COLUMN step_face_map_path TEXT")
+                if not has_column("commits", "object_iteration_id"):
+                    cur.execute("ALTER TABLE commits ADD COLUMN object_iteration_id INTEGER")
             except Exception:
                 pass
 
@@ -75,6 +77,7 @@ class CommitRepository:
         step_diff_status=None,
         step_error=None,
         step_face_map_path=None,
+        object_iteration_id=None,
     ) -> int:
         with self.get_conn() as conn:
             cur = conn.cursor()
@@ -83,9 +86,10 @@ class CommitRepository:
                     part_id, type, filename, file_path, base_file_name, designer, message,
                     committed_by, status, committed_at, signature, project_id, title, commit_id,
                     step_compare_enabled, step_file_path, step_prev_file_path, step_diff_path,
-                    step_diff_summary, step_diff_status, step_error, step_face_map_path
+                    step_diff_summary, step_diff_status, step_error, step_face_map_path,
+                    object_iteration_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 part_id,
                 part_type,
@@ -109,6 +113,7 @@ class CommitRepository:
                 step_diff_status,
                 step_error,
                 step_face_map_path,
+                object_iteration_id,
             ))
             return cur.lastrowid
 
@@ -420,6 +425,7 @@ class CommitRepository:
             'step_diff_status',
             'step_error',
             'step_face_map_path',
+            'object_iteration_id',
         ]
         filtered = {k: data.get(k) for k in keys}
         return Commit(**filtered)

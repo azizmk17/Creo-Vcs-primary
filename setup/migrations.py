@@ -1093,6 +1093,289 @@ def _migration_23(conn):
     _ensure_column(conn, "bom", "pending_revision_code", "pending_revision_code TEXT")
 
 
+def _migration_24(conn):
+    """Add named frozen assembly configurations and their exact occurrence manifests."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS assembly_configurations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            name TEXT NOT NULL COLLATE NOCASE,
+            series_key TEXT NOT NULL DEFAULT '',
+            configuration_name TEXT NOT NULL DEFAULT '',
+            version_number INTEGER NOT NULL DEFAULT 1,
+            based_on_configuration_id INTEGER,
+            purpose TEXT NOT NULL DEFAULT '',
+            description TEXT NOT NULL DEFAULT '',
+            root_bom_id INTEGER NOT NULL,
+            root_iteration_id INTEGER NOT NULL,
+            root_version_label TEXT NOT NULL,
+            root_name TEXT NOT NULL DEFAULT '',
+            source_project_version TEXT NOT NULL DEFAULT '',
+            storage_rel_path TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'Draft',
+            member_count INTEGER NOT NULL DEFAULT 0,
+            file_count INTEGER NOT NULL DEFAULT 0,
+            created_by INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            draft_updated_at TEXT,
+            frozen_at TEXT,
+            frozen_by INTEGER,
+            last_built_at TEXT,
+            last_built_path TEXT,
+            UNIQUE(project_id, name),
+            FOREIGN KEY (project_id) REFERENCES projects(id),
+            FOREIGN KEY (root_bom_id) REFERENCES bom(id),
+            FOREIGN KEY (root_iteration_id) REFERENCES bom_iterations(id),
+            FOREIGN KEY (created_by) REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS assembly_configuration_members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            configuration_id INTEGER NOT NULL,
+            sequence_no INTEGER NOT NULL,
+            occurrence_path TEXT NOT NULL,
+            parent_occurrence_path TEXT,
+            usage_id INTEGER,
+            bom_id INTEGER NOT NULL,
+            revision_id INTEGER NOT NULL,
+            iteration_id INTEGER NOT NULL,
+            version_label TEXT NOT NULL,
+            quantity INTEGER NOT NULL DEFAULT 1,
+            position INTEGER NOT NULL DEFAULT 0,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            type TEXT NOT NULL DEFAULT '',
+            name TEXT NOT NULL DEFAULT '',
+            aes_number TEXT NOT NULL DEFAULT '',
+            part_number TEXT NOT NULL DEFAULT '',
+            drawing_number TEXT NOT NULL DEFAULT '',
+            filename TEXT NOT NULL DEFAULT '',
+            drawing TEXT NOT NULL DEFAULT '',
+            native_source_rel_path TEXT NOT NULL DEFAULT '',
+            drawing_source_rel_path TEXT NOT NULL DEFAULT '',
+            native_frozen_rel_path TEXT NOT NULL DEFAULT '',
+            drawing_frozen_rel_path TEXT NOT NULL DEFAULT '',
+            native_sha256 TEXT NOT NULL DEFAULT '',
+            drawing_sha256 TEXT NOT NULL DEFAULT '',
+            UNIQUE(configuration_id, occurrence_path),
+            FOREIGN KEY (configuration_id) REFERENCES assembly_configurations(id),
+            FOREIGN KEY (bom_id) REFERENCES bom(id),
+            FOREIGN KEY (revision_id) REFERENCES bom_revisions(id),
+            FOREIGN KEY (iteration_id) REFERENCES bom_iterations(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_assembly_configurations_project
+            ON assembly_configurations(project_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_assembly_configuration_members_config
+            ON assembly_configuration_members(configuration_id, sequence_no);
+        CREATE INDEX IF NOT EXISTS idx_assembly_configuration_members_iteration
+            ON assembly_configuration_members(iteration_id);
+        """
+    )
+    _ensure_column(
+        conn,
+        "assembly_configuration_members",
+        "native_source_rel_path",
+        "native_source_rel_path TEXT NOT NULL DEFAULT ''",
+    )
+    _ensure_column(
+        conn,
+        "assembly_configuration_members",
+        "drawing_source_rel_path",
+        "drawing_source_rel_path TEXT NOT NULL DEFAULT ''",
+    )
+
+
+def _migration_25(conn):
+    """Add editable Draft/Frozen configuration versions."""
+    for column, definition in (
+        ("series_key", "series_key TEXT NOT NULL DEFAULT ''"),
+        ("configuration_name", "configuration_name TEXT NOT NULL DEFAULT ''"),
+        ("version_number", "version_number INTEGER NOT NULL DEFAULT 1"),
+        ("based_on_configuration_id", "based_on_configuration_id INTEGER"),
+        ("draft_updated_at", "draft_updated_at TEXT"),
+        ("frozen_at", "frozen_at TEXT"),
+        ("frozen_by", "frozen_by INTEGER"),
+    ):
+        _ensure_column(conn, "assembly_configurations", column, definition)
+    conn.execute(
+        """
+        UPDATE assembly_configurations
+        SET series_key='legacy:' || id
+        WHERE trim(COALESCE(series_key,''))=''
+        """
+    )
+    conn.execute(
+        """
+        UPDATE assembly_configurations
+        SET configuration_name=name
+        WHERE trim(COALESCE(configuration_name,''))=''
+        """
+    )
+    conn.execute(
+        """
+        UPDATE assembly_configurations
+        SET version_number=1
+        WHERE version_number IS NULL OR version_number < 1
+        """
+    )
+    conn.execute(
+        """
+        UPDATE assembly_configurations
+        SET state='Frozen'
+        WHERE lower(trim(COALESCE(state,''))) NOT IN ('draft','frozen')
+           OR trim(COALESCE(state,''))=''
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_assembly_configurations_series
+        ON assembly_configurations(project_id, series_key, version_number DESC)
+        """
+    )
+
+
+def _migration_26(conn):
+    """Bind history-producing records to the exact BOM object iteration."""
+    tables = {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    for table_name in ("commits", "lock_logs", "part_file_versions"):
+        if table_name in tables:
+            _ensure_column(
+                conn,
+                table_name,
+                "object_iteration_id",
+                "object_iteration_id INTEGER",
+            )
+
+    if "commits" in tables:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_commits_object_iteration ON commits(object_iteration_id)"
+        )
+    if "lock_logs" in tables:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_lock_logs_object_iteration ON lock_logs(object_iteration_id)"
+        )
+    if "part_file_versions" in tables:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_part_file_versions_object_iteration "
+            "ON part_file_versions(object_iteration_id)"
+        )
+
+
+def _migration_27(conn):
+    """Add managed vault metadata and immutable iteration file manifests."""
+    tables = {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    if "part_files" in tables:
+        _ensure_column(conn, "part_files", "file_role", "file_role TEXT NOT NULL DEFAULT 'document'")
+        _ensure_column(conn, "part_files", "deleted_at", "deleted_at TEXT")
+        conn.execute(
+            """
+            UPDATE part_files
+            SET file_role=CASE UPPER(TRIM(COALESCE(file_type,'')))
+                WHEN 'PDF' THEN 'generated_pdf'
+                WHEN 'STEP' THEN 'generated_step'
+                WHEN 'STP' THEN 'generated_step'
+                WHEN 'DRW' THEN 'drawing'
+                ELSE 'document'
+            END
+            WHERE TRIM(COALESCE(file_role,''))='' OR file_role='document'
+            """
+        )
+    if "part_file_versions" in tables:
+        for column, definition in (
+            ("storage_scheme", "storage_scheme TEXT NOT NULL DEFAULT 'legacy'"),
+            ("source_kind", "source_kind TEXT NOT NULL DEFAULT 'manual'"),
+            ("source_commit_id", "source_commit_id TEXT"),
+            ("integrity_status", "integrity_status TEXT NOT NULL DEFAULT 'Unknown'"),
+            ("derived_from_version_id", "derived_from_version_id INTEGER"),
+            ("deleted_at", "deleted_at TEXT"),
+        ):
+            _ensure_column(conn, "part_file_versions", column, definition)
+        conn.execute(
+            """
+            UPDATE part_file_versions
+            SET source_kind='legacy',
+                integrity_status=CASE
+                    WHEN sha256 IS NOT NULL AND TRIM(sha256)<>'' THEN 'Available'
+                    ELSE 'Unknown'
+                END
+            WHERE storage_scheme='legacy'
+            """
+        )
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS bom_iteration_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bom_id INTEGER NOT NULL,
+            iteration_id INTEGER NOT NULL,
+            binding_key TEXT NOT NULL,
+            file_role TEXT NOT NULL,
+            file_type TEXT NOT NULL DEFAULT '',
+            source_kind TEXT NOT NULL DEFAULT 'legacy',
+            part_file_id INTEGER,
+            part_file_version_id INTEGER,
+            filename TEXT NOT NULL,
+            file_revision TEXT NOT NULL DEFAULT '',
+            creo_iteration INTEGER,
+            storage_scheme TEXT NOT NULL DEFAULT 'legacy_reference',
+            vault_rel_path TEXT NOT NULL DEFAULT '',
+            sha256 TEXT,
+            size_bytes INTEGER,
+            integrity_status TEXT NOT NULL DEFAULT 'Unknown',
+            lifecycle_state TEXT NOT NULL DEFAULT 'In Work',
+            source_commit_id TEXT,
+            created_by INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(iteration_id, binding_key),
+            FOREIGN KEY (bom_id) REFERENCES bom(id),
+            FOREIGN KEY (iteration_id) REFERENCES bom_iterations(id),
+            FOREIGN KEY (part_file_id) REFERENCES part_files(id),
+            FOREIGN KEY (part_file_version_id) REFERENCES part_file_versions(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_bom_iteration_files_iteration
+            ON bom_iteration_files(iteration_id, file_role);
+        CREATE INDEX IF NOT EXISTS idx_bom_iteration_files_bom
+            ON bom_iteration_files(bom_id, iteration_id);
+        CREATE INDEX IF NOT EXISTS idx_bom_iteration_files_version
+            ON bom_iteration_files(part_file_version_id);
+        """
+    )
+
+
+def _migration_28(conn):
+    """Restore explicit attachment revision in managed-file manifests."""
+    tables = {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    if "bom_iteration_files" not in tables:
+        return
+    _ensure_column(
+        conn, "bom_iteration_files", "file_revision",
+        "file_revision TEXT NOT NULL DEFAULT ''",
+    )
+    if "part_file_versions" in tables:
+        conn.execute(
+            """
+            UPDATE bom_iteration_files
+            SET file_revision=COALESCE((
+                SELECT v.revision
+                FROM part_file_versions v
+                WHERE v.id=bom_iteration_files.part_file_version_id
+            ), '')
+            WHERE part_file_version_id IS NOT NULL
+              AND TRIM(COALESCE(file_revision,''))=''
+            """
+        )
+
+
 MIGRATIONS = {
     1: """
     CREATE TABLE IF NOT EXISTS users (
@@ -1449,6 +1732,16 @@ WHERE r.name = 'designer' AND p.name = 'manage_issues';
     22: _migration_22,
 
     23: _migration_23,
+
+    24: _migration_24,
+
+    25: _migration_25,
+
+    26: _migration_26,
+
+    27: _migration_27,
+
+    28: _migration_28,
 
 }
 

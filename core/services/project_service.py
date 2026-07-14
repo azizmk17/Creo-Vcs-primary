@@ -81,7 +81,7 @@ class ProjectService:
         """Copy only latest Creo iterations (e.g. part.prt.2) from src_dir into dst_dir.
 
         - Preserves relative directory structure
-        - Skips heavy/internal folders: vault, commits, __pycache__, .git
+        - Skips transient/internal folders: commits, .nexus, __pycache__, .git
         - Requires dst_dir to be empty (or non-existent)
         """
 
@@ -95,7 +95,7 @@ class ProjectService:
         os.makedirs(dst_dir, exist_ok=True)
 
         # Keep vault (attachments) so history/files remain available in the new revision.
-        skip_dirs = {"commits", "__pycache__", ".git"}
+        skip_dirs = {"commits", ".nexus", "__pycache__", ".git"}
 
         for root, dirs, files in os.walk(src_dir):
             if callable(cancel_cb) and cancel_cb():

@@ -34,3 +34,4 @@ class Commit:
     step_diff_status: Optional[str] = None
     step_error: Optional[str] = None
     step_face_map_path: Optional[str] = None
+    object_iteration_id: Optional[int] = None

@@ -8,6 +8,7 @@ import json
 from dataclasses import asdict
 from core.repositories.commit_repository import CommitRepository
 from core.repositories.bom_repository import BomRepository
+from core.repositories.bom_revision_repository import BomRevisionRepository
 from core.repositories.lock_repository import LockRepository
 from core.repositories.user_repository import UserRepository
 from core.repositories.signature_repository import SignatureRepository
@@ -34,6 +35,7 @@ class CommitService(BaseService):
         super().__init__()
         self.commit_repository = CommitRepository()
         self.bom_repo = BomRepository()
+        self.revision_repo = BomRevisionRepository()
         self.lock_repo = LockRepository()
         self.signature_repo = SignatureRepository()
         self.user_service = UserService(UserRepository())
@@ -43,6 +45,14 @@ class CommitService(BaseService):
         self.part_file_service = PartFileService()
 
         self.session = SessionManager()
+
+    def _object_iteration_id(self, part_id: int):
+        try:
+            context = self.revision_repo.get_current_context(int(part_id))
+            value = context.get("current_iteration_id")
+            return int(value) if value is not None else None
+        except Exception:
+            return None
 
     def _canonical_part_root(self, value: str) -> str:
         base = os.path.basename(value or "")
@@ -501,6 +511,7 @@ class CommitService(BaseService):
                     step_diff_status=step_meta.get("step_diff_status"),
                     step_error=step_meta.get("step_error"),
                     step_face_map_path=step_meta.get("step_face_map_path"),
+                    object_iteration_id=self._object_iteration_id(item["part_id"]),
                 )
                 inserted_any = True
 
@@ -628,11 +639,31 @@ class CommitService(BaseService):
         
         grouped = {}
         seen_files_by_group = {}
+        project_directories = {}
+
+        def commit_directory(commit):
+            commit_project_id = getattr(commit, "project_id", None)
+            if commit_project_id not in project_directories:
+                try:
+                    project = self.project_service.get_project_by_id(int(commit_project_id)) or {}
+                    project_directories[commit_project_id] = str(
+                        project.get("working_directory") or ""
+                    ).strip()
+                except Exception:
+                    project_directories[commit_project_id] = ""
+            working_dir = project_directories.get(commit_project_id) or ""
+            username = str(getattr(commit, "username", "") or "").strip()
+            title = str(getattr(commit, "title", "") or "").strip()
+            logical_id = str(getattr(commit, "commit_id", "") or "").strip()
+            if not working_dir or not username or not title or not logical_id:
+                return ""
+            return os.path.normpath(
+                os.path.join(working_dir, "commits", username, f"{title}_{logical_id}")
+            )
+
         for c in all_commits:
             key = (c.designer, c.commit_id)
             if key not in grouped:
-                file_path = str(getattr(c, "file_path", "") or "")
-                commit_dir = os.path.dirname(file_path) if file_path else ""
                 grouped[key] = {
                     "designer": c.designer,
                     "status": c.status,
@@ -641,15 +672,11 @@ class CommitService(BaseService):
                     "project_id": getattr(c, "project_id", None),
                     "title": c.title,
                     "date": c.committed_at,
-                    "commit_dir": commit_dir,
+                    "commit_dir": commit_directory(c),
                     "parts": [],
                     "related_issues": self.issue_service.issues_for_commit(c.commit_id),
                 }
                 seen_files_by_group[key] = set()
-            elif not grouped[key].get("commit_dir"):
-                file_path = str(getattr(c, "file_path", "") or "")
-                if file_path:
-                    grouped[key]["commit_dir"] = os.path.dirname(file_path)
             file_label = str(getattr(c, "filename", "") or "")
             file_key = file_label.lower()
             if file_label and file_key not in seen_files_by_group.setdefault(key, set()):

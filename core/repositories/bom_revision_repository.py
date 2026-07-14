@@ -14,6 +14,20 @@ class BomRevisionRepository:
         "filename", "drawing", "base_file_name", "base_drw_name", "material",
         "weight", "notes", "pdf_path", "step_path",
     )
+    _CHECKIN_METADATA_FIELDS = (
+        "type", "name", "part_number", "drawing_number", "aes_number",
+        "material", "weight", "notes",
+    )
+    _CHECKIN_METADATA_LABELS = {
+        "type": "Type",
+        "name": "Name",
+        "part_number": "Part number",
+        "drawing_number": "Drawing number",
+        "aes_number": "AES number",
+        "material": "Material",
+        "weight": "Weight",
+        "notes": "Technical note",
+    }
 
     def __init__(self, db_name=DB_NAME):
         self.db_name = db_name
@@ -363,6 +377,161 @@ class BomRevisionRepository:
             self._ensure_bom_conn(conn, int(bom_id))
             return self._current_context_conn(conn, int(bom_id))
 
+    def analyze_working_object(self, bom_id: int) -> dict:
+        """Compare the checked-in object snapshot with its current working state."""
+        with self.get_conn() as conn:
+            current = self._ensure_bom_conn(conn, int(bom_id))
+            try:
+                baseline_object = json.loads(str(current.get("object_data_json") or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                baseline_object = {}
+
+            columns = ", ".join(self._SNAPSHOT_FIELDS)
+            row = conn.execute(
+                f"SELECT {columns} FROM bom WHERE id=?", (int(bom_id),)
+            ).fetchone()
+            working_object = dict(row) if row else {}
+
+            def comparable(value):
+                if value is None:
+                    return ""
+                if isinstance(value, float) and value.is_integer():
+                    return str(int(value))
+                return str(value).strip()
+
+            metadata_changes = []
+            for field in self._CHECKIN_METADATA_FIELDS:
+                before = baseline_object.get(field)
+                after = working_object.get(field)
+                if comparable(before) == comparable(after):
+                    continue
+                metadata_changes.append({
+                    "field": field,
+                    "label": self._CHECKIN_METADATA_LABELS.get(field, field.replace("_", " ").title()),
+                    "before": before,
+                    "after": after,
+                })
+
+            baseline_rows = conn.execute(
+                """
+                SELECT ib.usage_id, ib.child_bom_id AS child_id,
+                       COALESCE(ib.quantity, 1) AS quantity,
+                       COALESCE(ib.sort_order, ib.id) AS sort_order,
+                       ib.child_iteration_id,
+                       child.name, child.aes_number,
+                       child_rev.revision_code || '.' || child_it.iteration_number AS version_label
+                FROM bom_iteration_bindings ib
+                JOIN bom child ON child.id=ib.child_bom_id
+                JOIN bom_revisions child_rev ON child_rev.id=ib.child_revision_id
+                JOIN bom_iterations child_it ON child_it.id=ib.child_iteration_id
+                WHERE ib.parent_iteration_id=?
+                ORDER BY COALESCE(ib.sort_order, ib.id), ib.id
+                """,
+                (int(current["current_iteration_id"]),),
+            ).fetchall()
+            working_rows = conn.execute(
+                """
+                SELECT bc.id AS usage_id, bc.child_id,
+                       COALESCE(bc.quantity, 1) AS quantity,
+                       COALESCE(bc.sort_order, bc.id) AS sort_order,
+                       COALESCE(wb.child_iteration_id, child.current_iteration_id) AS child_iteration_id,
+                       child.name, child.aes_number,
+                       child_rev.revision_code || '.' || child_it.iteration_number AS version_label
+                FROM bom_children bc
+                JOIN bom child ON child.id=bc.child_id
+                LEFT JOIN bom_working_bindings wb
+                    ON wb.parent_bom_id=bc.parent_id AND wb.usage_id=bc.id
+                LEFT JOIN bom_revisions child_rev
+                    ON child_rev.id=COALESCE(wb.child_revision_id, child.current_revision_id)
+                LEFT JOIN bom_iterations child_it
+                    ON child_it.id=COALESCE(wb.child_iteration_id, child.current_iteration_id)
+                WHERE bc.parent_id=?
+                ORDER BY COALESCE(bc.sort_order, bc.id), bc.id
+                """,
+                (int(bom_id),),
+            ).fetchall()
+
+            baseline_by_usage = {
+                int(item["usage_id"]): dict(item)
+                for item in baseline_rows
+                if item["usage_id"] is not None
+            }
+            working_by_usage = {
+                int(item["usage_id"]): dict(item)
+                for item in working_rows
+                if item["usage_id"] is not None
+            }
+
+            def item_label(item):
+                aes = str(item.get("aes_number") or "").strip()
+                name = str(item.get("name") or item.get("child_id") or "Item").strip()
+                return f"{aes} {name}".strip()
+
+            structure_changes = []
+            for usage_id in sorted(set(working_by_usage) - set(baseline_by_usage)):
+                item = working_by_usage[usage_id]
+                structure_changes.append({
+                    "kind": "added",
+                    "usage_id": usage_id,
+                    "child_id": int(item["child_id"]),
+                    "text": f"Added: {item_label(item)}",
+                })
+            for usage_id in sorted(set(baseline_by_usage) - set(working_by_usage)):
+                item = baseline_by_usage[usage_id]
+                structure_changes.append({
+                    "kind": "removed",
+                    "usage_id": usage_id,
+                    "child_id": int(item["child_id"]),
+                    "text": f"Removed: {item_label(item)}",
+                })
+            for usage_id in sorted(set(baseline_by_usage) & set(working_by_usage)):
+                before = baseline_by_usage[usage_id]
+                after = working_by_usage[usage_id]
+                label = item_label(after)
+                if int(before["child_id"]) != int(after["child_id"]):
+                    structure_changes.append({
+                        "kind": "replaced",
+                        "usage_id": usage_id,
+                        "child_id": int(after["child_id"]),
+                        "text": f"Replaced: {item_label(before)} -> {label}",
+                    })
+                    continue
+                if int(before["quantity"] or 1) != int(after["quantity"] or 1):
+                    structure_changes.append({
+                        "kind": "quantity",
+                        "usage_id": usage_id,
+                        "child_id": int(after["child_id"]),
+                        "text": (
+                            f"Quantity changed: {label}, "
+                            f"{int(before['quantity'] or 1)} -> {int(after['quantity'] or 1)}"
+                        ),
+                    })
+                if int(before["child_iteration_id"] or 0) != int(after["child_iteration_id"] or 0):
+                    structure_changes.append({
+                        "kind": "binding",
+                        "usage_id": usage_id,
+                        "child_id": int(after["child_id"]),
+                        "text": (
+                            f"Child version changed: {label}, "
+                            f"{before.get('version_label') or '?'} -> {after.get('version_label') or '?'}"
+                        ),
+                    })
+                if int(before["sort_order"] or 0) != int(after["sort_order"] or 0):
+                    structure_changes.append({
+                        "kind": "reordered",
+                        "usage_id": usage_id,
+                        "child_id": int(after["child_id"]),
+                        "text": f"Reordered: {label}",
+                    })
+
+            return {
+                "context": dict(current),
+                "baseline_object": baseline_object,
+                "working_object": working_object,
+                "metadata_changes": metadata_changes,
+                "structure_changes": structure_changes,
+            }
+
     def get_current_contexts_for_project(self, project_id: int) -> dict[int, dict]:
         with self.get_conn() as conn:
             rows = conn.execute("SELECT id FROM bom WHERE project_id=?", (int(project_id),)).fetchall()
@@ -455,6 +624,56 @@ class BomRevisionRepository:
                 (int(iteration_id),),
             ).fetchone()
             return dict(row) if row else {}
+
+    def get_iteration_object_contexts(self, iteration_ids) -> dict[int, dict]:
+        """Load immutable object metadata for many selected iterations at once."""
+        ids = sorted({int(value) for value in (iteration_ids or []) if value is not None})
+        if not ids:
+            return {}
+        result = {}
+        with self.get_conn() as conn:
+            for offset in range(0, len(ids), 800):
+                chunk = ids[offset:offset + 800]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT i.id AS iteration_id, i.revision_id, i.iteration_number,
+                           i.object_data_json, i.created_at, i.created_by, i.checkin_note,
+                           r.bom_id, r.revision_code, r.state, b.project_id,
+                           b.type AS current_type, b.name AS current_name,
+                           b.aes_number AS current_aes_number,
+                           b.part_number AS current_part_number,
+                           b.drawing_number AS current_drawing_number,
+                           b.filename AS current_filename,
+                           b.drawing AS current_drawing
+                    FROM bom_iterations i
+                    JOIN bom_revisions r ON r.id=i.revision_id
+                    JOIN bom b ON b.id=r.bom_id
+                    WHERE i.id IN ({placeholders})
+                    """,
+                    chunk,
+                ).fetchall()
+                for row in rows:
+                    item = dict(row)
+                    snapshot = self._snapshot_object_data(
+                        item.pop("object_data_json", None)
+                    )
+                    fallback_fields = {
+                        "type": item.pop("current_type", ""),
+                        "name": item.pop("current_name", ""),
+                        "aes_number": item.pop("current_aes_number", ""),
+                        "part_number": item.pop("current_part_number", ""),
+                        "drawing_number": item.pop("current_drawing_number", ""),
+                        "filename": item.pop("current_filename", ""),
+                        "drawing": item.pop("current_drawing", ""),
+                    }
+                    for field, fallback in fallback_fields.items():
+                        item[field] = str(snapshot.get(field, fallback) or "").strip()
+                    item["version_label"] = (
+                        f"{item['revision_code']}.{int(item['iteration_number'])}"
+                    )
+                    result[int(item["iteration_id"])] = item
+        return result
 
     def get_iteration_cad_files(self, iteration_id: int) -> dict:
         context = self.get_iteration_context(int(iteration_id))
@@ -650,6 +869,163 @@ class BomRevisionRepository:
             "left_binding_count": len(left_rows),
             "right_binding_count": len(right_rows),
         }
+
+    def get_iteration_structure_snapshot(self, bom_id: int, iteration_id: int) -> dict:
+        """Return one exact recursive assembly configuration from immutable bindings."""
+        with self.get_conn() as conn:
+            self._ensure_bom_conn(conn, int(bom_id))
+            context_cache = {}
+            binding_cache = {}
+
+            def iteration_context(selected_iteration_id: int) -> dict:
+                selected_iteration_id = int(selected_iteration_id)
+                if selected_iteration_id in context_cache:
+                    return dict(context_cache[selected_iteration_id])
+                row = conn.execute(
+                    """
+                    SELECT i.id AS iteration_id, i.revision_id, i.iteration_number,
+                           i.object_data_json, i.checkin_note, i.created_at,
+                           r.bom_id, r.revision_code, r.state,
+                           b.project_id, b.type AS current_type, b.name AS current_name,
+                           b.aes_number AS current_aes_number,
+                           b.part_number AS current_part_number,
+                           b.drawing_number AS current_drawing_number
+                    FROM bom_iterations i
+                    JOIN bom_revisions r ON r.id=i.revision_id
+                    LEFT JOIN bom b ON b.id=r.bom_id
+                    WHERE i.id=?
+                    """,
+                    (selected_iteration_id,),
+                ).fetchone()
+                if not row:
+                    raise ValueError(f"Iteration {selected_iteration_id} was not found.")
+                result = dict(row)
+                snapshot = self._snapshot_object_data(result.pop("object_data_json", None))
+                if not snapshot:
+                    raise ValueError(
+                        f"Iteration {selected_iteration_id} has no immutable object snapshot."
+                    )
+                fallback_fields = {
+                    "type": result.pop("current_type", ""),
+                    "name": result.pop("current_name", ""),
+                    "aes_number": result.pop("current_aes_number", ""),
+                    "part_number": result.pop("current_part_number", ""),
+                    "drawing_number": result.pop("current_drawing_number", ""),
+                }
+                for field, fallback in fallback_fields.items():
+                    result[field] = str(snapshot.get(field, fallback) or "").strip()
+                for field in (
+                    "filename", "drawing", "base_file_name", "base_drw_name",
+                    "material", "weight", "notes", "pdf_path", "step_path",
+                ):
+                    result[field] = str(snapshot.get(field) or "").strip()
+                result["version_label"] = (
+                    f"{result['revision_code']}.{int(result['iteration_number'])}"
+                )
+                context_cache[selected_iteration_id] = dict(result)
+                return result
+
+            root = iteration_context(int(iteration_id))
+            if int(root["bom_id"]) != int(bom_id):
+                raise ValueError("The selected iteration does not belong to this assembly.")
+            if str(root.get("type") or "").lower() not in {"asm", "assembly"}:
+                raise ValueError("A frozen configuration must start from an assembly iteration.")
+            project_id = root.get("project_id")
+            if project_id is None:
+                raise ValueError("The selected assembly is not assigned to a project.")
+
+            members = []
+
+            def child_bindings(parent_iteration_id: int) -> list[dict]:
+                parent_iteration_id = int(parent_iteration_id)
+                if parent_iteration_id not in binding_cache:
+                    binding_cache[parent_iteration_id] = self._iteration_bindings_conn(
+                        conn, parent_iteration_id
+                    )
+                return [dict(row) for row in binding_cache[parent_iteration_id]]
+
+            def walk(
+                context: dict,
+                occurrence_path: str,
+                parent_occurrence_path,
+                usage_id,
+                quantity: int,
+                position: int,
+                sort_order: int,
+                ancestors: tuple[int, ...],
+            ) -> None:
+                selected_iteration_id = int(context["iteration_id"])
+                if selected_iteration_id in ancestors:
+                    raise ValueError(
+                        f"Circular immutable structure detected at {context.get('name') or occurrence_path}."
+                    )
+                if int(context.get("project_id") or 0) != int(project_id):
+                    raise ValueError("A configuration cannot contain BOM objects from another project.")
+                members.append({
+                    "occurrence_path": occurrence_path,
+                    "parent_occurrence_path": parent_occurrence_path,
+                    "usage_id": int(usage_id) if usage_id is not None else None,
+                    "bom_id": int(context["bom_id"]),
+                    "revision_id": int(context["revision_id"]),
+                    "iteration_id": selected_iteration_id,
+                    "revision_code": str(context.get("revision_code") or ""),
+                    "iteration_number": int(context.get("iteration_number") or 0),
+                    "version_label": str(context.get("version_label") or ""),
+                    "quantity": max(1, int(quantity or 1)),
+                    "position": int(position or 0),
+                    "sort_order": int(sort_order or 0),
+                    "type": str(context.get("type") or ""),
+                    "name": str(context.get("name") or ""),
+                    "aes_number": str(context.get("aes_number") or ""),
+                    "part_number": str(context.get("part_number") or ""),
+                    "drawing_number": str(context.get("drawing_number") or ""),
+                    "filename": str(context.get("filename") or ""),
+                    "drawing": str(context.get("drawing") or ""),
+                    "is_root": occurrence_path == "root",
+                })
+                if str(context.get("type") or "").lower() not in {"asm", "assembly"}:
+                    return
+                next_ancestors = (*ancestors, selected_iteration_id)
+                if len(next_ancestors) > 100:
+                    raise ValueError("The assembly structure exceeds the supported depth of 100 levels.")
+                bindings = child_bindings(selected_iteration_id)
+                if not bindings:
+                    current_child_count = int(conn.execute(
+                        "SELECT COUNT(*) FROM bom_children WHERE parent_id=?",
+                        (int(context["bom_id"]),),
+                    ).fetchone()[0])
+                    if current_child_count:
+                        raise ValueError(
+                            f"{context.get('name') or context.get('bom_id')} "
+                            f"{context.get('version_label') or ''} has no captured child bindings "
+                            "and cannot be frozen exactly."
+                        )
+                for binding in bindings:
+                    child = iteration_context(int(binding["child_iteration_id"]))
+                    if int(child["bom_id"]) != int(binding["child_bom_id"]):
+                        raise ValueError("An immutable child binding points to the wrong BOM object.")
+                    segment = str(binding.get("occurrence_key") or "occurrence").replace(":", "_")
+                    walk(
+                        child,
+                        f"{occurrence_path}/{segment}",
+                        occurrence_path,
+                        binding.get("usage_id"),
+                        int(binding.get("quantity") or 1),
+                        int(binding.get("position") or 0),
+                        int(binding.get("sort_order") or 0),
+                        next_ancestors,
+                    )
+
+            walk(root, "root", None, None, 1, 0, 0, ())
+            return {
+                "project_id": int(project_id),
+                "root_bom_id": int(bom_id),
+                "root_iteration_id": int(iteration_id),
+                "root_version": str(root.get("version_label") or ""),
+                "root_name": str(root.get("name") or ""),
+                "root_aes_number": str(root.get("aes_number") or ""),
+                "members": members,
+            }
 
     def validate_released_checkout(self, bom_id: int, revision_code: str) -> dict:
         code = self.normalize_revision_code(revision_code)

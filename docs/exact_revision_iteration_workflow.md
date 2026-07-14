@@ -255,6 +255,11 @@ Only configurations stored in `bom_iteration_bindings` can be compared exactly. 
 cannot reconstruct a pre-migration historical configuration that was never recorded;
 the dialog identifies a side that has no captured bindings.
 
+Named prototype, 3D-printing, manufacturing-trial, and customer configurations can be
+captured and built from these same immutable bindings. See
+`docs/frozen_assembly_configurations.md` for the data-only capture and on-demand build
+workflow.
+
 ## Creo Family Tables and Shared Native Files
 
 Nexus already groups BOM rows that share the same base Creo native filename. Checkout,
@@ -325,6 +330,14 @@ The migration cannot infer historical assembly configurations that were never st
 Migration 23 adds the nullable `bom.pending_revision_code` field. Existing objects,
 revisions, iterations, bindings, and locks are unchanged, and all existing rows start
 with no pending revision.
+
+Migration 24 adds empty frozen-configuration and occurrence-manifest tables. It does not
+modify existing BOM objects, revisions, iterations, bindings, files, commits, snapshots,
+baselines, locks, or project working directories.
+
+Migration 25 adds Draft/Frozen lifecycle and independent configuration version metadata.
+Existing configuration records become Frozen version 1; their structure and captured
+file identities are preserved. No BOM or Creo working file is modified.
 
 ## Relationship to Commits, Snapshots, and Baselines
 

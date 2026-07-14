@@ -2682,11 +2682,25 @@ class CommitPage(QWidget):
         commit_id = str(group.get("commit_id") or "")
         username = str(group.get("username") or "")
         candidates = []
+        project_working_dir = ""
+        try:
+            group_project_id = group.get("project_id") or self.session.project_id
+            project = self.project_service.get_project_by_id(int(group_project_id)) or {}
+            project_working_dir = str(project.get("working_directory") or "").strip()
+        except Exception:
+            project_working_dir = str(self.working_dir or "").strip()
         commit_dir = str(group.get("commit_dir") or "").strip()
         if commit_dir:
-            candidates.append(commit_dir)
+            if not os.path.isabs(commit_dir) and project_working_dir:
+                commit_dir = os.path.join(project_working_dir, commit_dir)
+            normalized_commit_dir = os.path.normpath(commit_dir)
+            leaf = os.path.basename(normalized_commit_dir).lower()
+            if commit_id.lower() in leaf and "commits" in {
+                part.lower() for part in normalized_commit_dir.split(os.sep)
+            }:
+                candidates.append(normalized_commit_dir)
         if username and title and commit_id:
-            commits_dir = self.commits_dir or os.path.join(self.working_dir or "", "commits")
+            commits_dir = os.path.join(project_working_dir, "commits")
             candidates.append(os.path.join(commits_dir, username, f"{title}_{commit_id}"))
             safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)
             if safe_title != title:
@@ -2695,8 +2709,6 @@ class CommitPage(QWidget):
             path = os.path.normpath(path)
             if safe_exists(path):
                 return path
-        if self.working_dir and safe_exists(self.working_dir):
-            return os.path.normpath(self.working_dir)
         return os.path.normpath(candidates[0]) if candidates else ""
 
     def browse_commit_directory(self, group):
@@ -2704,8 +2716,11 @@ class CommitPage(QWidget):
         if safe_exists(path):
             try:
                 safe_startfile(path)
-            except Exception:
-                subprocess.Popen(["explorer", path])
+            except Exception as exc:
+                QMessageBox.critical(
+                    self, "Open Commit Folder",
+                    f"Failed to open the exact commit directory:\n{path}\n\n{exc}",
+                )
         else:
             QMessageBox.warning(self, "Not Found", f"Commit directory not found:\n{path}")
 

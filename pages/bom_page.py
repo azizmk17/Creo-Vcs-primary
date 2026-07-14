@@ -15,6 +15,7 @@ from pages.part_dialog import PartDialog
 from collections import deque, Counter, defaultdict
 import time
 import json
+import re
 
 import os
 import sys
@@ -26,12 +27,14 @@ from core.session_manager import SessionManager
 from core.services.diag_service import DiagService
 from core.services.project_service import ProjectService
 from core.services.part_file_service import PartFileService
+from core.services.managed_file_service import ManagedFileService
 from core.services.package_export_service import PackageExportService
 from core.services.ui_permission import UIPermissionHelper
 from core.services.baseline_service import BaselineService
 from core.services.part_doc_ack_service import PartDocAckService
 from core.services.issue_service import IssueService
 from core.services.traceability_service import TraceabilityService
+from core.services.assembly_configuration_service import AssemblyConfigurationService
 from core.bom_filter import (
     deduplicate_bom_items_by_id,
     matches_bom_filter_text,
@@ -41,6 +44,11 @@ from core.repositories.commit_repository import CommitRepository
 from core.services.commit_service import CommitService
 from pages.dialogs.package_parts_dialog import PackagePartsDialog
 from pages.dialogs.assembly_iteration_compare_dialog import AssemblyIterationCompareDialog
+from pages.dialogs.checkout_review_dialog import CheckoutReviewDialog
+from pages.dialogs.assembly_configuration_dialogs import (
+    CreateAssemblyConfigurationDialog,
+    ManageAssemblyConfigurationsDialog,
+)
 from pages.dialogs.windchill_compare_dialog import WindchillCompareSetupDialog
 from pages.pdf_viewer_widget import PdfViewerWidget
 from utils import safe_exists, safe_startfile
@@ -1050,8 +1058,10 @@ class _TimelineTable(QTableWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setColumnCount(6)
-        self.setHorizontalHeaderLabels(["", "Timestamp", "Event", "User", "Project", "Details"])
+        self.setColumnCount(7)
+        self.setHorizontalHeaderLabels(
+            ["", "Timestamp", "Event", "Rev / Iter", "User", "Project", "Details"]
+        )
         self.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -1064,9 +1074,10 @@ class _TimelineTable(QTableWidget):
         hh.setSectionResizeMode(0, QHeaderView.Fixed)     # timeline dot
         hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # timestamp
         hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)  # event badge
-        hh.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # user
-        hh.setSectionResizeMode(4, QHeaderView.ResizeToContents)  # project
-        hh.setSectionResizeMode(5, QHeaderView.Stretch)           # details
+        hh.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # object revision / iteration
+        hh.setSectionResizeMode(4, QHeaderView.ResizeToContents)  # user
+        hh.setSectionResizeMode(5, QHeaderView.ResizeToContents)  # project
+        hh.setSectionResizeMode(6, QHeaderView.Stretch)           # details
         self.setColumnWidth(0, 30)
         self.setStyleSheet("""
             QTableWidget {
@@ -1147,29 +1158,39 @@ class _TimelineTable(QTableWidget):
             badge_lay.addStretch()
             self.setCellWidget(i, 2, badge_container)
 
-            # Col 3: user
+            # Col 3: BOM object revision / iteration
+            object_version = str(ev.get("object_version", "") or "")
+            object_version_item = QTableWidgetItem(object_version)
+            object_version_item.setTextAlignment(Qt.AlignCenter)
+            object_version_item.setForeground(QBrush(QColor("#1d4ed8")))
+            object_version_font = object_version_item.font()
+            object_version_font.setBold(True)
+            object_version_item.setFont(object_version_font)
+            self.setItem(i, 3, object_version_item)
+
+            # Col 4: user
             user_str = str(ev.get("user", "") or "")
             user_item = QTableWidgetItem(user_str)
             user_item.setForeground(QBrush(QColor("#374151")))
             fnt = user_item.font()
             fnt.setBold(True)
             user_item.setFont(fnt)
-            self.setItem(i, 3, user_item)
+            self.setItem(i, 4, user_item)
 
-            # Col 4: project / version
+            # Col 5: project / version
             proj = str(ev.get("project", "") or "")
             ver = str(ev.get("version", "") or "")
             proj_str = f"{proj} ({ver})" if proj and ver else proj or ver
             proj_item = QTableWidgetItem(proj_str)
             proj_item.setForeground(QBrush(QColor("#6b7280")))
-            self.setItem(i, 4, proj_item)
+            self.setItem(i, 5, proj_item)
 
-            # Col 5: details
+            # Col 6: details
             details = str(ev.get("details", "") or "")
             det_item = QTableWidgetItem(details)
             det_item.setToolTip(details)
             det_item.setForeground(QBrush(QColor("#4b5563")))
-            self.setItem(i, 5, det_item)
+            self.setItem(i, 6, det_item)
 
             # STEP indicator icon in details if applicable
             step_status = str(ev.get("step_diff_status", "") or "").strip()
@@ -1548,7 +1569,10 @@ class HistoryPanel(QWidget):
                 continue
             if q:
                 blob = " ".join(str(ev.get(k, "")) for k in
-                                ("timestamp", "event", "user", "details", "project", "version")).lower()
+                                (
+                                    "timestamp", "event", "object_version", "user",
+                                    "details", "project", "version",
+                                )).lower()
                 if q not in blob:
                     continue
             filtered.append(ev)
@@ -1804,12 +1828,16 @@ class BomPage(QWidget):
         self.session = SessionManager()
         self.perm = UIPermissionHelper()
         self.part_file_service = PartFileService()
+        self.managed_file_service = ManagedFileService(
+            part_file_service=self.part_file_service
+        )
         self.part_doc_ack_service = PartDocAckService()
         self.package_export_service = PackageExportService()
         self.baseline_service = BaselineService()
         self.commit_repo = CommitRepository()
         self.issue_service = IssueService()
         self.traceability_service = TraceabilityService()
+        self.assembly_configuration_service = AssemblyConfigurationService()
         self._issue_summary_cache = {}
 
         self.working_dir = None
@@ -2638,16 +2666,38 @@ class BomPage(QWidget):
         issues_layout.addLayout(issue_actions)
         self.tabs.addTab(issues_tab, "Issues")
 
-        # Files tab (Vault attachments + version history)
+        # Managed files: Creo content, generated outputs, and document history.
         files_tab = QWidget()
         self.files_tab = files_tab
         files_layout = QVBoxLayout(files_tab)
 
-        files_layout.addWidget(QLabel("Attachments:"))
+        files_summary = QFrame()
+        files_summary.setObjectName("detailCard")
+        summary_layout = QGridLayout(files_summary)
+        self.files_summary_labels = {}
+        for column, (key, title) in enumerate((
+            ("item", "BOM Object"),
+            ("version", "Rev / Iter"),
+            ("state", "Lifecycle"),
+            ("lock", "Checkout"),
+        )):
+            title_label = QLabel(title)
+            title_label.setObjectName("mutedLabel")
+            value_label = QLabel("-")
+            value_label.setStyleSheet("font-weight: 600;")
+            summary_layout.addWidget(title_label, 0, column)
+            summary_layout.addWidget(value_label, 1, column)
+            self.files_summary_labels[key] = value_label
+        files_layout.addWidget(files_summary)
+
+        files_layout.addWidget(QLabel("Current Managed Content"))
         self.files_table = FileDropTable()
-        self.files_table.setColumnCount(5)
-        self.files_table.setHorizontalHeaderLabels(["Name", "Type", "Active", "File", "Updated"])
-        self.files_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.files_table.setColumnCount(10)
+        self.files_table.setHorizontalHeaderLabels([
+            "Role", "File", "File Revision", "Creo Ver", "Rev / Iter", "Source", "State", "Health", "Created By", "Updated"
+        ])
+        self.files_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.files_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.files_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.files_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.files_table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -2658,22 +2708,28 @@ class BomPage(QWidget):
         files_layout.addWidget(self.files_table)
 
         files_actions = QHBoxLayout()
-        self.add_attachment_btn = QPushButton("Add Attachment")
+        self.add_attachment_btn = QPushButton("Attach Document")
         self.add_attachment_btn.setObjectName("primary")
         self.add_attachment_btn.clicked.connect(self.add_attachment)
-        self.add_version_btn = QPushButton("Add Version")
+        self.add_version_btn = QPushButton("Add Document Version")
         self.add_version_btn.setObjectName("neutral")
         self.add_version_btn.clicked.connect(self.add_attachment_version)
-        self.set_active_btn = QPushButton("Set Active")
+        self.set_active_btn = QPushButton("Use in Working Iteration")
         self.set_active_btn.setObjectName("neutral")
         self.set_active_btn.clicked.connect(self.set_active_version)
-        self.open_active_btn = QPushButton("Open Active")
+        self.open_active_btn = QPushButton("Open")
         self.open_active_btn.setObjectName("neutral")
         self.open_active_btn.clicked.connect(self.open_active_attachment)
+        self.preview_file_btn = QPushButton("Preview")
+        self.preview_file_btn.setObjectName("neutral")
+        self.preview_file_btn.setCheckable(True)
+        self.preview_file_btn.setToolTip("Show or collapse the selected PDF preview")
+        self.preview_file_btn.toggled.connect(self._toggle_managed_preview)
+        self.preview_file_btn.setEnabled(False)
         self.open_folder_btn = QPushButton("Open Folder")
         self.open_folder_btn.setObjectName("neutral")
         self.open_folder_btn.clicked.connect(self.open_active_attachment_folder)
-        self.remove_attachment_btn = QPushButton("Remove")
+        self.remove_attachment_btn = QPushButton("Obsolete Document")
         self.remove_attachment_btn.setObjectName("danger")
         self.remove_attachment_btn.clicked.connect(self.remove_attachment)
 
@@ -2695,6 +2751,7 @@ class BomPage(QWidget):
         files_actions.addWidget(self.add_version_btn)
         files_actions.addWidget(self.set_active_btn)
         files_actions.addWidget(self.open_active_btn)
+        files_actions.addWidget(self.preview_file_btn)
         files_actions.addWidget(self.open_folder_btn)
         files_actions.addWidget(self.remove_attachment_btn)
         files_actions.addWidget(self.link_file_issue_btn)
@@ -2703,11 +2760,15 @@ class BomPage(QWidget):
         files_actions.addWidget(self.export_baseline_btn)
         files_layout.addLayout(files_actions)
 
-        files_layout.addWidget(QLabel("Versions:"))
+        files_layout.addWidget(QLabel("Content History"))
         self.versions_table = QTableWidget()
-        self.versions_table.setColumnCount(7)
-        self.versions_table.setHorizontalHeaderLabels(["Version", "State", "Filename", "Created", "Released", "Revision", "Note"])
-        self.versions_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.versions_table.setColumnCount(11)
+        self.versions_table.setHorizontalHeaderLabels([
+            "Rev / Iter", "Role", "File", "File Revision", "Creo Ver", "Source", "State", "Health", "Created By", "Created", "Note"
+        ])
+        self.versions_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.versions_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.versions_table.horizontalHeader().setSectionResizeMode(10, QHeaderView.Stretch)
         self.versions_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.versions_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.versions_table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -2725,7 +2786,7 @@ class BomPage(QWidget):
         files_layout.addWidget(self.file_related_issues_table)
 
         versions_actions = QHBoxLayout()
-        self.open_version_btn = QPushButton("Open Version")
+        self.open_version_btn = QPushButton("Open Historical Content")
         self.open_version_btn.setObjectName("neutral")
         self.open_version_btn.clicked.connect(self.open_selected_version)
 
@@ -2736,12 +2797,12 @@ class BomPage(QWidget):
         self.remove_attachment_btn.setEnabled(_can_release)
         self.create_baseline_btn.setEnabled(_can_release)
 
-        self.release_version_btn = QPushButton("Release File Version")
+        self.release_version_btn = QPushButton("Approve Document Version")
         self.release_version_btn.setObjectName("primary")
         self.release_version_btn.clicked.connect(self.release_selected_version)
         self.release_version_btn.setEnabled(_can_release)
 
-        self.delete_version_btn = QPushButton("Delete Version")
+        self.delete_version_btn = QPushButton("Obsolete Version")
         self.delete_version_btn.setObjectName("danger")
         self.delete_version_btn.clicked.connect(self.delete_selected_version)
         self.delete_version_btn.setEnabled(_can_release)
@@ -2753,9 +2814,10 @@ class BomPage(QWidget):
         # ── Embedded PDF preview ──────────────────────────────────────
         self.pdf_viewer = PdfViewerWidget()
         self.pdf_viewer.setMinimumHeight(250)
+        self.pdf_viewer.setVisible(False)
         files_layout.addWidget(self.pdf_viewer)
 
-        self.tabs.addTab(files_tab, "Files")
+        self.tabs.addTab(files_tab, "Managed Files")
 
         # ── History tab (genius panel) ────────────────────────────────
         self.history_panel = HistoryPanel(self)
@@ -2767,11 +2829,13 @@ class BomPage(QWidget):
 
         right_layout.addWidget(self.tabs)
 
-        # Actions
-        action_group = QGroupBox("Actions")
-        action_layout = QVBoxLayout(action_group)
-        edit_actions = QHBoxLayout()
-        lifecycle_actions = QHBoxLayout()
+        # Compact, category-based action ribbon.
+        action_ribbon = QFrame()
+        action_ribbon.setObjectName("actionRibbon")
+        action_ribbon.setFixedHeight(52)
+        action_layout = QHBoxLayout(action_ribbon)
+        action_layout.setContentsMargins(3, 2, 3, 2)
+        action_layout.setSpacing(2)
         self.add_part_btn = QPushButton("Add Part")
         self.add_part_btn.setObjectName("primary")
         self.add_part_btn.clicked.connect(self.add_part)
@@ -2790,12 +2854,23 @@ class BomPage(QWidget):
         self.checkout_part_btn = QPushButton("Check Out")
         self.checkout_part_btn.setObjectName("neutral")
         self.checkout_part_btn.clicked.connect(self.checkout_part)
+        self.checkin_part_btn = QPushButton("Check In")
+        self.checkin_part_btn.setObjectName("neutral")
+        self.checkin_part_btn.clicked.connect(self.checkin_part)
         self.add_child_btn = QPushButton("Add Child")
         self.add_child_btn.setObjectName("primary")
         self.add_child_btn.clicked.connect(self.add_child)
         self.compare_structure_btn = QPushButton("Compare Structure")
         self.compare_structure_btn.setObjectName("neutral")
         self.compare_structure_btn.clicked.connect(lambda: self.compare_part_structure(whole_bom=True))
+        self.create_configuration_btn = QPushButton("Create Configuration")
+        self.create_configuration_btn.setObjectName("primary")
+        self.create_configuration_btn.clicked.connect(self.create_assembly_configuration)
+        self.create_configuration_btn.setEnabled(False)
+        self.manage_configurations_btn = QPushButton("Manage Configurations")
+        self.manage_configurations_btn.setObjectName("neutral")
+        self.manage_configurations_btn.clicked.connect(self.manage_assembly_configurations)
+        self.manage_configurations_btn.setEnabled(bool(self.session.project_id))
 
         _can_manage = self.perm.can("manage_parts")
         self.add_part_btn.setEnabled(_can_manage)
@@ -2813,20 +2888,122 @@ class BomPage(QWidget):
         self.release_revision_btn.clicked.connect(self.release_part_revision)
         self.release_revision_btn.setEnabled(self.perm.can("set_revision"))
 
-        edit_actions.addWidget(self.add_part_btn)
-        edit_actions.addWidget(self.add_folder_btn)
-        edit_actions.addWidget(self.edit_part_btn)
-        edit_actions.addWidget(self.delete_part_btn)
-        edit_actions.addWidget(self.add_child_btn)
-        edit_actions.addWidget(self.compare_structure_btn)
-        lifecycle_actions.addWidget(self.checkout_part_btn)
-        lifecycle_actions.addWidget(self.undo_checkout_btn)
-        lifecycle_actions.addStretch()
-        lifecycle_actions.addWidget(self.set_revision_btn)
-        lifecycle_actions.addWidget(self.release_revision_btn)
-        action_layout.addLayout(edit_actions)
-        action_layout.addLayout(lifecycle_actions)
-        right_layout.addWidget(action_group)
+        action_buttons = (
+            self.add_part_btn, self.add_child_btn, self.add_folder_btn,
+            self.edit_part_btn, self.compare_structure_btn, self.delete_part_btn,
+            self.checkout_part_btn, self.checkin_part_btn, self.undo_checkout_btn,
+            self.set_revision_btn, self.release_revision_btn,
+            self.create_configuration_btn, self.manage_configurations_btn,
+        )
+        for button in action_buttons:
+            button.setFixedHeight(25)
+            button.setIconSize(QSize(14, 14))
+            button.setProperty("ribbonAction", True)
+            button.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+
+        style = self.style()
+        action_specs = (
+            (self.add_part_btn, "Add Part", QStyle.SP_FileIcon, "Add a new BOM item"),
+            (self.edit_part_btn, "Edit", QStyle.SP_FileDialogDetailedView, "Edit the selected item"),
+            (self.delete_part_btn, "Delete", QStyle.SP_TrashIcon, "Delete the selected item"),
+            (self.checkout_part_btn, "Check Out", QStyle.SP_ArrowForward, "Check out the selected item"),
+            (self.checkin_part_btn, "Check In", QStyle.SP_DialogApplyButton, "Review and finish the selected checkout"),
+            (self.undo_checkout_btn, "Undo", QStyle.SP_ArrowBack, "Undo checkout"),
+            (self.add_child_btn, "Add Child", QStyle.SP_ArrowDown, "Add a child to the selected assembly"),
+            (self.add_folder_btn, "Folder", QStyle.SP_DirIcon, "Add an organization folder"),
+            (self.compare_structure_btn, "Compare", QStyle.SP_FileDialogContentsView, "Compare BOM structures"),
+            (self.set_revision_btn, "Create New Revision", QStyle.SP_FileDialogNewFolder, "Create a new revision"),
+            (self.release_revision_btn, "Release Revision", QStyle.SP_DialogApplyButton, "Release the current revision"),
+            (self.create_configuration_btn, "Create Configuration", QStyle.SP_FileDialogNewFolder, "Create an assembly configuration"),
+            (self.manage_configurations_btn, "Manage Configurations", QStyle.SP_ComputerIcon, "Manage assembly configurations"),
+        )
+        for button, text_value, icon_type, tooltip in action_specs:
+            button.setText(text_value)
+            button.setIcon(style.standardIcon(icon_type))
+            button.setToolTip(tooltip)
+
+        self._action_ribbon_menu_bindings = []
+
+        def make_menu_button(text_value, tooltip, icon_type, entries):
+            button = QPushButton(text_value)
+            button.setProperty("ribbonAction", True)
+            button.setFixedHeight(25)
+            button.setIconSize(QSize(14, 14))
+            button.setIcon(style.standardIcon(icon_type))
+            button.setToolTip(tooltip)
+            button.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+            menu = QMenu(button)
+            menu.setStyleSheet("QMenu { font-size: 10px; } QMenu::item { padding: 4px 18px 4px 22px; }")
+            bindings = []
+            for label, target in entries:
+                action = QAction(target.icon(), label, menu)
+                action.triggered.connect(lambda _checked=False, target=target: target.click())
+                menu.addAction(action)
+                bindings.append((action, target))
+            self._action_ribbon_menu_bindings.append((button, bindings))
+            menu.aboutToShow.connect(self._sync_action_ribbon_menus)
+            button.setMenu(menu)
+            return button
+
+        self.revision_actions_btn = make_menu_button(
+            "Revision",
+            "Revision actions",
+            QStyle.SP_FileDialogNewFolder,
+            (
+                ("Create New Revision", self.set_revision_btn),
+                ("Release Revision", self.release_revision_btn),
+            ),
+        )
+        self.configuration_actions_btn = make_menu_button(
+            "Config",
+            "Configuration actions",
+            QStyle.SP_ComputerIcon,
+            (
+                ("Create Configuration", self.create_configuration_btn),
+                ("Manage Configurations", self.manage_configurations_btn),
+            ),
+        )
+
+        def add_action_category(title, buttons):
+            category = QFrame()
+            category.setObjectName("actionCategory")
+            category_layout = QVBoxLayout(category)
+            category_layout.setContentsMargins(3, 0, 3, 1)
+            category_layout.setSpacing(0)
+            title_label = QLabel(title)
+            title_label.setObjectName("actionCategoryTitle")
+            title_label.setAlignment(Qt.AlignCenter)
+            title_label.setFixedHeight(15)
+            command_layout = QHBoxLayout()
+            command_layout.setContentsMargins(0, 0, 0, 0)
+            command_layout.setSpacing(1)
+            for button in buttons:
+                command_layout.addWidget(button)
+            category_layout.addWidget(title_label)
+            category_layout.addLayout(command_layout)
+            action_layout.addWidget(category)
+
+        add_action_category("Editing", (self.add_part_btn, self.edit_part_btn, self.delete_part_btn))
+        add_action_category(
+            "Check Out/In",
+            (self.checkout_part_btn, self.checkin_part_btn, self.undo_checkout_btn),
+        )
+        add_action_category("New/Add To", (self.add_child_btn, self.add_folder_btn))
+        add_action_category("Lifecycle", (self.revision_actions_btn,))
+        add_action_category("Tools", (self.compare_structure_btn, self.configuration_actions_btn))
+        action_layout.addStretch(1)
+        action_ribbon.setStyleSheet(
+            "QFrame#actionRibbon { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 3px; }"
+            "QFrame#actionCategory { background: transparent; border: 0; border-right: 1px solid #cbd5e1; }"
+            "QLabel#actionCategoryTitle { color: #4f6f94; font-size: 9px; font-weight: 600; border: 0; }"
+            "QPushButton[ribbonAction=\"true\"] { background: transparent; color: #1f2937; border: 1px solid transparent; "
+            "font-size: 10px; padding: 1px 4px; }"
+            "QPushButton[ribbonAction=\"true\"]:hover { background: #e7f0fb; border-color: #a9c7e8; }"
+            "QPushButton[ribbonAction=\"true\"]:pressed { background: #d7e7f8; }"
+            "QPushButton[ribbonAction=\"true\"]:disabled { color: #9ca3af; background: transparent; }"
+        )
+        self._sync_action_ribbon_menus()
+        right_layout.addWidget(action_ribbon)
 
         splitter.addWidget(left_widget)
         splitter.addWidget(right_widget)
@@ -2838,6 +3015,15 @@ class BomPage(QWidget):
         # Equal stretch = 50% / 50%
         splitter.setStretchFactor(0, 1)  # left
         splitter.setStretchFactor(1, 1)  # right
+
+    def _sync_action_ribbon_menus(self) -> None:
+        for menu_button, bindings in getattr(self, "_action_ribbon_menu_bindings", []):
+            has_enabled_action = False
+            for action, target_button in bindings:
+                enabled = target_button.isEnabled()
+                action.setEnabled(enabled)
+                has_enabled_action = has_enabled_action or enabled
+            menu_button.setEnabled(has_enabled_action)
 
     # -------------------------
     # Context menu / tree actions
@@ -3037,6 +3223,10 @@ class BomPage(QWidget):
         compare_iterations_action.triggered.connect(
             lambda _=False, pid=item_id: self.compare_assembly_iterations(int(pid))
         )
+        create_configuration_action = QAction("Create Configuration...", self)
+        create_configuration_action.triggered.connect(
+            lambda _=False, pid=item_id: self.create_assembly_configuration(int(pid))
+        )
         compare_action = QAction("Compare to Part Structure", self)
         compare_action.triggered.connect(lambda _=False, pid=item_id: self.compare_part_structure(int(pid)))
         refresh_files_act = QAction("Refresh Files", self)
@@ -3049,6 +3239,7 @@ class BomPage(QWidget):
         menu.addAction(view_cad_files_action)
         if str(item.text(BOM_COL_TYPE) or "").strip().lower() in {"asm", "assembly"}:
             menu.addAction(compare_iterations_action)
+            menu.addAction(create_configuration_action)
         menu.addAction(compare_action)
         menu.addSeparator()
         menu.addAction(refresh_files_act)
@@ -4262,32 +4453,71 @@ class BomPage(QWidget):
                 self.file_related_issues_table.setRowCount(0)
             if hasattr(self, "pdf_viewer"):
                 self.pdf_viewer.close_preview()
+                self.pdf_viewer.setVisible(False)
+            if hasattr(self, "preview_file_btn"):
+                self.preview_file_btn.blockSignals(True)
+                self.preview_file_btn.setChecked(False)
+                self.preview_file_btn.setText("Preview")
+                self.preview_file_btn.blockSignals(False)
             self._set_files_tab_enabled(False)
             return
 
         self._set_files_tab_enabled(True)
-        attachments = self.part_file_service.list_attachments(self.current_part_id)
+        details = {}
+        try:
+            managed_files = self.managed_file_service.list_current_files(
+                int(self.current_part_id)
+            )
+        except Exception as exc:
+            managed_files = []
+            if hasattr(self, "pdf_viewer"):
+                self.pdf_viewer.show_error(f"Unable to load managed files:\n{exc}")
 
-        self.files_table.setRowCount(len(attachments))
+        try:
+            details = self.bom_service.get_part_details(int(self.current_part_id)) or {}
+            context = self.managed_file_service.revision_repo.get_current_context(
+                int(self.current_part_id)
+            )
+            lock = self.managed_file_service.part_file_service.lock_repo.get_by_part(
+                int(self.current_part_id)
+            )
+            values = {
+                "item": " - ".join(
+                    value for value in (
+                        str(details.get("aes_number") or "").strip(),
+                        str(details.get("name") or "").strip(),
+                    ) if value
+                ) or str(self.current_part_id),
+                "version": str(context.get("version_label") or "-"),
+                "state": str(context.get("state") or "-"),
+                "lock": self.managed_file_service._username(lock.user_id) if lock else "Not checked out",
+            }
+            for key, label in getattr(self, "files_summary_labels", {}).items():
+                label.setText(values.get(key, "-"))
+        except Exception:
+            pass
+
+        self.files_table.setRowCount(len(managed_files))
         first_pdf_row = None
-        for i, f in enumerate(attachments):
-            versions = self.part_file_service.list_versions(f.id)
-            active_version = None
-            for v in versions:
-                if f.active_version_id and v.id == f.active_version_id:
-                    active_version = v
-                    break
-            if not active_version and versions:
-                active_version = versions[0]
-
-            name_item = QTableWidgetItem(str(f.display_name))
-            name_item.setData(Qt.UserRole, f.id)
-            self.files_table.setItem(i, 0, name_item)
-            self.files_table.setItem(i, 1, QTableWidgetItem(str(f.file_type)))
-            self.files_table.setItem(i, 2, QTableWidgetItem(str(active_version.version_no) if active_version else ""))
-            self.files_table.setItem(i, 3, QTableWidgetItem(str(active_version.original_filename) if active_version else ""))
-            self.files_table.setItem(i, 4, QTableWidgetItem(str(active_version.created_at) if active_version else str(f.created_at or "")))
-            if first_pdf_row is None and str(f.file_type or "").upper() == "PDF":
+        for i, entry in enumerate(managed_files):
+            role_item = QTableWidgetItem(str(entry.get("role_label") or ""))
+            role_item.setData(Qt.UserRole, entry.get("file_id"))
+            role_item.setData(Qt.UserRole + 1, entry)
+            self.files_table.setItem(i, 0, role_item)
+            values = [
+                entry.get("filename"),
+                entry.get("file_revision"),
+                entry.get("creo_iteration"),
+                entry.get("bound_to"),
+                entry.get("source"),
+                entry.get("state"),
+                entry.get("health"),
+                entry.get("created_by_label"),
+                entry.get("updated"),
+            ]
+            for column, value in enumerate(values, start=1):
+                self.files_table.setItem(i, column, QTableWidgetItem(str(value or "")))
+            if first_pdf_row is None and str(entry.get("file_type") or "").upper() == "PDF":
                 first_pdf_row = i
 
         # Clear versions view until an attachment is selected
@@ -4298,12 +4528,7 @@ class BomPage(QWidget):
             self.files_table.selectRow(first_pdf_row)
             self.on_attachment_selected()
         elif hasattr(self, "pdf_viewer"):
-            details = self.bom_service.get_part_details(int(self.current_part_id)) or {}
-            legacy_pdf = self._resolve_file_path(details.get("pdf_path", ""))
-            if legacy_pdf:
-                self.pdf_viewer.load_pdf(legacy_pdf)
-            else:
-                self.pdf_viewer.close_preview()
+            self._collapse_managed_preview()
 
     def _selected_attachment_id(self):
         items = getattr(self, "files_table", None).selectedItems() if hasattr(self, "files_table") else []
@@ -4312,6 +4537,22 @@ class BomPage(QWidget):
         file_id = self.files_table.item(self.files_table.currentRow(), 0).data(Qt.UserRole)
         return file_id
 
+    def _selected_managed_file(self):
+        if not hasattr(self, "files_table") or self.files_table.currentRow() < 0:
+            return None
+        item = self.files_table.item(self.files_table.currentRow(), 0)
+        return item.data(Qt.UserRole + 1) if item else None
+
+    def _selected_file_type(self):
+        entry = self._selected_managed_file() or {}
+        return str(entry.get("file_type") or "").strip().upper()
+
+    def _selected_history_row(self):
+        if not hasattr(self, "versions_table") or self.versions_table.currentRow() < 0:
+            return None
+        item = self.versions_table.item(self.versions_table.currentRow(), 0)
+        return item.data(Qt.UserRole + 1) if item else None
+
     def _selected_version_id(self):
         items = getattr(self, "versions_table", None).selectedItems() if hasattr(self, "versions_table") else []
         if not items:
@@ -4319,39 +4560,69 @@ class BomPage(QWidget):
         return self.versions_table.item(self.versions_table.currentRow(), 0).data(Qt.UserRole)
 
     def on_attachment_selected(self):
+        selected = self._selected_managed_file()
         file_id = self._selected_attachment_id()
-        if not file_id:
+        if not selected:
             self.versions_table.setRowCount(0)
             if hasattr(self, "file_related_issues_table"):
                 self.file_related_issues_table.setRowCount(0)
             if hasattr(self, "pdf_viewer"):
                 self.pdf_viewer.close_preview()
+            self._collapse_managed_preview()
             return
-        versions = self.part_file_service.list_versions(file_id)
-        self.versions_table.setRowCount(len(versions))
-        current_revision = ""
-        try:
-            details = self.bom_service.get_part_details(int(self.current_part_id)) or {}
-            current_revision = str(details.get("revision") or "").strip().upper()
-        except Exception:
-            current_revision = ""
-        for i, v in enumerate(versions):
-            ver_item = QTableWidgetItem(str(v.version_no))
-            ver_item.setData(Qt.UserRole, v.id)
-            self.versions_table.setItem(i, 0, ver_item)
-            self.versions_table.setItem(i, 1, QTableWidgetItem(str(v.lifecycle_state or "")))
-            self.versions_table.setItem(i, 2, QTableWidgetItem(str(v.original_filename)))
-            self.versions_table.setItem(i, 3, QTableWidgetItem(str(v.created_at or "")))
-            self.versions_table.setItem(i, 4, QTableWidgetItem(str(v.released_at or "")))
-            version_revision = getattr(v, "revision", None)
-            if version_revision is None:
-                version_revision = current_revision or ""
-            self.versions_table.setItem(i, 5, QTableWidgetItem(str(version_revision)))
-            self.versions_table.setItem(i, 6, QTableWidgetItem(str(v.note or "")))
+        history = self.managed_file_service.list_file_history(
+            int(self.current_part_id),
+            str(selected.get("role") or "document"),
+            file_id=file_id,
+        )
+        self.versions_table.setRowCount(len(history))
+        for i, row in enumerate(history):
+            version_item = QTableWidgetItem(str(row.get("bound_to") or ""))
+            version_item.setData(Qt.UserRole, row.get("version_id"))
+            version_item.setData(Qt.UserRole + 1, row)
+            self.versions_table.setItem(i, 0, version_item)
+            values = [
+                row.get("role_label"), row.get("filename"), row.get("file_revision"), row.get("creo_iteration"),
+                row.get("source"), row.get("state"), row.get("health"),
+                row.get("created_by_label"), row.get("created_at"), row.get("note"),
+            ]
+            for column, value in enumerate(values, start=1):
+                self.versions_table.setItem(i, column, QTableWidgetItem(str(value or "")))
 
         # Auto-preview the active version if it is a PDF
         self._try_pdf_preview_for_active(file_id)
-        self._load_related_issues_for_file(file_id, self._selected_version_id())
+        if file_id:
+            self._load_related_issues_for_file(file_id, self._selected_version_id())
+        elif hasattr(self, "file_related_issues_table"):
+            self.file_related_issues_table.setRowCount(0)
+        self._update_managed_file_actions()
+
+    def _update_managed_file_actions(self):
+        entry = self._selected_managed_file() or {}
+        is_document = bool(entry.get("file_id"))
+        can_manage = bool(self.perm.can("release_files") and is_document)
+        for button in (
+            getattr(self, "add_version_btn", None),
+            getattr(self, "set_active_btn", None),
+            getattr(self, "remove_attachment_btn", None),
+            getattr(self, "link_file_issue_btn", None),
+            getattr(self, "release_version_btn", None),
+            getattr(self, "delete_version_btn", None),
+        ):
+            if button:
+                button.setEnabled(can_manage)
+        for button in (
+            getattr(self, "open_active_btn", None),
+            getattr(self, "open_folder_btn", None),
+            getattr(self, "open_version_btn", None),
+        ):
+            if button:
+                button.setEnabled(bool(entry))
+        if hasattr(self, "preview_file_btn"):
+            is_pdf = str(entry.get("file_type") or "").upper() == "PDF"
+            self.preview_file_btn.setEnabled(is_pdf)
+            if not is_pdf:
+                self._collapse_managed_preview()
 
     def _load_related_issues_for_file(self, file_id, version_id=None):
         if not hasattr(self, "file_related_issues_table"):
@@ -4379,20 +4650,46 @@ class BomPage(QWidget):
                 self.file_related_issues_table.setItem(row, col, cell)
 
     # ── PDF preview helpers ─────────────────────────────────────────
-    def _try_pdf_preview_for_active(self, file_id):
-        """Load the active version into the PDF viewer if it is a PDF."""
+    def _collapse_managed_preview(self):
+        if hasattr(self, "preview_file_btn"):
+            self.preview_file_btn.blockSignals(True)
+            self.preview_file_btn.setChecked(False)
+            self.preview_file_btn.setText("Preview")
+            self.preview_file_btn.blockSignals(False)
+        if hasattr(self, "pdf_viewer"):
+            self.pdf_viewer.close_preview()
+            self.pdf_viewer.setVisible(False)
+
+    def _toggle_managed_preview(self, checked):
         if not hasattr(self, "pdf_viewer"):
             return
+        if not checked:
+            self._collapse_managed_preview()
+            return
+        entry = self._selected_managed_file() or {}
+        if str(entry.get("file_type") or "").upper() != "PDF":
+            self._collapse_managed_preview()
+            return
+        self.preview_file_btn.setText("Hide Preview")
+        self.pdf_viewer.setVisible(True)
+        history = self._selected_history_row() or {}
+        if str(history.get("filename") or "").lower().endswith(".pdf"):
+            self._on_version_selection_changed()
+        else:
+            self._try_pdf_preview_for_active(self._selected_attachment_id())
+
+    def _try_pdf_preview_for_active(self, file_id):
+        """Load the selected managed PDF into the preview."""
+        if not hasattr(self, "pdf_viewer"):
+            return
+        if not getattr(self, "preview_file_btn", None) or not self.preview_file_btn.isChecked():
+            return
         try:
-            # Check the attachment file_type
-            row = self.files_table.currentRow()
-            if row < 0:
-                return
-            file_type_item = self.files_table.item(row, 1)
-            if not file_type_item or file_type_item.text().upper() != "PDF":
+            entry = self._selected_managed_file() or {}
+            if str(entry.get("file_type") or "").upper() != "PDF":
                 self.pdf_viewer.close_preview()
                 return
-            path = self.part_file_service.resolve_active_path(file_id)
+            path = str(entry.get("path") or "")
             resolved = self._resolve_file_path(path)
             if resolved:
                 self.pdf_viewer.load_pdf(resolved)
@@ -4409,17 +4706,18 @@ class BomPage(QWidget):
             self._load_related_issues_for_file(file_id, version_id)
         if not hasattr(self, "pdf_viewer"):
             return
-        if not version_id:
+        self._update_managed_file_actions()
+        if not getattr(self, "preview_file_btn", None) or not self.preview_file_btn.isChecked():
             return
         try:
-            ver = self.part_file_service.repo.get_version_by_id(version_id)
-            if not ver:
+            history = self._selected_history_row() or {}
+            if not history:
                 return
-            fname = (getattr(ver, "original_filename", "") or "").lower()
+            fname = str(history.get("filename") or "").lower()
             if not fname.endswith(".pdf"):
-                self.pdf_viewer.close_preview()
+                self._collapse_managed_preview()
                 return
-            path = self.part_file_service.resolve_version_path(ver)
+            path = str(history.get("path") or "")
             resolved = self._resolve_file_path(path)
             if resolved:
                 self.pdf_viewer.load_pdf(resolved)
@@ -4444,7 +4742,7 @@ class BomPage(QWidget):
             if getattr(self, "current_part_id", None):
                 self._refresh_part_in_tree(int(self.current_part_id))
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to release version:\n{e}")
+            QMessageBox.critical(self, "Error", f"Failed to approve document version:\n{e}")
 
     def set_part_revision(self):
         if not getattr(self, "current_part_id", None):
@@ -4524,7 +4822,10 @@ class BomPage(QWidget):
         if not getattr(self, "current_part_id", None):
             return
 
-        file_type, ok = QInputDialog.getItem(self, "File Type", "Select attachment type:", ["PDF", "STEP", "DWG", "OTHER"], 0, False)
+        file_type, ok = QInputDialog.getItem(
+            self, "Document Type", "Select document type:",
+            ["PDF", "STEP", "DWG", "XLSX", "OTHER"], 0, False
+        )
         if not ok:
             return
 
@@ -4532,11 +4833,22 @@ class BomPage(QWidget):
         if not ok or not display_name.strip():
             return
 
+        file_revision, ok = QInputDialog.getText(
+            self, "File Revision", "File revision (optional, e.g. A010 or A020):"
+        )
+        if not ok:
+            return
+
         note, _ = QInputDialog.getText(self, "Version Note", "Version note (optional):")
 
         source_path, _ = QFileDialog.getOpenFileName(self, "Select file")
         if not source_path:
             return
+        if self._is_native_creo_path(source_path):
+            return QMessageBox.warning(
+                self, "Native Creo Content",
+                "Native PRT, ASM, and DRW files are managed through checkout and commit."
+            )
 
         try:
             self.part_file_service.create_attachment(
@@ -4546,6 +4858,8 @@ class BomPage(QWidget):
                 description="",
                 source_path=source_path,
                 note=note or "",
+                revision_override=str(file_revision or "").strip().upper(),
+                file_role=self.managed_file_service.role_for_type(file_type),
             )
             self.refresh_files_tab()
             self._refresh_part_in_tree(int(self.current_part_id))
@@ -4579,8 +4893,7 @@ class BomPage(QWidget):
             return
         issue = issues[labels.index(selected)]
 
-        file_type_item = self.files_table.item(self.files_table.currentRow(), 1)
-        file_type = (file_type_item.text() if file_type_item else "").strip().upper()
+        file_type = self._selected_file_type()
         default_role = {
             "PDF": "exported_pdf",
             "STEP": "exported_step",
@@ -4676,7 +4989,7 @@ class BomPage(QWidget):
         file_id = self._selected_attachment_id()
         version_id = self._selected_version_id()
         if not file_id or not version_id:
-            QMessageBox.warning(self, "Select", "Select an attachment and a version.")
+            QMessageBox.warning(self, "Select", "Select a document and a historical version.")
             return
         try:
             self.part_file_service.set_active_version(file_id, version_id)
@@ -4685,33 +4998,33 @@ class BomPage(QWidget):
             if getattr(self, "current_part_id", None):
                 self._refresh_part_in_tree(int(self.current_part_id))
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to set active version:\n{e}")
+            QMessageBox.critical(self, "Error", f"Failed to select the working document version:\n{e}")
 
     def open_active_attachment(self):
-        file_id = self._selected_attachment_id()
-        if not file_id:
-            QMessageBox.warning(self, "Select", "Select an attachment.")
+        entry = self._selected_managed_file() or {}
+        if not entry:
+            QMessageBox.warning(self, "Select", "Select managed content.")
             return
-        path = self.part_file_service.resolve_active_path(file_id)
-        self._open_file(path, "Attachment")
+        self._open_file(str(entry.get("path") or ""), "Managed Content")
 
     def open_active_attachment_folder(self):
-        file_id = self._selected_attachment_id()
-        if not file_id:
-            QMessageBox.warning(self, "Select", "Select an attachment.")
+        entry = self._selected_managed_file() or {}
+        if not entry:
+            QMessageBox.warning(self, "Select", "Select managed content.")
             return
-        path = self.part_file_service.resolve_active_path(file_id)
+        path = str(entry.get("path") or "")
         resolved = self._resolve_file_path(path)
         if not resolved or not safe_exists(resolved):
             QMessageBox.warning(self, "Missing File", f"Attachment file not found:\n{resolved}")
             return
+        folder = os.path.dirname(os.path.abspath(os.path.normpath(resolved)))
+        if not folder or not safe_exists(folder):
+            QMessageBox.warning(self, "Missing Folder", f"Managed file folder not found:\n{folder}")
+            return
         try:
-            subprocess.Popen(["explorer", "/select,", resolved])
-        except Exception:
-            try:
-                safe_startfile(os.path.dirname(resolved))
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to open folder:\n{e}")
+            safe_startfile(folder)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to open managed file folder:\n{e}")
 
     def _infer_file_type_from_path(self, path: str) -> str:
         ext = os.path.splitext(path or "")[1].lower()
@@ -4721,7 +5034,13 @@ class BomPage(QWidget):
             return "STEP"
         if ext in (".dwg", ".dxf"):
             return "DWG"
+        if ext in (".xlsx", ".xls"):
+            return "XLSX"
         return "OTHER"
+
+    @staticmethod
+    def _is_native_creo_path(path: str) -> bool:
+        return bool(re.search(r"\.(?:prt|asm|drw)(?:\.\d+)?$", str(path or ""), re.IGNORECASE))
 
     def _on_files_dropped(self, paths):
         if not getattr(self, "current_part_id", None):
@@ -4744,6 +5063,8 @@ class BomPage(QWidget):
             try:
                 if not p or not safe_exists(p):
                     raise ValueError("File not found")
+                if self._is_native_creo_path(p):
+                    raise ValueError("Native Creo content must be added through checkout and commit")
 
                 file_type = self._infer_file_type_from_path(p)
                 if file_type == "OTHER":
@@ -4751,8 +5072,8 @@ class BomPage(QWidget):
                         self,
                         "File Type",
                         f"Select type for:\n{os.path.basename(p)}",
-                        ["PDF", "STEP", "DWG", "OTHER"],
-                        3,
+                        ["PDF", "STEP", "DWG", "XLSX", "OTHER"],
+                        4,
                         False,
                     )
                     if not ok:
@@ -4762,7 +5083,11 @@ class BomPage(QWidget):
                 existing = None
                 try:
                     for f in (attachments or []):
-                        if str((f.file_type or "")).upper() == str(file_type or "").upper():
+                        expected_role = self.managed_file_service.role_for_type(file_type)
+                        if (
+                            str((f.file_type or "")).upper() == str(file_type or "").upper()
+                            and str(getattr(f, "file_role", "") or "").lower() == expected_role
+                        ):
                             existing = f
                             break
                 except Exception:
@@ -4786,6 +5111,7 @@ class BomPage(QWidget):
                         source_path=p,
                         note=note or "",
                         revision_override=revision,
+                        file_role=self.managed_file_service.role_for_type(file_type),
                     )
                     # refresh cached attachments so subsequent dropped files see the new attachment
                     try:
@@ -4803,16 +5129,11 @@ class BomPage(QWidget):
             QMessageBox.warning(self, "Some files failed", "\n".join(failed[:15]))
 
     def open_selected_version(self):
-        version_id = self._selected_version_id()
-        if not version_id:
-            QMessageBox.warning(self, "Select", "Select a version.")
+        history = self._selected_history_row() or {}
+        if not history:
+            QMessageBox.warning(self, "Select", "Select historical content.")
             return
-        ver = self.part_file_service.repo.get_version_by_id(version_id)
-        if not ver:
-            QMessageBox.warning(self, "Missing", "Version not found.")
-            return
-        path = self.part_file_service.resolve_version_path(ver)
-        self._open_file(path, "Attachment")
+        self._open_file(str(history.get("path") or ""), "Historical Content")
 
     def delete_selected_version(self):
         if not self.perm.can("release_files"):
@@ -4822,7 +5143,11 @@ class BomPage(QWidget):
         if not file_id or not version_id:
             QMessageBox.warning(self, "Select", "Select an attachment and a version.")
             return
-        confirm = QMessageBox.question(self, "Confirm", "Delete selected version?", QMessageBox.Yes | QMessageBox.No)
+        confirm = QMessageBox.question(
+            self, "Obsolete Version",
+            "Mark the selected document version obsolete? The managed content will be preserved.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
         if confirm != QMessageBox.Yes:
             return
         try:
@@ -4832,7 +5157,7 @@ class BomPage(QWidget):
             if getattr(self, "current_part_id", None):
                 self._refresh_part_in_tree(int(self.current_part_id))
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to delete version:\n{e}")
+            QMessageBox.critical(self, "Error", f"Failed to obsolete version:\n{e}")
 
     def remove_attachment(self):
         if not self.perm.can("release_files"):
@@ -4841,7 +5166,11 @@ class BomPage(QWidget):
         if not file_id:
             QMessageBox.warning(self, "Select", "Select an attachment.")
             return
-        confirm = QMessageBox.question(self, "Confirm", "Remove attachment and all versions?", QMessageBox.Yes | QMessageBox.No)
+        confirm = QMessageBox.question(
+            self, "Obsolete Document",
+            "Mark this document and its versions obsolete? Managed content and released references will be preserved.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
         if confirm != QMessageBox.Yes:
             return
         try:
@@ -5186,6 +5515,60 @@ class BomPage(QWidget):
                 self,
                 "Compare Assembly Iterations",
                 f"Failed to compare assembly iterations:\n{exc}",
+            )
+
+    def create_assembly_configuration(self, part_id=None):
+        if isinstance(part_id, bool):
+            part_id = None
+        part_id = part_id or getattr(self, "current_part_id", None)
+        if not part_id:
+            return QMessageBox.warning(
+                self, "Create Configuration", "Select an assembly first."
+            )
+        project_id = getattr(self.session, "project_id", None)
+        if not project_id:
+            return QMessageBox.warning(
+                self, "Create Configuration", "No active project is selected."
+            )
+        try:
+            details = self.bom_service.get_part_details(int(part_id)) or {}
+            if str(details.get("type") or "").strip().lower() not in {"asm", "assembly"}:
+                return QMessageBox.warning(
+                    self, "Create Configuration", "A configuration must start from an assembly."
+                )
+            if not self.bom_service.list_part_iterations(int(part_id)):
+                return QMessageBox.information(
+                    self,
+                    "Create Configuration",
+                    "This assembly has no checked-in iteration to freeze.",
+                )
+            dialog = CreateAssemblyConfigurationDialog(
+                self,
+                self.assembly_configuration_service,
+                self.bom_service,
+                int(project_id),
+                int(part_id),
+            )
+            dialog.exec_()
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Create Configuration", f"Failed to create configuration:\n{exc}"
+            )
+
+    def manage_assembly_configurations(self):
+        project_id = getattr(self.session, "project_id", None)
+        if not project_id:
+            return QMessageBox.warning(
+                self, "Manage Configurations", "No active project is selected."
+            )
+        try:
+            dialog = ManageAssemblyConfigurationsDialog(
+                self, self.assembly_configuration_service, int(project_id)
+            )
+            dialog.exec_()
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Manage Configurations", f"Failed to open configurations:\n{exc}"
             )
 
 
@@ -7147,6 +7530,60 @@ class BomPage(QWidget):
             self._sync_search_tree_row_numbers()
         return part_ids
 
+    def checkin_part(self, part_id=None):
+        if isinstance(part_id, bool):
+            part_id = None
+        part_id = part_id or getattr(self, "current_part_id", None)
+        if not part_id:
+            QMessageBox.warning(self, "Check In", "Select a checked-out BOM item.")
+            return
+        try:
+            analysis = self.bom_service.analyze_checkout(int(part_id))
+        except (ValueError, PermissionError) as exc:
+            QMessageBox.warning(self, "Check In", str(exc))
+            return
+        except Exception as exc:
+            QMessageBox.critical(self, "Check In", f"Could not analyze the checkout:\n{exc}")
+            return
+
+        dialog = CheckoutReviewDialog(analysis, self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        if dialog.action == CheckoutReviewDialog.ACTION_COMMIT:
+            main_window = self.window()
+            commit_page = getattr(main_window, "commit_page", None)
+            if commit_page is None or not hasattr(commit_page, "prepare_checkin_from_bom"):
+                QMessageBox.warning(self, "Check In", "The Commit page is not available.")
+                return
+            commit_page.prepare_checkin_from_bom(analysis)
+            if hasattr(main_window, "switch_page"):
+                main_window.switch_page(1)
+            return
+        if dialog.action != CheckoutReviewDialog.ACTION_CHECKIN:
+            return
+
+        try:
+            result = self.bom_service.checkin_non_cad_changes(
+                int(part_id), dialog.comment()
+            )
+            context = (result or {}).get("context") or {}
+            QMessageBox.information(
+                self,
+                "Check In",
+                f"Checkout completed as {context.get('version_label') or analysis.get('next_version')}.\n"
+                "Unchanged native CAD and drawing content were inherited.",
+            )
+            for affected_id in (result or {}).get("affected_part_ids") or [int(part_id)]:
+                self._refresh_loaded_part_branch(int(affected_id))
+                self._invalidate_doc_indicator(int(affected_id))
+            self._renumber_full_bom_tree_rows()
+            self._sync_search_tree_row_numbers()
+            self.display_details(int(part_id))
+        except (ValueError, PermissionError) as exc:
+            QMessageBox.warning(self, "Check In", str(exc))
+        except Exception as exc:
+            QMessageBox.critical(self, "Check In", f"Check-in failed:\n{exc}")
+
     def undo_checkout(self, part_id=None):
         if not part_id:
             if not self.current_part_id:
@@ -7987,11 +8424,15 @@ class BomPage(QWidget):
             self.compare_iterations_btn.setEnabled(
                 bool(enabled) and str(details.get("type") or "").lower() in {"asm", "assembly"}
             )
+            self.create_configuration_btn.setEnabled(
+                bool(enabled) and str(details.get("type") or "").lower() in {"asm", "assembly"}
+            )
             self.update_child_versions_btn.setEnabled(
                 bool(enabled) and str(details.get("type") or "").lower() in {"asm", "assembly"}
             )
         except Exception:
             pass
+        self._sync_action_ribbon_menus()
 
     def _show_folder_selection(self, item: QTreeWidgetItem, folder_id: int) -> None:
         self.clear_details()
@@ -8481,11 +8922,13 @@ class BomPage(QWidget):
         self.delete_part_btn.setEnabled(has_item and can_manage and editable_checkout)
         self.add_child_btn.setEnabled(has_item and locked and can_manage and is_assembly and editable_checkout)
         self.compare_iterations_btn.setEnabled(has_item and is_assembly)
+        self.create_configuration_btn.setEnabled(has_item and is_assembly)
         self.update_child_versions_btn.setEnabled(has_item and locked and is_assembly and editable_checkout)
         self.set_revision_btn.setEnabled(
             has_item and not locked and released and not pending_revision and can_revision
         )
         self.release_revision_btn.setEnabled(has_item and not locked and not released and can_revision)
+        self._sync_action_ribbon_menus()
 
     def _edit_current_part_categories(self) -> None:
         part_id = getattr(self, "current_part_id", None)
@@ -8813,6 +9256,9 @@ class BomPage(QWidget):
         info_parts = []
         if user:
             info_parts.append(f"👤 {user}")
+        object_version = str(ev_data.get("object_version", "") or "")
+        if object_version:
+            info_parts.append(f"Revision / iteration: {object_version}")
         proj = str(ev_data.get("project", "") or "")
         ver = str(ev_data.get("version", "") or "")
         if proj:
@@ -8839,7 +9285,7 @@ class BomPage(QWidget):
 
 
         # --- Add extra commit-related info ---
-        shown_keys = {"timestamp", "event", "user", "project", "version", "details", "commit_id", "step_diff_status", "step_diff_summary", "step_error", "step_file_path", "step_prev_file_path"}
+        shown_keys = {"timestamp", "event", "object_version", "user", "project", "version", "details", "commit_id", "step_diff_status", "step_diff_summary", "step_error", "step_file_path", "step_prev_file_path"}
         extra_commit_info = []
         for k, v in (ev_data.items() if isinstance(ev_data, dict) else []):
             if k in shown_keys:
@@ -9011,7 +9457,9 @@ class BomPage(QWidget):
             msg.setPlainText(str(message))
             layout.addWidget(msg)
 
-        self._add_commit_key_value_table(layout, details, first)
+        display_details = dict(details)
+        display_details["object_version"] = ev_data.get("object_version", "")
+        self._add_commit_key_value_table(layout, display_details, first)
         self._add_commit_files_tree(layout, files)
         self._add_commit_issues_table(layout, details.get("issues") or [])
         self._add_commit_doc_table(layout, details.get("engineering_files") or [], "Vaulted Engineering Outputs")
@@ -9049,6 +9497,7 @@ class BomPage(QWidget):
             ("Commit ID", details.get("commit_id")),
             ("Project", details.get("project_name")),
             ("Project Version", details.get("project_version_label")),
+            ("Revision / Iteration", details.get("object_version")),
             ("Author", details.get("author")),
             ("Designer", details.get("designer")),
             ("Checker", details.get("checker")),
@@ -9266,7 +9715,7 @@ class BomPage(QWidget):
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
-                w.writerow(["timestamp", "project", "version", "event", "user", "details",
+                w.writerow(["timestamp", "project", "version", "object_version", "event", "user", "details",
                             "commit_id", "step_diff_status", "step_diff_summary"])
                 for ev in rows:
                     w.writerow(
@@ -9274,6 +9723,7 @@ class BomPage(QWidget):
                             ev.get("timestamp", ""),
                             ev.get("project", ""),
                             ev.get("version", ""),
+                            ev.get("object_version", ""),
                             ev.get("event", ""),
                             ev.get("user", ""),
                             ev.get("details", ""),
@@ -9676,11 +10126,7 @@ class BomPage(QWidget):
         if not file_id:
             return
 
-        # Determine doc type from selected attachment row
-        try:
-            file_type = str(self.files_table.item(self.files_table.currentRow(), 1).text() or "").upper()
-        except Exception:
-            file_type = ""
+        file_type = self._selected_file_type()
 
         menu = QMenu(self)
         if file_type in ("PDF", "STEP"):

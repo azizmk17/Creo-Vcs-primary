@@ -279,6 +279,7 @@ class BomService(BaseService):
         if not part:
             raise ValueError("Part not found")
         related_parts = self._parts_sharing_base_file(part)
+        checkin_log_ids = {}
         for related in related_parts:
             self.revision_repo.assert_checkout_mutable(int(related.id))
         locked_by_part = {
@@ -313,17 +314,23 @@ class BomService(BaseService):
                     "Checked in shared CAD family part" if len(related_parts) > 1 else "Checked in part"
                 ),
             )
-            success = self.lock_repo.checkin(related_id, effective_user_id, signature)
-            if not success:
+            log_id = self.lock_repo.checkin(related_id, effective_user_id, signature)
+            if not log_id:
                 raise ValueError("Failed to check in part")
+            checkin_log_ids[related_id] = int(log_id)
             self.bom_repo.checkin_bom(related_id)
         for related in related_parts:
-            self.revision_repo.record_checkin(
-                int(related.id),
+            related_id = int(related.id)
+            context = self.revision_repo.record_checkin(
+                related_id,
                 effective_user_id,
                 note=note,
                 source_commit_id=source_commit_id,
             )
+            log_id = checkin_log_ids.get(related_id)
+            iteration_id = context.get("current_iteration_id")
+            if log_id and iteration_id is not None:
+                self.lock_repo.set_log_object_iteration(log_id, int(iteration_id))
         self._tree_dirty.add(int(self.session.project_id))
         return True
 
@@ -385,7 +392,12 @@ class BomService(BaseService):
                     ("Checked out shared CAD family part" if len(related_parts) > 1 else "Checked out part")
                 ),
             )
-            success = self.lock_repo.checkout(related_id, effective_user_id, signature)
+            success = self.lock_repo.checkout(
+                related_id,
+                effective_user_id,
+                signature,
+                object_iteration_id=contexts[related_id].get("current_iteration_id"),
+            )
             if not success:
                 raise ValueError("Failed to check out part")
             self.bom_repo.checkout_bom(related_id)
@@ -410,6 +422,7 @@ class BomService(BaseService):
         if not part:
             raise ValueError("Part not found")
         related_parts = self._parts_sharing_base_file(part)
+        checkin_log_ids = {}
         for related in related_parts:
             self.revision_repo.assert_checkout_mutable(int(related.id))
         locked_by_part = {
@@ -432,16 +445,135 @@ class BomService(BaseService):
                     "Checked in shared CAD family part" if len(related_parts) > 1 else "Checked in part"
                 ),
             )
-            success = self.lock_repo.checkin(related_id, user_id, signature)
-            if not success:
+            log_id = self.lock_repo.checkin(related_id, user_id, signature)
+            if not log_id:
                 raise ValueError("Failed to check in part")
+            checkin_log_ids[related_id] = int(log_id)
             self.bom_repo.checkin_bom(related_id)
         for related in related_parts:
-            self.revision_repo.record_checkin(
-                int(related.id), int(user_id), note=note, source_commit_id=source_commit_id
+            related_id = int(related.id)
+            context = self.revision_repo.record_checkin(
+                related_id, int(user_id), note=note, source_commit_id=source_commit_id
             )
+            log_id = checkin_log_ids.get(related_id)
+            iteration_id = context.get("current_iteration_id")
+            if log_id and iteration_id is not None:
+                self.lock_repo.set_log_object_iteration(log_id, int(iteration_id))
         self._tree_dirty.add(int(self.session.project_id))
         return True
+
+    def analyze_checkout(self, part_id: int) -> Dict:
+        from core.services.checkout_change_service import CheckoutChangeService
+
+        return CheckoutChangeService().analyze(int(part_id))
+
+    def checkin_non_cad_changes(self, part_id: int, note: str) -> Dict:
+        """Finish a checkout when only controlled object data changed."""
+        from core.services.checkout_change_service import CheckoutChangeService
+        from core.services.managed_file_service import ManagedFileService
+
+        part = self.bom_repo.get_by_id(int(part_id))
+        if not part:
+            raise ValueError("Part not found")
+        note = str(note or "").strip()
+        if not note:
+            raise ValueError("A check-in comment is required.")
+
+        related_parts = self._parts_sharing_base_file(part)
+        locks = {
+            int(related.id): self.lock_repo.get_by_part(int(related.id))
+            for related in related_parts
+        }
+        active_ids = [part_id for part_id, lock in locks.items() if lock]
+        if int(part_id) not in active_ids:
+            raise ValueError("The selected item is not checked out.")
+
+        actor = int(self.user_id) if self.user_id is not None else None
+        if actor is None:
+            raise PermissionError("You must be logged in.")
+        for lock in (locks[related_id] for related_id in active_ids):
+            if int(lock.user_id) != actor and not self.permission_repo.user_has_permission(
+                actor, "merge", self.session.project_id
+            ):
+                raise ValueError("This item is checked out by another user.")
+
+        analyzer = CheckoutChangeService()
+        analyses = {related_id: analyzer.analyze(related_id) for related_id in active_ids}
+        selected = analyses[int(part_id)]
+        if selected.get("requires_commit"):
+            raise ValueError("Native CAD or drawing content changed. Continue through Commit.")
+        if selected.get("structure_requires_cad"):
+            raise ValueError(
+                "The assembly structure changed without an updated native assembly file. "
+                "Update the assembly in Creo before check-in."
+            )
+        if not selected.get("has_non_cad_changes"):
+            raise ValueError("No metadata, document, or structure changes were detected.")
+
+        for analysis in analyses.values():
+            if analysis.get("requires_commit"):
+                raise ValueError(
+                    "A shared CAD-family item has modified native content. Continue through Commit."
+                )
+            if analysis.get("structure_requires_cad"):
+                raise ValueError(
+                    "A shared CAD-family assembly has structure changes without an updated native file."
+                )
+
+        managed_files = ManagedFileService()
+        result_context = None
+        affected_ids = []
+        for related_id in active_ids:
+            lock = locks[related_id]
+            analysis = analyses[related_id]
+            previous_iteration_id = int(analysis["current_iteration_id"])
+            if analysis.get("has_non_cad_changes"):
+                context = self.revision_repo.record_checkin(
+                    related_id,
+                    int(lock.user_id),
+                    note=note,
+                    source_commit_id=None,
+                )
+                managed_files.capture_iteration(
+                    related_id,
+                    int(context["current_iteration_id"]),
+                    inherit_from_iteration_id=previous_iteration_id,
+                )
+                signature = self.signature_repo.add_signature(
+                    "checkin", int(lock.user_id), note=note
+                )
+                log_id = self.lock_repo.checkin(
+                    related_id,
+                    int(lock.user_id),
+                    signature,
+                    object_iteration_id=int(context["current_iteration_id"]),
+                )
+                if not log_id:
+                    raise ValueError("Failed to release the checkout after creating the iteration.")
+                if related_id == int(part_id):
+                    result_context = context
+            else:
+                context = self.revision_repo.restore_checked_in_state(related_id)
+                signature = self.signature_repo.add_signature(
+                    "undo_checkout",
+                    int(lock.user_id),
+                    note="Shared CAD-family checkout released without BOM-object changes",
+                )
+                self.lock_repo.undo_checkout(
+                    related_id,
+                    int(lock.user_id),
+                    signature,
+                    object_iteration_id=context.get("current_iteration_id"),
+                )
+            self.bom_repo.checkin_bom(related_id)
+            affected_ids.append(related_id)
+
+        self._tree_dirty.add(int(self.session.project_id))
+        return {
+            "context": result_context or self.revision_repo.get_current_context(int(part_id)),
+            "affected_part_ids": sorted(set(affected_ids)),
+            "analysis": selected,
+        }
 
     def undo_checkout(self, part_id: int, as_user_id: int | None = None) -> bool:
         part = self.bom_repo.get_by_id(int(part_id))
@@ -467,8 +599,10 @@ class BomService(BaseService):
 
         # Restore first. If restoration fails, keep the lock so no partial working
         # configuration is exposed as checked in.
+        restored_contexts = {}
         for related in related_parts:
-            self.revision_repo.restore_checked_in_state(int(related.id))
+            related_id = int(related.id)
+            restored_contexts[related_id] = self.revision_repo.restore_checked_in_state(related_id)
         for related in related_parts:
             related_id = int(related.id)
             lock = locks.get(related_id)
@@ -478,7 +612,14 @@ class BomService(BaseService):
             signature = self.signature_repo.add_signature(
                 "undo_checkout", effective_user_id, note="Checkout undone; working changes discarded"
             )
-            self.lock_repo.undo_checkout(related_id, effective_user_id, signature)
+            self.lock_repo.undo_checkout(
+                related_id,
+                effective_user_id,
+                signature,
+                object_iteration_id=restored_contexts.get(related_id, {}).get(
+                    "current_iteration_id"
+                ),
+            )
             self.bom_repo.checkin_bom(related_id)
         self._tree_dirty.add(int(self.session.project_id))
         return True
@@ -499,7 +640,12 @@ class BomService(BaseService):
             else:
                 self.revision_repo.assert_mutable(int(related.id))
             signature = self.signature_repo.add_signature("checkout", int(user_id), note="Checked out part")
-            if not self.lock_repo.checkout(int(related.id), int(user_id), signature):
+            if not self.lock_repo.checkout(
+                int(related.id),
+                int(user_id),
+                signature,
+                object_iteration_id=context.get("current_iteration_id"),
+            ):
                 raise ValueError("Failed to check out part")
             self.bom_repo.checkout_bom(int(related.id))
             if released:
@@ -710,7 +856,99 @@ class BomService(BaseService):
                 str(row["name"])
                 for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
             }
+            table_columns = {
+                table_name: {
+                    str(row["name"])
+                    for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+                }
+                for table_name in ("commits", "lock_logs", "part_file_versions")
+                if table_name in tables
+            }
+            iteration_by_id = {}
+            iterations_by_bom = defaultdict(list)
+            iteration_by_commit = {}
+            latest_iteration_by_revision = {}
+
+            def object_version_for(
+                bom_id,
+                timestamp=None,
+                explicit_iteration_id=None,
+                source_commit_id=None,
+                prefer_next=False,
+            ):
+                try:
+                    bom_id = int(bom_id)
+                except Exception:
+                    return ""
+                source_key = str(source_commit_id or "").strip()
+                if source_key:
+                    linked = iteration_by_commit.get((bom_id, source_key))
+                    if linked:
+                        return linked.get("version_label", "")
+                if explicit_iteration_id is not None:
+                    try:
+                        explicit = iteration_by_id.get(int(explicit_iteration_id))
+                    except Exception:
+                        explicit = None
+                    if explicit and int(explicit.get("bom_id") or 0) == bom_id:
+                        return explicit.get("version_label", "")
+
+                candidates = iterations_by_bom.get(bom_id, [])
+                if not candidates:
+                    return ""
+                target_dt = self._parse_dt(timestamp)
+                if target_dt is None:
+                    return candidates[-1].get("version_label", "")
+
+                if prefer_next:
+                    future = [
+                        item for item in candidates
+                        if item.get("_created_dt") is not None
+                        and item["_created_dt"] >= target_dt
+                    ]
+                    if future:
+                        seconds = (future[0]["_created_dt"] - target_dt).total_seconds()
+                        if seconds <= 300:
+                            return future[0].get("version_label", "")
+
+                previous = [
+                    item for item in candidates
+                    if item.get("_created_dt") is not None
+                    and item["_created_dt"] <= target_dt
+                ]
+                if previous:
+                    return previous[-1].get("version_label", "")
+                return candidates[0].get("version_label", "")
+
             if {"bom_revisions", "bom_iterations"}.issubset(tables):
+                iteration_rows = conn.execute(
+                    f"""
+                    SELECT i.*, r.revision_code, r.bom_id, b.project_id, u.username
+                    FROM bom_iterations i
+                    JOIN bom_revisions r ON r.id=i.revision_id
+                    JOIN bom b ON b.id=r.bom_id
+                    LEFT JOIN users u ON u.id=i.created_by
+                    WHERE r.bom_id IN ({','.join(['?'] * len(part_ids))})
+                    ORDER BY i.created_at, i.id
+                    """,
+                    tuple(part_ids),
+                ).fetchall()
+                normalized_iterations = []
+                for iteration_row in iteration_rows:
+                    iteration = dict(iteration_row)
+                    iteration_number = int(iteration.get("iteration_number") or 1)
+                    iteration["version_label"] = (
+                        f"{iteration.get('revision_code')}.{iteration_number}"
+                    )
+                    iteration["_created_dt"] = self._parse_dt(iteration.get("created_at"))
+                    iteration_by_id[int(iteration["id"])] = iteration
+                    iterations_by_bom[int(iteration["bom_id"])].append(iteration)
+                    latest_iteration_by_revision[int(iteration["revision_id"])] = iteration
+                    source_commit_id = str(iteration.get("source_commit_id") or "").strip()
+                    if source_commit_id:
+                        iteration_by_commit[(int(iteration["bom_id"]), source_commit_id)] = iteration
+                    normalized_iterations.append(iteration)
+
                 revision_rows = conn.execute(
                     f"""
                     SELECT r.*, b.project_id
@@ -726,41 +964,34 @@ class BomService(BaseService):
                     pid = int(revision.get("project_id") or 0)
                     info = project_map.get(pid, {"project_name": "", "project_version": ""})
                     if revision.get("released_at"):
+                        released_iteration = latest_iteration_by_revision.get(int(revision["id"]))
                         events.append({
                             "timestamp": revision.get("released_at"),
                             "event": "PART_RELEASED",
                             "user": username_for(revision.get("released_by")),
                             "project": info.get("project_name", ""),
                             "version": info.get("project_version", ""),
+                            "object_version": (
+                                released_iteration.get("version_label", "")
+                                if released_iteration else ""
+                            ),
                             "details": (
                                 f"Revision {revision.get('revision_code') or ''} | "
                                 f"{revision.get('release_note') or ''}"
                             ).strip(" |"),
                         })
-                iteration_rows = conn.execute(
-                    f"""
-                    SELECT i.*, r.revision_code, r.bom_id, b.project_id, u.username
-                    FROM bom_iterations i
-                    JOIN bom_revisions r ON r.id=i.revision_id
-                    JOIN bom b ON b.id=r.bom_id
-                    LEFT JOIN users u ON u.id=i.created_by
-                    WHERE r.bom_id IN ({','.join(['?'] * len(part_ids))})
-                    ORDER BY i.created_at DESC, i.id DESC
-                    """,
-                    tuple(part_ids),
-                ).fetchall()
-                for iteration_row in iteration_rows:
-                    iteration = dict(iteration_row)
+                for iteration in normalized_iterations:
                     pid = int(iteration.get("project_id") or 0)
                     info = project_map.get(pid, {"project_name": "", "project_version": ""})
                     iteration_number = int(iteration.get("iteration_number") or 1)
-                    version_label = f"{iteration.get('revision_code')}.{iteration_number}"
+                    version_label = iteration.get("version_label", "")
                     events.append({
                         "timestamp": iteration.get("created_at"),
                         "event": "REVISION_CREATED" if iteration_number == 1 else "OBJECT_ITERATION",
                         "user": iteration.get("username") or "",
                         "project": info.get("project_name", ""),
                         "version": info.get("project_version", ""),
+                        "object_version": version_label,
                         "details": (
                             f"{version_label} | {iteration.get('checkin_note') or ''}"
                         ).strip(" |"),
@@ -779,6 +1010,9 @@ class BomService(BaseService):
                                 "user": username_for(pr.get("released_by")),
                                 "project": info.get("project_name", ""),
                                 "version": info.get("project_version", ""),
+                                "object_version": (
+                                    f"{pr.get('revision')}.1" if pr.get("revision") else ""
+                                ),
                                 "details": f"Revision {pr.get('revision') or ''}".strip(),
                             }
                         )
@@ -809,6 +1043,12 @@ class BomService(BaseService):
                             "user": (d.get("designer_name") or ""),
                             "project": (d.get("project_name") or ""),
                             "version": (d.get("project_version") or "A"),
+                            "object_version": object_version_for(
+                                d.get("part_id"),
+                                d.get("committed_at"),
+                                explicit_iteration_id=d.get("object_iteration_id"),
+                                source_commit_id=d.get("commit_id"),
+                            ),
                             "details": f"{(d.get('status') or '').strip()} | {(d.get('title') or '').strip()} | {(d.get('message') or '').strip()}{step_suffix}".strip(" |"),
                             "commit_id": d.get("commit_id"),
                             "commit_unique_id": d.get("id"),
@@ -827,11 +1067,16 @@ class BomService(BaseService):
 
             # Lock logs (checkin/checkout)
             try:
+                lock_iteration_select = (
+                    ", ll.object_iteration_id AS object_iteration_id"
+                    if "object_iteration_id" in table_columns.get("lock_logs", set())
+                    else ""
+                )
                 rows = conn.execute(
                     f"""
-                    SELECT ll.action, ll.timestamp, u.username AS username,
-                           b.project_id AS project_id,
-                           sig.note AS note
+                    SELECT ll.part_id, ll.action, ll.timestamp, u.username AS username,
+                            b.project_id AS project_id,
+                            sig.note AS note{lock_iteration_select}
                     FROM lock_logs ll
                     LEFT JOIN users u ON u.id = ll.user_id
                     LEFT JOIN signature sig ON sig.id = ll.signature
@@ -858,6 +1103,12 @@ class BomService(BaseService):
                             "user": (d.get("username") or ""),
                             "project": info.get("project_name", ""),
                             "version": info.get("project_version", ""),
+                            "object_version": object_version_for(
+                                d.get("part_id"),
+                                d.get("timestamp"),
+                                explicit_iteration_id=d.get("object_iteration_id"),
+                                prefer_next=(event_name == "CHECKIN"),
+                            ),
                             "details": (d.get("note") or "").strip(),
                         }
                     )
@@ -868,13 +1119,18 @@ class BomService(BaseService):
             try:
                 tables = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
                 if "part_files" in tables and "part_file_versions" in tables:
+                    file_iteration_select = (
+                        ", pv.object_iteration_id AS object_iteration_id"
+                        if "object_iteration_id" in table_columns.get("part_file_versions", set())
+                        else ""
+                    )
                     rows = conn.execute(
                         f"""
                         SELECT pf.part_id, pf.file_type, pf.display_name,
                                pv.version_no, pv.original_filename, pv.note,
                                pv.created_at, pv.created_by,
                                pv.lifecycle_state, pv.released_at, pv.released_by,
-                               b.project_id AS project_id
+                               b.project_id AS project_id{file_iteration_select}
                         FROM part_files pf
                         JOIN part_file_versions pv ON pv.file_id = pf.id
                         LEFT JOIN bom b ON b.id = pf.part_id
@@ -895,6 +1151,11 @@ class BomService(BaseService):
                                 "user": username_for(d.get("created_by")),
                                 "project": info.get("project_name", ""),
                                 "version": info.get("project_version", ""),
+                                "object_version": object_version_for(
+                                    d.get("part_id"),
+                                    d.get("created_at"),
+                                    explicit_iteration_id=d.get("object_iteration_id"),
+                                ),
                                 "details": f"{(d.get('file_type') or '').upper()} | {(d.get('display_name') or '').strip()} | v{d.get('version_no')} | {(d.get('original_filename') or '').strip()} | {(d.get('note') or '').strip()}".strip(" |"),
                             }
                         )
@@ -907,6 +1168,11 @@ class BomService(BaseService):
                                     "user": username_for(d.get("released_by")),
                                     "project": info.get("project_name", ""),
                                     "version": info.get("project_version", ""),
+                                    "object_version": object_version_for(
+                                        d.get("part_id"),
+                                        d.get("released_at"),
+                                        explicit_iteration_id=d.get("object_iteration_id"),
+                                    ),
                                     "details": f"{(d.get('file_type') or '').upper()} | {(d.get('display_name') or '').strip()} | v{d.get('version_no')}".strip(" |"),
                                 }
                             )
@@ -918,6 +1184,8 @@ class BomService(BaseService):
             dt = self._parse_dt(ev.get("timestamp"))
             return (dt is None, dt or datetime.min, str(ev.get("timestamp") or ""))
 
+        for event in events:
+            event.setdefault("object_version", "")
         events.sort(key=_sort_key, reverse=True)
         return events
 
@@ -1506,6 +1774,7 @@ class BomService(BaseService):
 
     def release_part(self, part_id: int, note: str = ""):
         from core.services.issue_service import IssueService
+        from core.services.managed_file_service import ManagedFileService
         part = self.bom_repo.get_by_id(int(part_id))
         if not part:
             raise ValueError("Part not found")
@@ -1518,6 +1787,9 @@ class BomService(BaseService):
             if str(context.get("state") or "").strip().lower() == "released":
                 raise ValueError(f"{context.get('version_label')} is already released.")
         IssueService().assert_no_critical_issues(related_ids, operation="release", include_children=True)
+        managed_files = ManagedFileService()
+        for related_id in related_ids:
+            managed_files.capture_current_iteration(related_id)
         released = None
         for related_id in related_ids:
             result = self.revision_repo.release_current_revision(
@@ -1525,6 +1797,10 @@ class BomService(BaseService):
             )
             if related_id == int(part_id):
                 released = result
+            context = self.revision_repo.get_current_context(related_id)
+            managed_files.repo.set_iteration_lifecycle(
+                int(context["current_iteration_id"]), "Released"
+            )
         self._tree_dirty.add(int(self.session.project_id))
         return released
 

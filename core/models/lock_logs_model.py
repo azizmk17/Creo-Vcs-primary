@@ -10,3 +10,4 @@ class Lock_logs:
     action: str
     timestamp: str
     signature: int
+    object_iteration_id: Optional[int] = None

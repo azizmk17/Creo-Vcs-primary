@@ -30,6 +30,8 @@ class PartFileRepository:
                     created_by INTEGER DEFAULT NULL,
                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
                     active_version_id INTEGER DEFAULT NULL,
+                    file_role TEXT NOT NULL DEFAULT 'document',
+                    deleted_at TEXT DEFAULT NULL,
                     FOREIGN KEY (part_id) REFERENCES bom(id)
                 );
 
@@ -52,6 +54,13 @@ class PartFileRepository:
                     released_at TEXT DEFAULT NULL,
                     root_project_id INTEGER DEFAULT NULL,
                     project_version_label TEXT DEFAULT NULL,
+                    object_iteration_id INTEGER DEFAULT NULL,
+                    storage_scheme TEXT NOT NULL DEFAULT 'legacy',
+                    source_kind TEXT NOT NULL DEFAULT 'manual',
+                    source_commit_id TEXT DEFAULT NULL,
+                    integrity_status TEXT NOT NULL DEFAULT 'Unknown',
+                    derived_from_version_id INTEGER DEFAULT NULL,
+                    deleted_at TEXT DEFAULT NULL,
                     FOREIGN KEY (file_id) REFERENCES part_files(id),
                     UNIQUE(file_id, version_no)
                 );
@@ -62,6 +71,13 @@ class PartFileRepository:
 
             # Best-effort add columns if DB pre-dates lifecycle/version-context fields
             try:
+                file_cols = [r[1] for r in conn.execute("PRAGMA table_info(part_files)").fetchall()]
+                if "file_role" not in file_cols:
+                    conn.execute(
+                        "ALTER TABLE part_files ADD COLUMN file_role TEXT NOT NULL DEFAULT 'document'"
+                    )
+                if "deleted_at" not in file_cols:
+                    conn.execute("ALTER TABLE part_files ADD COLUMN deleted_at TEXT")
                 cols = [r[1] for r in conn.execute("PRAGMA table_info(part_file_versions)").fetchall()]
                 if "lifecycle_state" not in cols:
                     conn.execute("ALTER TABLE part_file_versions ADD COLUMN lifecycle_state TEXT DEFAULT 'WIP'")
@@ -75,6 +91,22 @@ class PartFileRepository:
                     conn.execute("ALTER TABLE part_file_versions ADD COLUMN project_version_label TEXT")
                 if "revision" not in cols:
                     conn.execute("ALTER TABLE part_file_versions ADD COLUMN revision TEXT")
+                if "object_iteration_id" not in cols:
+                    conn.execute(
+                        "ALTER TABLE part_file_versions ADD COLUMN object_iteration_id INTEGER"
+                    )
+                for column, definition in (
+                    ("storage_scheme", "storage_scheme TEXT NOT NULL DEFAULT 'legacy'"),
+                    ("source_kind", "source_kind TEXT NOT NULL DEFAULT 'manual'"),
+                    ("source_commit_id", "source_commit_id TEXT"),
+                    ("integrity_status", "integrity_status TEXT NOT NULL DEFAULT 'Unknown'"),
+                    ("derived_from_version_id", "derived_from_version_id INTEGER"),
+                    ("deleted_at", "deleted_at TEXT"),
+                ):
+                    if column not in cols:
+                        conn.execute(
+                            f"ALTER TABLE part_file_versions ADD COLUMN {definition}"
+                        )
                 self._migrate_revision_notes_once(conn)
             except Exception:
                 pass
@@ -131,15 +163,27 @@ class PartFileRepository:
     # -----------------
     # Files
     # -----------------
-    def create_file(self, part_id: int, file_type: str, display_name: str, description: str = "", created_by: Optional[int] = None) -> int:
+    def create_file(
+        self,
+        part_id: int,
+        file_type: str,
+        display_name: str,
+        description: str = "",
+        created_by: Optional[int] = None,
+        file_role: str = "document",
+    ) -> int:
         with self.get_conn() as conn:
             cur = conn.cursor()
             cur.execute(
                 """
-                INSERT INTO part_files (part_id, file_type, display_name, description, created_by)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO part_files (
+                    part_id, file_type, display_name, description, created_by, file_role
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (part_id, file_type, display_name, description or None, created_by),
+                (
+                    part_id, file_type, display_name, description or None, created_by,
+                    str(file_role or "document"),
+                ),
             )
             conn.commit()
             return cur.lastrowid
@@ -147,7 +191,11 @@ class PartFileRepository:
     def get_files_for_part(self, part_id: int) -> List[PartFile]:
         with self.get_conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM part_files WHERE part_id = ? ORDER BY created_at DESC",
+                """
+                SELECT * FROM part_files
+                WHERE part_id = ? AND deleted_at IS NULL
+                ORDER BY created_at DESC
+                """,
                 (part_id,),
             ).fetchall()
             return [PartFile(**dict(r)) for r in rows]
@@ -167,8 +215,26 @@ class PartFileRepository:
 
     def delete_file(self, file_id: int):
         with self.get_conn() as conn:
-            conn.execute("DELETE FROM part_file_versions WHERE file_id = ?", (file_id,))
-            conn.execute("DELETE FROM part_files WHERE id = ?", (file_id,))
+            conn.execute(
+                """
+                UPDATE part_file_versions
+                SET deleted_at=COALESCE(deleted_at, datetime('now')),
+                    lifecycle_state=CASE
+                        WHEN UPPER(COALESCE(lifecycle_state,''))='RELEASED' THEN lifecycle_state
+                        ELSE 'Obsolete'
+                    END
+                WHERE file_id=?
+                """,
+                (file_id,),
+            )
+            conn.execute(
+                """
+                UPDATE part_files
+                SET deleted_at=COALESCE(deleted_at, datetime('now')), active_version_id=NULL
+                WHERE id=?
+                """,
+                (file_id,),
+            )
             conn.commit()
 
     # -----------------
@@ -177,7 +243,11 @@ class PartFileRepository:
     def get_versions(self, file_id: int) -> List[PartFileVersion]:
         with self.get_conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM part_file_versions WHERE file_id = ? ORDER BY version_no DESC",
+                """
+                SELECT * FROM part_file_versions
+                WHERE file_id = ? AND deleted_at IS NULL
+                ORDER BY version_no DESC
+                """,
                 (file_id,),
             ).fetchall()
             return [PartFileVersion(**dict(r)) for r in rows]
@@ -209,62 +279,45 @@ class PartFileRepository:
         created_by: Optional[int] = None,
         root_project_id: Optional[int] = None,
         project_version_label: Optional[str] = None,
+        object_iteration_id: Optional[int] = None,
+        storage_scheme: str = "legacy",
+        source_kind: str = "manual",
+        source_commit_id: Optional[str] = None,
+        integrity_status: str = "Unknown",
+        derived_from_version_id: Optional[int] = None,
     ) -> int:
         with self.get_conn() as conn:
             cur = conn.cursor()
-
-            # Older DBs might not have the version-context columns.
-            cols = []
-            try:
-                cols = [r[1] for r in conn.execute("PRAGMA table_info(part_file_versions)").fetchall()]
-            except Exception:
-                cols = []
-
-            if "root_project_id" in cols and "project_version_label" in cols:
-                revision_sql = ", revision" if "revision" in cols else ""
-                revision_placeholder = ", ?" if "revision" in cols else ""
-                cur.execute(
-                    f"""
-                    INSERT INTO part_file_versions (
-                        file_id, version_no, original_filename, vault_rel_path, sha256, size_bytes, note, created_by,
-                        lifecycle_state, root_project_id, project_version_label{revision_sql}
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?{revision_placeholder})
-                    """,
-                    tuple([
-                        file_id,
-                        version_no,
-                        original_filename,
-                        vault_rel_path,
-                        sha256,
-                        size_bytes,
-                        note or None,
-                        created_by,
-                        "WIP",
-                        root_project_id,
-                        project_version_label,
-                    ] + ([revision if revision is not None else None] if "revision" in cols else [])),
-                )
-            else:
-                revision_sql = ", revision" if "revision" in cols else ""
-                revision_placeholder = ", ?" if "revision" in cols else ""
-                cur.execute(
-                    f"""
-                    INSERT INTO part_file_versions (
-                        file_id, version_no, original_filename, vault_rel_path, sha256, size_bytes, note, created_by, lifecycle_state{revision_sql}
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?{revision_placeholder})
-                    """,
-                    tuple([
-                        file_id,
-                        version_no,
-                        original_filename,
-                        vault_rel_path,
-                        sha256,
-                        size_bytes,
-                        note or None,
-                        created_by,
-                        "WIP",
-                    ] + ([revision if revision is not None else None] if "revision" in cols else [])),
-                )
+            available = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(part_file_versions)").fetchall()
+            }
+            values_by_column = {
+                "file_id": file_id,
+                "version_no": version_no,
+                "original_filename": original_filename,
+                "vault_rel_path": vault_rel_path,
+                "sha256": sha256,
+                "size_bytes": size_bytes,
+                "note": note or None,
+                "revision": revision if revision is not None else None,
+                "created_by": created_by,
+                "lifecycle_state": "WIP",
+                "root_project_id": root_project_id,
+                "project_version_label": project_version_label,
+                "object_iteration_id": object_iteration_id,
+                "storage_scheme": str(storage_scheme or "legacy"),
+                "source_kind": str(source_kind or "manual"),
+                "source_commit_id": source_commit_id,
+                "integrity_status": str(integrity_status or "Unknown"),
+                "derived_from_version_id": derived_from_version_id,
+            }
+            columns = [name for name in values_by_column if name in available]
+            cur.execute(
+                f"INSERT INTO part_file_versions ({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' for _ in columns)})",
+                tuple(values_by_column[name] for name in columns),
+            )
 
             conn.commit()
             return cur.lastrowid
@@ -283,7 +336,18 @@ class PartFileRepository:
 
     def delete_version(self, version_id: int):
         with self.get_conn() as conn:
-            conn.execute("DELETE FROM part_file_versions WHERE id = ?", (version_id,))
+            conn.execute(
+                """
+                UPDATE part_file_versions
+                SET deleted_at=COALESCE(deleted_at, datetime('now')),
+                    lifecycle_state=CASE
+                        WHEN UPPER(COALESCE(lifecycle_state,''))='RELEASED' THEN lifecycle_state
+                        ELSE 'Obsolete'
+                    END
+                WHERE id=?
+                """,
+                (version_id,),
+            )
             conn.commit()
 
     def clear_active_if_matches(self, file_id: int, version_id: int):

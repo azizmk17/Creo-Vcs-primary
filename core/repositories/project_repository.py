@@ -211,6 +211,25 @@ class ProjectRepository:
             except Exception:
                 pass
             try:
+                tables = set(self._list_tables(conn))
+                if "assembly_configurations" in tables:
+                    if "assembly_configuration_members" in tables:
+                        cur.execute(
+                            """
+                            DELETE FROM assembly_configuration_members
+                            WHERE configuration_id IN (
+                                SELECT id FROM assembly_configurations WHERE project_id=?
+                            )
+                            """,
+                            (project_id,),
+                        )
+                    cur.execute(
+                        "DELETE FROM assembly_configurations WHERE project_id=?",
+                        (project_id,),
+                    )
+            except Exception:
+                pass
+            try:
                 cur.execute("DELETE FROM bom WHERE project_id = ?", (project_id,))
             except Exception:
                 pass
@@ -523,7 +542,9 @@ class ProjectRepository:
                             except Exception:
                                 pass
 
-                self._duplicate_bom_revision_configuration(conn, bom_id_map, relation_id_map)
+                _, iteration_id_map = self._duplicate_bom_revision_configuration(
+                    conn, bom_id_map, relation_id_map
+                )
 
                 # Preserve issue identity and traceability across the new project revision.
                 self._duplicate_issue_part_links(conn, bom_id_map)
@@ -580,13 +601,21 @@ class ProjectRepository:
                             for v_row in old_versions:
                                 v = dict(v_row)
                                 old_vid = int(v.get("id"))
+                                version_overrides = {"file_id": new_file_id}
+                                if "object_iteration_id" in pv_cols:
+                                    old_iteration_id = v.get("object_iteration_id")
+                                    version_overrides["object_iteration_id"] = (
+                                        iteration_id_map.get(int(old_iteration_id))
+                                        if old_iteration_id is not None
+                                        else None
+                                    )
                                 new_vid = int(
                                     self._insert_row_from_row(
                                         conn,
                                         "part_file_versions",
                                         pv_cols,
                                         v,
-                                        overrides={"file_id": new_file_id},
+                                        overrides=version_overrides,
                                         id_col="id",
                                     )
                                 )
@@ -638,7 +667,7 @@ class ProjectRepository:
         tables = set(self._list_tables(conn))
         required = {"bom_revisions", "bom_iterations", "bom_iteration_bindings"}
         if not bom_id_map or not required.issubset(tables):
-            return
+            return {}, {}
 
         revision_cols = self._table_columns(conn, "bom_revisions")
         iteration_cols = self._table_columns(conn, "bom_iterations")
@@ -724,6 +753,7 @@ class ProjectRepository:
                 "UPDATE bom SET current_revision_id=?, current_iteration_id=? WHERE id=?",
                 (new_revision_id, new_iteration_id, int(new_bom_id)),
             )
+        return revision_id_map, iteration_id_map
 
     def _list_tables(self, conn):
         rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()

@@ -3,18 +3,22 @@ import os
 from typing import List, Optional, Tuple
 
 from core.repositories.bom_repository import BomRepository
+from core.repositories.bom_revision_repository import BomRevisionRepository
+from core.repositories.lock_repository import LockRepository
 from core.repositories.part_file_repository import PartFileRepository
 from core.session_manager import SessionManager
 from core.services.project_service import ProjectService
 from core.models.part_file_model import PartFile
 from core.models.part_file_version_model import PartFileVersion
-from utils import ensure_dir_exists, safe_copy2, safe_exists, safe_open, safe_remove
+from utils import ensure_dir_exists, safe_copy2, safe_exists, safe_open
 
 
 class PartFileService:
     def __init__(self, repo: Optional[PartFileRepository] = None):
         self.repo = repo or PartFileRepository()
         self.bom_repo = BomRepository()
+        self.revision_repo = BomRevisionRepository()
+        self.lock_repo = LockRepository()
         self.session = SessionManager()
         self.project_service = ProjectService()
 
@@ -59,6 +63,38 @@ class PartFileService:
         # Use stable, collision-free folders by IDs
         return os.path.join("vault", f"part_{part_id}", f"file_{file_id}", f"v{version_no}", original_filename)
 
+    def _family_working_dir(self, root_project_id: Optional[int]) -> str:
+        try:
+            if root_project_id:
+                root = self.project_service.get_project_by_id(int(root_project_id)) or {}
+                root_dir = str(root.get("working_directory") or "").strip()
+                if root_dir:
+                    return root_dir
+        except Exception:
+            pass
+        return self._working_dir()
+
+    def _store_managed_blob(self, source_path: str, root_project_id: Optional[int]) -> dict:
+        family_dir = self._family_working_dir(root_project_id)
+        if not family_dir:
+            raise ValueError("Project working directory is not set")
+        sha256 = self._hash_file_sha256(source_path)
+        filename = self._safe_filename(os.path.basename(source_path))
+        rel_path = os.path.join(
+            ".nexus", "vault", "blobs", sha256[:2], sha256, filename
+        )
+        abs_path = os.path.join(family_dir, rel_path)
+        if not safe_exists(abs_path):
+            ensure_dir_exists(os.path.dirname(abs_path))
+            safe_copy2(source_path, abs_path)
+        return {
+            "vault_rel_path": rel_path,
+            "sha256": sha256,
+            "size_bytes": os.path.getsize(abs_path),
+            "storage_scheme": "managed_blob",
+            "integrity_status": "Verified",
+        }
+
     def _project_version_context(self) -> Tuple[Optional[int], Optional[str]]:
         project_id = self.session.project_id
         if not project_id:
@@ -72,6 +108,14 @@ class PartFileService:
             return str(getattr(part, "revision", "") or "").strip().upper()
         except Exception:
             return ""
+
+    def _object_iteration_id(self, part_id: int) -> Optional[int]:
+        try:
+            context = self.revision_repo.get_current_context(int(part_id))
+            value = context.get("current_iteration_id")
+            return int(value) if value is not None else None
+        except Exception:
+            return None
 
     def _working_dir_for_root_label(self, root_project_id: Optional[int], version_label: Optional[str]) -> str:
         try:
@@ -113,42 +157,41 @@ class PartFileService:
         source_path: str,
         note: str = "",
         revision_override: Optional[str] = None,
+        file_role: str = "document",
+        source_kind: str = "manual",
+        source_commit_id: Optional[str] = None,
     ) -> int:
         if not part_id:
             raise ValueError("part_id is required")
         self._assert_part_revision_mutable(int(part_id))
-        wd = self._working_dir()
-        if not wd:
-            raise ValueError("Project working directory is not set")
         if not source_path or not safe_exists(source_path):
             raise ValueError("Source file does not exist")
 
         created_by = self.session.user_id
         root_project_id, project_version_label = self._project_version_context()
         revision = self._part_revision(part_id) if revision_override is None else str(revision_override or "")
-        file_id = self.repo.create_file(part_id, file_type, display_name, description, created_by=created_by)
-
-        version_no = 1
-        rel_path = self._version_dest_relpath(part_id, file_id, version_no, source_path)
-        abs_path = os.path.join(wd, rel_path)
-        ensure_dir_exists(os.path.dirname(abs_path))
-
-        safe_copy2(source_path, abs_path)
-        sha256 = self._hash_file_sha256(abs_path)
-        size_bytes = os.path.getsize(abs_path)
-
+        stored = self._store_managed_blob(source_path, root_project_id)
+        file_id = self.repo.create_file(
+            part_id, file_type, display_name, description,
+            created_by=created_by, file_role=file_role,
+        )
         version_id = self.repo.add_version(
             file_id=file_id,
-            version_no=version_no,
+            version_no=1,
             original_filename=os.path.basename(source_path),
-            vault_rel_path=rel_path,
-            sha256=sha256,
-            size_bytes=size_bytes,
+            vault_rel_path=stored["vault_rel_path"],
+            sha256=stored["sha256"],
+            size_bytes=stored["size_bytes"],
             note=note,
             revision=revision,
             created_by=created_by,
+            object_iteration_id=self._object_iteration_id(part_id),
             root_project_id=root_project_id,
             project_version_label=project_version_label,
+            storage_scheme=stored["storage_scheme"],
+            source_kind=source_kind,
+            source_commit_id=source_commit_id,
+            integrity_status=stored["integrity_status"],
         )
         self.repo.set_active_version(file_id, version_id)
         return file_id
@@ -157,41 +200,9 @@ class PartFileService:
         pf = self.repo.get_file_by_id(file_id)
         if not pf:
             raise ValueError("Attachment not found")
-        self._assert_part_revision_mutable(int(pf.part_id))
-        wd = self._working_dir()
-        if not wd:
-            raise ValueError("Project working directory is not set")
-        if not source_path or not safe_exists(source_path):
-            raise ValueError("Source file does not exist")
-
-        created_by = self.session.user_id
-        root_project_id, project_version_label = self._project_version_context()
-        revision = self._part_revision(pf.part_id)
-        version_no = self.repo.get_next_version_no(file_id)
-
-        rel_path = self._version_dest_relpath(pf.part_id, file_id, version_no, source_path)
-        abs_path = os.path.join(wd, rel_path)
-        ensure_dir_exists(os.path.dirname(abs_path))
-
-        safe_copy2(source_path, abs_path)
-        sha256 = self._hash_file_sha256(abs_path)
-        size_bytes = os.path.getsize(abs_path)
-
-        version_id = self.repo.add_version(
-            file_id=file_id,
-            version_no=version_no,
-            original_filename=os.path.basename(source_path),
-            vault_rel_path=rel_path,
-            sha256=sha256,
-            size_bytes=size_bytes,
-            note=note,
-            revision=revision,
-            created_by=created_by,
-            root_project_id=root_project_id,
-            project_version_label=project_version_label,
+        return self.add_new_version_with_revision(
+            file_id, source_path, note=note, revision=self._part_revision(pf.part_id)
         )
-        self.repo.set_active_version(file_id, version_id)
-        return version_id
 
     def add_new_version_with_revision(
         self,
@@ -199,14 +210,14 @@ class PartFileService:
         source_path: str,
         note: str = "",
         revision: Optional[str] = None,
+        source_kind: str = "manual",
+        source_commit_id: Optional[str] = None,
+        derived_from_version_id: Optional[int] = None,
     ) -> int:
         pf = self.repo.get_file_by_id(file_id)
         if not pf:
             raise ValueError("Attachment not found")
         self._assert_part_revision_mutable(int(pf.part_id))
-        wd = self._working_dir()
-        if not wd:
-            raise ValueError("Project working directory is not set")
         if not source_path or not safe_exists(source_path):
             raise ValueError("Source file does not exist")
 
@@ -214,26 +225,26 @@ class PartFileService:
         root_project_id, project_version_label = self._project_version_context()
         version_no = self.repo.get_next_version_no(file_id)
 
-        rel_path = self._version_dest_relpath(pf.part_id, file_id, version_no, source_path)
-        abs_path = os.path.join(wd, rel_path)
-        ensure_dir_exists(os.path.dirname(abs_path))
-
-        safe_copy2(source_path, abs_path)
-        sha256 = self._hash_file_sha256(abs_path)
-        size_bytes = os.path.getsize(abs_path)
+        stored = self._store_managed_blob(source_path, root_project_id)
 
         version_id = self.repo.add_version(
             file_id=file_id,
             version_no=version_no,
             original_filename=os.path.basename(source_path),
-            vault_rel_path=rel_path,
-            sha256=sha256,
-            size_bytes=size_bytes,
+            vault_rel_path=stored["vault_rel_path"],
+            sha256=stored["sha256"],
+            size_bytes=stored["size_bytes"],
             note=note,
             revision=str(revision or ""),
             created_by=created_by,
             root_project_id=root_project_id,
             project_version_label=project_version_label,
+            object_iteration_id=self._object_iteration_id(pf.part_id),
+            storage_scheme=stored["storage_scheme"],
+            source_kind=source_kind,
+            source_commit_id=source_commit_id,
+            integrity_status=stored["integrity_status"],
+            derived_from_version_id=derived_from_version_id,
         )
         self.repo.set_active_version(file_id, version_id)
         return version_id
@@ -247,6 +258,9 @@ class PartFileService:
         revision: Optional[str] = None,
         display_name: Optional[str] = None,
         description: str = "",
+        file_role: str = "",
+        source_kind: str = "generated",
+        source_commit_id: Optional[str] = None,
     ) -> tuple[int, int]:
         normalized_type = str(file_type or "").strip().upper()
         if not normalized_type:
@@ -254,7 +268,13 @@ class PartFileService:
 
         existing = None
         for attachment in self.list_attachments(part_id):
-            if str(attachment.file_type or "").strip().upper() == normalized_type:
+            same_type = str(attachment.file_type or "").strip().upper() == normalized_type
+            same_role = (
+                not file_role
+                or str(getattr(attachment, "file_role", "") or "").strip().lower()
+                == str(file_role).strip().lower()
+            )
+            if same_type and same_role:
                 existing = attachment
                 break
 
@@ -264,6 +284,8 @@ class PartFileService:
                 source_path,
                 note=note,
                 revision=revision,
+                source_kind=source_kind,
+                source_commit_id=source_commit_id,
             )
             return existing.id, version_id
 
@@ -275,6 +297,9 @@ class PartFileService:
             source_path=source_path,
             note=note,
             revision_override=revision,
+            file_role=file_role or "document",
+            source_kind=source_kind,
+            source_commit_id=source_commit_id,
         )
         active = self.get_active_version(file_id)
         return file_id, int(active.id) if active else 0
@@ -290,9 +315,17 @@ class PartFileService:
         if not part_file:
             raise ValueError("Attachment not found")
         self._assert_part_revision_mutable(int(part_file.part_id))
+        lock = self.lock_repo.get_by_part(int(part_file.part_id))
+        if not lock:
+            raise ValueError("Check out the BOM item before changing the working document version.")
+        if int(getattr(lock, "user_id", 0) or 0) != int(self.session.user_id or 0):
+            raise ValueError("Only the checkout owner can change the working document version.")
         self.repo.set_active_version(file_id, version_id)
 
     def resolve_version_path(self, version: PartFileVersion) -> str:
+        if str(getattr(version, "storage_scheme", "legacy") or "legacy").lower() == "managed_blob":
+            root = self._family_working_dir(getattr(version, "root_project_id", None))
+            return os.path.join(root, version.vault_rel_path) if root else ""
         # Prefer the project WD that originally stored this version.
         wd = self._working_dir_for_version(getattr(version, "root_project_id", None), getattr(version, "project_version_label", None))
         if not wd:
@@ -348,15 +381,8 @@ class PartFileService:
             return
         self._assert_part_revision_mutable(int(pf.part_id))
         ver = self.repo.get_version_by_id(version_id)
-        if ver:
-            if str(getattr(ver, "lifecycle_state", "") or "").strip().lower() == "released":
-                raise ValueError("Released attachment versions are immutable and cannot be deleted.")
-            abs_path = self.resolve_version_path(ver)
-            try:
-                if abs_path and safe_exists(abs_path):
-                    safe_remove(abs_path)
-            except Exception:
-                pass
+        if ver and str(getattr(ver, "lifecycle_state", "") or "").strip().lower() == "released":
+            raise ValueError("Released attachment versions are immutable and cannot be deleted.")
 
         # clear active if needed
         self.repo.clear_active_if_matches(file_id, version_id)
@@ -374,21 +400,12 @@ class PartFileService:
         if not part_file:
             return
         self._assert_part_revision_mutable(int(part_file.part_id))
-        # delete files on disk (best-effort)
         versions = self.repo.get_versions(file_id)
         if any(
             str(getattr(version, "lifecycle_state", "") or "").strip().lower() == "released"
             for version in versions
         ):
             raise ValueError("An attachment containing released versions cannot be deleted.")
-        for v in versions:
-            abs_path = self.resolve_version_path(v)
-            try:
-                if abs_path and safe_exists(abs_path):
-                    safe_remove(abs_path)
-            except Exception:
-                pass
-
         self.repo.delete_file(file_id)
 
     def update_version_revision(self, version_id: int, revision: str):

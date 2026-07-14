@@ -18,6 +18,7 @@ from core.services.base_service import BaseService
 from core.services.issue_service import IssueService
 from core.services.traceability_service import TraceabilityService
 from core.services.part_file_service import PartFileService
+from core.services.managed_file_service import ManagedFileService
 from core.services.export_naming import is_project_revision
 from utils import (
     is_creo_file,
@@ -46,6 +47,9 @@ class MergeService(BaseService):
         self.issue_service = IssueService()
         self.traceability_service = TraceabilityService()
         self.part_file_service = PartFileService()
+        self.managed_file_service = ManagedFileService(
+            part_file_service=self.part_file_service
+        )
 
         self.working_dir = working_dir
         self.commits_dir = commits_dir
@@ -208,6 +212,13 @@ class MergeService(BaseService):
                     revision=item.get("revision") or "",
                     display_name=os.path.splitext(os.path.basename(vault_source_path))[0],
                     description=item.get("description") or "Attached during commit push",
+                    file_role=(
+                        "generated_pdf" if file_role == "exported_pdf"
+                        else "generated_step" if file_role == "exported_step"
+                        else "document"
+                    ),
+                    source_kind="generated",
+                    source_commit_id=commit_id,
                 )
                 self.traceability_service.link_commit_to_engineering_file(
                     commit_id=commit_id,
@@ -264,7 +275,15 @@ class MergeService(BaseService):
         except Exception as exc:
             print(f"Warning: Failed to remove empty commit attachment directory {commit_dir}: {exc}")
 
-        return sorted(set(changed_part_ids))
+        changed_part_ids = sorted(set(changed_part_ids))
+        for part_id in changed_part_ids:
+            try:
+                self.managed_file_service.capture_current_iteration(
+                    int(part_id), source_commit_id=commit_id
+                )
+            except Exception as exc:
+                print(f"Warning: Failed to update managed-file manifest for BOM {part_id}: {exc}")
+        return changed_part_ids
 
     def get_last_approved_version(self, base_name):
         max_version = 0
@@ -549,6 +568,7 @@ class MergeService(BaseService):
 
     def finalize_merge(self, merged_entries, merge_user_id, merge_id, message):
         """Finalize the merge by updating database entries."""
+        checkin_sources = {}
         for item in merged_entries:
             print(f"Finalizing merge for part ID {item['item_id']} with commit ID {item['commit_id']} with new filename {item['new_filename']}")
 
@@ -580,16 +600,28 @@ class MergeService(BaseService):
             self.signature_repo.add_signature('Merge', merge_user_id , message)
             print(f"Added signature")
 
-            # Check in the part after merge: release the checkout lock if it exists.
-            lock = self.lock_repo.get_lock_by_part(item['item_id'])
+            checkin_sources.setdefault(
+                int(item['item_id']),
+                str(item.get('source_commit_id') or item.get('commit_id') or ''),
+            )
+
+        # Capture one object iteration only after every CAD and drawing row is updated.
+        for part_id, source_commit_id in checkin_sources.items():
+            lock = self.lock_repo.get_lock_by_part(part_id)
             if lock:
                 self.bom_service.checkin_by_part_id(
-                    item['item_id'],
+                    part_id,
                     lock.user_id,
                     note=message,
-                    source_commit_id=str(item.get('source_commit_id') or item.get('commit_id') or ''),
+                    source_commit_id=source_commit_id,
                 )
-                print(f"Checked in lock for part ID {item['item_id']} by user ID {lock.user_id}")
+                print(f"Checked in lock for part ID {part_id} by user ID {lock.user_id}")
+            try:
+                self.managed_file_service.capture_current_iteration(
+                    part_id, source_commit_id=source_commit_id
+                )
+            except Exception as exc:
+                print(f"Warning: Failed to capture managed files for BOM {part_id}: {exc}")
 
         
         print(f"Finalized merge for entries: {merged_entries}")
