@@ -16,6 +16,17 @@ from core.session_manager import SessionManager
 from config import DB_NAME
 
 from core.services.base_service import BaseService
+from core.ebom_policy import (
+    delivery_policy_label,
+    normalize_cad_control_mode,
+    normalize_classification,
+    normalize_default_behavior,
+    normalize_occurrence_behavior,
+    normalize_requirement,
+    requires_aes_number,
+)
+from core.services.ebom_service import EbomExportService, EbomService
+from core.services.release_validation_service import ReleaseValidationService
 
 
 class BomService(BaseService):
@@ -29,6 +40,9 @@ class BomService(BaseService):
         self.folder_repo = BomFolderRepository()
         self.filter_repo = BomFilterRepository()
         self.revision_repo = BomRevisionRepository()
+        self.ebom_service = EbomService()
+        self.ebom_export_service = EbomExportService(self.ebom_service)
+        self.release_validation_service = ReleaseValidationService()
         self.session = SessionManager()
         self._tree_cache: dict = {}    # project_id -> tree dict
         self._tree_dirty: set = set()  # project_ids that need re-fetch
@@ -130,11 +144,76 @@ class BomService(BaseService):
     # -------------------------------
     # INSERT PART / ASM
     # -------------------------------
+    def list_representation_targets(self, exclude_id=None) -> List[Dict]:
+        if not self.session.project_id:
+            return []
+        return self.bom_repo.list_deliverable_parts(
+            int(self.session.project_id), exclude_id=exclude_id
+        )
+
+    def _representation_values(self, part_data: dict, part_id=None) -> dict:
+        """Validate and enforce the invariant for an alternate CAD representation."""
+        values = dict(part_data or {})
+        if part_id is not None and "represented_part_id" not in values:
+            current = self.bom_repo.get_by_id(int(part_id))
+            values["represented_part_id"] = (
+                current.represented_part_id if current else None
+            )
+        raw_target = values.get("represented_part_id")
+        if raw_target in (None, "", 0, "0"):
+            values["represented_part_id"] = None
+            return values
+        try:
+            target_id = int(raw_target)
+        except (TypeError, ValueError):
+            raise ValueError("Select a valid deliverable physical part.")
+        if part_id is not None and int(part_id) == target_id:
+            raise ValueError("A BOM item cannot be a representation of itself.")
+        target = self.bom_repo.get_by_id(target_id)
+        if not target or int(target.project_id or 0) != int(self.session.project_id or 0):
+            raise ValueError("The represented physical part is not in this project.")
+        if target.represented_part_id is not None:
+            raise ValueError("A CAD representation must link directly to a deliverable physical part.")
+        if str(target.classification or "PHYSICAL").upper() != "PHYSICAL":
+            raise ValueError("The represented item must be classified as PHYSICAL.")
+        if part_id is not None and any(
+            str(values.get(field) or "").strip()
+            for field in ("drawing_number", "drawing", "pdf_path", "step_path")
+        ):
+            raise ValueError(
+                "A CAD-only representation cannot have a drawing, PDF, or STEP delivery file. "
+                "Attach delivery files to the linked physical part instead."
+            )
+
+        values.update({
+            "represented_part_id": target_id,
+            "aes_number": str(target.aes_number or ""),
+            "classification": "CAD_ONLY",
+            "default_ebom_behavior": "EXCLUDE",
+            "cad_requirement": "REQUIRED",
+            "drawing_requirement": "NOT_REQUIRED",
+            "drawing_number": "",
+            "drawing": "",
+            "pdf_path": "",
+            "step_path": "",
+            "cad_control_mode": "CONTROLLED",
+        })
+        return values
+
     def add_part(self, part_data: dict) -> int:
-        aes_number = part_data.get("aes_number") or part_data.get("id")
-        
-        existing = self.bom_repo.get_by_aes(aes_number, self.session.project_id)
-        if existing:
+        part_data = self._representation_values(part_data)
+        aes_number = str(part_data.get("aes_number") or "").strip()
+        if requires_aes_number(
+            part_data.get("default_ebom_behavior"),
+            part_data.get("represented_part_id"),
+        ) and not aes_number:
+            raise ValueError("AES Number is required for items that are for delivery.")
+
+        existing = (
+            self.bom_repo.get_by_aes(aes_number, self.session.project_id)
+            if aes_number else None
+        )
+        if existing and not part_data.get("represented_part_id"):
             return "existing"
         
         if part_data.get("filename"):
@@ -170,10 +249,28 @@ class BomService(BaseService):
             status=part_data.get("status", "Design"),
             created=part_data.get("created"),
             modified=part_data.get("modified"),
-            project_id=self.session.project_id
+            project_id=self.session.project_id,
+            classification=normalize_classification(part_data.get("classification")),
+            default_ebom_behavior=normalize_default_behavior(
+                part_data.get("default_ebom_behavior")
+            ),
+            cad_requirement=normalize_requirement(
+                part_data.get("cad_requirement"), "CAD requirement"
+            ),
+            drawing_requirement=normalize_requirement(
+                part_data.get("drawing_requirement"), "drawing requirement"
+            ),
+            represented_part_id=part_data.get("represented_part_id"),
+            cad_control_mode=normalize_cad_control_mode(
+                part_data.get("cad_control_mode")
+            ),
         )
         result = self.bom_repo.insert(bom_item)
         if isinstance(result, int):
+            if base_f_name:
+                self.bom_repo.remove_cad_dependency_by_base(
+                    int(self.session.project_id), base_f_name
+                )
             self.revision_repo.ensure_bom(int(result), created_by=self.user_id)
         self._tree_dirty.add(int(self.session.project_id))
         return result
@@ -189,6 +286,31 @@ class BomService(BaseService):
         if not part:
             return False
         self._assert_checked_out_for_change(int(part.id), "edit its attributes")
+        part_data = self._representation_values(part_data, part_id=part.id)
+        effective_behavior = part_data.get(
+            "default_ebom_behavior", part.default_ebom_behavior
+        )
+        effective_representation = part_data.get(
+            "represented_part_id", part.represented_part_id
+        )
+        effective_aes = str(part_data.get("aes_number", part.aes_number) or "").strip()
+        if requires_aes_number(
+            effective_behavior, effective_representation
+        ) and not effective_aes:
+            raise ValueError("AES Number is required for items that are for delivery.")
+        if "aes_number" in part_data:
+            part_data["aes_number"] = effective_aes
+        if "cad_control_mode" in part_data:
+            new_control_mode = normalize_cad_control_mode(part_data.get("cad_control_mode"))
+            if (
+                str(part.cad_control_mode or "CONTROLLED").upper() == "SUPPLIER_PACKAGE"
+                and new_control_mode != "SUPPLIER_PACKAGE"
+                and self.bom_repo.count_cad_dependencies(int(part.id))
+            ):
+                raise ValueError(
+                    "Remove the owned CAD dependencies before changing this item back to CONTROLLED."
+                )
+            part_data["cad_control_mode"] = new_control_mode
             
         # Update part fields
         for key, value in part_data.items():
@@ -196,6 +318,8 @@ class BomService(BaseService):
                 setattr(part, key, value)
                 
         result = self.bom_repo.update(part)
+        if part.represented_part_id is None:
+            self.bom_repo.sync_representation_aes(int(part.id), str(part.aes_number or ""))
         self._tree_dirty.add(int(self.session.project_id))
         return result
 
@@ -209,6 +333,19 @@ class BomService(BaseService):
         part = self.bom_repo.get_by_id(part_id)
         if not part:
             return False
+        representations = self.bom_repo.get_representations(int(part.id))
+        if representations:
+            labels = ", ".join(str(item.name or item.filename or item.id) for item in representations[:3])
+            raise ValueError(
+                "This deliverable part has linked CAD representations. "
+                f"Unlink or delete them first: {labels}"
+            )
+        dependency_count = self.bom_repo.count_cad_dependencies(int(part.id))
+        if dependency_count:
+            raise ValueError(
+                f"This supplier package owns {dependency_count} CAD dependencies. "
+                "Unassign them in Diagnostics before deleting the item."
+            )
         context = self.revision_repo.get_current_context(int(part.id))
         if str(context.get("state") or "").strip().lower() == "released":
             raise ValueError(
@@ -1262,6 +1399,10 @@ class BomService(BaseService):
             d["iteration_number"] = version.get("iteration_number")
             d["category_names"] = list(category_map.get(int(part.id), []))
             d["binding_update_count"] = int(binding_updates.get(int(part.id), 0))
+            d["ebom_behavior"] = "INHERIT"
+            d["resolved_ebom_behavior"] = normalize_default_behavior(
+                d.get("default_ebom_behavior")
+            )
             if d.get("locked"):
                 d["locked_by_username"] = lock_owner.get(int(d.get("id")))
             results.append(d)
@@ -1441,7 +1582,31 @@ class BomService(BaseService):
     def _path_key(path) -> str:
         if isinstance(path, str):
             return path
-        return "/".join(str(int(value)) for value in (path or ()))
+        segments = []
+        for value in path or ():
+            if isinstance(value, (tuple, list)):
+                part_id = int(value[0])
+                usage_id = value[1] if len(value) > 1 else None
+                segment = str(part_id)
+                if usage_id is not None:
+                    segment += f":u{int(usage_id)}"
+                segments.append(segment)
+            else:
+                segments.append(str(int(value)))
+        return "/".join(segments)
+
+    @staticmethod
+    def _path_part_ids(path) -> tuple[int, ...]:
+        raw_segments = str(path or "").split("/") if isinstance(path, str) else path or ()
+        result = []
+        for value in raw_segments:
+            if isinstance(value, (tuple, list)):
+                value = value[0]
+            else:
+                value = str(value).split(":u", 1)[0]
+            if str(value).strip():
+                result.append(int(value))
+        return tuple(result)
 
     def _build_lazy_index(self, project_id: int) -> Dict:
         """Build a small ID-only index used by lazy rows and permanent numbering."""
@@ -1452,12 +1617,14 @@ class BomService(BaseService):
         part_ids = self.bom_repo.get_project_ids(pid)
         part_set = set(part_ids)
         children = defaultdict(list)
+        occurrences = defaultdict(list)
         all_children = set()
         for row in self.children_repo.get_structure_rows(pid):
             parent_id = int(row["parent_id"])
             child_id = int(row["child_id"])
             if parent_id in part_set and child_id in part_set:
                 children[parent_id].append(child_id)
+                occurrences[parent_id].append(dict(row))
                 all_children.add(child_id)
         roots = [part_id for part_id in part_ids if part_id not in all_children]
 
@@ -1476,20 +1643,20 @@ class BomService(BaseService):
         folder_path_rows = {}
         visited_paths = set()
 
-        def walk_item(part_id: int, parent_path: tuple):
+        def walk_item(part_id: int, parent_path: tuple, usage_id=None):
             nonlocal row_number
-            path = parent_path + (int(part_id),)
+            path = parent_path + ((int(part_id), usage_id),)
             if path in visited_paths:
                 return
             visited_paths.add(path)
             row_number += 1
             path_rows[self._path_key(path)] = row_number
             part_rows[int(part_id)].append(row_number)
-            if int(part_id) in parent_path:
+            if int(part_id) in self._path_part_ids(parent_path):
                 return
-            walk_context(int(part_id), children.get(int(part_id), []), path)
+            walk_context(int(part_id), occurrences.get(int(part_id), []), path)
 
-        def walk_context(parent_id, item_ids, parent_path: tuple):
+        def walk_context(parent_id, item_occurrences, parent_path: tuple):
             context_folders = folders_by_context.get(parent_id, [])
             by_parent_folder = defaultdict(list)
             roots_for_context = []
@@ -1506,9 +1673,12 @@ class BomService(BaseService):
             for values in by_parent_folder.values():
                 values.sort(key=sort_key)
 
-            for item_id in item_ids:
+            for occurrence in item_occurrences:
+                item_id = int(occurrence["child_id"])
                 if int(item_id) not in assigned:
-                    walk_item(int(item_id), parent_path)
+                    walk_item(
+                        int(item_id), parent_path, occurrence.get("usage_id")
+                    )
 
             def walk_folder(folder, folder_parent_path: str):
                 nonlocal row_number
@@ -1516,17 +1686,32 @@ class BomService(BaseService):
                 folder_rows[int(folder["id"])] = row_number
                 folder_path = f"{folder_parent_path}/f{int(folder['id'])}" if folder_parent_path else f"f{int(folder['id'])}"
                 folder_path_rows[folder_path] = row_number
-                allowed = set(int(value) for value in item_ids)
+                allowed = {
+                    int(occurrence["child_id"]) for occurrence in item_occurrences
+                }
                 for item_id in folder.get("item_ids") or []:
-                    if int(item_id) in allowed:
-                        walk_item(int(item_id), parent_path)
+                    if int(item_id) not in allowed:
+                        continue
+                    for occurrence in item_occurrences:
+                        if int(occurrence["child_id"]) == int(item_id):
+                            walk_item(
+                                int(item_id), parent_path,
+                                occurrence.get("usage_id"),
+                            )
                 for child_folder in by_parent_folder.get(int(folder["id"]), []):
                     walk_folder(child_folder, folder_path)
 
             for folder in roots_for_context:
                 walk_folder(folder, self._path_key(parent_path))
 
-        walk_context(None, roots, ())
+        walk_context(
+            None,
+            [
+                {"child_id": root_id, "usage_id": None}
+                for root_id in roots
+            ],
+            (),
+        )
         # Corrupt/circular legacy structures may have no natural root. Keep them locatable.
         indexed_parts = set(part_rows)
         for part_id in part_ids:
@@ -1543,6 +1728,7 @@ class BomService(BaseService):
             "project_id": pid,
             "roots": roots,
             "children": dict(children),
+            "occurrences": {key: list(value) for key, value in occurrences.items()},
             "path_rows": path_rows,
             "part_rows": {key: list(value) for key, value in part_rows.items()},
             "folder_rows": folder_rows,
@@ -1555,11 +1741,20 @@ class BomService(BaseService):
         self._tree_dirty.discard(pid)
         return index
 
-    def _lazy_level_nodes(self, project_id: int, ids, parent_path=()) -> List[Dict]:
+    def _lazy_level_nodes(
+        self, project_id: int, ids, parent_path=(), occurrence_rows=None
+    ) -> List[Dict]:
         pid = int(project_id)
         index = self._build_lazy_index(pid)
-        path_prefix = tuple(int(value) for value in (parent_path or ()))
-        parts = self.bom_repo.get_many(pid, ids)
+        path_prefix_key = self._path_key(parent_path)
+        ancestor_ids = self._path_part_ids(path_prefix_key)
+        occurrence_rows = list(occurrence_rows or [])
+        requested_ids = (
+            [int(row["child_id"]) for row in occurrence_rows]
+            if occurrence_rows else list(ids or [])
+        )
+        parts = self.bom_repo.get_many(pid, requested_ids)
+        parts_by_id = {int(part.id): part for part in parts}
         categories = self.bom_repo.get_categories_for_boms(part.id for part in parts)
         versions = self.revision_repo.get_current_contexts(part.id for part in parts)
         try:
@@ -1567,9 +1762,19 @@ class BomService(BaseService):
         except Exception:
             lock_owner = {}
         nodes = []
-        for part in parts:
+        sources = (
+            [(parts_by_id.get(int(row["child_id"])), row) for row in occurrence_rows]
+            if occurrence_rows else [(part, None) for part in parts]
+        )
+        for part, occurrence in sources:
+            if part is None:
+                continue
             node = part.__dict__.copy()
-            path = path_prefix + (int(part.id),)
+            usage_id = occurrence.get("usage_id") if occurrence else None
+            segment = str(int(part.id))
+            if usage_id is not None:
+                segment += f":u{int(usage_id)}"
+            path = f"{path_prefix_key}/{segment}" if path_prefix_key else segment
             node["children"] = []
             node["category_names"] = list(categories.get(int(part.id), []))
             version = versions.get(int(part.id), {})
@@ -1578,9 +1783,27 @@ class BomService(BaseService):
             node["binding_update_count"] = int(
                 (index.get("binding_update_counts") or {}).get(int(part.id), 0)
             )
-            node["_tree_path"] = self._path_key(path)
+            node["_tree_path"] = path
             node["_tree_row_number"] = index["path_rows"].get(node["_tree_path"], "")
-            node["_has_children"] = bool(index["children"].get(int(part.id))) and int(part.id) not in path_prefix
+            node["_has_children"] = (
+                bool(index["children"].get(int(part.id)))
+                and int(part.id) not in ancestor_ids
+            )
+            node["usage_id"] = int(usage_id) if usage_id is not None else None
+            node["relation_parent_id"] = (
+                int(occurrence["parent_id"]) if occurrence else None
+            )
+            node["quantity"] = (
+                max(1, int(occurrence.get("quantity") or 1)) if occurrence else 1
+            )
+            node["ebom_behavior"] = normalize_occurrence_behavior(
+                occurrence.get("ebom_behavior") if occurrence else None
+            )
+            node["resolved_ebom_behavior"] = (
+                normalize_default_behavior(node.get("default_ebom_behavior"))
+                if node["ebom_behavior"] == "INHERIT"
+                else node["ebom_behavior"]
+            )
             node["_defer_indicators"] = True
             if node.get("locked"):
                 node["locked_by_username"] = lock_owner.get(int(part.id))
@@ -1601,9 +1824,10 @@ class BomService(BaseService):
     def get_bom_lazy_children(self, project_id: int, parent_id: int, parent_path=()) -> List[Dict]:
         index = self._build_lazy_index(int(project_id))
         child_ids = index["children"].get(int(parent_id), [])
-        if isinstance(parent_path, str):
-            parent_path = tuple(int(value) for value in parent_path.split("/") if value)
-        return self._lazy_level_nodes(int(project_id), child_ids, parent_path)
+        occurrences = index["occurrences"].get(int(parent_id), [])
+        return self._lazy_level_nodes(
+            int(project_id), child_ids, parent_path, occurrence_rows=occurrences
+        )
 
     def get_bom_lazy_numbering(self, project_id: int) -> Dict:
         index = self._build_lazy_index(int(project_id))
@@ -1708,6 +1932,16 @@ class BomService(BaseService):
         d["iteration_number"] = version_context.get("iteration_number")
         d["current_version"] = version_context.get("version_label") or str(d.get("revision") or "")
         d["revision_state"] = version_context.get("state") or d.get("lifecycle_state")
+        d["delivery_policy"] = delivery_policy_label(
+            d.get("default_ebom_behavior")
+        )
+        d["cad_dependency_count"] = self.bom_repo.count_cad_dependencies(int(part_id))
+        represented_part_id = d.get("represented_part_id")
+        if represented_part_id:
+            represented = self.bom_repo.get_by_id(int(represented_part_id))
+            if represented:
+                d["represented_part_name"] = str(represented.name or "")
+                d["represented_part_aes"] = str(represented.aes_number or "")
         if str(d.get("type") or "").strip().lower() in {"asm", "assembly"}:
             try:
                 d["binding_update_count"] = self.revision_repo.count_parent_binding_updates(
@@ -1787,6 +2021,10 @@ class BomService(BaseService):
             if str(context.get("state") or "").strip().lower() == "released":
                 raise ValueError(f"{context.get('version_label')} is already released.")
         IssueService().assert_no_critical_issues(related_ids, operation="release", include_children=True)
+        for related_id in related_ids:
+            self.release_validation_service.assert_bom_releasable(
+                related_id, include_children=True
+            )
         managed_files = ManagedFileService()
         for related_id in related_ids:
             managed_files.capture_current_iteration(related_id)
@@ -1824,6 +2062,44 @@ class BomService(BaseService):
         )
         self._tree_dirty.add(int(self.session.project_id))
         return changed
+
+    def set_occurrence_ebom_behavior(
+        self, parent_id: int, usage_id: int, ebom_behavior: str
+    ) -> Dict:
+        """Change one usage policy; the checked-out parent owns the new iteration."""
+        self._assert_checked_out_for_change(
+            int(parent_id), "edit an occurrence's EBOM behavior"
+        )
+        relation = self.children_repo.set_ebom_behavior(
+            int(parent_id), int(usage_id),
+            normalize_occurrence_behavior(ebom_behavior),
+        )
+        self.revision_repo.sync_working_bindings(
+            int(parent_id), int(self.user_id)
+        )
+        self._tree_dirty.add(int(self.session.project_id))
+        return relation.__dict__.copy()
+
+    def get_released_ebom(self, root_bom_id: int, iteration_id=None) -> Dict:
+        return self.ebom_service.resolve_bom(int(root_bom_id), iteration_id)
+
+    def get_released_ebom_project(self, project_id: int | None = None) -> Dict:
+        project_id = int(project_id or self.session.project_id)
+        return self.ebom_service.resolve_project(project_id)
+
+    def get_effective_ebom_where_used(self, child_bom_id: int) -> List[Dict]:
+        if not self.session.project_id:
+            return []
+        return self.ebom_service.effective_where_used(
+            int(self.session.project_id), int(child_bom_id)
+        )
+
+    def export_released_ebom(
+        self, root_bom_id: int, file_path: str, iteration_id=None
+    ) -> Dict:
+        return self.ebom_export_service.export_bom(
+            int(root_bom_id), file_path, iteration_id
+        )
 
     # -------------------------------
     # REMOVE CHILD RELATIONSHIP
@@ -2015,11 +2291,49 @@ class BomService(BaseService):
 
         uses = build_uses(int(part_id), set())
         where_used = build_where_used(int(part_id))
+        effective_where_used = part_node(int(part_id), "Selected Item")
+        effective_count = 0
+        effective_error = ""
+        if effective_where_used:
+            try:
+                for occurrence in self.get_effective_ebom_where_used(int(part_id)):
+                    parent_id = int(occurrence["effective_parent_bom_id"])
+                    parent = part_node(
+                        parent_id,
+                        "Effective EBOM Parent",
+                        occurrence.get("effective_quantity"),
+                        usage_id=occurrence.get("usage_id"),
+                        relation_parent_id=parent_id,
+                    )
+                    if not parent:
+                        continue
+                    promoted = list(occurrence.get("promoted_through") or [])
+                    parent["relation"] = (
+                        "Effective Parent (promoted)" if promoted
+                        else "Effective EBOM Parent"
+                    )
+                    parent["promotion_path"] = " > ".join(
+                        str(
+                            value.get("aes_number")
+                            or value.get("name")
+                            or value.get("bom_id")
+                        )
+                        for value in promoted
+                    )
+                    parent["source_quantity"] = occurrence.get("source_quantity")
+                    parent["effective_quantity"] = occurrence.get("effective_quantity")
+                    effective_where_used["children"].append(parent)
+                    effective_count += 1
+            except Exception as exc:
+                effective_error = str(exc)
         return {
             "uses": uses,
             "where_used": where_used,
+            "effective_where_used": effective_where_used,
             "uses_count": descendant_count(uses),
             "where_used_count": descendant_count(where_used),
+            "effective_where_used_count": effective_count,
+            "effective_where_used_error": effective_error,
         }
 
     # -------------------------------

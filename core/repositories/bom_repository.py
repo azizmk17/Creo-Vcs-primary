@@ -1,6 +1,12 @@
 import sqlite3
 from typing import List, Optional
 from core.models.bom_model import Bom
+from core.ebom_policy import (
+    normalize_classification,
+    normalize_cad_control_mode,
+    normalize_default_behavior,
+    normalize_requirement,
+)
 from config import DB_NAME
 
 class BomRepository:
@@ -8,6 +14,7 @@ class BomRepository:
         self.db_name = db_name
         self._ensure_metadata_columns()
         self._ensure_plm_columns()
+        self._ensure_ebom_columns()
         self._ensure_category_schema()
 
     def get_conn(self):
@@ -43,6 +50,51 @@ class BomRepository:
                     conn.execute("ALTER TABLE bom ADD COLUMN released_at TEXT")
                 if "pending_revision_code" not in cols:
                     conn.execute("ALTER TABLE bom ADD COLUMN pending_revision_code TEXT")
+        except Exception:
+            pass
+
+    def _ensure_ebom_columns(self):
+        """Compatibility fallback when a repository is opened before migrations."""
+        try:
+            with self.get_conn() as conn:
+                columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(bom)")}
+                definitions = {
+                    "classification": "classification TEXT NOT NULL DEFAULT 'PHYSICAL'",
+                    "default_ebom_behavior": (
+                        "default_ebom_behavior TEXT NOT NULL DEFAULT 'NORMAL'"
+                    ),
+                    "cad_requirement": (
+                        "cad_requirement TEXT NOT NULL DEFAULT 'OPTIONAL'"
+                    ),
+                    "drawing_requirement": (
+                        "drawing_requirement TEXT NOT NULL DEFAULT 'OPTIONAL'"
+                    ),
+                    "represented_part_id": "represented_part_id INTEGER",
+                    "cad_control_mode": (
+                        "cad_control_mode TEXT NOT NULL DEFAULT 'CONTROLLED'"
+                    ),
+                }
+                for name, definition in definitions.items():
+                    if name not in columns:
+                        conn.execute(f"ALTER TABLE bom ADD COLUMN {definition}")
+                conn.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS bom_cad_dependencies (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        project_id INTEGER NOT NULL,
+                        owner_bom_id INTEGER NOT NULL,
+                        base_file_name TEXT NOT NULL COLLATE NOCASE,
+                        original_filename TEXT NOT NULL DEFAULT '',
+                        assigned_by INTEGER,
+                        assigned_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        UNIQUE(project_id, base_file_name)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_bom_cad_dependencies_owner
+                        ON bom_cad_dependencies(owner_bom_id);
+                    CREATE INDEX IF NOT EXISTS idx_bom_cad_dependencies_project
+                        ON bom_cad_dependencies(project_id, base_file_name);
+                    """
+                )
         except Exception:
             pass
 
@@ -151,12 +203,22 @@ class BomRepository:
             cur = conn.cursor()
             cur.execute("""
                 INSERT INTO bom (type, name, part_number, drawing_number, aes_number,
-                                filename, drawing, base_file_name, base_drw_name, material, weight, notes, pdf_path, step_path, status, created, modified, project_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                filename, drawing, base_file_name, base_drw_name, material,
+                                weight, notes, pdf_path, step_path, status, created, modified,
+                                project_id, classification, default_ebom_behavior,
+                                cad_requirement, drawing_requirement, represented_part_id,
+                                cad_control_mode)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 bom.type, bom.name, bom.part_number, bom.drawing_number, bom.aes_number,
                 bom.filename, bom.drawing, bom.base_file_name, bom.base_drw_name, bom.material, bom.weight, bom.notes, bom.pdf_path, bom.step_path, bom.status,
-                bom.created, bom.modified, bom.project_id
+                bom.created, bom.modified, bom.project_id,
+                normalize_classification(bom.classification),
+                normalize_default_behavior(bom.default_ebom_behavior),
+                normalize_requirement(bom.cad_requirement, "CAD requirement"),
+                normalize_requirement(bom.drawing_requirement, "drawing requirement"),
+                bom.represented_part_id,
+                normalize_cad_control_mode(bom.cad_control_mode),
             ))
             return cur.lastrowid
 
@@ -176,7 +238,12 @@ class BomRepository:
     def get_by_aes(self, aes_number: str, project_id) -> Optional[Bom]:
         with self.get_conn() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT * FROM bom WHERE aes_number=? AND project_id=?", (aes_number,project_id,))
+            cur.execute(
+                """SELECT * FROM bom WHERE aes_number=? AND project_id=?
+                   ORDER BY CASE WHEN represented_part_id IS NULL THEN 0 ELSE 1 END, id
+                   LIMIT 1""",
+                (aes_number, project_id),
+            )
             row = cur.fetchone()
             if row:
                 return Bom(**row)
@@ -291,6 +358,186 @@ class BomRepository:
             cur.execute("SELECT * FROM bom WHERE project_id=?", (project_id,))
             rows = cur.fetchall()
             return [Bom(**row) for row in rows]
+
+    def list_deliverable_parts(self, project_id: int, exclude_id=None) -> List[dict]:
+        """Return physical BOM identities that CAD-only representations may reference."""
+        params = [int(project_id)]
+        exclude_clause = ""
+        if exclude_id is not None:
+            exclude_clause = " AND id<>?"
+            params.append(int(exclude_id))
+        with self.get_conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, aes_number, name, type
+                FROM bom
+                WHERE project_id=?
+                  AND represented_part_id IS NULL
+                  AND UPPER(COALESCE(classification, 'PHYSICAL'))='PHYSICAL'
+                  {exclude_clause}
+                ORDER BY lower(COALESCE(aes_number, '')), lower(name), id
+                """,
+                params,
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_representations(self, represented_part_id: int) -> List[Bom]:
+        with self.get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM bom WHERE represented_part_id=? ORDER BY id",
+                (int(represented_part_id),),
+            ).fetchall()
+            return [Bom(**row) for row in rows]
+
+    def sync_representation_aes(self, represented_part_id: int, aes_number: str) -> None:
+        with self.get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE bom
+                SET aes_number=?, modified=datetime('now')
+                WHERE represented_part_id=?
+                """,
+                (str(aes_number or ""), int(represented_part_id)),
+            )
+
+    def list_supplier_packages(self, project_id: int) -> List[dict]:
+        with self.get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT b.id, b.aes_number, b.name, b.type,
+                       COUNT(d.id) AS dependency_count
+                FROM bom b
+                LEFT JOIN bom_cad_dependencies d ON d.owner_bom_id=b.id
+                WHERE b.project_id=?
+                  AND UPPER(COALESCE(b.cad_control_mode,'CONTROLLED'))='SUPPLIER_PACKAGE'
+                GROUP BY b.id
+                ORDER BY lower(COALESCE(b.aes_number,'')), lower(b.name), b.id
+                """,
+                (int(project_id),),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def assign_cad_dependencies(
+        self, project_id: int, owner_bom_id: int, dependencies, assigned_by=None
+    ) -> int:
+        cleaned = []
+        seen = set()
+        for dependency in dependencies or []:
+            base = str((dependency or {}).get("base_file_name") or "").strip()
+            filename = str((dependency or {}).get("original_filename") or base).strip()
+            key = base.casefold()
+            if base and key not in seen:
+                seen.add(key)
+                cleaned.append((base, filename))
+        if not cleaned:
+            return 0
+        with self.get_conn() as conn:
+            owner = conn.execute(
+                """
+                SELECT id FROM bom
+                WHERE id=? AND project_id=?
+                  AND UPPER(COALESCE(cad_control_mode,'CONTROLLED'))='SUPPLIER_PACKAGE'
+                """,
+                (int(owner_bom_id), int(project_id)),
+            ).fetchone()
+            if not owner:
+                raise ValueError("Select a supplier-managed CAD package in this project.")
+            for base, filename in cleaned:
+                conn.execute(
+                    """
+                    INSERT INTO bom_cad_dependencies(
+                        project_id, owner_bom_id, base_file_name,
+                        original_filename, assigned_by
+                    ) VALUES(?,?,?,?,?)
+                    ON CONFLICT(project_id, base_file_name) DO UPDATE SET
+                        owner_bom_id=excluded.owner_bom_id,
+                        original_filename=excluded.original_filename,
+                        assigned_by=excluded.assigned_by,
+                        assigned_at=datetime('now')
+                    """,
+                    (int(project_id), int(owner_bom_id), base, filename, assigned_by),
+                )
+        return len(cleaned)
+
+    def list_cad_dependencies(self, project_id: int, owner_bom_id=None) -> List[dict]:
+        params = [int(project_id)]
+        owner_clause = ""
+        if owner_bom_id is not None:
+            owner_clause = " AND d.owner_bom_id=?"
+            params.append(int(owner_bom_id))
+        with self.get_conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT d.*, b.aes_number AS owner_aes_number, b.name AS owner_name
+                FROM bom_cad_dependencies d
+                JOIN bom b ON b.id=d.owner_bom_id
+                WHERE d.project_id=? {owner_clause}
+                ORDER BY lower(COALESCE(b.aes_number,'')), lower(d.base_file_name), d.id
+                """,
+                params,
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def remove_cad_dependencies(self, project_id: int, dependency_ids) -> int:
+        ids = sorted({int(value) for value in (dependency_ids or [])})
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        with self.get_conn() as conn:
+            cur = conn.execute(
+                f"DELETE FROM bom_cad_dependencies WHERE project_id=? AND id IN ({placeholders})",
+                [int(project_id), *ids],
+            )
+            return int(cur.rowcount or 0)
+
+    def remove_cad_dependency_by_base(self, project_id: int, base_file_name: str) -> int:
+        with self.get_conn() as conn:
+            cur = conn.execute(
+                """
+                DELETE FROM bom_cad_dependencies
+                WHERE project_id=? AND base_file_name=? COLLATE NOCASE
+                """,
+                (int(project_id), str(base_file_name or "")),
+            )
+            return int(cur.rowcount or 0)
+
+    def dependency_base_names(self, project_id: int) -> set[str]:
+        with self.get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT d.base_file_name
+                FROM bom_cad_dependencies d
+                JOIN bom b ON b.id=d.owner_bom_id
+                WHERE d.project_id=?
+                  AND UPPER(COALESCE(b.cad_control_mode,'CONTROLLED'))='SUPPLIER_PACKAGE'
+                """,
+                (int(project_id),),
+            ).fetchall()
+            return {str(row[0]).casefold() for row in rows if row[0]}
+
+    def get_dependency_owner(self, project_id: int, base_file_name: str) -> Optional[dict]:
+        with self.get_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT d.id AS dependency_id, d.owner_bom_id, d.base_file_name,
+                       b.aes_number, b.name
+                FROM bom_cad_dependencies d
+                JOIN bom b ON b.id=d.owner_bom_id
+                WHERE d.project_id=? AND d.base_file_name=? COLLATE NOCASE
+                  AND UPPER(COALESCE(b.cad_control_mode,'CONTROLLED'))='SUPPLIER_PACKAGE'
+                LIMIT 1
+                """,
+                (int(project_id), str(base_file_name or "")),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def count_cad_dependencies(self, owner_bom_id: int) -> int:
+        with self.get_conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM bom_cad_dependencies WHERE owner_bom_id=?",
+                (int(owner_bom_id),),
+            ).fetchone()
+            return int(row[0] or 0) if row else 0
 
     def get_project_ids(self, project_id: int) -> List[int]:
         """Return the lightweight project membership used by the lazy BOM index."""
@@ -511,12 +758,22 @@ class BomRepository:
             cur.execute("""
                 UPDATE bom
                 SET type=?, name=?, part_number=?, drawing_number=?, aes_number=?,
-                    filename=?, drawing=?, material=?, weight=?, notes=?, pdf_path=?, step_path=?, status=?, created=?, modified=?
+                    filename=?, drawing=?, material=?, weight=?, notes=?, pdf_path=?, step_path=?,
+                    status=?, created=?, modified=?, classification=?,
+                    default_ebom_behavior=?, cad_requirement=?, drawing_requirement=?,
+                    represented_part_id=?, cad_control_mode=?
                 WHERE id=?
             """, (
                 bom.type, bom.name, bom.part_number, bom.drawing_number, bom.aes_number,
                 bom.filename, bom.drawing, bom.material, bom.weight, bom.notes, bom.pdf_path, bom.step_path, bom.status,
-                bom.created, bom.modified, bom.id
+                bom.created, bom.modified,
+                normalize_classification(bom.classification),
+                normalize_default_behavior(bom.default_ebom_behavior),
+                normalize_requirement(bom.cad_requirement, "CAD requirement"),
+                normalize_requirement(bom.drawing_requirement, "drawing requirement"),
+                bom.represented_part_id,
+                normalize_cad_control_mode(bom.cad_control_mode),
+                bom.id,
             ))
 
             conn.commit()

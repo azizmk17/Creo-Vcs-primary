@@ -1,7 +1,7 @@
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit,
-    QMessageBox
+    QMessageBox, QInputDialog, QLineEdit, QCheckBox
 )
 from PyQt5.QtGui import QFont
 from PyQt5.QtCore import Qt
@@ -34,6 +34,7 @@ class DiagPage(QDialog):
 
         self.working_dir = None
         self.commits_dir = None
+        self._checked_by_table = {}
 
         self.setup_ui()
         self.connect_events()
@@ -53,6 +54,8 @@ class DiagPage(QDialog):
         try:
             self.btn_force_integrate.setEnabled(can_admin_actions)
             self.btn_delete_selected.setEnabled(can_admin_actions)
+            self.btn_assign_supplier.setEnabled(can_admin_actions)
+            self.btn_unassign_supplier.setEnabled(can_admin_actions)
             if not project_loaded:
                 tip = "Load a project to use this action."
             elif not can_admin_actions:
@@ -62,6 +65,8 @@ class DiagPage(QDialog):
             if tip:
                 self.btn_force_integrate.setToolTip(tip)
                 self.btn_delete_selected.setToolTip(tip)
+                self.btn_assign_supplier.setToolTip(tip)
+                self.btn_unassign_supplier.setToolTip(tip)
         except Exception:
             pass
 
@@ -94,18 +99,48 @@ class DiagPage(QDialog):
             hbox.addWidget(w)
         layout.addWidget(status_frame)
 
+        filter_row = QHBoxLayout()
+        self.table_search_input = QLineEdit()
+        self.table_search_input.setPlaceholderText(
+            "Search the current diagnostic tab..."
+        )
+        self.table_search_input.setClearButtonEnabled(True)
+        filter_row.addWidget(self.table_search_input, 1)
+        self.show_only_selected_input = QCheckBox("Show only selected")
+        filter_row.addWidget(self.show_only_selected_input)
+        self.checked_count_label = QLabel("0 selected")
+        self.checked_count_label.setStyleSheet("color: #6b7280; font-weight: 600;")
+        filter_row.addWidget(self.checked_count_label)
+        layout.addLayout(filter_row)
+
         # tabs
         self.tabs = QTabWidget()
         self.tab_db = self.create_tab_table("Database vs Commits Folder")
         self.tab_working = self.create_tab_table("Working Directory Validation")
         self.tab_orphan = self.create_tab_table("Untracked / Orphan Files")
+        self.tab_supplier = self.create_tab_table("Supplier-owned CAD Dependencies")
         self.tabs.addTab(self.tab_db, "Database Sync")
         self.tabs.addTab(self.tab_working, "Working Dir Check")
         self.tabs.addTab(self.tab_orphan, "Orphan Files")
+        self.tabs.addTab(self.tab_supplier, "Supplier Packages")
         layout.addWidget(self.tabs)
 
         # Actions for unexpected parts
         action_row = QHBoxLayout()
+        self.btn_assign_supplier = QPushButton("Assign selected to supplier package")
+        self.btn_assign_supplier.setObjectName("primary")
+        self.btn_assign_supplier.setToolTip(
+            "Assign selected orphan or unexpected Creo files to a black-box supplier assembly without creating BOM items."
+        )
+        action_row.addWidget(self.btn_assign_supplier)
+
+        self.btn_unassign_supplier = QPushButton("Unassign selected package files")
+        self.btn_unassign_supplier.setObjectName("secondary")
+        self.btn_unassign_supplier.setToolTip(
+            "Remove selected ownership records so the files become orphan/unexpected again."
+        )
+        action_row.addWidget(self.btn_unassign_supplier)
+
         self.btn_force_integrate = QPushButton("Force integrate selected")
         self.btn_force_integrate.setObjectName("secondary")
         self.btn_force_integrate.setToolTip(
@@ -148,6 +183,11 @@ class DiagPage(QDialog):
         self.btn_scan.clicked.connect(self.run_full_scan)
         self.btn_force_integrate.clicked.connect(self.force_integrate_selected)
         self.btn_delete_selected.clicked.connect(self.delete_selected_unexpected)
+        self.btn_assign_supplier.clicked.connect(self.assign_selected_to_supplier_package)
+        self.btn_unassign_supplier.clicked.connect(self.unassign_selected_supplier_files)
+        self.table_search_input.textChanged.connect(self._apply_current_table_filter)
+        self.show_only_selected_input.toggled.connect(self._apply_current_table_filter)
+        self.tabs.currentChanged.connect(self._apply_current_table_filter)
 
     def create_status_box(self, title, value, color):
         frame = QFrame()
@@ -172,9 +212,70 @@ class DiagPage(QDialog):
         # enable row selection for force-integrate
         table.setSelectionBehavior(QTableWidget.SelectRows)
         table.setSelectionMode(QTableWidget.ExtendedSelection)
+        table.itemChanged.connect(
+            lambda item, current_table=table: self._on_table_item_changed(
+                current_table, item
+            )
+        )
         vbox.addWidget(table)
         frame.table = table
         return frame
+
+    @staticmethod
+    def _row_key(item: QTableWidgetItem) -> str:
+        return str(item.data(Qt.UserRole + 1) or "") if item else ""
+
+    def _checked_keys(self, table: QTableWidget) -> set[str]:
+        return self._checked_by_table.setdefault(table, set())
+
+    def _on_table_item_changed(self, table: QTableWidget, item: QTableWidgetItem) -> None:
+        if item is None or item.column() != 0:
+            return
+        key = self._row_key(item)
+        if not key:
+            return
+        checked = self._checked_keys(table)
+        if item.checkState() == Qt.Checked:
+            checked.add(key)
+        else:
+            checked.discard(key)
+        self._apply_table_filter(table)
+
+    def _apply_current_table_filter(self, *_args) -> None:
+        try:
+            current = self.tabs.currentWidget()
+            table = getattr(current, "table", None)
+            if table is not None:
+                self._apply_table_filter(table)
+        except Exception:
+            pass
+
+    def _apply_table_filter(self, table: QTableWidget) -> None:
+        query = str(self.table_search_input.text() or "").strip().casefold()
+        selected_only = self.show_only_selected_input.isChecked()
+        for row in range(table.rowCount()):
+            first = table.item(row, 0)
+            checked = bool(first and first.checkState() == Qt.Checked)
+            searchable = " ".join(
+                str(table.item(row, column).text() or "")
+                for column in range(table.columnCount())
+                if table.item(row, column) is not None
+            ).casefold()
+            table.setRowHidden(
+                row,
+                bool((query and query not in searchable) or (selected_only and not checked)),
+            )
+        if table is getattr(self.tabs.currentWidget(), "table", None):
+            self.checked_count_label.setText(
+                f"{len(self._checked_keys(table))} selected"
+            )
+
+    def _checked_rows(self, table: QTableWidget) -> list[int]:
+        return [
+            row for row in range(table.rowCount())
+            if table.item(row, 0) is not None
+            and table.item(row, 0).checkState() == Qt.Checked
+        ]
 
     def run_full_scan(self):
         self.console.append(">> Running full synchronization analysis...\n")
@@ -189,11 +290,13 @@ class DiagPage(QDialog):
         db_result = self.service.check_db_vs_commits(self.commits_dir)
         working_result = self.service.check_working_directory(self.working_dir)
         orphan_result = self.service.check_orphan_files(self.working_dir)
+        supplier_dependencies = self.service.list_cad_dependencies()
 
         # Update tables
         self.populate_table(self.tab_db.table, db_result["rows"])
         self.populate_table(self.tab_working.table, working_result)
         self.populate_table(self.tab_orphan.table, orphan_result)
+        self._populate_supplier_dependencies(supplier_dependencies)
 
         # Update summary
         def update_status(label_frame, color):
@@ -226,6 +329,128 @@ class DiagPage(QDialog):
         self.console.append(">> Scan complete.\n")
         self._apply_action_permissions()
 
+    def _populate_supplier_dependencies(self, dependencies) -> None:
+        table = self.tab_supplier.table
+        rows = list(dependencies or [])
+        previous = set(self._checked_keys(table))
+        incoming = set()
+        table.blockSignals(True)
+        table.setRowCount(len(rows))
+        for row_index, dependency in enumerate(rows):
+            filename = str(
+                dependency.get("original_filename")
+                or dependency.get("base_file_name")
+                or ""
+            )
+            owner = " — ".join(
+                value for value in (
+                    str(dependency.get("owner_aes_number") or "").strip(),
+                    str(dependency.get("owner_name") or "").strip(),
+                ) if value
+            )
+            name_item = QTableWidgetItem(filename)
+            name_item.setData(Qt.UserRole, int(dependency["id"]))
+            key = f"dependency:{int(dependency['id'])}"
+            incoming.add(key)
+            name_item.setData(Qt.UserRole + 1, key)
+            name_item.setFlags(name_item.flags() | Qt.ItemIsUserCheckable)
+            name_item.setCheckState(Qt.Checked if key in previous else Qt.Unchecked)
+            table.setItem(row_index, 0, name_item)
+            table.setItem(row_index, 1, QTableWidgetItem("Owned dependency"))
+            table.setItem(row_index, 2, QTableWidgetItem(owner))
+        self._checked_by_table[table] = previous.intersection(incoming)
+        table.blockSignals(False)
+        self._apply_table_filter(table)
+
+    def assign_selected_to_supplier_package(self):
+        if not self.perm.can("merge"):
+            QMessageBox.warning(self, "Permission denied", "Only Master/Admin can assign package files.")
+            return
+        current = self.tabs.currentWidget()
+        if current not in (self.tab_orphan, self.tab_working):
+            QMessageBox.information(
+                self,
+                "Select files",
+                "Select files in Orphan Files or Working Dir Check first.",
+            )
+            return
+        table = current.table
+        selected_rows = self._checked_rows(table)
+        filenames = [
+            str(table.item(row, 0).text() or "").strip()
+            for row in selected_rows if table.item(row, 0)
+        ]
+        if not filenames:
+            QMessageBox.information(self, "No selection", "Check one or more Creo files.")
+            return
+        packages = self.service.list_supplier_packages()
+        if not packages:
+            QMessageBox.information(
+                self,
+                "No supplier package",
+                "Edit the owning assembly and set CAD Control to SUPPLIER PACKAGE first.",
+            )
+            return
+        labels = [
+            f"{row.get('aes_number') or 'No AES'} — {row.get('name') or row.get('id')} ({int(row.get('dependency_count') or 0)} files)"
+            for row in packages
+        ]
+        selected_label, ok = QInputDialog.getItem(
+            self,
+            "Assign CAD dependencies",
+            "Supplier-managed assembly:",
+            labels,
+            0,
+            False,
+        )
+        if not ok:
+            return
+        package = packages[labels.index(selected_label)]
+        try:
+            count = self.service.assign_cad_dependencies(int(package["id"]), filenames)
+        except Exception as exc:
+            QMessageBox.critical(self, "Assignment failed", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "Dependencies assigned",
+            f"Assigned {count} CAD file(s) to {package.get('aes_number') or package.get('name')}.\n"
+            "They are no longer checked as individual BOM files.",
+        )
+        self.refresh_status()
+        self.tabs.setCurrentWidget(self.tab_supplier)
+
+    def unassign_selected_supplier_files(self):
+        if not self.perm.can("merge"):
+            QMessageBox.warning(self, "Permission denied", "Only Master/Admin can unassign package files.")
+            return
+        table = self.tab_supplier.table
+        dependency_ids = []
+        for row in self._checked_rows(table):
+            item = table.item(row, 0)
+            if item and item.data(Qt.UserRole) is not None:
+                dependency_ids.append(int(item.data(Qt.UserRole)))
+        if not dependency_ids:
+            QMessageBox.information(
+                self, "No selection", "Check package files in the Supplier Packages tab."
+            )
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Unassign dependencies",
+            f"Unassign {len(dependency_ids)} selected CAD file(s)? They may appear as orphan files again.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        try:
+            count = self.service.remove_cad_dependencies(dependency_ids)
+        except Exception as exc:
+            QMessageBox.critical(self, "Unassign failed", str(exc))
+            return
+        QMessageBox.information(self, "Dependencies unassigned", f"Unassigned {count} file(s).")
+        self.refresh_status()
+
     def force_integrate_selected(self):
         """Take selected rows from Working Dir Check where status is Unexpected and allowlist them."""
         if not self.perm.can("merge"):
@@ -233,13 +458,13 @@ class DiagPage(QDialog):
             return
 
         table = self.tab_working.table
-        rows = {idx.row() for idx in table.selectionModel().selectedRows()}
+        rows = self._checked_rows(table)
         if not rows:
-            QMessageBox.information(self, "No selection", "Select one or more unexpected parts in the Working Dir Check tab.")
+            QMessageBox.information(self, "No selection", "Check one or more unexpected parts in the Working Dir Check tab.")
             return
 
         to_integrate = []
-        for r in sorted(rows):
+        for r in rows:
             item = table.item(r, 0)
             status = table.item(r, 1)
             if not item:
@@ -286,13 +511,13 @@ class DiagPage(QDialog):
             return
 
         table = self.tab_working.table
-        rows = {idx.row() for idx in table.selectionModel().selectedRows()}
+        rows = self._checked_rows(table)
         if not rows:
-            QMessageBox.information(self, "No selection", "Select one or more unexpected parts in the Working Dir Check tab.")
+            QMessageBox.information(self, "No selection", "Check one or more unexpected parts in the Working Dir Check tab.")
             return
 
         to_delete: list[str] = []
-        for r in sorted(rows):
+        for r in rows:
             item = table.item(r, 0)
             status = table.item(r, 1)
             if not item:
@@ -364,11 +589,24 @@ class DiagPage(QDialog):
         self.refresh_status()
 
     def populate_table(self, table, rows):
+        previous = set(self._checked_keys(table))
+        incoming = set()
+        table.blockSignals(True)
         table.setRowCount(0)
         for r, row in enumerate(rows):
             table.insertRow(r)
             for c, val in enumerate(row):
-                table.setItem(r, c, QTableWidgetItem(str(val)))
+                cell = QTableWidgetItem(str(val))
+                if c == 0:
+                    key = f"item:{str(val).strip().casefold()}"
+                    incoming.add(key)
+                    cell.setData(Qt.UserRole + 1, key)
+                    cell.setFlags(cell.flags() | Qt.ItemIsUserCheckable)
+                    cell.setCheckState(Qt.Checked if key in previous else Qt.Unchecked)
+                table.setItem(r, c, cell)
+        self._checked_by_table[table] = previous.intersection(incoming)
+        table.blockSignals(False)
+        self._apply_table_filter(table)
 
 
 

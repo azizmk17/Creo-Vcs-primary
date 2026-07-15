@@ -8,4 +8,5 @@ class BomChild:
     child_id: int
     quantity: int
     sort_order: int = 0
+    ebom_behavior: str = "INHERIT"
     

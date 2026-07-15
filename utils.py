@@ -60,6 +60,11 @@ def safe_open(path: str, *args, **kwargs):
     return open(long_path(path), *args, **kwargs)
 
 
+def safe_getsize(path: str) -> int:
+    """Return a file size while supporting Windows extended-length paths."""
+    return os.path.getsize(long_path(path))
+
+
 def _short_view_copy(path: str) -> str:
     """Copy a long-path file to a short temp path for apps that cannot open long paths."""
     source = os.path.abspath(os.path.normpath(str(path)))

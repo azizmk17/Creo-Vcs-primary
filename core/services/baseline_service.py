@@ -12,6 +12,8 @@ from core.repositories.bom_revision_repository import BomRevisionRepository
 from core.services.base_service import BaseService
 from core.services.export_naming import exported_document_filename, safe_filename
 from core.services.part_file_service import PartFileService
+from core.services.ebom_service import EbomService
+from config import DB_NAME
 
 
 class BaselineService(BaseService):
@@ -30,6 +32,36 @@ class BaselineService(BaseService):
         self.children_repo = bom_children_repo or BomChildrenRepository()
         self.revision_repo = BomRevisionRepository()
         self.part_file_service = part_file_service or PartFileService()
+        self.ebom_service = EbomService(
+            db_name=getattr(self.revision_repo, "db_name", DB_NAME)
+        )
+
+    def resolve_released_ebom(self, baseline_id: int) -> Dict:
+        """Reproduce EBOM rules from the exact object iterations in a baseline."""
+        baseline = self.baseline_repo.get_by_id(int(baseline_id))
+        if not baseline:
+            raise ValueError("Baseline not found")
+        try:
+            root_ids = [int(value) for value in json.loads(baseline.part_ids_json or "[]")]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            root_ids = []
+        iteration_by_part = {}
+        for row in self.baseline_file_repo.list_for_baseline(int(baseline_id)):
+            if row.object_iteration_id is not None:
+                iteration_by_part.setdefault(
+                    int(row.part_id), int(row.object_iteration_id)
+                )
+        roots = []
+        for root_id in root_ids:
+            iteration_id = iteration_by_part.get(int(root_id))
+            if iteration_id is None:
+                raise ValueError(
+                    f"Baseline {baseline.name} does not contain an object iteration for root {root_id}."
+                )
+            roots.append(
+                self.ebom_service.resolve_bom(root_id, iteration_id=iteration_id)
+            )
+        return {"baseline_id": int(baseline_id), "roots": roots}
 
     def _collect_part_ids_recursive(self, root_part_id: int) -> List[int]:
         visited: Set[int] = set()

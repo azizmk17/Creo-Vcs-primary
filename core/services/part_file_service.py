@@ -10,7 +10,7 @@ from core.session_manager import SessionManager
 from core.services.project_service import ProjectService
 from core.models.part_file_model import PartFile
 from core.models.part_file_version_model import PartFileVersion
-from utils import ensure_dir_exists, safe_copy2, safe_exists, safe_open
+from utils import ensure_dir_exists, safe_copy2, safe_exists, safe_getsize, safe_open
 
 
 class PartFileService:
@@ -90,7 +90,7 @@ class PartFileService:
         return {
             "vault_rel_path": rel_path,
             "sha256": sha256,
-            "size_bytes": os.path.getsize(abs_path),
+            "size_bytes": safe_getsize(abs_path),
             "storage_scheme": "managed_blob",
             "integrity_status": "Verified",
         }

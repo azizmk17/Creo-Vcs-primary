@@ -3045,15 +3045,15 @@ class CommitPage(QWidget):
         dialog = PartDialog(self, filename=filename)
         if dialog.exec_() == QDialog.Accepted:
             part_data = dialog.get_data()
-            if not part_data["aes_number"] or not part_data["name"]:
+            if not part_data["name"]:
                 QMessageBox.warning(self, "Validation",
-                    "AES Number and Name are required.")
+                    "Name is required.")
                 return
             try:
-                self.bom_service.add_part(part_data)
+                added_part_id = self.bom_service.add_part(part_data)
                 QMessageBox.information(self, "Success",
                     "Part added successfully.")
-                self.bom_service.checkout_part(part_data["aes_number"])
+                self.bom_service.checkout_part(int(added_part_id))
                 self.commit_changes()
             except Exception as e:
                 QMessageBox.critical(self, "Error",

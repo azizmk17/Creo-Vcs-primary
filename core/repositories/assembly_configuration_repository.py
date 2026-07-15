@@ -9,7 +9,7 @@ class AssemblyConfigurationRepository:
     _MEMBER_COLUMNS = (
         "sequence_no", "occurrence_path", "parent_occurrence_path", "usage_id",
         "bom_id", "revision_id", "iteration_id", "version_label", "quantity",
-        "position", "sort_order", "type", "name", "aes_number", "part_number",
+        "position", "sort_order", "ebom_behavior", "type", "name", "aes_number", "part_number",
         "drawing_number", "filename", "drawing", "native_source_rel_path",
         "drawing_source_rel_path", "native_frozen_rel_path",
         "drawing_frozen_rel_path", "native_sha256", "drawing_sha256",
@@ -95,6 +95,7 @@ class AssemblyConfigurationRepository:
                     quantity INTEGER NOT NULL DEFAULT 1,
                     position INTEGER NOT NULL DEFAULT 0,
                     sort_order INTEGER NOT NULL DEFAULT 0,
+                    ebom_behavior TEXT NOT NULL DEFAULT 'INHERIT',
                     type TEXT NOT NULL DEFAULT '',
                     name TEXT NOT NULL DEFAULT '',
                     aes_number TEXT NOT NULL DEFAULT '',
@@ -112,6 +113,17 @@ class AssemblyConfigurationRepository:
                 );
                 """
             )
+            member_columns = {
+                str(row[1])
+                for row in conn.execute(
+                    "PRAGMA table_info(assembly_configuration_members)"
+                ).fetchall()
+            }
+            if "ebom_behavior" not in member_columns:
+                conn.execute(
+                    "ALTER TABLE assembly_configuration_members ADD COLUMN "
+                    "ebom_behavior TEXT NOT NULL DEFAULT 'INHERIT'"
+                )
             configuration_columns = self._columns(conn, "assembly_configurations")
             for column, definition in self._VERSION_COLUMNS:
                 if column not in configuration_columns:

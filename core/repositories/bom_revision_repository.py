@@ -3,6 +3,12 @@ import re
 import sqlite3
 
 from config import DB_NAME
+from core.ebom_policy import (
+    normalize_classification,
+    normalize_default_behavior,
+    normalize_occurrence_behavior,
+    normalize_requirement,
+)
 
 
 class BomRevisionRepository:
@@ -12,11 +18,17 @@ class BomRevisionRepository:
     _SNAPSHOT_FIELDS = (
         "type", "name", "part_number", "drawing_number", "aes_number",
         "filename", "drawing", "base_file_name", "base_drw_name", "material",
-        "weight", "notes", "pdf_path", "step_path",
+        "weight", "notes", "pdf_path", "step_path", "classification",
+        "default_ebom_behavior", "cad_requirement", "drawing_requirement",
+        "represented_part_id",
+        "cad_control_mode",
     )
     _CHECKIN_METADATA_FIELDS = (
         "type", "name", "part_number", "drawing_number", "aes_number",
-        "material", "weight", "notes",
+        "material", "weight", "notes", "classification",
+        "default_ebom_behavior", "cad_requirement", "drawing_requirement",
+        "represented_part_id",
+        "cad_control_mode",
     )
     _CHECKIN_METADATA_LABELS = {
         "type": "Type",
@@ -27,6 +39,12 @@ class BomRevisionRepository:
         "material": "Material",
         "weight": "Weight",
         "notes": "Technical note",
+        "classification": "Classification",
+        "default_ebom_behavior": "Default EBOM behavior",
+        "cad_requirement": "CAD requirement",
+        "drawing_requirement": "Drawing requirement",
+        "represented_part_id": "Deliverable physical part",
+        "cad_control_mode": "CAD control mode",
     }
 
     def __init__(self, db_name=DB_NAME):
@@ -91,6 +109,37 @@ class BomRevisionRepository:
                 conn.execute("ALTER TABLE bom ADD COLUMN current_iteration_id INTEGER")
             if "pending_revision_code" not in columns:
                 conn.execute("ALTER TABLE bom ADD COLUMN pending_revision_code TEXT")
+            for name, definition in (
+                ("classification", "classification TEXT NOT NULL DEFAULT 'PHYSICAL'"),
+                (
+                    "default_ebom_behavior",
+                    "default_ebom_behavior TEXT NOT NULL DEFAULT 'NORMAL'",
+                ),
+                (
+                    "cad_requirement",
+                    "cad_requirement TEXT NOT NULL DEFAULT 'OPTIONAL'",
+                ),
+                (
+                    "drawing_requirement",
+                    "drawing_requirement TEXT NOT NULL DEFAULT 'OPTIONAL'",
+                ),
+                ("represented_part_id", "represented_part_id INTEGER"),
+                (
+                    "cad_control_mode",
+                    "cad_control_mode TEXT NOT NULL DEFAULT 'CONTROLLED'",
+                ),
+            ):
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE bom ADD COLUMN {definition}")
+            child_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(bom_children)").fetchall()
+            }
+            if child_columns and "ebom_behavior" not in child_columns:
+                conn.execute(
+                    "ALTER TABLE bom_children ADD COLUMN "
+                    "ebom_behavior TEXT NOT NULL DEFAULT 'INHERIT'"
+                )
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS bom_revisions (
@@ -125,6 +174,7 @@ class BomRevisionRepository:
                     child_iteration_id INTEGER NOT NULL,
                     quantity INTEGER NOT NULL DEFAULT 1,
                     sort_order INTEGER NOT NULL DEFAULT 0,
+                    ebom_behavior TEXT NOT NULL DEFAULT 'INHERIT',
                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
                     UNIQUE(parent_iteration_id, usage_id)
                 );
@@ -157,6 +207,17 @@ class BomRevisionRepository:
                 conn.execute("ALTER TABLE bom_iterations ADD COLUMN source_commit_id TEXT")
             if "object_data_json" not in iteration_columns:
                 conn.execute("ALTER TABLE bom_iterations ADD COLUMN object_data_json TEXT")
+            binding_columns = {
+                str(row[1])
+                for row in conn.execute(
+                    "PRAGMA table_info(bom_iteration_bindings)"
+                ).fetchall()
+            }
+            if "ebom_behavior" not in binding_columns:
+                conn.execute(
+                    "ALTER TABLE bom_iteration_bindings ADD COLUMN "
+                    "ebom_behavior TEXT NOT NULL DEFAULT 'INHERIT'"
+                )
             iteration_columns = self._iteration_columns_conn(conn)
             if "commit_id" in iteration_columns:
                 conn.execute(
@@ -310,6 +371,7 @@ class BomRevisionRepository:
             SELECT bc.id AS usage_id, bc.parent_id, bc.child_id,
                    COALESCE(bc.quantity, 1) AS quantity,
                    COALESCE(bc.sort_order, bc.id) AS sort_order,
+                   COALESCE(bc.ebom_behavior, 'INHERIT') AS ebom_behavior,
                    parent.current_iteration_id AS parent_iteration_id,
                    child.current_revision_id AS child_revision_id,
                    child.current_iteration_id AS child_iteration_id
@@ -326,13 +388,14 @@ class BomRevisionRepository:
                 """
                 INSERT OR IGNORE INTO bom_iteration_bindings(
                     parent_iteration_id, usage_id, child_bom_id, child_revision_id,
-                    child_iteration_id, quantity, sort_order
-                ) VALUES(?,?,?,?,?,?,?)
+                    child_iteration_id, quantity, sort_order, ebom_behavior
+                ) VALUES(?,?,?,?,?,?,?,?)
                 """,
                 (
                     int(row["parent_iteration_id"]), int(row["usage_id"]), int(row["child_id"]),
                     int(row["child_revision_id"]), int(row["child_iteration_id"]),
                     max(1, int(row["quantity"] or 1)), int(row["sort_order"] or 0),
+                    normalize_occurrence_behavior(row["ebom_behavior"]),
                 ),
             )
 
@@ -417,6 +480,7 @@ class BomRevisionRepository:
                 SELECT ib.usage_id, ib.child_bom_id AS child_id,
                        COALESCE(ib.quantity, 1) AS quantity,
                        COALESCE(ib.sort_order, ib.id) AS sort_order,
+                       COALESCE(ib.ebom_behavior, 'INHERIT') AS ebom_behavior,
                        ib.child_iteration_id,
                        child.name, child.aes_number,
                        child_rev.revision_code || '.' || child_it.iteration_number AS version_label
@@ -434,6 +498,7 @@ class BomRevisionRepository:
                 SELECT bc.id AS usage_id, bc.child_id,
                        COALESCE(bc.quantity, 1) AS quantity,
                        COALESCE(bc.sort_order, bc.id) AS sort_order,
+                       COALESCE(bc.ebom_behavior, 'INHERIT') AS ebom_behavior,
                        COALESCE(wb.child_iteration_id, child.current_iteration_id) AS child_iteration_id,
                        child.name, child.aes_number,
                        child_rev.revision_code || '.' || child_it.iteration_number AS version_label
@@ -522,6 +587,19 @@ class BomRevisionRepository:
                         "usage_id": usage_id,
                         "child_id": int(after["child_id"]),
                         "text": f"Reordered: {label}",
+                    })
+                if normalize_occurrence_behavior(
+                    before.get("ebom_behavior")
+                ) != normalize_occurrence_behavior(after.get("ebom_behavior")):
+                    structure_changes.append({
+                        "kind": "ebom_behavior",
+                        "usage_id": usage_id,
+                        "child_id": int(after["child_id"]),
+                        "text": (
+                            f"EBOM behavior changed: {label}, "
+                            f"{normalize_occurrence_behavior(before.get('ebom_behavior'))} -> "
+                            f"{normalize_occurrence_behavior(after.get('ebom_behavior'))}"
+                        ),
                     })
 
             return {
@@ -710,6 +788,7 @@ class BomRevisionRepository:
                    ib.child_revision_id, ib.child_iteration_id,
                    COALESCE(ib.quantity,1) AS quantity,
                    COALESCE(ib.sort_order,ib.id) AS sort_order,
+                   COALESCE(ib.ebom_behavior, 'INHERIT') AS ebom_behavior,
                    child.name, child.aes_number, child.part_number, child.type,
                    child_rev.revision_code AS child_revision,
                    child_it.iteration_number AS child_iteration,
@@ -749,6 +828,21 @@ class BomRevisionRepository:
                 ),
                 "filename": filename,
                 "drawing": drawing,
+                "classification": normalize_classification(
+                    snapshot.get("classification")
+                ),
+                "default_ebom_behavior": normalize_default_behavior(
+                    snapshot.get("default_ebom_behavior")
+                ),
+                "cad_requirement": normalize_requirement(
+                    snapshot.get("cad_requirement"), "CAD requirement"
+                ),
+                "drawing_requirement": normalize_requirement(
+                    snapshot.get("drawing_requirement"), "drawing requirement"
+                ),
+                "ebom_behavior": normalize_occurrence_behavior(
+                    item.get("ebom_behavior")
+                ),
             })
             result.append(item)
         return result
@@ -807,6 +901,7 @@ class BomRevisionRepository:
             "version_changed": 0,
             "quantity_changed": 0,
             "order_changed": 0,
+            "ebom_behavior_changed": 0,
             "component_changed": 0,
         }
         for key in ordered_keys:
@@ -837,6 +932,11 @@ class BomRevisionRepository:
                 if int(left["position"] or 0) != int(right["position"] or 0):
                     change_types.append("order_changed")
                     labels.append("Order")
+                if normalize_occurrence_behavior(
+                    left.get("ebom_behavior")
+                ) != normalize_occurrence_behavior(right.get("ebom_behavior")):
+                    change_types.append("ebom_behavior_changed")
+                    labels.append("EBOM behavior")
                 change_label = ", ".join(labels) if labels else "Unchanged"
 
             summary["total"] += 1
@@ -919,6 +1019,18 @@ class BomRevisionRepository:
                     "material", "weight", "notes", "pdf_path", "step_path",
                 ):
                     result[field] = str(snapshot.get(field) or "").strip()
+                result["classification"] = normalize_classification(
+                    snapshot.get("classification")
+                )
+                result["default_ebom_behavior"] = normalize_default_behavior(
+                    snapshot.get("default_ebom_behavior")
+                )
+                result["cad_requirement"] = normalize_requirement(
+                    snapshot.get("cad_requirement"), "CAD requirement"
+                )
+                result["drawing_requirement"] = normalize_requirement(
+                    snapshot.get("drawing_requirement"), "drawing requirement"
+                )
                 result["version_label"] = (
                     f"{result['revision_code']}.{int(result['iteration_number'])}"
                 )
@@ -952,6 +1064,7 @@ class BomRevisionRepository:
                 quantity: int,
                 position: int,
                 sort_order: int,
+                ebom_behavior: str,
                 ancestors: tuple[int, ...],
             ) -> None:
                 selected_iteration_id = int(context["iteration_id"])
@@ -974,6 +1087,15 @@ class BomRevisionRepository:
                     "quantity": max(1, int(quantity or 1)),
                     "position": int(position or 0),
                     "sort_order": int(sort_order or 0),
+                    "ebom_behavior": normalize_occurrence_behavior(ebom_behavior),
+                    "classification": str(context.get("classification") or "PHYSICAL"),
+                    "default_ebom_behavior": str(
+                        context.get("default_ebom_behavior") or "NORMAL"
+                    ),
+                    "cad_requirement": str(context.get("cad_requirement") or "OPTIONAL"),
+                    "drawing_requirement": str(
+                        context.get("drawing_requirement") or "OPTIONAL"
+                    ),
                     "type": str(context.get("type") or ""),
                     "name": str(context.get("name") or ""),
                     "aes_number": str(context.get("aes_number") or ""),
@@ -1013,10 +1135,11 @@ class BomRevisionRepository:
                         int(binding.get("quantity") or 1),
                         int(binding.get("position") or 0),
                         int(binding.get("sort_order") or 0),
+                        str(binding.get("ebom_behavior") or "INHERIT"),
                         next_ancestors,
                     )
 
-            walk(root, "root", None, None, 1, 0, 0, ())
+            walk(root, "root", None, None, 1, 0, 0, "NORMAL", ())
             return {
                 "project_id": int(project_id),
                 "root_bom_id": int(bom_id),
@@ -1211,7 +1334,8 @@ class BomRevisionRepository:
 
             bindings = conn.execute(
                 """
-                SELECT usage_id, child_bom_id, quantity, sort_order
+                SELECT usage_id, child_bom_id, quantity, sort_order,
+                       COALESCE(ebom_behavior, 'INHERIT') AS ebom_behavior
                 FROM bom_iteration_bindings
                 WHERE parent_iteration_id=?
                 ORDER BY sort_order, id
@@ -1226,12 +1350,14 @@ class BomRevisionRepository:
                     try:
                         conn.execute(
                             """
-                            INSERT INTO bom_children(id, parent_id, child_id, quantity, sort_order)
-                            VALUES(?,?,?,?,?)
+                            INSERT INTO bom_children(
+                                id, parent_id, child_id, quantity, sort_order, ebom_behavior
+                            ) VALUES(?,?,?,?,?,?)
                             """,
                             (
                                 int(usage_id), int(bom_id), int(binding["child_bom_id"]),
                                 max(1, int(binding["quantity"] or 1)), int(binding["sort_order"] or 0),
+                                normalize_occurrence_behavior(binding["ebom_behavior"]),
                             ),
                         )
                         inserted = True
@@ -1240,12 +1366,14 @@ class BomRevisionRepository:
                 if not inserted:
                     conn.execute(
                         """
-                        INSERT INTO bom_children(parent_id, child_id, quantity, sort_order)
-                        VALUES(?,?,?,?)
+                        INSERT INTO bom_children(
+                            parent_id, child_id, quantity, sort_order, ebom_behavior
+                        ) VALUES(?,?,?,?,?)
                         """,
                         (
                             int(bom_id), int(binding["child_bom_id"]),
                             max(1, int(binding["quantity"] or 1)), int(binding["sort_order"] or 0),
+                            normalize_occurrence_behavior(binding["ebom_behavior"]),
                         ),
                     )
             conn.execute("DELETE FROM bom_working_bindings WHERE parent_bom_id=?", (int(bom_id),))
@@ -1349,7 +1477,8 @@ class BomRevisionRepository:
         relations = conn.execute(
             """
             SELECT id, child_id, COALESCE(quantity,1) AS quantity,
-                   COALESCE(sort_order,id) AS sort_order
+                   COALESCE(sort_order,id) AS sort_order,
+                   COALESCE(ebom_behavior, 'INHERIT') AS ebom_behavior
             FROM bom_children WHERE parent_id=?
             ORDER BY COALESCE(sort_order,id), id
             """,
@@ -1363,13 +1492,14 @@ class BomRevisionRepository:
                 """
                 INSERT INTO bom_iteration_bindings(
                     parent_iteration_id, usage_id, child_bom_id, child_revision_id,
-                    child_iteration_id, quantity, sort_order
-                ) VALUES(?,?,?,?,?,?,?)
+                    child_iteration_id, quantity, sort_order, ebom_behavior
+                ) VALUES(?,?,?,?,?,?,?,?)
                 """,
                 (
                     int(iteration_id), int(relation["id"]), int(relation["child_id"]),
                     revision_id, child_iteration_id,
                     max(1, int(relation["quantity"] or 1)), int(relation["sort_order"] or 0),
+                    normalize_occurrence_behavior(relation["ebom_behavior"]),
                 ),
             )
 
@@ -1476,7 +1606,8 @@ class BomRevisionRepository:
             source_bindings = conn.execute(
                 """
                 SELECT usage_id, child_bom_id, child_revision_id, child_iteration_id,
-                       quantity, sort_order
+                       quantity, sort_order,
+                       COALESCE(ebom_behavior, 'INHERIT') AS ebom_behavior
                 FROM bom_iteration_bindings
                 WHERE parent_iteration_id=? ORDER BY sort_order, id
                 """,
@@ -1487,13 +1618,14 @@ class BomRevisionRepository:
                     """
                     INSERT INTO bom_iteration_bindings(
                         parent_iteration_id, usage_id, child_bom_id, child_revision_id,
-                        child_iteration_id, quantity, sort_order
-                    ) VALUES(?,?,?,?,?,?,?)
+                        child_iteration_id, quantity, sort_order, ebom_behavior
+                    ) VALUES(?,?,?,?,?,?,?,?)
                     """,
                     (
                         iteration_id, binding["usage_id"], int(binding["child_bom_id"]),
                         int(binding["child_revision_id"]), int(binding["child_iteration_id"]),
                         int(binding["quantity"] or 1), int(binding["sort_order"] or 0),
+                        normalize_occurrence_behavior(binding["ebom_behavior"]),
                     ),
                 )
             conn.execute(
@@ -1548,6 +1680,7 @@ class BomRevisionRepository:
                 SELECT bc.id AS usage_id, bc.parent_id, bc.child_id AS child_bom_id,
                        COALESCE(bc.quantity,1) AS quantity,
                        COALESCE(bc.sort_order,bc.id) AS sort_order,
+                       COALESCE(bc.ebom_behavior, 'INHERIT') AS ebom_behavior,
                        child.name, child.aes_number, child.part_number, child.type,
                        COALESCE(wb.child_revision_id, ib.child_revision_id, child.current_revision_id) AS bound_revision_id,
                        COALESCE(wb.child_iteration_id, ib.child_iteration_id, child.current_iteration_id) AS bound_iteration_id,
@@ -1674,11 +1807,26 @@ class BomRevisionRepository:
             for row in object_rows:
                 item = dict(row)
                 context = contexts.get(int(item["id"]), {})
+                snapshot = self._snapshot_object_data(
+                    context.get("object_data_json")
+                )
                 item.update({
                     "revision_id": context.get("current_revision_id"),
                     "iteration_id": context.get("current_iteration_id"),
                     "version": context.get("version_label"),
                     "state": context.get("state"),
+                    "classification": normalize_classification(
+                        snapshot.get("classification")
+                    ),
+                    "default_ebom_behavior": normalize_default_behavior(
+                        snapshot.get("default_ebom_behavior")
+                    ),
+                    "cad_requirement": normalize_requirement(
+                        snapshot.get("cad_requirement"), "CAD requirement"
+                    ),
+                    "drawing_requirement": normalize_requirement(
+                        snapshot.get("drawing_requirement"), "drawing requirement"
+                    ),
                 })
                 objects.append(item)
             binding_rows = conn.execute(
@@ -1689,7 +1837,8 @@ class BomRevisionRepository:
                        ib.child_revision_id, ib.child_iteration_id,
                        child_rev.revision_code AS child_revision,
                        child_it.iteration_number AS child_iteration,
-                       ib.quantity, ib.sort_order
+                       ib.quantity, ib.sort_order,
+                       COALESCE(ib.ebom_behavior, 'INHERIT') AS ebom_behavior
                 FROM bom parent
                 JOIN bom_iteration_bindings ib
                     ON ib.parent_iteration_id=parent.current_iteration_id

@@ -30,3 +30,9 @@ class Bom:
     current_revision_id: Optional[int] = None
     current_iteration_id: Optional[int] = None
     pending_revision_code: Optional[str] = None
+    classification: str = "PHYSICAL"
+    default_ebom_behavior: str = "NORMAL"
+    cad_requirement: str = "OPTIONAL"
+    drawing_requirement: str = "OPTIONAL"
+    represented_part_id: Optional[int] = None
+    cad_control_mode: str = "CONTROLLED"

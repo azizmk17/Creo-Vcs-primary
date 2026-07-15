@@ -492,8 +492,6 @@ def _migration_13(conn):
         CREATE INDEX IF NOT EXISTS idx_issue_notifications_user ON issue_notifications(user_id, is_read, created_at);
         """
     )
-
-
 def _migration_14(conn):
     """Engineering traceability links for Jira, commit groups, and vaulted files."""
     conn.executescript(
@@ -1376,6 +1374,230 @@ def _migration_28(conn):
         )
 
 
+def _migration_29(conn):
+    """Add versioned CAD/EBOM policy fields without creating another BOM store."""
+    tables = {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    if "bom" in tables:
+        _ensure_column(
+            conn, "bom", "classification",
+            "classification TEXT NOT NULL DEFAULT 'PHYSICAL'",
+        )
+        _ensure_column(
+            conn, "bom", "default_ebom_behavior",
+            "default_ebom_behavior TEXT NOT NULL DEFAULT 'NORMAL'",
+        )
+        _ensure_column(
+            conn, "bom", "cad_requirement",
+            "cad_requirement TEXT NOT NULL DEFAULT 'OPTIONAL'",
+        )
+        _ensure_column(
+            conn, "bom", "drawing_requirement",
+            "drawing_requirement TEXT NOT NULL DEFAULT 'OPTIONAL'",
+        )
+        conn.execute(
+            """
+            UPDATE bom
+            SET classification=CASE
+                    WHEN UPPER(TRIM(COALESCE(classification,'')))
+                         IN ('PHYSICAL','CAD_ONLY','REFERENCE','SKELETON')
+                    THEN UPPER(TRIM(classification)) ELSE 'PHYSICAL' END,
+                default_ebom_behavior=CASE
+                    WHEN UPPER(TRIM(COALESCE(default_ebom_behavior,'')))
+                         IN ('NORMAL','FLATTEN','EXCLUDE')
+                    THEN UPPER(TRIM(default_ebom_behavior)) ELSE 'NORMAL' END,
+                cad_requirement=CASE
+                    WHEN UPPER(TRIM(COALESCE(cad_requirement,'')))
+                         IN ('REQUIRED','OPTIONAL','NOT_REQUIRED')
+                    THEN UPPER(TRIM(cad_requirement)) ELSE 'OPTIONAL' END,
+                drawing_requirement=CASE
+                    WHEN UPPER(TRIM(COALESCE(drawing_requirement,'')))
+                         IN ('REQUIRED','OPTIONAL','NOT_REQUIRED')
+                    THEN UPPER(TRIM(drawing_requirement)) ELSE 'OPTIONAL' END
+            """
+        )
+
+    if "bom_children" in tables:
+        _ensure_column(
+            conn, "bom_children", "ebom_behavior",
+            "ebom_behavior TEXT NOT NULL DEFAULT 'INHERIT'",
+        )
+        conn.execute(
+            """
+            UPDATE bom_children
+            SET ebom_behavior=CASE
+                WHEN UPPER(TRIM(COALESCE(ebom_behavior,'')))
+                     IN ('INHERIT','NORMAL','FLATTEN','EXCLUDE')
+                THEN UPPER(TRIM(ebom_behavior)) ELSE 'INHERIT' END
+            """
+        )
+
+    if "bom_iteration_bindings" in tables:
+        _ensure_column(
+            conn, "bom_iteration_bindings", "ebom_behavior",
+            "ebom_behavior TEXT NOT NULL DEFAULT 'INHERIT'",
+        )
+        conn.execute(
+            """
+            UPDATE bom_iteration_bindings
+            SET ebom_behavior=CASE
+                WHEN UPPER(TRIM(COALESCE(ebom_behavior,'')))
+                     IN ('INHERIT','NORMAL','FLATTEN','EXCLUDE')
+                THEN UPPER(TRIM(ebom_behavior)) ELSE 'INHERIT' END
+            """
+        )
+
+    if "assembly_configuration_members" in tables:
+        _ensure_column(
+            conn, "assembly_configuration_members", "ebom_behavior",
+            "ebom_behavior TEXT NOT NULL DEFAULT 'INHERIT'",
+        )
+        conn.execute(
+            """
+            UPDATE assembly_configuration_members
+            SET ebom_behavior=CASE
+                WHEN UPPER(TRIM(COALESCE(ebom_behavior,'')))
+                     IN ('INHERIT','NORMAL','FLATTEN','EXCLUDE')
+                THEN UPPER(TRIM(ebom_behavior)) ELSE 'INHERIT' END
+            """
+        )
+    # Historical object snapshots need explicit compatibility policy values so
+    # resolution never consults mutable current object data for old iterations.
+    if "bom_iterations" in tables and "bom_revisions" in tables and "bom" in tables:
+        rows = conn.execute(
+            """
+            SELECT i.id, i.object_data_json,
+                   b.classification, b.default_ebom_behavior,
+                   b.cad_requirement, b.drawing_requirement
+            FROM bom_iterations i
+            JOIN bom_revisions r ON r.id=i.revision_id
+            JOIN bom b ON b.id=r.bom_id
+            ORDER BY i.id
+            """
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(str(row[1] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            snapshot_defaults = {
+                "classification": (
+                    {"PHYSICAL", "CAD_ONLY", "REFERENCE", "SKELETON"},
+                    str(row[2] or "PHYSICAL"),
+                    "PHYSICAL",
+                ),
+                "default_ebom_behavior": (
+                    {"NORMAL", "FLATTEN", "EXCLUDE"},
+                    str(row[3] or "NORMAL"),
+                    "NORMAL",
+                ),
+                "cad_requirement": (
+                    {"REQUIRED", "OPTIONAL", "NOT_REQUIRED"},
+                    str(row[4] or "OPTIONAL"),
+                    "OPTIONAL",
+                ),
+                "drawing_requirement": (
+                    {"REQUIRED", "OPTIONAL", "NOT_REQUIRED"},
+                    str(row[5] or "OPTIONAL"),
+                    "OPTIONAL",
+                ),
+            }
+            for key, (allowed, current_default, fallback) in snapshot_defaults.items():
+                value = str(payload.get(key, current_default) or "").strip().upper()
+                payload[key] = value if value in allowed else fallback
+            conn.execute(
+                "UPDATE bom_iterations SET object_data_json=? WHERE id=?",
+                (
+                    json.dumps(
+                        payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+                    ),
+                    int(row[0]),
+                ),
+            )
+
+
+def _migration_30(conn):
+    """Link alternate CAD representations to their deliverable physical BOM item."""
+    tables = {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    if "bom" not in tables:
+        return
+    _ensure_column(conn, "bom", "represented_part_id", "represented_part_id INTEGER")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bom_represented_part ON bom(represented_part_id)"
+    )
+
+
+def _migration_31(conn):
+    """Add supplier-managed CAD package ownership without creating BOM rows."""
+    tables = {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    if "bom" not in tables:
+        return
+    _ensure_column(
+        conn,
+        "bom",
+        "cad_control_mode",
+        "cad_control_mode TEXT NOT NULL DEFAULT 'CONTROLLED'",
+    )
+    conn.execute(
+        """
+        UPDATE bom
+        SET cad_control_mode=CASE
+            WHEN UPPER(TRIM(COALESCE(cad_control_mode,'')))='SUPPLIER_PACKAGE'
+            THEN 'SUPPLIER_PACKAGE' ELSE 'CONTROLLED' END
+        """
+    )
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS bom_cad_dependencies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            owner_bom_id INTEGER NOT NULL,
+            base_file_name TEXT NOT NULL COLLATE NOCASE,
+            original_filename TEXT NOT NULL DEFAULT '',
+            assigned_by INTEGER,
+            assigned_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(project_id, base_file_name)
+        );
+        CREATE INDEX IF NOT EXISTS idx_bom_cad_dependencies_owner
+            ON bom_cad_dependencies(owner_bom_id);
+        CREATE INDEX IF NOT EXISTS idx_bom_cad_dependencies_project
+            ON bom_cad_dependencies(project_id, base_file_name);
+        """
+    )
+    if "bom_iterations" in tables:
+        rows = conn.execute(
+            "SELECT id, object_data_json FROM bom_iterations ORDER BY id"
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(str(row[1] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            mode = str(payload.get("cad_control_mode") or "CONTROLLED").strip().upper()
+            payload["cad_control_mode"] = (
+                mode if mode in {"CONTROLLED", "SUPPLIER_PACKAGE"} else "CONTROLLED"
+            )
+            conn.execute(
+                "UPDATE bom_iterations SET object_data_json=? WHERE id=?",
+                (
+                    json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
+                    int(row[0]),
+                ),
+            )
+
+
 MIGRATIONS = {
     1: """
     CREATE TABLE IF NOT EXISTS users (
@@ -1742,6 +1964,12 @@ WHERE r.name = 'designer' AND p.name = 'manage_issues';
     27: _migration_27,
 
     28: _migration_28,
+
+    29: _migration_29,
+
+    30: _migration_30,
+
+    31: _migration_31,
 
 }
 

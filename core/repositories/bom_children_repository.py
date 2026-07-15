@@ -1,12 +1,14 @@
 import sqlite3
 from typing import List
 from core.models.bom_children_model import BomChild
+from core.ebom_policy import normalize_occurrence_behavior
 from config import DB_NAME
 
 class BomChildrenRepository:
     def __init__(self, db_name=DB_NAME):
         self.db_name = db_name
         self._ensure_sort_order_column()
+        self._ensure_ebom_behavior_column()
 
     def get_conn(self):
         conn = sqlite3.connect(self.db_name)
@@ -29,6 +31,20 @@ class BomChildrenRepository:
         except Exception:
             pass
 
+    def _ensure_ebom_behavior_column(self):
+        try:
+            with self.get_conn() as conn:
+                columns = {
+                    str(row[1]) for row in conn.execute("PRAGMA table_info(bom_children)")
+                }
+                if "ebom_behavior" not in columns:
+                    conn.execute(
+                        "ALTER TABLE bom_children ADD COLUMN "
+                        "ebom_behavior TEXT NOT NULL DEFAULT 'INHERIT'"
+                    )
+        except Exception:
+            pass
+
     def _next_sort_order(self, conn, parent_id: int) -> int:
         row = conn.execute(
             "SELECT COALESCE(MAX(sort_order), 0) + 10 FROM bom_children WHERE parent_id = ?",
@@ -42,7 +58,11 @@ class BomChildrenRepository:
     # -------------------------------
     # CREATE / INSERT
     # -------------------------------
-    def insert(self, parent_id: int, child_id: int, quantity: int = 1) -> int:
+    def insert(
+        self, parent_id: int, child_id: int, quantity: int = 1,
+        ebom_behavior: str = "INHERIT",
+    ) -> int:
+        behavior = normalize_occurrence_behavior(ebom_behavior)
         with self.get_conn() as conn:
             cur = conn.cursor()
 
@@ -66,9 +86,13 @@ class BomChildrenRepository:
             else:
                 # If not exists → insert new relation
                 cur.execute("""
-                    INSERT INTO bom_children (parent_id, child_id, quantity, sort_order)
-                    VALUES (?, ?, ?, ?)
-                """, (parent_id, child_id, quantity, self._next_sort_order(conn, int(parent_id))))
+                    INSERT INTO bom_children (
+                        parent_id, child_id, quantity, sort_order, ebom_behavior
+                    ) VALUES (?, ?, ?, ?, ?)
+                """, (
+                    parent_id, child_id, quantity,
+                    self._next_sort_order(conn, int(parent_id)), behavior,
+                ))
                 conn.commit()
                 return cur.lastrowid
 
@@ -110,7 +134,9 @@ class BomChildrenRepository:
             cur = conn.cursor()
             cur.execute(
                 """
-                SELECT bc.id, bc.parent_id, bc.child_id, bc.quantity, COALESCE(bc.sort_order, bc.id) AS sort_order
+                SELECT bc.id, bc.parent_id, bc.child_id, bc.quantity,
+                       COALESCE(bc.sort_order, bc.id) AS sort_order,
+                       COALESCE(bc.ebom_behavior, 'INHERIT') AS ebom_behavior
                 FROM bom_children bc
                 JOIN bom b ON b.id = bc.parent_id
                 WHERE b.project_id = ?
@@ -126,8 +152,10 @@ class BomChildrenRepository:
         with self.get_conn() as conn:
             rows = conn.execute(
                 """
-                SELECT bc.parent_id, bc.child_id,
-                       COALESCE(bc.sort_order, bc.id) AS sort_order
+                SELECT bc.id AS usage_id, bc.parent_id, bc.child_id,
+                       COALESCE(bc.quantity, 1) AS quantity,
+                       COALESCE(bc.sort_order, bc.id) AS sort_order,
+                       COALESCE(bc.ebom_behavior, 'INHERIT') AS ebom_behavior
                 FROM bom_children bc
                 JOIN bom parent ON parent.id=bc.parent_id
                 JOIN bom child ON child.id=bc.child_id
@@ -150,7 +178,9 @@ class BomChildrenRepository:
                        bc.parent_id,
                        parent.name AS parent_name,
                        parent.aes_number AS parent_aes_number,
-                       COALESCE(bc.quantity, 1) AS quantity
+                       COALESCE(bc.quantity, 1) AS quantity,
+                       bc.id AS usage_id,
+                       COALESCE(bc.ebom_behavior, 'INHERIT') AS ebom_behavior
                 FROM bom b
                 LEFT JOIN bom_children bc ON bc.child_id=b.id
                 LEFT JOIN bom parent ON parent.id=bc.parent_id
@@ -204,10 +234,12 @@ class BomChildrenRepository:
                     continue
 
                 quantity = 1
+                occurrence_behavior = "INHERIT"
                 if source_parent_id is not None:
                     source = conn.execute(
                         """
-                        SELECT quantity FROM bom_children
+                        SELECT quantity, COALESCE(ebom_behavior, 'INHERIT') AS ebom_behavior
+                        FROM bom_children
                         WHERE parent_id=? AND child_id=?
                         """,
                         (int(source_parent_id), int(child_id)),
@@ -215,6 +247,9 @@ class BomChildrenRepository:
                     if not source:
                         raise ValueError(f"The selected source relation for item {child_id} no longer exists.")
                     quantity = max(1, int(source["quantity"] or 1))
+                    occurrence_behavior = normalize_occurrence_behavior(
+                        source["ebom_behavior"]
+                    )
 
                 target = conn.execute(
                     """
@@ -231,12 +266,14 @@ class BomChildrenRepository:
                 else:
                     conn.execute(
                         """
-                        INSERT INTO bom_children(parent_id, child_id, quantity, sort_order)
-                        VALUES(?,?,?,?)
+                        INSERT INTO bom_children(
+                            parent_id, child_id, quantity, sort_order, ebom_behavior
+                        ) VALUES(?,?,?,?,?)
                         """,
                         (
                             int(target_parent_id), int(child_id), quantity,
                             self._next_sort_order(conn, int(target_parent_id)),
+                            occurrence_behavior,
                         ),
                     )
 
@@ -256,6 +293,28 @@ class BomChildrenRepository:
             "skipped_child_ids": skipped,
             "had_root_sources": any(source is None for _child, source in normalized),
         }
+
+    def set_ebom_behavior(
+        self, parent_id: int, usage_id: int, ebom_behavior: str
+    ) -> BomChild:
+        behavior = normalize_occurrence_behavior(ebom_behavior)
+        with self.get_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM bom_children WHERE id=? AND parent_id=?
+                """,
+                (int(usage_id), int(parent_id)),
+            ).fetchone()
+            if not row:
+                raise ValueError("The selected child occurrence no longer exists.")
+            conn.execute(
+                "UPDATE bom_children SET ebom_behavior=? WHERE id=? AND parent_id=?",
+                (behavior, int(usage_id), int(parent_id)),
+            )
+            updated = conn.execute(
+                "SELECT * FROM bom_children WHERE id=?", (int(usage_id),)
+            ).fetchone()
+        return BomChild(**dict(updated))
 
     def set_child_order(self, parent_id: int, ordered_child_ids: list[int]) -> bool:
         ordered = []

@@ -350,6 +350,20 @@ class CommitService(BaseService):
                 bom_entry = bom_entries[0] if bom_entries else None
 
             if not bom_entry:
+                dependency_owner = self.bom_repo.get_dependency_owner(
+                    int(self.session.project_id), base_f_name
+                )
+                if dependency_owner:
+                    owner_label = (
+                        dependency_owner.get("aes_number")
+                        or dependency_owner.get("name")
+                        or dependency_owner.get("owner_bom_id")
+                    )
+                    raise ValueError(
+                        f"Commit blocked: {filename} is an owned CAD dependency of supplier package "
+                        f"{owner_label}. Commit the owning assembly when its controlled CAD changes; "
+                        "this dependency does not require an individual BOM commit."
+                    )
                 if part_type == "Cad":
                     raise ValueError(f"cad404:{filename}")
                 elif part_type == "Drw":

@@ -9,7 +9,7 @@ from core.repositories.managed_file_repository import ManagedFileRepository
 from core.services.part_file_service import PartFileService
 from core.services.project_service import ProjectService
 from core.session_manager import SessionManager
-from utils import ensure_dir_exists, safe_copy2, safe_exists, safe_open
+from utils import ensure_dir_exists, safe_copy2, safe_exists, safe_getsize, safe_open
 
 
 class ManagedFileService:
@@ -127,7 +127,7 @@ class ManagedFileService:
             "storage_scheme": "managed_blob",
             "vault_rel_path": rel_path,
             "sha256": sha256,
-            "size_bytes": os.path.getsize(destination),
+            "size_bytes": safe_getsize(destination),
             "integrity_status": "Verified",
             "path": destination,
         }
@@ -171,7 +171,7 @@ class ManagedFileService:
             "storage_scheme": "working_reference",
             "vault_rel_path": filename,
             "sha256": None,
-            "size_bytes": os.path.getsize(working_path) if exists else None,
+            "size_bytes": safe_getsize(working_path) if exists else None,
             "integrity_status": "Available" if exists else "Missing",
             "lifecycle_state": str(context.get("state") or "In Work"),
             "source_commit_id": context.get("source_commit_id"),

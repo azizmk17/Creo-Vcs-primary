@@ -102,11 +102,22 @@ class PackageExportService:
 
         exported: List[Dict] = []
         missing: List[Dict] = []
+        skipped: List[Dict] = []
 
         for pid in selected:
             part = self.bom_repo.get_by_id(pid)
             if not part:
                 missing.append({"part_id": pid, "reason": "part_not_found"})
+                continue
+
+            if getattr(part, "represented_part_id", None):
+                skipped.append({
+                    "part_id": pid,
+                    "aes_number": getattr(part, "aes_number", None),
+                    "name": getattr(part, "name", None),
+                    "reason": "cad_representation",
+                    "represented_part_id": int(part.represented_part_id),
+                })
                 continue
 
             part_info = {
@@ -195,6 +206,7 @@ class PackageExportService:
             },
             "exported": exported,
             "missing": missing,
+            "skipped": skipped,
         }
 
         if create_zip:

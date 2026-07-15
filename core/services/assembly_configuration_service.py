@@ -11,6 +11,9 @@ from core.repositories.bom_revision_repository import BomRevisionRepository
 from core.services.audit_service import AuditService
 from core.services.base_service import BaseService
 from core.services.project_service import ProjectService
+from core.services.ebom_service import EbomService
+from core.ebom_policy import normalize_occurrence_behavior
+from config import DB_NAME
 from utils import (
     ensure_dir_exists,
     safe_copy2,
@@ -51,6 +54,9 @@ class AssemblyConfigurationService(BaseService):
         self.bom_repo = bom_repo or BomRepository()
         self.project_service = project_service or ProjectService()
         self.audit_service = audit_service or AuditService()
+        self.ebom_service = EbomService(
+            db_name=getattr(self.revision_repo, "db_name", DB_NAME)
+        )
 
     @staticmethod
     def _clean_name(value: str) -> str:
@@ -233,6 +239,9 @@ class AssemblyConfigurationService(BaseService):
                 "quantity": max(1, int(member.get("quantity") or 1)),
                 "position": max(0, int(member.get("position") or 0)),
                 "sort_order": max(0, int(member.get("sort_order") or 0)),
+                "ebom_behavior": normalize_occurrence_behavior(
+                    member.get("ebom_behavior")
+                ),
                 "usage_id": (
                     int(member["usage_id"])
                     if member.get("usage_id") is not None
@@ -422,6 +431,16 @@ class AssemblyConfigurationService(BaseService):
         if not configuration:
             raise ValueError("Configuration was not found in the active project.")
         return configuration
+
+    def resolve_released_ebom(
+        self, configuration_id: int, project_id=None
+    ) -> dict:
+        """Resolve the exact occurrence tree frozen by a named CAD configuration."""
+        configuration = self.get_configuration(int(configuration_id), project_id)
+        members = self.repo.list_members(int(configuration_id))
+        return self.ebom_service.resolve_configuration_members(
+            int(configuration["root_bom_id"]), members,
+        )
 
     def list_members(self, configuration_id: int, project_id=None) -> list[dict]:
         self.get_configuration(int(configuration_id), project_id)

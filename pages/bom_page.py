@@ -270,6 +270,9 @@ BOM_TREE_PLACEHOLDER_ROLE = Qt.UserRole + 43
 BOM_TREE_LOADING_ROLE = Qt.UserRole + 44
 BOM_TREE_REPLACE_CHILDREN_ROLE = Qt.UserRole + 45
 BOM_TREE_BINDING_UPDATE_ROLE = Qt.UserRole + 46
+BOM_TREE_POLICY_ROLE = Qt.UserRole + 47
+BOM_TREE_OCCURRENCE_ROLE = Qt.UserRole + 48
+BOM_TREE_PROMOTION_ROLE = Qt.UserRole + 49
 STRUCTURE_CURRENT_ITERATION_ROLE = Qt.UserRole + 60
 STRUCTURE_BOUND_ITERATION_ROLE = Qt.UserRole + 61
 STRUCTURE_LATEST_ITERATION_ROLE = Qt.UserRole + 62
@@ -325,6 +328,9 @@ BOM_COL_REV = 5
 BOM_COL_STATUS = 6
 BOM_COL_INTEGRITY = 7
 BOM_TREE_COLUMN_COUNT = 8
+EBOM_COL_SOURCE_QTY = 8
+EBOM_COL_EFFECTIVE_QTY = 9
+EBOM_COL_LEVEL = 10
 
 # Inline "In Work" beside name (spec)
 _BOM_INWORK_COLOR = QColor("#BA7517")
@@ -558,6 +564,8 @@ class _BomTreeNameDelegate(QStyledItemDelegate):
         direct_total_count = int(issue_summary.get("direct_total_count", total_count) or 0)
         inherited_total_count = int(issue_summary.get("inherited_total_count") or 0)
         binding_update_count = int(item.data(0, BOM_TREE_BINDING_UPDATE_ROLE) or 0)
+        policy = item.data(0, BOM_TREE_POLICY_ROLE) or {}
+        promotion = item.data(0, BOM_TREE_PROMOTION_ROLE) or []
         widget = opt.widget or self._tree
         style = widget.style()
 
@@ -590,6 +598,26 @@ class _BomTreeNameDelegate(QStyledItemDelegate):
                 issue_badges.append(("+", QColor("#2563eb")))
         if binding_update_count:
             issue_badges.append((f"v+{binding_update_count}", QColor("#b45309")))
+        classification = str(policy.get("classification") or "PHYSICAL").upper()
+        is_representation = bool(policy.get("represented_part_id"))
+        is_supplier_package = str(
+            policy.get("cad_control_mode") or "CONTROLLED"
+        ).upper() == "SUPPLIER_PACKAGE"
+        if is_supplier_package:
+            issue_badges.append(("SUPPLIER PACKAGE", QColor("#9a3412")))
+        if is_representation:
+            issue_badges.append(("CAD REP", QColor("#6d28d9")))
+        elif classification != "PHYSICAL":
+            issue_badges.append((classification.replace("_", " "), QColor("#6d28d9")))
+        behavior = str(policy.get("resolved_ebom_behavior") or "NORMAL").upper()
+        if is_representation:
+            pass
+        elif behavior == "FLATTEN":
+            issue_badges.append(("FLATTEN", QColor("#0369a1")))
+        elif behavior == "EXCLUDE":
+            issue_badges.append(("NOT FOR DELIVERY", QColor("#b91c1c")))
+        if promotion:
+            issue_badges.append(("PROMOTED", QColor("#0f766e")))
 
         painter.save()
         painter.setFont(name_font)
@@ -691,6 +719,10 @@ class _BomTreeFilesDelegate(QStyledItemDelegate):
         if item.data(0, BOM_TREE_FOLDER_ROLE):
             return
 
+        policy = item.data(0, BOM_TREE_POLICY_ROLE) or {}
+        if policy.get("represented_part_id"):
+            return
+
         payload = item.data(BOM_COL_FILES, BOM_TREE_FILES_ROLE) or {}
         pdf = payload.get("pdf") or ("na", "")
         step = payload.get("step") or ("na", "")
@@ -706,6 +738,14 @@ class _BomTreeFilesDelegate(QStyledItemDelegate):
         item = self._tree.itemFromIndex(index)
         if not item:
             return super().helpEvent(event, view, option, index)
+        policy = item.data(0, BOM_TREE_POLICY_ROLE) or {}
+        if policy.get("represented_part_id"):
+            QToolTip.showText(
+                event.globalPos(),
+                "CAD-only representation: PDF and STEP delivery files belong to the linked physical part.",
+                view,
+            )
+            return True
         payload = item.data(BOM_COL_FILES, BOM_TREE_FILES_ROLE) or {}
         pdf_rect, step_rect = _files_delegate_pill_rects(option.rect, payload)
         try:
@@ -1894,6 +1934,7 @@ class BomPage(QWidget):
         self._active_saved_filter_id = None
         self._active_saved_filter_name = ""
         self._advanced_filter_dialog = None
+        self._bom_mode = "cad"
         self.init_ui()
 
         # Pre-render indicator icons (fast + consistent colors)
@@ -2034,10 +2075,154 @@ class BomPage(QWidget):
             stack = getattr(self, "_tree_stack", None)
             if stack is None:
                 return
-            target = 0 if loading else (2 if getattr(self, "_in_search_mode", False) else 1)
+            if loading:
+                target = 0
+            elif getattr(self, "_bom_mode", "cad") == "ebom":
+                target = 3
+            else:
+                target = 2 if getattr(self, "_in_search_mode", False) else 1
             stack.setCurrentIndex(target)
         except Exception:
             pass
+
+    def _on_bom_mode_changed(self, _index: int = 0) -> None:
+        mode = str(self.bom_mode_selector.currentData() or "cad")
+        self._bom_mode = mode
+        if mode == "ebom":
+            self._in_search_mode = False
+            self._load_released_ebom_tree()
+        else:
+            if self.search_input.text().strip():
+                self._perform_search_now()
+            else:
+                self._tree_stack.setCurrentIndex(1)
+            if not self._is_default_bom_advanced_filter():
+                self.apply_bom_tree_filter(self._bom_advanced_filters)
+        read_only = mode == "ebom"
+        try:
+            self.add_part_btn.setEnabled(
+                not read_only and self.perm.can("manage_parts")
+            )
+            self.add_folder_btn.setEnabled(
+                not read_only and self.perm.can("manage_parts")
+            )
+        except Exception:
+            pass
+        if getattr(self, "_current_part_details", None):
+            self._update_lifecycle_action_states(self._current_part_details)
+
+    def _add_released_ebom_node(
+        self, info: dict, parent_item: QTreeWidgetItem | None = None
+    ) -> QTreeWidgetItem:
+        payload = dict(info or {})
+        payload["id"] = int(payload.get("bom_id") or payload.get("id"))
+        payload["current_version"] = str(
+            payload.get("version_label") or payload.get("current_version") or ""
+        )
+        payload["status"] = str(payload.get("state") or payload.get("status") or "")
+        payload["relation_parent_id"] = payload.get("effective_parent_bom_id")
+        payload["quantity"] = int(payload.get("source_quantity") or 1)
+        payload["_has_children"] = bool(payload.get("children"))
+        item = QTreeWidgetItem([""] * self._ebom_tree.columnCount())
+        self._apply_tree_item_data(item, payload)
+        item.setText(EBOM_COL_SOURCE_QTY, str(int(payload.get("source_quantity") or 1)))
+        item.setText(
+            EBOM_COL_EFFECTIVE_QTY,
+            str(int(payload.get("effective_quantity") or 1)),
+        )
+        item.setText(EBOM_COL_LEVEL, str(int(payload.get("level") or 0)))
+        promotion = list(payload.get("promoted_through") or [])
+        if promotion:
+            labels = " > ".join(
+                str(value.get("aes_number") or value.get("name") or value.get("bom_id"))
+                for value in promotion
+            )
+            item.setToolTip(
+                EBOM_COL_EFFECTIVE_QTY,
+                f"Promoted through {labels}; flattened quantities are multiplied.",
+            )
+        if parent_item is None:
+            self._ebom_tree.addTopLevelItem(item)
+        else:
+            parent_item.addChild(item)
+        for child in payload.get("children") or []:
+            self._add_released_ebom_node(child, item)
+        return item
+
+    def _load_released_ebom_tree(self) -> None:
+        self._set_tree_loading(True)
+        try:
+            QApplication.processEvents()
+            data = self.bom_service.get_released_ebom_project(
+                int(self.session.project_id)
+            ) if self.session.project_id else {"roots": []}
+            self._ebom_tree.setUpdatesEnabled(False)
+            self._ebom_tree.clear()
+            visible_roots = list(data.get("roots") or [])
+            excluded_roots = list(data.get("excluded_roots") or [])
+            flattened_roots = list(data.get("flattened_roots") or [])
+            for root in visible_roots:
+                self._add_released_ebom_node(root)
+            self._renumber_tree_rows(self._ebom_tree)
+            self._refresh_ebom_filters()
+            self._ebom_tree.expandToDepth(1)
+            self.bom_mode_selector.setToolTip(
+                "Released EBOM contains only NORMAL deliverable rows. "
+                f"Visible roots: {len(visible_roots)}; not-for-delivery roots hidden: "
+                f"{len(excluded_roots)}; flattened CAD roots hidden: {len(flattened_roots)}."
+            )
+            if not visible_roots and (excluded_roots or flattened_roots):
+                self.show_alert(
+                    "Released EBOM has no visible deliverable root. In CAD Structure, "
+                    "review items marked NOT FOR DELIVERY or FLATTEN.",
+                    "warning",
+                )
+            else:
+                self.hide_alert()
+        except Exception as exc:
+            self._ebom_tree.clear()
+            self.show_alert(f"Released EBOM could not be resolved: {exc}", "error")
+        finally:
+            self._ebom_tree.setUpdatesEnabled(True)
+            self._set_tree_loading(False)
+
+    def _refresh_ebom_filters(self) -> int:
+        tree = getattr(self, "_ebom_tree", None)
+        if tree is None:
+            return 0
+        query = str(self.search_input.text() or "").strip()
+        filters = self._bom_advanced_filters or self._default_bom_advanced_filters()
+        advanced_active = not self._is_default_bom_advanced_filter(filters)
+        show_parents = bool(filters.get("show_parent_matches", True))
+        visible_count = 0
+
+        def recurse(item):
+            nonlocal visible_count
+            haystack = " ".join(
+                str(item.text(column) or "")
+                for column in range(self._ebom_tree.columnCount())
+            ) + " " + str(item.toolTip(BOM_COL_NAME) or "")
+            basic_match = matches_bom_filter_text(haystack, query)
+            advanced_match = (
+                self._bom_tree_item_matches_advanced_filter(item, filters)
+                if advanced_active else True
+            )
+            self_match = basic_match and advanced_match
+            child_match = False
+            for index in range(item.childCount()):
+                child_match = recurse(item.child(index)) or child_match
+            show = self_match or (show_parents and child_match)
+            item.setHidden(not show)
+            if self_match:
+                visible_count += 1
+            if child_match and (query or advanced_active):
+                item.setExpanded(True)
+            return show
+
+        for index in range(tree.topLevelItemCount()):
+            recurse(tree.topLevelItem(index))
+        self._renumber_tree_rows(tree)
+        return visible_count
 
     def _show_tree_placeholder(self, _message: str) -> None:
         # Backward compatible; loader is now a spinner overlay.
@@ -2237,6 +2422,22 @@ class BomPage(QWidget):
         """)
         bom_header_row = QHBoxLayout()
         bom_header_row.addWidget(bom_header)
+        self.bom_mode_selector = QComboBox()
+        self.bom_mode_selector.addItem("CAD Structure", "cad")
+        self.bom_mode_selector.addItem("Released EBOM", "ebom")
+        self.bom_mode_selector.setFixedWidth(138)
+        self.bom_mode_selector.setToolTip(
+            "CAD Structure is authoritative and editable. Released EBOM is derived and read-only."
+        )
+        self.bom_mode_selector.currentIndexChanged.connect(
+            self._on_bom_mode_changed
+        )
+        bom_header_row.addWidget(self.bom_mode_selector)
+        self.bom_export_btn = QPushButton("Export")
+        self.bom_export_btn.setObjectName("neutral")
+        self.bom_export_btn.setFixedHeight(24)
+        self.bom_export_btn.clicked.connect(self.export_bom)
+        bom_header_row.addWidget(self.bom_export_btn)
         bom_header_row.addStretch()
         self.bom_health_label = QLabel("Health: --")
         self.bom_health_label.setStyleSheet(
@@ -2332,6 +2533,35 @@ class BomPage(QWidget):
         self._search_tree.customContextMenuRequested.connect(self.show_tree_context_menu)
         self._tree_stack.addWidget(self._search_tree)          # index 2
 
+        # The formal EBOM is a derived immutable-iteration view. It has its own
+        # tree so CAD lazy-loading, selection, and editing state remain untouched.
+        self._ebom_tree = QTreeWidget()
+        self._ebom_tree.setHeaderLabels([
+            "#", "Name", "Files", "AES Number", "Type", "Rev/Iter",
+            "Status", "Integrity", "Source Qty", "Effective Qty", "Level",
+        ])
+        self._ebom_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self._ebom_tree.setAlternatingRowColors(True)
+        self._ebom_tree.setUniformRowHeights(True)
+        self._ebom_tree.setIndentation(14)
+        self._ebom_tree.setAnimated(True)
+        self._ebom_tree.setMouseTracking(True)
+        self._ebom_tree.setColumnWidth(BOM_COL_ROW, 38)
+        self._ebom_tree.setColumnWidth(BOM_COL_NAME, 260)
+        self._ebom_tree.setColumnWidth(BOM_COL_FILES, 100)
+        self._ebom_tree.setColumnWidth(BOM_COL_AES, 90)
+        self._ebom_tree.setColumnWidth(BOM_COL_TYPE, 60)
+        self._ebom_tree.setColumnWidth(BOM_COL_REV, 65)
+        self._ebom_tree.setColumnWidth(BOM_COL_STATUS, 75)
+        self._ebom_tree.setColumnWidth(BOM_COL_INTEGRITY, 55)
+        self._ebom_tree.setColumnWidth(EBOM_COL_SOURCE_QTY, 74)
+        self._ebom_tree.setColumnWidth(EBOM_COL_EFFECTIVE_QTY, 84)
+        self._ebom_tree.setColumnWidth(EBOM_COL_LEVEL, 45)
+        self._ebom_tree.setTreePosition(BOM_COL_NAME)
+        self._ebom_tree.itemClicked.connect(self.on_tree_item_clicked)
+        self._ebom_tree.itemDoubleClicked.connect(self._on_tree_item_double_clicked)
+        self._tree_stack.addWidget(self._ebom_tree)             # index 3
+
         _bom_tree_qss = f"""
             QTreeWidget {{
                 background: #FFFFFF;
@@ -2385,6 +2615,7 @@ class BomPage(QWidget):
         """
         self.tree.setStyleSheet(_bom_tree_qss)
         self._search_tree.setStyleSheet(_bom_tree_qss)
+        self._ebom_tree.setStyleSheet(_bom_tree_qss)
 
         def _bom_tree_sel_palette(w):
             try:
@@ -2398,7 +2629,7 @@ class BomPage(QWidget):
             except Exception:
                 pass
 
-        for _tw in (self.tree, self._search_tree):
+        for _tw in (self.tree, self._search_tree, self._ebom_tree):
             try:
                 _tw.setShowDecorationSelected(True)
             except Exception:
@@ -2413,6 +2644,10 @@ class BomPage(QWidget):
         self._search_tree.setItemDelegateForColumn(BOM_COL_FILES, _BomTreeFilesDelegate(self._search_tree, self._search_tree))
         self._search_tree.setItemDelegateForColumn(BOM_COL_STATUS, _BomTreeStatusDelegate(self._search_tree, self._search_tree))
         self._search_tree.setItemDelegateForColumn(BOM_COL_INTEGRITY, _BomTreeIntegrityDelegate(self._search_tree, self._search_tree))
+        self._ebom_tree.setItemDelegateForColumn(BOM_COL_NAME, _BomTreeNameDelegate(self._ebom_tree, self._ebom_tree))
+        self._ebom_tree.setItemDelegateForColumn(BOM_COL_FILES, _BomTreeFilesDelegate(self._ebom_tree, self._ebom_tree))
+        self._ebom_tree.setItemDelegateForColumn(BOM_COL_STATUS, _BomTreeStatusDelegate(self._ebom_tree, self._ebom_tree))
+        self._ebom_tree.setItemDelegateForColumn(BOM_COL_INTEGRITY, _BomTreeIntegrityDelegate(self._ebom_tree, self._ebom_tree))
 
         self._tree_stack.setCurrentIndex(1)
 
@@ -2611,13 +2846,22 @@ class BomPage(QWidget):
         self.structure_views = QTabWidget()
         self.uses_tree = self._create_structure_relation_tree()
         self.where_used_tree = self._create_structure_relation_tree()
+        self.effective_where_used_tree = self._create_structure_relation_tree()
         self.uses_tree.itemDoubleClicked.connect(self._open_structure_tree_item)
         self.where_used_tree.itemDoubleClicked.connect(self._open_structure_tree_item)
-        for relation_tree in (self.uses_tree, self.where_used_tree):
+        self.effective_where_used_tree.itemDoubleClicked.connect(
+            self._open_structure_tree_item
+        )
+        for relation_tree in (
+            self.uses_tree, self.where_used_tree, self.effective_where_used_tree
+        ):
             relation_tree.setContextMenuPolicy(Qt.CustomContextMenu)
             relation_tree.customContextMenuRequested.connect(self._show_structure_context_menu)
         self.structure_views.addTab(self.uses_tree, "Uses")
-        self.structure_views.addTab(self.where_used_tree, "Where Used")
+        self.structure_views.addTab(self.where_used_tree, "CAD Where Used")
+        self.structure_views.addTab(
+            self.effective_where_used_tree, "Effective EBOM Where Used"
+        )
         structure_layout.addWidget(self.structure_views, 1)
         structure_actions = QHBoxLayout()
         self.compare_iterations_btn = QPushButton("Compare Iterations")
@@ -3292,6 +3536,9 @@ class BomPage(QWidget):
         view_3d_action = QAction("🔬 View STEP in 3D Viewer", self)
         view_3d_action.triggered.connect(lambda: self._open_step_in_3d_viewer(item_id))
 
+        policy = item.data(0, BOM_TREE_POLICY_ROLE) or {}
+        is_cad_representation = bool(policy.get("represented_part_id"))
+
         if self.perm.can("manage_parts"):
             menu.addAction(edit_action)
             menu.addAction(delete_action)
@@ -3300,7 +3547,25 @@ class BomPage(QWidget):
                 menu.addAction(add_folder_action)
             if selected_relation_items:
                 menu.addAction(add_to_parent_action)
-        menu.addAction(add_dwg_action)
+        if not is_cad_representation:
+            menu.addAction(add_dwg_action)
+
+        occurrence = item.data(0, BOM_TREE_OCCURRENCE_ROLE) or {}
+        if (
+            getattr(self, "_bom_mode", "cad") == "cad"
+            and occurrence.get("usage_id") is not None
+            and occurrence.get("parent_id") is not None
+            and self.perm.can("manage_parts")
+        ):
+            edit_ebom_behavior_action = QAction("Edit EBOM Behavior", self)
+            edit_ebom_behavior_action.triggered.connect(
+                lambda _checked=False, parent_id=int(occurrence["parent_id"]),
+                       usage_id=int(occurrence["usage_id"]), row_item=item:
+                    self._edit_occurrence_ebom_behavior(
+                        parent_id, usage_id, row_item
+                    )
+            )
+            menu.addAction(edit_ebom_behavior_action)
 
         try:
             summary = self._indicator_summary_for_part(int(item_id), self._issues_for_part(int(item_id)))
@@ -3369,13 +3634,68 @@ class BomPage(QWidget):
             latest_step = self.commit_repo.get_latest_step_commit_for_part(
                 int(item_id), int(self.session.project_id)
             )
-            if latest_step and latest_step.step_file_path and os.path.exists(latest_step.step_file_path):
+            if (
+                not is_cad_representation
+                and latest_step
+                and latest_step.step_file_path
+                and os.path.exists(latest_step.step_file_path)
+            ):
                 menu.addSeparator()
                 menu.addAction(view_3d_action)
         except Exception:
             pass
 
         menu.exec_(tree.viewport().mapToGlobal(position))
+
+    def _edit_occurrence_ebom_behavior(
+        self, parent_id: int, usage_id: int, item: QTreeWidgetItem
+    ) -> None:
+        policy = item.data(0, BOM_TREE_POLICY_ROLE) or {}
+        current = str(policy.get("ebom_behavior") or "INHERIT").upper()
+        choices = [
+            ("INHERIT", "INHERIT — use the child object's default"),
+            ("NORMAL", "NORMAL — deliver this occurrence"),
+            ("FLATTEN", "FLATTEN — hide this occurrence, promote its children"),
+            ("EXCLUDE", "EXCLUDE — not for delivery in this parent"),
+        ]
+        current_index = next(
+            (index for index, value in enumerate(choices) if value[0] == current),
+            0,
+        )
+        selected_label, ok = QInputDialog.getItem(
+            self,
+            "Edit EBOM Behavior",
+            "Occurrence delivery behavior:",
+            [value[1] for value in choices],
+            current_index,
+            False,
+        )
+        if not ok:
+            return
+        selected = next(
+            value for value, label in choices if label == selected_label
+        )
+        try:
+            relation = self.bom_service.set_occurrence_ebom_behavior(
+                int(parent_id), int(usage_id), str(selected)
+            )
+            updated = dict(policy)
+            updated["ebom_behavior"] = str(relation["ebom_behavior"])
+            updated["resolved_ebom_behavior"] = (
+                str(updated.get("default_ebom_behavior") or "NORMAL")
+                if updated["ebom_behavior"] == "INHERIT"
+                else updated["ebom_behavior"]
+            )
+            item.setData(0, BOM_TREE_POLICY_ROLE, updated)
+            item.treeWidget().viewport().update()
+            QMessageBox.information(
+                self,
+                "EBOM Behavior",
+                "The checked-out parent structure was updated. The rule will be "
+                "frozen in its next iteration on check-in.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Edit EBOM Behavior", str(exc))
 
     def _default_bom_advanced_filters(self) -> dict:
         return {
@@ -3751,7 +4071,11 @@ class BomPage(QWidget):
 
     def _collect_tree_column_values(self, column: int) -> list[str]:
         values = set()
-        for tree in (getattr(self, "tree", None), getattr(self, "_search_tree", None)):
+        for tree in (
+            getattr(self, "tree", None),
+            getattr(self, "_search_tree", None),
+            getattr(self, "_ebom_tree", None),
+        ):
             if tree is None:
                 continue
             try:
@@ -3764,6 +4088,8 @@ class BomPage(QWidget):
         return sorted(values, key=lambda s: s.lower())
 
     def _current_tree_for_filtering(self) -> QTreeWidget:
+        if getattr(self, "_bom_mode", "cad") == "ebom":
+            return getattr(self, "_ebom_tree", self.tree)
         if getattr(self, "_in_search_mode", False):
             return getattr(self, "_search_tree", self.tree)
         return self.tree
@@ -4108,7 +4434,11 @@ class BomPage(QWidget):
         self._bom_advanced_filters = self._default_bom_advanced_filters()
         self._active_saved_filter_id = None
         self._active_saved_filter_name = ""
-        for tree in (getattr(self, "tree", None), getattr(self, "_search_tree", None)):
+        for tree in (
+            getattr(self, "tree", None),
+            getattr(self, "_search_tree", None),
+            getattr(self, "_ebom_tree", None),
+        ):
             if tree is None:
                 continue
             try:
@@ -4116,7 +4446,9 @@ class BomPage(QWidget):
                     item.setHidden(False)
             except Exception:
                 pass
-        if was_flat_filter:
+        if getattr(self, "_bom_mode", "cad") == "ebom":
+            self._refresh_ebom_filters()
+        elif was_flat_filter:
             try:
                 if self.search_input.text().strip():
                     self._perform_search_now()
@@ -4202,6 +4534,9 @@ class BomPage(QWidget):
             (0, BOM_TREE_ISSUE_ROLE),
             (0, BOM_TREE_CATEGORY_ROLE),
             (0, BOM_TREE_BINDING_UPDATE_ROLE),
+            (0, BOM_TREE_POLICY_ROLE),
+            (0, BOM_TREE_OCCURRENCE_ROLE),
+            (0, BOM_TREE_PROMOTION_ROLE),
             (BOM_COL_FILES, BOM_TREE_FILES_ROLE),
             (BOM_COL_INTEGRITY, BOM_TREE_INTEGRITY_ROLE),
         ):
@@ -4282,6 +4617,10 @@ class BomPage(QWidget):
         )
         if self._is_default_bom_advanced_filter():
             self.clear_bom_tree_filter()
+            return
+        if getattr(self, "_bom_mode", "cad") == "ebom":
+            total_visible = self._refresh_ebom_filters()
+            self._update_advanced_filter_button_state(total_visible)
             return
         # Let an incremental basic-search build finish before filtering its rows.
         # _search_build_step() reapplies the current advanced filter on completion.
@@ -5977,6 +6316,12 @@ class BomPage(QWidget):
 
     def _perform_search_now(self):
         query = self.search_input.text().strip()
+        if getattr(self, "_bom_mode", "cad") == "ebom":
+            visible = self._refresh_ebom_filters()
+            if not self._is_default_bom_advanced_filter():
+                self._update_advanced_filter_button_state(visible)
+            self._tree_stack.setCurrentIndex(3)
+            return
         if not query:
             self._exit_search_mode()
             if not self._is_default_bom_advanced_filter():
@@ -6009,6 +6354,8 @@ class BomPage(QWidget):
         thread.start()
 
     def _on_search_finished(self, seq: int, results: object) -> None:
+        if getattr(self, "_bom_mode", "cad") == "ebom":
+            return
         if int(seq) != int(getattr(self, "_tree_load_seq", 0)):
             return
         self._begin_search_build(int(seq), list(results or []))
@@ -6385,6 +6732,28 @@ class BomPage(QWidget):
         item.setData(0, BOM_TREE_CATEGORY_ROLE, list(category_names or []))
         binding_update_count = int(info.get("binding_update_count") or 0)
         item.setData(0, BOM_TREE_BINDING_UPDATE_ROLE, binding_update_count)
+        item.setData(0, BOM_TREE_POLICY_ROLE, {
+            "classification": str(info.get("classification") or "PHYSICAL"),
+            "default_ebom_behavior": str(
+                info.get("default_ebom_behavior") or "NORMAL"
+            ),
+            "ebom_behavior": str(info.get("ebom_behavior") or "INHERIT"),
+            "resolved_ebom_behavior": str(
+                info.get("resolved_ebom_behavior")
+                or info.get("default_ebom_behavior")
+                or "NORMAL"
+            ),
+            "represented_part_id": info.get("represented_part_id"),
+            "cad_control_mode": str(info.get("cad_control_mode") or "CONTROLLED"),
+        })
+        item.setData(0, BOM_TREE_OCCURRENCE_ROLE, {
+            "usage_id": info.get("usage_id"),
+            "parent_id": info.get("relation_parent_id"),
+            "quantity": info.get("quantity"),
+        })
+        item.setData(
+            0, BOM_TREE_PROMOTION_ROLE, list(info.get("promoted_through") or [])
+        )
         item.setText(BOM_COL_FILES, "")
         item.setText(BOM_COL_AES, str(info.get("aes_number", "") or ""))
         item.setText(BOM_COL_TYPE, str(info.get("type", "") or ""))
@@ -6427,8 +6796,50 @@ class BomPage(QWidget):
                 tips0.append(
                     f"{binding_update_count} direct child version update(s) available"
                 )
-            tips0.append(str(summary["pdf"].get("tooltip", "PDF: unknown")))
-            tips0.append(str(summary["step"].get("tooltip", "STEP: unknown")))
+            classification = str(info.get("classification") or "PHYSICAL").upper()
+            occurrence_behavior = str(info.get("ebom_behavior") or "INHERIT").upper()
+            resolved_behavior = str(
+                info.get("resolved_ebom_behavior")
+                or info.get("default_ebom_behavior")
+                or "NORMAL"
+            ).upper()
+            tips0.append(
+                f"EBOM policy: {classification}; occurrence {occurrence_behavior}; "
+                f"effective {resolved_behavior}"
+            )
+            if str(info.get("cad_control_mode") or "CONTROLLED").upper() == "SUPPLIER_PACKAGE":
+                tips0.append(
+                    "Supplier-managed CAD package: internal owned CAD dependencies are not BOM items and are excluded from individual integrity checks."
+                )
+            if info.get("represented_part_id"):
+                tips0.append(
+                    f"CAD-only representation of physical BOM item #{info.get('represented_part_id')}. "
+                    "It shares that item's AES number and has no drawing, PDF, or STEP delivery output."
+                )
+            elif resolved_behavior == "EXCLUDE":
+                tips0.append(
+                    "Not for delivery: this CAD occurrence and its descendants do not appear in Released EBOM."
+                )
+            elif resolved_behavior == "FLATTEN":
+                tips0.append(
+                    "CAD grouping only: this occurrence does not appear in Released EBOM; its children are promoted."
+                )
+            promoted_through = list(info.get("promoted_through") or [])
+            if promoted_through:
+                labels = " > ".join(
+                    str(
+                        value.get("aes_number")
+                        or value.get("name")
+                        or value.get("bom_id")
+                    )
+                    for value in promoted_through
+                )
+                tips0.append(
+                    f"Promoted through flattened CAD structure: {labels}"
+                )
+            if not info.get("represented_part_id"):
+                tips0.append(str(summary["pdf"].get("tooltip", "PDF: unknown")))
+                tips0.append(str(summary["step"].get("tooltip", "STEP: unknown")))
             item.setToolTip(BOM_COL_NAME, "\n".join(tips0))
             item.setToolTip(BOM_COL_FILES, "\n".join([
                 str(summary["pdf"].get("tooltip", "PDF: unknown")),
@@ -6487,6 +6898,7 @@ class BomPage(QWidget):
     def _refresh_bom_row_numbers(self) -> None:
         self._renumber_full_bom_tree_rows()
         self._sync_search_tree_row_numbers()
+        self._renumber_tree_rows(getattr(self, "_ebom_tree", None))
 
     def _renumber_full_bom_tree_rows(self) -> None:
         if getattr(self, "_lazy_tree_active", False):
@@ -7413,8 +7825,8 @@ class BomPage(QWidget):
         dialog = PartDialog(self)
         if dialog.exec_() == QDialog.Accepted:
             part_data = dialog.get_data()
-            if not part_data["aes_number"] or not part_data["name"]:
-                QMessageBox.warning(self, "Validation Error", "AES Number and Name are required fields.")
+            if not part_data["name"]:
+                QMessageBox.warning(self, "Validation Error", "Name is required.")
                 return
             try:
                 added= self.bom_service.add_part(part_data)
@@ -7449,8 +7861,8 @@ class BomPage(QWidget):
         dialog = PartDialog(self, part_data)
         if dialog.exec_() == QDialog.Accepted:
             updated_data = dialog.get_data()
-            if not updated_data["aes_number"] or not updated_data["name"]:
-                QMessageBox.warning(self, "Validation Error", "AES Number and Name are required fields.")
+            if not updated_data["name"]:
+                QMessageBox.warning(self, "Validation Error", "Name is required.")
                 return
             try:
                 self.bom_service.update_part(id, updated_data)
@@ -8470,6 +8882,28 @@ class BomPage(QWidget):
                 active_count = int(issue_summary.get("active_count") or 0)
                 if active_count:
                     name_tips.append(f"{active_count} active issue(s) linked to this part")
+                policy = item.data(0, BOM_TREE_POLICY_ROLE) or {}
+                classification = str(
+                    policy.get("classification") or "PHYSICAL"
+                ).upper()
+                occurrence_behavior = str(
+                    policy.get("ebom_behavior") or "INHERIT"
+                ).upper()
+                resolved_behavior = str(
+                    policy.get("resolved_ebom_behavior") or "NORMAL"
+                ).upper()
+                name_tips.append(
+                    f"EBOM policy: {classification}; occurrence {occurrence_behavior}; "
+                    f"effective {resolved_behavior}"
+                )
+                if resolved_behavior == "EXCLUDE":
+                    name_tips.append(
+                        "Not for delivery: excluded with all descendants from Released EBOM."
+                    )
+                elif resolved_behavior == "FLATTEN":
+                    name_tips.append(
+                        "CAD grouping only: hidden from Released EBOM; children are promoted."
+                    )
                 name_tips.extend([
                     str(summary["pdf"].get("tooltip", "PDF: unknown")),
                     str(summary["step"].get("tooltip", "STEP: unknown")),
@@ -8545,6 +8979,12 @@ class BomPage(QWidget):
         if node.get("cycle"):
             item.setToolTip(0, "Circular structure reference")
             item.setForeground(2, QBrush(QColor("#b91c1c")))
+        if node.get("promotion_path"):
+            item.setToolTip(
+                0,
+                "Effective EBOM parent after flattening through: "
+                + str(node["promotion_path"]),
+            )
         if parent is None:
             tree.addTopLevelItem(item)
         else:
@@ -8556,7 +8996,12 @@ class BomPage(QWidget):
     def _populate_structure_views(self, context: dict) -> None:
         uses = (context or {}).get("uses")
         where_used = (context or {}).get("where_used")
-        for tree, root in ((self.uses_tree, uses), (self.where_used_tree, where_used)):
+        effective_where_used = (context or {}).get("effective_where_used")
+        for tree, root in (
+            (self.uses_tree, uses),
+            (self.where_used_tree, where_used),
+            (self.effective_where_used_tree, effective_where_used),
+        ):
             tree.setUpdatesEnabled(False)
             try:
                 tree.clear()
@@ -8568,11 +9013,24 @@ class BomPage(QWidget):
 
         uses_count = int((context or {}).get("uses_count") or 0)
         where_used_count = int((context or {}).get("where_used_count") or 0)
+        effective_count = int(
+            (context or {}).get("effective_where_used_count") or 0
+        )
+        effective_error = str(
+            (context or {}).get("effective_where_used_error") or ""
+        )
         self.structure_summary_label.setText(
-            f"Structure relations: {uses_count} uses  |  {where_used_count} where used"
+            f"Structure relations: {uses_count} uses  |  {where_used_count} direct CAD parent(s)"
+            f"  |  {effective_count} effective EBOM parent occurrence(s)"
         )
         self.structure_views.setTabText(0, f"Uses ({uses_count})")
-        self.structure_views.setTabText(1, f"Where Used ({where_used_count})")
+        self.structure_views.setTabText(1, f"CAD Where Used ({where_used_count})")
+        self.structure_views.setTabText(
+            2, f"Effective EBOM Where Used ({effective_count})"
+        )
+        self.effective_where_used_tree.setToolTip(
+            effective_error or "First visible EBOM parent after flattening."
+        )
         try:
             details = getattr(self, "_current_part_details", {}) or {}
             self._update_lifecycle_action_states(details)
@@ -8831,9 +9289,11 @@ class BomPage(QWidget):
         self._update_details_summary({})
         self.uses_tree.clear()
         self.where_used_tree.clear()
+        self.effective_where_used_tree.clear()
         self.structure_summary_label.setText("Select a BOM item")
         self.structure_views.setTabText(0, "Uses")
-        self.structure_views.setTabText(1, "Where Used")
+        self.structure_views.setTabText(1, "CAD Where Used")
+        self.structure_views.setTabText(2, "Effective EBOM Where Used")
         self.notes_view.clear()
         try:
             self.part_issues_table.setRowCount(0)
@@ -8882,6 +9342,33 @@ class BomPage(QWidget):
             identity_parts.append(part_type.upper())
         if current_version:
             identity_parts.append(f"Version {current_version}")
+        classification = str(
+            self._current_part_details.get("classification") or "PHYSICAL"
+        ).upper()
+        default_behavior = str(
+            self._current_part_details.get("default_ebom_behavior") or "NORMAL"
+        ).upper()
+        if classification != "PHYSICAL":
+            identity_parts.append(classification.replace("_", " "))
+        if default_behavior == "EXCLUDE":
+            identity_parts.append("Default: NOT FOR DELIVERY")
+        elif default_behavior == "FLATTEN":
+            identity_parts.append("Default: FLATTEN IN EBOM")
+        if self._current_part_details.get("represented_part_id"):
+            target_label = self._details_value(
+                self._current_part_details,
+                ("represented_part_name", "represented_part_aes"),
+            )
+            identity_parts.append(
+                f"CAD REP OF {target_label or ('#' + str(self._current_part_details['represented_part_id']))}"
+            )
+        if str(
+            self._current_part_details.get("cad_control_mode") or "CONTROLLED"
+        ).upper() == "SUPPLIER_PACKAGE":
+            dependency_count = int(
+                self._current_part_details.get("cad_dependency_count") or 0
+            )
+            identity_parts.append(f"SUPPLIER PACKAGE · {dependency_count} CAD FILES")
         self.details_identity_label.setText(
             "  |  ".join(identity_parts)
             if identity_parts else "Select a row in the BOM structure to view its summary."
@@ -8916,18 +9403,35 @@ class BomPage(QWidget):
         is_assembly = str(details.get("type") or "").strip().lower() in {"asm", "assembly"}
         can_manage = self.perm.can("manage_parts")
         can_revision = self.perm.can("set_revision")
-        self.checkout_part_btn.setEnabled(has_item and not locked and not obsolete)
-        self.undo_checkout_btn.setEnabled(has_item and locked)
-        self.edit_part_btn.setEnabled(has_item and locked and can_manage and editable_checkout)
-        self.delete_part_btn.setEnabled(has_item and can_manage and editable_checkout)
-        self.add_child_btn.setEnabled(has_item and locked and can_manage and is_assembly and editable_checkout)
-        self.compare_iterations_btn.setEnabled(has_item and is_assembly)
-        self.create_configuration_btn.setEnabled(has_item and is_assembly)
-        self.update_child_versions_btn.setEnabled(has_item and locked and is_assembly and editable_checkout)
-        self.set_revision_btn.setEnabled(
-            has_item and not locked and released and not pending_revision and can_revision
+        read_only_ebom = getattr(self, "_bom_mode", "cad") == "ebom"
+        self.checkout_part_btn.setEnabled(
+            has_item and not locked and not obsolete and not read_only_ebom
         )
-        self.release_revision_btn.setEnabled(has_item and not locked and not released and can_revision)
+        self.undo_checkout_btn.setEnabled(has_item and locked and not read_only_ebom)
+        self.edit_part_btn.setEnabled(
+            has_item and locked and can_manage and editable_checkout and not read_only_ebom
+        )
+        self.delete_part_btn.setEnabled(
+            has_item and can_manage and editable_checkout and not read_only_ebom
+        )
+        self.add_child_btn.setEnabled(
+            has_item and locked and can_manage and is_assembly
+            and editable_checkout and not read_only_ebom
+        )
+        self.compare_iterations_btn.setEnabled(has_item and is_assembly)
+        self.create_configuration_btn.setEnabled(
+            has_item and is_assembly and not read_only_ebom
+        )
+        self.update_child_versions_btn.setEnabled(
+            has_item and locked and is_assembly and editable_checkout and not read_only_ebom
+        )
+        self.set_revision_btn.setEnabled(
+            has_item and not locked and released and not pending_revision
+            and can_revision and not read_only_ebom
+        )
+        self.release_revision_btn.setEnabled(
+            has_item and not locked and not released and can_revision and not read_only_ebom
+        )
         self._sync_action_ribbon_menus()
 
     def _edit_current_part_categories(self) -> None:
@@ -9988,6 +10492,40 @@ class BomPage(QWidget):
         wb.save(file_path)
 
     def export_bom(self):
+        if getattr(self, "_bom_mode", "cad") == "ebom":
+            selected = self._ebom_tree.currentItem()
+            if selected is None and self._ebom_tree.topLevelItemCount():
+                selected = self._ebom_tree.topLevelItem(0)
+            if selected is None:
+                QMessageBox.warning(
+                    self, "Export Released EBOM", "There is no resolved EBOM to export."
+                )
+                return
+            while selected.parent() is not None:
+                selected = selected.parent()
+            root_bom_id = selected.data(0, Qt.UserRole)
+            file_path, _selected_filter = QFileDialog.getSaveFileName(
+                self,
+                "Export Released EBOM",
+                "released_ebom.csv",
+                "CSV Files (*.csv)",
+            )
+            if not file_path:
+                return
+            if not file_path.lower().endswith(".csv"):
+                file_path += ".csv"
+            try:
+                result = self.bom_service.export_released_ebom(
+                    int(root_bom_id), file_path
+                )
+                QMessageBox.information(
+                    self,
+                    "Export Released EBOM",
+                    f"Exported {result['row_count']} effective EBOM row(s) to {file_path}.",
+                )
+            except Exception as exc:
+                QMessageBox.critical(self, "Export Released EBOM", str(exc))
+            return
         default_name = "bom_filtered.xlsx" if not self._is_default_bom_advanced_filter() else "bom.xlsx"
         file_path, selected_filter = QFileDialog.getSaveFileName(
             self,
