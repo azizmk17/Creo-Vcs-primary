@@ -36,3 +36,8 @@ class Bom:
     drawing_requirement: str = "OPTIONAL"
     represented_part_id: Optional[int] = None
     cad_control_mode: str = "CONTROLLED"
+    item_type: str = "MECHANICAL_PART"
+    assembly_mode: str = "COMPONENT"
+    procurement_source: str = "MAKE"
+    item_view: str = "DESIGN"
+    default_unit: str = "EA"

@@ -7,6 +7,15 @@ from core.ebom_policy import (
     normalize_default_behavior,
     normalize_requirement,
 )
+from core.item_policy import (
+    ITEM_NUMBER_START,
+    ITEM_NUMBER_WIDTH,
+    normalize_assembly_mode,
+    normalize_default_unit,
+    normalize_item_type,
+    normalize_item_view,
+    normalize_procurement_source,
+)
 from config import DB_NAME
 
 class BomRepository:
@@ -59,6 +68,8 @@ class BomRepository:
             with self.get_conn() as conn:
                 columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(bom)")}
                 definitions = {
+                    "part_number": "part_number TEXT",
+                    "project_id": "project_id INTEGER",
                     "classification": "classification TEXT NOT NULL DEFAULT 'PHYSICAL'",
                     "default_ebom_behavior": (
                         "default_ebom_behavior TEXT NOT NULL DEFAULT 'NORMAL'"
@@ -72,6 +83,21 @@ class BomRepository:
                     "represented_part_id": "represented_part_id INTEGER",
                     "cad_control_mode": (
                         "cad_control_mode TEXT NOT NULL DEFAULT 'CONTROLLED'"
+                    ),
+                    "item_type": (
+                        "item_type TEXT NOT NULL DEFAULT 'MECHANICAL_PART'"
+                    ),
+                    "assembly_mode": (
+                        "assembly_mode TEXT NOT NULL DEFAULT 'COMPONENT'"
+                    ),
+                    "procurement_source": (
+                        "procurement_source TEXT NOT NULL DEFAULT 'MAKE'"
+                    ),
+                    "item_view": (
+                        "item_view TEXT NOT NULL DEFAULT 'DESIGN'"
+                    ),
+                    "default_unit": (
+                        "default_unit TEXT NOT NULL DEFAULT 'EA'"
                     ),
                 }
                 for name, definition in definitions.items():
@@ -93,10 +119,48 @@ class BomRepository:
                         ON bom_cad_dependencies(owner_bom_id);
                     CREATE INDEX IF NOT EXISTS idx_bom_cad_dependencies_project
                         ON bom_cad_dependencies(project_id, base_file_name);
+                    CREATE TABLE IF NOT EXISTS item_number_sequence (
+                        id INTEGER PRIMARY KEY CHECK(id=1),
+                        next_value INTEGER NOT NULL,
+                        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    );
                     """
                 )
+                self._initialize_item_number_sequence(conn)
+                try:
+                    conn.execute(
+                        """
+                        CREATE UNIQUE INDEX IF NOT EXISTS ux_bom_project_item_number
+                        ON bom(project_id, part_number COLLATE NOCASE)
+                        WHERE part_number IS NOT NULL AND trim(part_number)<>''
+                          AND represented_part_id IS NULL
+                        """
+                    )
+                except sqlite3.IntegrityError:
+                    # Legacy databases can contain duplicate numbers.  Service
+                    # validation prevents new conflicts until those rows are repaired.
+                    pass
         except Exception:
             pass
+
+    @staticmethod
+    def _initialize_item_number_sequence(conn) -> None:
+        row = conn.execute(
+            "SELECT next_value FROM item_number_sequence WHERE id=1"
+        ).fetchone()
+        if row is not None:
+            return
+        highest = ITEM_NUMBER_START - 1
+        for existing in conn.execute(
+            "SELECT part_number FROM bom WHERE part_number IS NOT NULL"
+        ).fetchall():
+            raw = str(existing[0] or "").strip()
+            if raw.isdigit():
+                highest = max(highest, int(raw))
+        conn.execute(
+            "INSERT INTO item_number_sequence(id,next_value) VALUES(1,?)",
+            (max(ITEM_NUMBER_START, highest + 1),),
+        )
 
     def _ensure_category_schema(self):
         """Keep category storage available when a repository starts before migrations run."""
@@ -207,8 +271,9 @@ class BomRepository:
                                 weight, notes, pdf_path, step_path, status, created, modified,
                                 project_id, classification, default_ebom_behavior,
                                 cad_requirement, drawing_requirement, represented_part_id,
-                                cad_control_mode)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                cad_control_mode, item_type, assembly_mode,
+                                procurement_source, item_view, default_unit)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 bom.type, bom.name, bom.part_number, bom.drawing_number, bom.aes_number,
                 bom.filename, bom.drawing, bom.base_file_name, bom.base_drw_name, bom.material, bom.weight, bom.notes, bom.pdf_path, bom.step_path, bom.status,
@@ -219,6 +284,11 @@ class BomRepository:
                 normalize_requirement(bom.drawing_requirement, "drawing requirement"),
                 bom.represented_part_id,
                 normalize_cad_control_mode(bom.cad_control_mode),
+                normalize_item_type(bom.item_type),
+                normalize_assembly_mode(bom.assembly_mode),
+                normalize_procurement_source(bom.procurement_source),
+                normalize_item_view(bom.item_view),
+                normalize_default_unit(bom.default_unit),
             ))
             return cur.lastrowid
 
@@ -289,6 +359,56 @@ class BomRepository:
             if row:
                 return Bom(**row)
             return None
+
+    def get_by_part_number(self, part_number: str, project_id) -> Optional[Bom]:
+        """Return the real Item identified by its project-scoped PLM Number."""
+        number = str(part_number or "").strip()
+        if not number:
+            return None
+        with self.get_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM bom
+                WHERE project_id=? AND lower(trim(part_number))=lower(?)
+                  AND represented_part_id IS NULL
+                ORDER BY id LIMIT 1
+                """,
+                (int(project_id), number),
+            ).fetchone()
+            return Bom(**row) if row else None
+
+    def allocate_part_number(self) -> str:
+        """Atomically reserve the next global generated Item Number."""
+        with self.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS item_number_sequence (
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    next_value INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+                """
+            )
+            self._initialize_item_number_sequence(conn)
+            row = conn.execute(
+                "SELECT next_value FROM item_number_sequence WHERE id=1"
+            ).fetchone()
+            candidate = max(ITEM_NUMBER_START, int(row[0] if row else ITEM_NUMBER_START))
+            while conn.execute(
+                "SELECT 1 FROM bom WHERE lower(trim(part_number))=lower(?) LIMIT 1",
+                (str(candidate).zfill(ITEM_NUMBER_WIDTH),),
+            ).fetchone():
+                candidate += 1
+            conn.execute(
+                """
+                UPDATE item_number_sequence
+                SET next_value=?,updated_at=datetime('now') WHERE id=1
+                """,
+                (candidate + 1,),
+            )
+            conn.commit()
+            return str(candidate).zfill(ITEM_NUMBER_WIDTH)
 
     def get_all_by_base_file_name_for_commit(
         self,
@@ -369,13 +489,13 @@ class BomRepository:
         with self.get_conn() as conn:
             rows = conn.execute(
                 f"""
-                SELECT id, aes_number, name, type
+                SELECT id, part_number, aes_number, name, type
                 FROM bom
                 WHERE project_id=?
                   AND represented_part_id IS NULL
                   AND UPPER(COALESCE(classification, 'PHYSICAL'))='PHYSICAL'
                   {exclude_clause}
-                ORDER BY lower(COALESCE(aes_number, '')), lower(name), id
+                ORDER BY lower(COALESCE(part_number, '')), lower(name), id
                 """,
                 params,
             ).fetchall()
@@ -404,14 +524,14 @@ class BomRepository:
         with self.get_conn() as conn:
             rows = conn.execute(
                 """
-                SELECT b.id, b.aes_number, b.name, b.type,
+                SELECT b.id, b.part_number, b.aes_number, b.name, b.type,
                        COUNT(d.id) AS dependency_count
                 FROM bom b
                 LEFT JOIN bom_cad_dependencies d ON d.owner_bom_id=b.id
                 WHERE b.project_id=?
                   AND UPPER(COALESCE(b.cad_control_mode,'CONTROLLED'))='SUPPLIER_PACKAGE'
                 GROUP BY b.id
-                ORDER BY lower(COALESCE(b.aes_number,'')), lower(b.name), b.id
+                ORDER BY lower(COALESCE(b.part_number,'')), lower(b.name), b.id
                 """,
                 (int(project_id),),
             ).fetchall()
@@ -468,11 +588,12 @@ class BomRepository:
         with self.get_conn() as conn:
             rows = conn.execute(
                 f"""
-                SELECT d.*, b.aes_number AS owner_aes_number, b.name AS owner_name
+                SELECT d.*, b.part_number AS owner_item_number,
+                       b.aes_number AS owner_aes_number, b.name AS owner_name
                 FROM bom_cad_dependencies d
                 JOIN bom b ON b.id=d.owner_bom_id
                 WHERE d.project_id=? {owner_clause}
-                ORDER BY lower(COALESCE(b.aes_number,'')), lower(d.base_file_name), d.id
+                ORDER BY lower(COALESCE(b.part_number,'')), lower(d.base_file_name), d.id
                 """,
                 params,
             ).fetchall()
@@ -520,7 +641,7 @@ class BomRepository:
             row = conn.execute(
                 """
                 SELECT d.id AS dependency_id, d.owner_bom_id, d.base_file_name,
-                       b.aes_number, b.name
+                       b.part_number, b.aes_number, b.name
                 FROM bom_cad_dependencies d
                 JOIN bom b ON b.id=d.owner_bom_id
                 WHERE d.project_id=? AND d.base_file_name=? COLLATE NOCASE
@@ -716,7 +837,7 @@ class BomRepository:
                 FROM bom_item_categories ic
                 JOIN bom b ON b.id=ic.bom_id
                 WHERE ic.category_id=? AND b.project_id=?
-                ORDER BY lower(COALESCE(b.aes_number, '')), lower(b.name), b.id
+                ORDER BY lower(COALESCE(b.part_number, '')), lower(b.name), b.id
                 """,
                 (int(category_id), int(project_id)),
             ).fetchall()
@@ -736,7 +857,7 @@ class BomRepository:
                 FROM bom_item_categories ic
                 JOIN bom b ON b.id=ic.bom_id
                 WHERE ic.category_id=? AND b.project_id=?
-                ORDER BY lower(COALESCE(b.aes_number, '')), lower(b.name), b.id
+                ORDER BY lower(COALESCE(b.part_number, '')), lower(b.name), b.id
                 """,
                 (int(category_id), int(project_id)),
             ).fetchall()
@@ -761,7 +882,8 @@ class BomRepository:
                     filename=?, drawing=?, material=?, weight=?, notes=?, pdf_path=?, step_path=?,
                     status=?, created=?, modified=?, classification=?,
                     default_ebom_behavior=?, cad_requirement=?, drawing_requirement=?,
-                    represented_part_id=?, cad_control_mode=?
+                    represented_part_id=?, cad_control_mode=?, item_type=?,
+                    assembly_mode=?, procurement_source=?, item_view=?, default_unit=?
                 WHERE id=?
             """, (
                 bom.type, bom.name, bom.part_number, bom.drawing_number, bom.aes_number,
@@ -773,6 +895,11 @@ class BomRepository:
                 normalize_requirement(bom.drawing_requirement, "drawing requirement"),
                 bom.represented_part_id,
                 normalize_cad_control_mode(bom.cad_control_mode),
+                normalize_item_type(bom.item_type),
+                normalize_assembly_mode(bom.assembly_mode),
+                normalize_procurement_source(bom.procurement_source),
+                normalize_item_view(bom.item_view),
+                normalize_default_unit(bom.default_unit),
                 bom.id,
             ))
 

@@ -25,8 +25,16 @@ from core.ebom_policy import (
     normalize_requirement,
     requires_aes_number,
 )
+from core.item_policy import (
+    normalize_assembly_mode,
+    normalize_default_unit,
+    normalize_item_type,
+    normalize_item_view,
+    normalize_procurement_source,
+)
 from core.services.ebom_service import EbomExportService, EbomService
 from core.services.release_validation_service import ReleaseValidationService
+from core.services.pdm_service import PdmService
 
 
 class BomService(BaseService):
@@ -43,6 +51,7 @@ class BomService(BaseService):
         self.ebom_service = EbomService()
         self.ebom_export_service = EbomExportService(self.ebom_service)
         self.release_validation_service = ReleaseValidationService()
+        self.pdm_service = PdmService()
         self.session = SessionManager()
         self._tree_cache: dict = {}    # project_id -> tree dict
         self._tree_dirty: set = set()  # project_ids that need re-fetch
@@ -202,19 +211,32 @@ class BomService(BaseService):
 
     def add_part(self, part_data: dict) -> int:
         part_data = self._representation_values(part_data)
+        part_number = str(part_data.get("part_number") or "").strip()
+        if not part_number:
+            part_number = self.bom_repo.allocate_part_number()
+        existing_number = self.bom_repo.get_by_part_number(
+            part_number, self.session.project_id
+        )
+        if existing_number:
+            raise ValueError(
+                f"Item Number {part_number} already identifies another Item in this product."
+            )
+        part_data["part_number"] = part_number
         aes_number = str(part_data.get("aes_number") or "").strip()
         if requires_aes_number(
             part_data.get("default_ebom_behavior"),
             part_data.get("represented_part_id"),
         ) and not aes_number:
-            raise ValueError("AES Number is required for items that are for delivery.")
+            raise ValueError("AES Number is required for Items that are for delivery.")
 
         existing = (
             self.bom_repo.get_by_aes(aes_number, self.session.project_id)
             if aes_number else None
         )
         if existing and not part_data.get("represented_part_id"):
-            return "existing"
+            raise ValueError(
+                f"AES Number {aes_number} is already assigned to another deliverable Item."
+            )
         
         if part_data.get("filename"):
             filename = os.path.basename(part_data.get("filename"))
@@ -230,11 +252,17 @@ class BomService(BaseService):
             drawing_filename = None
             base_drw_name = None
 
+        raw_assembly_mode = part_data.get("assembly_mode")
+        if not raw_assembly_mode and str(part_data.get("type") or "").lower() in {
+            "asm", "assembly"
+        }:
+            raw_assembly_mode = "SEPARABLE"
+
         bom_item = Bom(
             id=None,
             type=part_data.get("type", "prt"),
             name=part_data.get("name", "Unnamed"),
-            part_number=part_data.get("part_number"),
+            part_number=part_number,
             drawing_number=part_data.get("drawing_number"),
             aes_number=aes_number,
             filename=filename,
@@ -264,14 +292,31 @@ class BomService(BaseService):
             cad_control_mode=normalize_cad_control_mode(
                 part_data.get("cad_control_mode")
             ),
+            item_type=normalize_item_type(part_data.get("item_type")),
+            assembly_mode=normalize_assembly_mode(raw_assembly_mode),
+            procurement_source=normalize_procurement_source(
+                part_data.get("procurement_source")
+            ),
+            item_view=normalize_item_view(part_data.get("item_view")),
+            default_unit=normalize_default_unit(part_data.get("default_unit")),
         )
-        result = self.bom_repo.insert(bom_item)
+        try:
+            result = self.bom_repo.insert(bom_item)
+        except sqlite3.IntegrityError as exc:
+            if "item_number" in str(exc).lower() or "part_number" in str(exc).lower():
+                raise ValueError(
+                    f"Item Number {part_number} was allocated by another operation. Try again."
+                ) from exc
+            raise
         if isinstance(result, int):
             if base_f_name:
                 self.bom_repo.remove_cad_dependency_by_base(
                     int(self.session.project_id), base_f_name
                 )
             self.revision_repo.ensure_bom(int(result), created_by=self.user_id)
+            pdm_service = getattr(self, "pdm_service", None)
+            if pdm_service is not None:
+                pdm_service.sync_legacy_item(int(result))
         self._tree_dirty.add(int(self.session.project_id))
         return result
 
@@ -287,6 +332,27 @@ class BomService(BaseService):
             return False
         self._assert_checked_out_for_change(int(part.id), "edit its attributes")
         part_data = self._representation_values(part_data, part_id=part.id)
+        requested_number = str(
+            part_data.get("part_number", part.part_number) or ""
+        ).strip()
+        current_number = str(part.part_number or "").strip()
+        if not requested_number:
+            if current_number:
+                requested_number = current_number
+            else:
+                requested_number = self.bom_repo.allocate_part_number()
+        if current_number and requested_number.casefold() != current_number.casefold():
+            raise ValueError(
+                "Item Number is immutable. Use a controlled Rename operation to change identity."
+            )
+        number_owner = self.bom_repo.get_by_part_number(
+            requested_number, self.session.project_id
+        )
+        if number_owner and int(number_owner.id) != int(part.id):
+            raise ValueError(
+                f"Item Number {requested_number} already identifies another Item in this product."
+            )
+        part_data["part_number"] = current_number or requested_number
         effective_behavior = part_data.get(
             "default_ebom_behavior", part.default_ebom_behavior
         )
@@ -297,7 +363,15 @@ class BomService(BaseService):
         if requires_aes_number(
             effective_behavior, effective_representation
         ) and not effective_aes:
-            raise ValueError("AES Number is required for items that are for delivery.")
+            raise ValueError("AES Number is required for Items that are for delivery.")
+        if effective_aes and effective_representation is None:
+            aes_owner = self.bom_repo.get_by_aes(
+                effective_aes, self.session.project_id
+            )
+            if aes_owner and int(aes_owner.id) != int(part.id):
+                raise ValueError(
+                    f"AES Number {effective_aes} is already assigned to another deliverable Item."
+                )
         if "aes_number" in part_data:
             part_data["aes_number"] = effective_aes
         if "cad_control_mode" in part_data:
@@ -311,6 +385,16 @@ class BomService(BaseService):
                     "Remove the owned CAD dependencies before changing this item back to CONTROLLED."
                 )
             part_data["cad_control_mode"] = new_control_mode
+        normalizers = {
+            "item_type": normalize_item_type,
+            "assembly_mode": normalize_assembly_mode,
+            "procurement_source": normalize_procurement_source,
+            "item_view": normalize_item_view,
+            "default_unit": normalize_default_unit,
+        }
+        for field, normalizer in normalizers.items():
+            if field in part_data:
+                part_data[field] = normalizer(part_data.get(field))
             
         # Update part fields
         for key, value in part_data.items():
@@ -376,6 +460,20 @@ class BomService(BaseService):
         self._assert_checked_out_for_change(int(parent.id), "change its structure")
 
         result = self.children_repo.insert(parent.id, child.id)
+        relation = next(
+            (
+                row for row in self.children_repo.get_children(int(parent.id))
+                if int(row.id) == int(result)
+            ),
+            None,
+        )
+        pdm_service = getattr(self, "pdm_service", None)
+        if pdm_service is not None:
+            pdm_service.sync_legacy_cad_relation(
+                int(parent.id), int(child.id),
+                quantity=int(getattr(relation, "quantity", 1) or 1),
+                legacy_usage_id=int(result),
+            )
         self.revision_repo.ensure_bom(int(child.id), created_by=self.user_id)
         self.revision_repo.sync_working_bindings(int(parent.id), int(self.user_id))
         self._tree_dirty.add(int(self.session.project_id))
@@ -393,6 +491,74 @@ class BomService(BaseService):
             related = []
         return related or [part]
 
+    def _checkout_scope(self, part, exact_item: bool = False) -> List:
+        """Return one Item for PDM workflows or the legacy shared-file family."""
+        return [part] if exact_item else self._parts_sharing_base_file(part)
+
+    def checked_out_cad_for_item(self, item_id: int) -> List[Dict]:
+        return self.pdm_service.list_checked_out_cad_for_item(int(item_id))
+
+    def _assert_no_active_cad_checkouts(self, item_ids, action: str) -> None:
+        active = []
+        for item_id in sorted({int(value) for value in (item_ids or [])}):
+            active.extend(self.checked_out_cad_for_item(item_id))
+        if not active:
+            return
+        labels = ", ".join(
+            str(row.get("file_name") or row.get("name") or row.get("id"))
+            for row in active[:5]
+        )
+        if len(active) > 5:
+            labels += f", and {len(active) - 5} more"
+        raise ValueError(
+            f"Check in or undo the associated CAD working copies before you {action}: {labels}."
+        )
+
+    def _item_has_working_object_changes(self, item_id: int) -> bool:
+        analysis = self.revision_repo.analyze_working_object(int(item_id))
+        return bool(
+            analysis.get("metadata_changes") or analysis.get("structure_changes")
+        )
+
+    def _release_auto_item_checkout_after_cad(
+        self, item_id: int | None, actor_id: int
+    ) -> dict:
+        """Close an unused CAD-origin Item checkout after the last CAD closes."""
+        if item_id is None:
+            return {"item_id": None, "item_checkout": "NOT_APPLICABLE"}
+        item_id = int(item_id)
+        if self.checked_out_cad_for_item(item_id):
+            return {"item_id": item_id, "item_checkout": "RETAINED_FOR_CAD"}
+        lock = self.lock_repo.get_by_part(item_id)
+        if not lock:
+            return {"item_id": item_id, "item_checkout": "ALREADY_CLOSED"}
+        if int(lock.user_id) != int(actor_id):
+            return {"item_id": item_id, "item_checkout": "RETAINED_OTHER_OWNER"}
+        if str(getattr(lock, "checkout_origin", "ITEM") or "ITEM").upper() != "CAD":
+            return {"item_id": item_id, "item_checkout": "RETAINED_EXPLICIT"}
+        try:
+            changed = self._item_has_working_object_changes(item_id)
+        except Exception:
+            # Never discard an Item working copy when its state cannot be proven clean.
+            self.lock_repo.set_checkout_origin(item_id, "ITEM")
+            return {"item_id": item_id, "item_checkout": "RETAINED_UNVERIFIED"}
+        if changed:
+            self.lock_repo.set_checkout_origin(item_id, "ITEM")
+            return {"item_id": item_id, "item_checkout": "RETAINED_WITH_CHANGES"}
+        try:
+            self.undo_checkout(item_id, exact_item=True)
+        except Exception as exc:
+            # CAD is already safely closed. Preserve the Item working copy so a
+            # cleanup failure can never discard work or leave an ambiguous
+            # expendable CAD-origin lock.
+            self.lock_repo.set_checkout_origin(item_id, "ITEM")
+            return {
+                "item_id": item_id,
+                "item_checkout": "RETAINED_RELEASE_FAILED",
+                "item_checkout_message": str(exc),
+            }
+        return {"item_id": item_id, "item_checkout": "AUTO_RELEASED"}
+
     def part_ids_sharing_base_file(self, part_id: int) -> List[int]:
         part = self.bom_repo.get_by_id(int(part_id))
         if not part:
@@ -407,6 +573,7 @@ class BomService(BaseService):
         as_user_id: int | None = None,
         note: str = "",
         source_commit_id: str | None = None,
+        exact_item: bool = False,
     ):
         if not source_commit_id:
             raise ValueError(
@@ -415,7 +582,10 @@ class BomService(BaseService):
         part = self.bom_repo.get_by_id(part_id)
         if not part:
             raise ValueError("Part not found")
-        related_parts = self._parts_sharing_base_file(part)
+        related_parts = self._checkout_scope(part, exact_item=bool(exact_item))
+        self._assert_no_active_cad_checkouts(
+            [related.id for related in related_parts], "check in the Item"
+        )
         checkin_log_ids = {}
         for related in related_parts:
             self.revision_repo.assert_checkout_mutable(int(related.id))
@@ -476,11 +646,16 @@ class BomService(BaseService):
         part_id: str,
         as_user_id: int | None = None,
         released_revision_code: str | None = None,
+        exact_item: bool = False,
+        checkout_origin: str = "ITEM",
     ):
         part = self.bom_repo.get_by_id(part_id)
         if not part:
             raise ValueError("Part not found")
-        related_parts = self._parts_sharing_base_file(part)
+        origin = str(checkout_origin or "ITEM").strip().upper()
+        if origin not in {"ITEM", "CAD"}:
+            raise ValueError(f"Unsupported checkout origin: {checkout_origin}.")
+        related_parts = self._checkout_scope(part, exact_item=bool(exact_item))
         contexts = {}
         for related in related_parts:
             related_id = int(related.id)
@@ -488,22 +663,27 @@ class BomService(BaseService):
             contexts[related_id] = context
             state = str(context.get("state") or "").strip().lower()
             if state == "released":
-                if not str(released_revision_code or "").strip():
+                pending_revision = str(
+                    context.get("pending_revision_code") or ""
+                ).strip()
+                target_revision = str(
+                    released_revision_code or pending_revision or ""
+                ).strip()
+                if not target_revision:
                     raise ValueError(
                         f"{context['version_label']} is Released. Enter the revision to create on commit."
                     )
-                self.revision_repo.validate_released_checkout(
-                    related_id, str(released_revision_code)
-                )
+                if pending_revision:
+                    if pending_revision.casefold() != target_revision.casefold():
+                        raise ValueError(
+                            f"This Item checkout is already preparing revision {pending_revision}."
+                        )
+                else:
+                    self.revision_repo.validate_released_checkout(
+                        related_id, target_revision
+                    )
             else:
                 self.revision_repo.assert_mutable(related_id)
-        existing_locks = [
-            self.lock_repo.get_by_part(int(p.id))
-            for p in related_parts
-            if getattr(p, "id", None) is not None
-        ]
-        if any(existing_locks):
-            raise ValueError("Part is already checked out.")
         actor_user_id = int(self.session.user_id) if self.session.user_id is not None else None
         if not actor_user_id:
             raise PermissionError("You must be logged in")
@@ -514,6 +694,24 @@ class BomService(BaseService):
             effective_user_id = int(as_user_id)
         else:
             effective_user_id = int(actor_user_id)
+
+        existing_locks = [
+            self.lock_repo.get_by_part(int(p.id))
+            for p in related_parts
+            if getattr(p, "id", None) is not None
+        ]
+        active_locks = [lock for lock in existing_locks if lock]
+        if active_locks:
+            if not exact_item or len(related_parts) != 1:
+                raise ValueError("Part is already checked out.")
+            lock = active_locks[0]
+            if int(lock.user_id) != int(effective_user_id):
+                raise ValueError("This Item is checked out by another user.")
+            if origin == "ITEM":
+                self.lock_repo.upgrade_to_item_checkout(
+                    int(part.id), int(effective_user_id)
+                )
+            return True
 
         for related in related_parts:
             related_id = int(related.id)
@@ -534,17 +732,69 @@ class BomService(BaseService):
                 effective_user_id,
                 signature,
                 object_iteration_id=contexts[related_id].get("current_iteration_id"),
+                checkout_origin=origin,
             )
             if not success:
                 raise ValueError("Failed to check out part")
             self.bom_repo.checkout_bom(related_id)
             if released_checkout:
-                self.revision_repo.prepare_released_checkout(
-                    related_id, str(released_revision_code)
-                )
+                if not str(
+                    contexts[related_id].get("pending_revision_code") or ""
+                ).strip():
+                    self.revision_repo.prepare_released_checkout(
+                        related_id, str(released_revision_code)
+                    )
             self.revision_repo.initialize_checkout(related_id, effective_user_id)
         self._tree_dirty.add(int(self.session.project_id))
         return True
+
+    def checkout_item(
+        self,
+        item_id: int,
+        *,
+        as_user_id: int | None = None,
+        released_revision_code: str | None = None,
+    ) -> bool:
+        """Check out exactly one EBOM Item and its OWNER CAD Document when present."""
+        item_id = int(item_id)
+        existing_lock = self.lock_repo.get_by_part(item_id)
+        checked_out = bool(self.checkout_part(
+            item_id,
+            as_user_id=as_user_id,
+            released_revision_code=released_revision_code,
+            exact_item=True,
+            checkout_origin="ITEM",
+        ))
+        owner_cad = self.pdm_service.owner_cad_for_item(item_id)
+        if not owner_cad:
+            return checked_out
+        try:
+            self.checkout_pdm_cad_document(
+                int(owner_cad["id"]),
+                released_item_revision_code=released_revision_code,
+                as_user_id=as_user_id,
+            )
+        except Exception:
+            if existing_lock is None:
+                try:
+                    self.undo_checkout(item_id, as_user_id=as_user_id, exact_item=True)
+                except Exception:
+                    pass
+            raise
+        return checked_out
+
+    def undo_item_checkout(
+        self, item_id: int, *, as_user_id: int | None = None
+    ) -> bool:
+        return self.undo_checkout(
+            int(item_id), as_user_id=as_user_id, exact_item=True
+        )
+
+    def checkin_item_data(self, item_id: int, note: str) -> Dict:
+        """Check in Item metadata/structure/documents without a CAD checkout."""
+        return self.checkin_non_cad_changes(
+            int(item_id), note, exact_item=True
+        )
 
     def checkin_by_part_id(
         self,
@@ -552,13 +802,17 @@ class BomService(BaseService):
         user_id: int,
         note: str = "",
         source_commit_id: str | None = None,
+        exact_item: bool = False,
     ):
         if not source_commit_id:
             raise ValueError("A commit reference is required to check in an item.")
         part = self.bom_repo.get_by_id(int(part_id))
         if not part:
             raise ValueError("Part not found")
-        related_parts = self._parts_sharing_base_file(part)
+        related_parts = self._checkout_scope(part, exact_item=bool(exact_item))
+        self._assert_no_active_cad_checkouts(
+            [related.id for related in related_parts], "check in the Item"
+        )
         checkin_log_ids = {}
         for related in related_parts:
             self.revision_repo.assert_checkout_mutable(int(related.id))
@@ -604,7 +858,23 @@ class BomService(BaseService):
 
         return CheckoutChangeService().analyze(int(part_id))
 
-    def checkin_non_cad_changes(self, part_id: int, note: str) -> Dict:
+    def analyze_item_checkout(self, item_id: int) -> Dict:
+        """Analyze one Item working copy without treating associated CAD as Item data."""
+        analysis = dict(self.analyze_checkout(int(item_id)))
+        analysis["requires_commit"] = False
+        analysis["structure_requires_cad"] = False
+        analysis["modified_paths"] = []
+        analysis["has_any_changes"] = bool(analysis.get("has_non_cad_changes"))
+        for key in ("native_cad", "drawing"):
+            content = dict(analysis.get(key) or {})
+            content["modified"] = False
+            content["reason"] = "Managed through the associated CAD Document"
+            analysis[key] = content
+        return analysis
+
+    def checkin_non_cad_changes(
+        self, part_id: int, note: str, *, exact_item: bool = False
+    ) -> Dict:
         """Finish a checkout when only controlled object data changed."""
         from core.services.checkout_change_service import CheckoutChangeService
         from core.services.managed_file_service import ManagedFileService
@@ -616,7 +886,10 @@ class BomService(BaseService):
         if not note:
             raise ValueError("A check-in comment is required.")
 
-        related_parts = self._parts_sharing_base_file(part)
+        related_parts = self._checkout_scope(part, exact_item=bool(exact_item))
+        self._assert_no_active_cad_checkouts(
+            [related.id for related in related_parts], "check in the Item"
+        )
         locks = {
             int(related.id): self.lock_repo.get_by_part(int(related.id))
             for related in related_parts
@@ -636,6 +909,14 @@ class BomService(BaseService):
 
         analyzer = CheckoutChangeService()
         analyses = {related_id: analyzer.analyze(related_id) for related_id in active_ids}
+        if exact_item:
+            # A first-class Item working copy owns business data, EBOM usages,
+            # and Item documents. Native CAD and drawing content belong to the
+            # associated CAD Document working copies and must not redirect this
+            # Item check-in through the legacy Commit page.
+            for analysis in analyses.values():
+                analysis["requires_commit"] = False
+                analysis["structure_requires_cad"] = False
         selected = analyses[int(part_id)]
         if selected.get("requires_commit"):
             raise ValueError("Native CAD or drawing content changed. Continue through Commit.")
@@ -712,11 +993,20 @@ class BomService(BaseService):
             "analysis": selected,
         }
 
-    def undo_checkout(self, part_id: int, as_user_id: int | None = None) -> bool:
+    def undo_checkout(
+        self,
+        part_id: int,
+        as_user_id: int | None = None,
+        *,
+        exact_item: bool = False,
+    ) -> bool:
         part = self.bom_repo.get_by_id(int(part_id))
         if not part:
             raise ValueError("Part not found")
-        related_parts = self._parts_sharing_base_file(part)
+        related_parts = self._checkout_scope(part, exact_item=bool(exact_item))
+        self._assert_no_active_cad_checkouts(
+            [related.id for related in related_parts], "undo the Item checkout"
+        )
         locks = {
             int(related.id): self.lock_repo.get_by_part(int(related.id))
             for related in related_parts
@@ -761,11 +1051,30 @@ class BomService(BaseService):
         self._tree_dirty.add(int(self.session.project_id))
         return True
 
-    def checkout_by_part_id(self, part_id: int, user_id: int):
+    def checkout_by_part_id(
+        self,
+        part_id: int,
+        user_id: int,
+        *,
+        exact_item: bool = False,
+        checkout_origin: str = "ITEM",
+    ):
         part = self.bom_repo.get_by_id(int(part_id))
         if not part:
             raise ValueError("Part not found")
-        for related in self._parts_sharing_base_file(part):
+        origin = str(checkout_origin or "ITEM").strip().upper()
+        if origin not in {"ITEM", "CAD"}:
+            raise ValueError(f"Unsupported checkout origin: {checkout_origin}.")
+        related_parts = self._checkout_scope(part, exact_item=bool(exact_item))
+        if exact_item and len(related_parts) == 1:
+            existing = self.lock_repo.get_by_part(int(part.id))
+            if existing:
+                if int(existing.user_id) != int(user_id):
+                    raise ValueError("This Item is checked out by another user.")
+                if origin == "ITEM":
+                    self.lock_repo.upgrade_to_item_checkout(int(part.id), int(user_id))
+                return True
+        for related in related_parts:
             context = self.revision_repo.get_current_context(int(related.id))
             released = str(context.get("state") or "").strip().lower() == "released"
             target_revision = None
@@ -782,6 +1091,7 @@ class BomService(BaseService):
                 int(user_id),
                 signature,
                 object_iteration_id=context.get("current_iteration_id"),
+                checkout_origin=origin,
             ):
                 raise ValueError("Failed to check out part")
             self.bom_repo.checkout_bom(int(related.id))
@@ -920,8 +1230,8 @@ class BomService(BaseService):
         """Unified event timeline for a part.
 
         Includes commits, checkin/checkout logs, releases, and attachment version events.
-        If include_all_revisions is True, it also aggregates the same AES number across
-        all projects in the current project's version family.
+        If include_all_revisions is True, it aggregates the same immutable Item Number
+        across all projects in the current project's version family.
         """
 
         part = self.bom_repo.get_by_id(part_id)
@@ -929,6 +1239,7 @@ class BomService(BaseService):
             return []
 
         aes = (getattr(part, "aes_number", None) or "").strip()
+        item_number = (getattr(part, "part_number", None) or "").strip()
         project_id = getattr(part, "project_id", None) or self.session.project_id
 
         family = self._project_family_ids(int(project_id)) if include_all_revisions else []
@@ -950,12 +1261,17 @@ class BomService(BaseService):
                         "project_version": (r["version_label"] or "A"),
                     }
 
-            # Resolve part ids across revisions via AES
+            # Resolve Item ids across project versions by immutable Item Number.
+            # AES is retained only as a compatibility fallback for legacy rows.
             part_ids: List[int] = [int(part_id)]
-            if include_all_revisions and aes and family_project_ids:
+            if include_all_revisions and (item_number or aes) and family_project_ids:
+                identity_column = "part_number" if item_number else "aes_number"
+                identity_value = item_number or aes
                 rows = conn.execute(
-                    f"SELECT id, project_id, revision, lifecycle_state, released_by, released_at FROM bom WHERE aes_number = ? AND project_id IN ({','.join(['?']*len(family_project_ids))})",
-                    (aes, *family_project_ids),
+                    f"SELECT id, project_id, revision, lifecycle_state, released_by, released_at "
+                    f"FROM bom WHERE lower(trim({identity_column}))=lower(?) "
+                    f"AND project_id IN ({','.join(['?']*len(family_project_ids))})",
+                    (identity_value, *family_project_ids),
                 ).fetchall()
                 part_rows = [dict(r) for r in rows]
                 part_ids = sorted({int(r["id"]) for r in part_rows})
@@ -1470,6 +1786,7 @@ class BomService(BaseService):
             sources.append({
                 "parent_id": int(parent.id),
                 "parent_name": str(parent.name or ""),
+                "parent_part_number": str(parent.part_number or ""),
                 "parent_aes_number": str(parent.aes_number or ""),
                 "quantity": max(1, int(relation.quantity or 1)),
             })
@@ -1942,6 +2259,7 @@ class BomService(BaseService):
             if represented:
                 d["represented_part_name"] = str(represented.name or "")
                 d["represented_part_aes"] = str(represented.aes_number or "")
+                d["represented_part_number"] = str(represented.part_number or "")
         if str(d.get("type") or "").strip().lower() in {"asm", "assembly"}:
             try:
                 d["binding_update_count"] = self.revision_repo.count_parent_binding_updates(
@@ -1958,6 +2276,12 @@ class BomService(BaseService):
             if d.get("locked") and self.session.project_id:
                 lock_owner = self.lock_repo.get_lock_owners_for_project(int(self.session.project_id))
                 d["locked_by_username"] = lock_owner.get(int(part_id))
+                lock = self.lock_repo.get_by_part(int(part_id))
+                if lock:
+                    d["locked_by_user_id"] = int(lock.user_id)
+                    d["checkout_origin"] = str(
+                        getattr(lock, "checkout_origin", "ITEM") or "ITEM"
+                    ).upper()
         except Exception:
             pass
         return d
@@ -2085,12 +2409,369 @@ class BomService(BaseService):
 
     def get_released_ebom_project(self, project_id: int | None = None) -> Dict:
         project_id = int(project_id or self.session.project_id)
-        return self.ebom_service.resolve_project(project_id)
+        structure = self.pdm_service.get_item_structure_project(project_id)
+        nodes = []
+
+        def collect(rows):
+            for row in rows or []:
+                nodes.append(row)
+                collect(row.get("children") or [])
+
+        collect(structure.get("roots") or [])
+        item_ids = {
+            int(row.get("bom_id") or row.get("id"))
+            for row in nodes
+            if row.get("bom_id") is not None or row.get("id") is not None
+        }
+        try:
+            contexts = self.revision_repo.get_current_contexts(item_ids)
+        except Exception:
+            contexts = {}
+        try:
+            lock_owners = self.lock_repo.get_lock_owners_for_project(project_id)
+        except Exception:
+            lock_owners = {}
+        for row in nodes:
+            item_id = int(row.get("bom_id") or row.get("id"))
+            context = contexts.get(item_id) or {}
+            version_label = str(
+                context.get("version_label") or row.get("version_label")
+                or row.get("revision") or ""
+            )
+            row["version_label"] = version_label
+            row["current_version"] = version_label
+            row["iteration_number"] = context.get("iteration_number")
+            row["revision_state"] = str(
+                context.get("state") or row.get("lifecycle_state")
+                or row.get("status") or ""
+            )
+            if row.get("locked"):
+                row["locked_by_username"] = lock_owners.get(item_id)
+        return structure
+
+    # -------------------------------
+    # PDM CAD DOCUMENT / ITEM DOMAIN
+    # -------------------------------
+    def list_pdm_cad_documents(self, project_id: int | None = None) -> List[Dict]:
+        return self.pdm_service.list_cad_documents(
+            int(project_id or self.session.project_id)
+        )
+
+    def list_pdm_items(self, project_id: int | None = None) -> List[Dict]:
+        rows = self.bom_repo.get_all(int(project_id or self.session.project_id))
+        return [
+            row.__dict__.copy() for row in rows
+            if getattr(row, "represented_part_id", None) is None
+        ]
+
+    def create_pdm_cad_document(self, **values) -> int:
+        return self.pdm_service.create_cad_document(
+            int(self.session.project_id), **values
+        )
+
+    def delete_pdm_cad_document(
+        self, cad_document_id: int, *, delete_related_drawings: bool = False
+    ) -> Dict:
+        return self.pdm_service.delete_cad_document(
+            int(cad_document_id),
+            delete_related_drawings=bool(delete_related_drawings),
+        )
+
+    def bind_pdm_drawing_to_model(
+        self, drawing_cad_document_id: int, model_cad_document_id: int
+    ) -> Dict:
+        return self.pdm_service.bind_drawing_to_model(
+            int(drawing_cad_document_id), int(model_cad_document_id)
+        )
+
+    def get_pdm_cad_structure(self) -> Dict:
+        return self.pdm_service.get_cad_structure_project(
+            int(self.session.project_id)
+        )
+
+    def _assert_owned_cad_checkout(self, cad_document_id: int, action: str) -> Dict:
+        document = self.pdm_service.repo.get_cad_document(int(cad_document_id))
+        if not document:
+            raise ValueError("The CAD Document was not found.")
+        owner = document.get("checked_out_by")
+        if owner is None:
+            raise ValueError(f"Check out the CAD assembly before you {action}.")
+        if int(owner) != int(self.user_id):
+            raise ValueError("The CAD assembly is checked out by another user.")
+        return document
+
+    def add_pdm_cad_member(
+        self, parent_cad_document_id: int, child_cad_document_id: int,
+        quantity: int = 1, build_excluded: bool = False,
+    ) -> int:
+        self._assert_owned_cad_checkout(
+            int(parent_cad_document_id), "change its CAD structure"
+        )
+        return self.pdm_service.add_cad_member(
+            int(parent_cad_document_id), int(child_cad_document_id),
+            int(quantity), build_excluded=bool(build_excluded),
+        )
+
+    def remove_pdm_cad_member(self, member_id: int) -> bool:
+        member = self.pdm_service.repo.get_cad_member(int(member_id))
+        if not member:
+            return False
+        self._assert_owned_cad_checkout(
+            int(member["parent_cad_document_id"]), "change its CAD structure"
+        )
+        return self.pdm_service.remove_cad_member(int(member_id))
+
+    def checkout_pdm_cad_document(
+        self,
+        cad_document_id: int,
+        *,
+        released_item_revision_code: str | None = None,
+        as_user_id: int | None = None,
+    ) -> Dict:
+        """Check out one CAD Document and ensure its associated Item is owned."""
+        cad_document_id = int(cad_document_id)
+        current_user_id = int(self.user_id)
+        actor_id = int(as_user_id) if as_user_id is not None else current_user_id
+        if actor_id != current_user_id and not self.permission_repo.user_has_permission(
+            current_user_id, "merge", self.session.project_id
+        ):
+            raise PermissionError("Only Master/Admin can check out CAD for another user.")
+        document = self.pdm_service.repo.get_cad_document(cad_document_id)
+        if not document:
+            raise ValueError("The CAD Document was not found.")
+        owner = document.get("checked_out_by")
+        if owner is not None and int(owner) != actor_id:
+            raise ValueError("The CAD Document is checked out by another user.")
+        state = str(document.get("lifecycle_state") or "").strip().upper()
+        if state == "RELEASED":
+            raise ValueError(
+                "The CAD Document is Released. Create a new CAD revision before check out."
+            )
+        if state == "OBSOLETE":
+            raise ValueError("An Obsolete CAD Document cannot be checked out.")
+
+        association = self.pdm_service.repo.get_active_association_for_cad(
+            cad_document_id
+        )
+        if association is None and document.get("drawing_owner_cad_document_id") is not None:
+            association = self.pdm_service.repo.get_active_association_for_cad(
+                int(document["drawing_owner_cad_document_id"])
+            )
+        associated_item_id = (
+            int(association["item_id"]) if association else None
+        )
+        auto_item_checkout = False
+        if associated_item_id is not None:
+            item_lock = self.lock_repo.get_by_part(associated_item_id)
+            if item_lock and int(item_lock.user_id) != actor_id:
+                raise ValueError(
+                    "The associated Item is checked out by another user. "
+                    "The CAD Document was not checked out."
+                )
+            if not item_lock:
+                self.checkout_part(
+                    associated_item_id,
+                    released_revision_code=released_item_revision_code,
+                    exact_item=True,
+                    checkout_origin="CAD",
+                )
+                auto_item_checkout = True
+
+        try:
+            result = self.pdm_service.checkout_cad_document(
+                cad_document_id, actor_id
+            )
+        except Exception:
+            if auto_item_checkout and associated_item_id is not None:
+                try:
+                    self.undo_checkout(associated_item_id, exact_item=True)
+                except Exception:
+                    pass
+            raise
+        return {
+            **result,
+            "associated_item_id": associated_item_id,
+            "item_checkout_auto_created": bool(auto_item_checkout),
+        }
+
+    def checkin_pdm_cad_document(
+        self,
+        cad_document_id: int,
+        source_path: str,
+        note: str = "",
+        *,
+        as_user_id: int | None = None,
+        source_commit_id: str | None = None,
+        source_file_name: str | None = None,
+        creo_file_version: int | None = None,
+    ) -> Dict:
+        cad_document_id = int(cad_document_id)
+        current_user_id = int(self.user_id)
+        actor_id = int(as_user_id) if as_user_id is not None else current_user_id
+        if actor_id != current_user_id and not self.permission_repo.user_has_permission(
+            current_user_id, "merge", self.session.project_id
+        ):
+            raise PermissionError("Only Master/Admin can check in CAD for another user.")
+        document = self.pdm_service.repo.get_cad_document(cad_document_id)
+        if not document:
+            raise ValueError("The CAD Document was not found.")
+        associated_item_id = (
+            int(document["checkout_item_id"])
+            if document.get("checkout_item_id") is not None else None
+        )
+        result = self.pdm_service.checkin_cad_document(
+            cad_document_id,
+            actor_id,
+            source_path,
+            note,
+            source_commit_id=source_commit_id,
+            source_file_name=source_file_name,
+            creo_file_version=creo_file_version,
+        )
+        item_result = self._release_auto_item_checkout_after_cad(
+            associated_item_id, actor_id
+        )
+        return {**result, **item_result}
+
+    def undo_checkout_pdm_cad_document(
+        self, cad_document_id: int, note: str = ""
+    ) -> Dict:
+        cad_document_id = int(cad_document_id)
+        actor_id = int(self.user_id)
+        document = self.pdm_service.repo.get_cad_document(cad_document_id)
+        if not document:
+            raise ValueError("The CAD Document was not found.")
+        associated_item_id = (
+            int(document["checkout_item_id"])
+            if document.get("checkout_item_id") is not None else None
+        )
+        result = self.pdm_service.undo_checkout_cad_document(
+            cad_document_id, actor_id, note
+        )
+        item_result = self._release_auto_item_checkout_after_cad(
+            associated_item_id, actor_id
+        )
+        return {**result, **item_result}
+
+    def revise_pdm_cad_document(self, cad_document_id: int) -> Dict:
+        return self.pdm_service.revise_cad_document(
+            int(cad_document_id), int(self.user_id)
+        )
+
+    def release_pdm_cad_document(self, cad_document_id: int) -> Dict:
+        return self.pdm_service.release_cad_document(int(cad_document_id))
+
+    def list_item_cad_associations(self, item_id: int) -> List[Dict]:
+        return self.pdm_service.list_item_cad_documents(int(item_id))
+
+    def associate_cad_document(
+        self, item_id: int, cad_document_id: int, association_type: str
+    ) -> Dict:
+        item_id = int(item_id)
+        cad_document_id = int(cad_document_id)
+        current = self.pdm_service.repo.get_active_association_for_cad(
+            cad_document_id
+        )
+        document = self.pdm_service.repo.get_cad_document(cad_document_id)
+        if not document:
+            raise ValueError("The CAD Document was not found.")
+        if document.get("checked_out_by") is not None:
+            raise ValueError(
+                "Check in or undo the CAD Document before changing its Item association."
+            )
+        changed_item_ids = {item_id}
+        if current and int(current["item_id"]) != item_id:
+            changed_item_ids.add(int(current["item_id"]))
+        for changed_item_id in sorted(changed_item_ids):
+            self._assert_checked_out_for_change(
+                changed_item_id, "change its CAD associations"
+            )
+        result = self.pdm_service.associate(
+            int(self.session.project_id), item_id, cad_document_id,
+            association_type, self.user_id,
+        )
+        for changed_item_id in changed_item_ids:
+            self.lock_repo.set_checkout_origin(changed_item_id, "ITEM")
+        return result
+
+    def remove_cad_item_association(self, association_id: int) -> bool:
+        association = self.pdm_service.repo.get_association(int(association_id))
+        if not association:
+            return False
+        document = self.pdm_service.repo.get_cad_document(
+            int(association["cad_document_id"])
+        )
+        if document and document.get("checked_out_by") is not None:
+            raise ValueError(
+                "Check in or undo the CAD Document before removing its Item association."
+            )
+        self._assert_checked_out_for_change(
+            int(association["item_id"]), "change its CAD associations"
+        )
+        removed = self.pdm_service.remove_association(int(association_id))
+        if removed:
+            self.lock_repo.set_checkout_origin(int(association["item_id"]), "ITEM")
+        return removed
+
+    def auto_associate_cad_documents(self) -> Dict:
+        proposals = self.pdm_service.auto_associate_candidates(
+            int(self.session.project_id)
+        )
+        item_ids = {
+            int(proposal["matches"][0]["id"])
+            for proposal in proposals
+            if proposal.get("status") == "MATCH"
+            and len(proposal.get("matches") or []) == 1
+        }
+        for item_id in sorted(item_ids):
+            self._assert_checked_out_for_change(
+                item_id, "apply automatic CAD associations"
+            )
+        result = self.pdm_service.apply_auto_associate(
+            int(self.session.project_id), self.user_id
+        )
+        for item_id in item_ids:
+            self.lock_repo.set_checkout_origin(item_id, "ITEM")
+        return result
+
+    def compare_cad_to_item_structure(self, item_id: int) -> Dict:
+        owner = self.pdm_service.owner_cad_for_item(int(item_id))
+        if not owner:
+            raise ValueError("This Item has no OWNER CAD Document.")
+        return self.pdm_service.compare_cad_to_item(int(owner["id"]))
+
+    def build_item_structure_from_cad(
+        self, item_id: int, multi_level: bool = True
+    ) -> Dict:
+        self._assert_checked_out_for_change(
+            int(item_id), "build its Item Structure from CAD"
+        )
+        owner = self.pdm_service.owner_cad_for_item(int(item_id))
+        if not owner:
+            raise ValueError("This Item has no OWNER CAD Document.")
+        result = self.pdm_service.build_part_structure(
+            int(owner["id"]), multi_level=bool(multi_level), actor_id=self.user_id
+        )
+        self._tree_dirty.add(int(self.session.project_id))
+        return result
+
+    def add_manual_item_usage(
+        self, parent_item_id: int, child_item_id: int, quantity: int = 1
+    ) -> int:
+        self._assert_checked_out_for_change(
+            int(parent_item_id), "change its Item Structure"
+        )
+        result = self.pdm_service.add_manual_item_usage(
+            int(self.session.project_id), int(parent_item_id), int(child_item_id),
+            int(quantity), self.user_id,
+        )
+        self._tree_dirty.add(int(self.session.project_id))
+        return result
 
     def get_effective_ebom_where_used(self, child_bom_id: int) -> List[Dict]:
         if not self.session.project_id:
             return []
-        return self.ebom_service.effective_where_used(
+        return self.pdm_service.item_where_used(
             int(self.session.project_id), int(child_bom_id)
         )
 
@@ -2099,6 +2780,11 @@ class BomService(BaseService):
     ) -> Dict:
         return self.ebom_export_service.export_bom(
             int(root_bom_id), file_path, iteration_id
+        )
+
+    def export_item_structure(self, root_item_id: int, file_path: str) -> Dict:
+        return self.pdm_service.export_item_structure(
+            int(root_item_id), file_path
         )
 
     # -------------------------------
@@ -2347,24 +3033,31 @@ class BomService(BaseService):
             import csv
             
             with open(file_path, 'w', newline='', encoding='utf-8') as csvfile:
-                fieldnames = ['aes_number', 'name', 'type', 'part_number', 'drawing_number', 
-                             'material', 'weight', 'status', 'notes']
+                fieldnames = [
+                    'part_number', 'name', 'aes_number', 'item_type', 'assembly_mode',
+                    'procurement_source', 'item_view', 'default_unit', 'type',
+                    'drawing_number', 'material', 'weight', 'status', 'notes',
+                ]
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 
                 writer.writeheader()
-                for part in self.bom_repo.get_all():
-                    if "_" not in (part.aes_number or ""):
-                        writer.writerow({
-                            'aes_number': part.aes_number or '',
-                            'name': part.name or '',
-                            'type': part.type or '',
-                            'part_number': part.part_number or '',
-                            'drawing_number': part.drawing_number or '',
-                            'material': part.material or '',
-                            'weight': part.weight or '',
-                            'status': part.status or '',
-                            'notes': part.notes or ''
-                        })
+                for part in self.bom_repo.get_all(int(self.session.project_id)):
+                    writer.writerow({
+                        'part_number': part.part_number or '',
+                        'name': part.name or '',
+                        'aes_number': part.aes_number or '',
+                        'item_type': part.item_type or '',
+                        'assembly_mode': part.assembly_mode or '',
+                        'procurement_source': part.procurement_source or '',
+                        'item_view': part.item_view or '',
+                        'default_unit': part.default_unit or '',
+                        'type': part.type or '',
+                        'drawing_number': part.drawing_number or '',
+                        'material': part.material or '',
+                        'weight': part.weight or '',
+                        'status': part.status or '',
+                        'notes': part.notes or ''
+                    })
             
             return True
         except Exception as e:

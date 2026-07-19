@@ -6,7 +6,9 @@ import sqlite3
 from config import DB_NAME
 from core.ebom_policy import (
     normalize_classification,
+    normalize_default_behavior,
     normalize_requirement,
+    requires_aes_number,
 )
 from core.repositories.bom_revision_repository import BomRevisionRepository
 
@@ -34,7 +36,8 @@ class ReleaseValidationService:
     @staticmethod
     def _label(row, snapshot) -> str:
         return str(
-            snapshot.get("aes_number")
+            snapshot.get("part_number")
+            or snapshot.get("aes_number")
             or snapshot.get("name")
             or row["bom_id"]
         )
@@ -45,6 +48,26 @@ class ReleaseValidationService:
         findings = []
         with self.get_conn() as conn:
             cache = {}
+            tables = {
+                str(value[0]) for value in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            has_pdm = {
+                "cad_documents", "cad_item_associations", "item_usages"
+            }.issubset(tables)
+            cad_columns = (
+                {
+                    str(value[1])
+                    for value in conn.execute(
+                        "PRAGMA table_info(cad_documents)"
+                    ).fetchall()
+                }
+                if "cad_documents" in tables else set()
+            )
+            has_drawing_model_link = (
+                "drawing_owner_cad_document_id" in cad_columns
+            )
 
             def context(selected_iteration_id: int):
                 selected_iteration_id = int(selected_iteration_id)
@@ -98,9 +121,100 @@ class ReleaseValidationService:
                 )
                 label = self._label(row, snapshot)
                 version = f"{row['revision_code']}.{int(row['iteration_number'])}"
+                item_number = str(snapshot.get("part_number") or "").strip()
+                if not item_number:
+                    findings.append({
+                        "bom_id": int(row["bom_id"]),
+                        "iteration_id": selected_iteration_id,
+                        "version": version,
+                        "classification": classification,
+                        "requirement": "part_number",
+                        "message": f"{label} {version} has no Item Number.",
+                    })
+                else:
+                    duplicate = conn.execute(
+                        """
+                        SELECT other.id
+                        FROM bom current
+                        JOIN bom other ON other.project_id=current.project_id
+                          AND other.id<>current.id
+                          AND lower(trim(other.part_number))=lower(?)
+                          AND other.represented_part_id IS NULL
+                        WHERE current.id=?
+                        LIMIT 1
+                        """,
+                        (item_number, int(row["bom_id"])),
+                    ).fetchone()
+                    if duplicate:
+                        findings.append({
+                            "bom_id": int(row["bom_id"]),
+                            "iteration_id": selected_iteration_id,
+                            "version": version,
+                            "classification": classification,
+                            "requirement": "part_number_unique",
+                            "message": (
+                                f"Item Number {item_number} is also assigned to Item "
+                                f"{int(duplicate['id'])}."
+                            ),
+                        })
+                default_behavior = normalize_default_behavior(
+                    snapshot.get("default_ebom_behavior")
+                )
+                if requires_aes_number(
+                    default_behavior, snapshot.get("represented_part_id")
+                ) and not str(snapshot.get("aes_number") or "").strip():
+                    findings.append({
+                        "bom_id": int(row["bom_id"]),
+                        "iteration_id": selected_iteration_id,
+                        "version": version,
+                        "classification": classification,
+                        "requirement": "aes_number",
+                        "message": f"{label} {version} is deliverable and requires an AES Number.",
+                    })
+                pdm_cad = None
+                pdm_drawing = None
+                if has_pdm:
+                    pdm_cad = conn.execute(
+                        """
+                        SELECT 1 FROM cad_item_associations a
+                        JOIN cad_documents d ON d.id=a.cad_document_id
+                        WHERE a.item_id=? AND a.active=1
+                          AND upper(d.category) IN ('ASSEMBLY','COMPONENT')
+                        LIMIT 1
+                        """,
+                        (int(row["bom_id"]),),
+                    ).fetchone()
+                    if has_drawing_model_link:
+                        pdm_drawing = conn.execute(
+                            """
+                            SELECT 1
+                            FROM cad_item_associations model_assoc
+                            JOIN cad_documents model
+                              ON model.id=model_assoc.cad_document_id
+                            JOIN cad_documents drawing
+                              ON drawing.drawing_owner_cad_document_id=model.id
+                             AND upper(drawing.category)='DRAWING'
+                            WHERE model_assoc.item_id=?
+                              AND model_assoc.active=1
+                              AND upper(model.category) IN ('ASSEMBLY','COMPONENT')
+                            LIMIT 1
+                            """,
+                            (int(row["bom_id"]),),
+                        ).fetchone()
+                    else:
+                        pdm_drawing = conn.execute(
+                            """
+                            SELECT 1 FROM cad_item_associations a
+                            JOIN cad_documents d ON d.id=a.cad_document_id
+                            WHERE a.item_id=? AND a.active=1
+                              AND upper(d.category)='DRAWING'
+                            LIMIT 1
+                            """,
+                            (int(row["bom_id"]),),
+                        ).fetchone()
                 if cad_requirement == "REQUIRED" and not str(
                     snapshot.get("filename") or ""
-                ).strip():
+                ).strip() and not pdm_cad:
                     findings.append({
                         "bom_id": int(row["bom_id"]),
                         "iteration_id": selected_iteration_id,
@@ -109,9 +223,11 @@ class ReleaseValidationService:
                         "requirement": "cad_requirement",
                         "message": f"{label} {version} requires native CAD.",
                     })
-                if drawing_requirement == "REQUIRED" and not str(
-                    snapshot.get("drawing") or ""
-                ).strip():
+                drawing_is_available = (
+                    bool(pdm_drawing)
+                    if pdm_cad else bool(str(snapshot.get("drawing") or "").strip())
+                )
+                if drawing_requirement == "REQUIRED" and not drawing_is_available:
                     findings.append({
                         "bom_id": int(row["bom_id"]),
                         "iteration_id": selected_iteration_id,
@@ -124,14 +240,33 @@ class ReleaseValidationService:
                 if not include_children:
                     return
                 next_ancestors = (*ancestors, selected_iteration_id)
-                bindings = conn.execute(
-                    """
-                    SELECT child_bom_id, child_revision_id, child_iteration_id
-                    FROM bom_iteration_bindings
-                    WHERE parent_iteration_id=? ORDER BY sort_order, id
-                    """,
-                    (selected_iteration_id,),
-                ).fetchall()
+                bindings = []
+                if has_pdm:
+                    bindings = conn.execute(
+                        """
+                        SELECT u.child_item_id AS child_bom_id,
+                               b.current_revision_id AS child_revision_id,
+                               b.current_iteration_id AS child_iteration_id
+                        FROM item_usages u JOIN bom b ON b.id=u.child_item_id
+                        WHERE u.parent_item_id=?
+                        ORDER BY COALESCE(u.sort_order,u.id),u.id
+                        """,
+                        (int(row["bom_id"]),),
+                    ).fetchall()
+                    bindings = [
+                        binding for binding in bindings
+                        if binding["child_revision_id"] is not None
+                        and binding["child_iteration_id"] is not None
+                    ]
+                if not bindings:
+                    bindings = conn.execute(
+                        """
+                        SELECT child_bom_id, child_revision_id, child_iteration_id
+                        FROM bom_iteration_bindings
+                        WHERE parent_iteration_id=? ORDER BY sort_order, id
+                        """,
+                        (selected_iteration_id,),
+                    ).fetchall()
                 for binding in bindings:
                     child_row, _snapshot = context(int(binding["child_iteration_id"]))
                     if int(child_row["bom_id"]) != int(binding["child_bom_id"]):

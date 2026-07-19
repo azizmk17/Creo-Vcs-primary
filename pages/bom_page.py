@@ -273,11 +273,35 @@ BOM_TREE_BINDING_UPDATE_ROLE = Qt.UserRole + 46
 BOM_TREE_POLICY_ROLE = Qt.UserRole + 47
 BOM_TREE_OCCURRENCE_ROLE = Qt.UserRole + 48
 BOM_TREE_PROMOTION_ROLE = Qt.UserRole + 49
+BOM_TREE_ITEM_NUMBER_ROLE = Qt.UserRole + 50
+BOM_TREE_AES_NUMBER_ROLE = Qt.UserRole + 51
 STRUCTURE_CURRENT_ITERATION_ROLE = Qt.UserRole + 60
 STRUCTURE_BOUND_ITERATION_ROLE = Qt.UserRole + 61
 STRUCTURE_LATEST_ITERATION_ROLE = Qt.UserRole + 62
+# Explicit PDM object identity.  Qt.UserRole remains the legacy Item/BOM id so
+# existing Item actions cannot accidentally interpret a CAD Document id as an
+# Item id.
+PDM_OBJECT_KIND_ROLE = Qt.UserRole + 70
+PDM_CAD_DOCUMENT_ID_ROLE = Qt.UserRole + 71
+PDM_ASSOCIATION_ID_ROLE = Qt.UserRole + 72
+PDM_ASSOCIATION_TYPE_ROLE = Qt.UserRole + 73
+PDM_ASSOCIATED_ITEM_ID_ROLE = Qt.UserRole + 74
+PDM_CAD_MEMBER_ID_ROLE = Qt.UserRole + 75
+PDM_CAD_PAYLOAD_ROLE = Qt.UserRole + 76
+PDM_CHILDREN_PAYLOAD_ROLE = Qt.UserRole + 77
+PDM_EBOM_ASSOCIATIONS_ROLE = Qt.UserRole + 78
+PDM_ASSOCIATIONS_SHOWN_ROLE = Qt.UserRole + 79
+PDM_NODE_PAYLOAD_ROLE = Qt.UserRole + 80
+COMPARE_ITEM_ID_ROLE = Qt.UserRole + 90
+COMPARE_CAD_ID_ROLE = Qt.UserRole + 91
+COMPARE_PAYLOAD_ROLE = Qt.UserRole + 92
+COMPARE_PARENT_ITEM_ID_ROLE = Qt.UserRole + 93
+
+PDM_OBJECT_ITEM = "ITEM"
+PDM_OBJECT_CAD = "CAD_DOCUMENT"
 
 _BOM_TYPE_ICON_CACHE = {}
+_PDM_OBJECT_ICON_CACHE = {}
 
 
 def _bom_type_icon(part_type: str) -> QIcon:
@@ -318,6 +342,79 @@ def _bom_type_icon(part_type: str) -> QIcon:
     icon = QIcon(pixmap)
     _BOM_TYPE_ICON_CACHE[key] = icon
     return icon
+
+
+def _pdm_item_icon() -> QIcon:
+    """Return an Item/Part master icon that is visually distinct from CAD."""
+    key = "pdm_item"
+    if key in _PDM_OBJECT_ICON_CACHE:
+        return _PDM_OBJECT_ICON_CACHE[key]
+    pixmap = QPixmap(16, 16)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.setPen(QPen(QColor("#8a5a12"), 1))
+    painter.setBrush(QBrush(QColor("#f2c56b")))
+    painter.drawRoundedRect(2, 2, 12, 12, 2, 2)
+    painter.setPen(QPen(QColor("#fff8e7"), 1.4))
+    painter.drawLine(5, 6, 11, 6)
+    painter.drawLine(5, 9, 10, 9)
+    painter.end()
+    icon = QIcon(pixmap)
+    _PDM_OBJECT_ICON_CACHE[key] = icon
+    return icon
+
+
+def _pdm_cad_icon(category: str) -> QIcon:
+    """Return category-specific blue CAD Document icons."""
+    category = str(category or "OTHER").strip().upper()
+    key = f"pdm_cad:{category}"
+    if key in _PDM_OBJECT_ICON_CACHE:
+        return _PDM_OBJECT_ICON_CACHE[key]
+    pixmap = QPixmap(16, 16)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.setPen(QPen(QColor("#24577a"), 1))
+    if category == "ASSEMBLY":
+        painter.setBrush(QBrush(QColor("#75b8df")))
+        painter.drawRoundedRect(1, 2, 7, 7, 1, 1)
+        painter.setBrush(QBrush(QColor("#438fbe")))
+        painter.drawRoundedRect(8, 7, 7, 7, 1, 1)
+        painter.drawLine(7, 8, 9, 9)
+    elif category == "DRAWING":
+        painter.setBrush(QBrush(QColor("#e8f4fb")))
+        painter.drawRoundedRect(3, 1, 10, 14, 1, 1)
+        painter.setPen(QPen(QColor("#438fbe"), 1))
+        painter.drawLine(5, 5, 11, 5)
+        painter.drawLine(5, 8, 11, 8)
+        painter.drawLine(5, 11, 9, 11)
+    else:
+        painter.setBrush(QBrush(QColor("#69acd3")))
+        painter.drawRoundedRect(2, 2, 12, 12, 2, 2)
+        painter.setPen(QPen(QColor("#dff3ff"), 1))
+        painter.drawLine(3, 6, 8, 9)
+        painter.drawLine(13, 6, 8, 9)
+        painter.drawLine(8, 9, 8, 13)
+    painter.end()
+    icon = QIcon(pixmap)
+    _PDM_OBJECT_ICON_CACHE[key] = icon
+    return icon
+
+
+CAD_COL_NAME = 0
+# Compatibility alias for integrations that used the former CAD-number column.
+CAD_COL_NUMBER = CAD_COL_NAME
+CAD_COL_ROW = CAD_COL_NAME
+CAD_COL_FILE = CAD_COL_NAME
+CAD_COL_DESCRIPTION = 1
+CAD_COL_CATEGORY = 2
+CAD_COL_REV = 3
+CAD_COL_STATE = 4
+CAD_COL_ASSOCIATION = 5
+CAD_COL_CHECKOUT = 6
+CAD_COL_BUILD = 7
+CAD_COL_QTY = 8
 
 BOM_COL_ROW = 0
 BOM_COL_NAME = 1
@@ -581,7 +678,10 @@ class _BomTreeNameDelegate(QStyledItemDelegate):
         # Keep normal (dark) text on selection — do not use HighlightedText (often white on blue).
         name_pen = QColor(_BOM_TREE_ROW_TEXT)
 
-        is_asm = bool(item.data(0, BOM_TREE_IS_ASSEMBLY_ROLE)) or item.childCount() > 0
+        is_asm = bool(item.data(0, BOM_TREE_IS_ASSEMBLY_ROLE)) or any(
+            item.child(index).data(0, PDM_OBJECT_KIND_ROLE) != PDM_OBJECT_CAD
+            for index in range(item.childCount())
+        )
         name_font = QFont(opt.font)
         name_font.setPixelSize(11)
         name_font.setBold(bool(is_asm))
@@ -719,6 +819,9 @@ class _BomTreeFilesDelegate(QStyledItemDelegate):
         if item.data(0, BOM_TREE_FOLDER_ROLE):
             return
 
+        if item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+            return
+
         policy = item.data(0, BOM_TREE_POLICY_ROLE) or {}
         if policy.get("represented_part_id"):
             return
@@ -737,6 +840,8 @@ class _BomTreeFilesDelegate(QStyledItemDelegate):
             return super().helpEvent(event, view, option, index)
         item = self._tree.itemFromIndex(index)
         if not item:
+            return super().helpEvent(event, view, option, index)
+        if item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
             return super().helpEvent(event, view, option, index)
         policy = item.data(0, BOM_TREE_POLICY_ROLE) or {}
         if policy.get("represented_part_id"):
@@ -870,6 +975,9 @@ class _BomTreeIntegrityDelegate(QStyledItemDelegate):
         if item.data(0, BOM_TREE_FOLDER_ROLE):
             return
 
+        if item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+            return
+
         payload = item.data(BOM_COL_INTEGRITY, BOM_TREE_INTEGRITY_ROLE) or {"state": "ok"}
         state = str(payload.get("state") or "ok")
         sym = "✓" if state == "ok" else "⚠"
@@ -887,6 +995,8 @@ class _BomTreeIntegrityDelegate(QStyledItemDelegate):
             return super().helpEvent(event, view, option, index)
         item = self._tree.itemFromIndex(index)
         if not item:
+            return super().helpEvent(event, view, option, index)
+        if item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
             return super().helpEvent(event, view, option, index)
         payload = item.data(BOM_COL_INTEGRITY, BOM_TREE_INTEGRITY_ROLE) or {}
         tip = str(payload.get("tooltip") or "")
@@ -1935,7 +2045,14 @@ class BomPage(QWidget):
         self._active_saved_filter_name = ""
         self._advanced_filter_dialog = None
         self._bom_mode = "cad"
+        self._pdm_cad_roots = []
+        self._pdm_cad_scope_path = []
+        self._pdm_ebom_roots = []
+        self._pdm_ebom_scope_path = []
+        self._ebom_associations_by_item = defaultdict(list)
         self.init_ui()
+        self.advanced_filter_btn.setEnabled(False)
+        self.saved_filters_btn.setEnabled(False)
 
         # Pre-render indicator icons (fast + consistent colors)
         self._indicator_icon_cache = {}
@@ -1966,6 +2083,7 @@ class BomPage(QWidget):
             except Exception:
                 pass
             self.load_tree()
+            self._load_pdm_cad_tree()
 
         try:
             self.destroyed.connect(lambda *_: self._cancel_background_work())
@@ -2080,7 +2198,7 @@ class BomPage(QWidget):
             elif getattr(self, "_bom_mode", "cad") == "ebom":
                 target = 3
             else:
-                target = 2 if getattr(self, "_in_search_mode", False) else 1
+                target = 4
             stack.setCurrentIndex(target)
         except Exception:
             pass
@@ -2088,31 +2206,397 @@ class BomPage(QWidget):
     def _on_bom_mode_changed(self, _index: int = 0) -> None:
         mode = str(self.bom_mode_selector.currentData() or "cad")
         self._bom_mode = mode
+        try:
+            self.advanced_filter_btn.setEnabled(mode == "ebom")
+            self.saved_filters_btn.setEnabled(mode == "ebom")
+            self.search_input.setPlaceholderText(
+                "Search Item Number, name, or AES..."
+                if mode == "ebom"
+                else "Search CAD file, name, description, or related drawing..."
+            )
+        except Exception:
+            pass
         if mode == "ebom":
             self._in_search_mode = False
             self._load_released_ebom_tree()
         else:
-            if self.search_input.text().strip():
-                self._perform_search_now()
-            else:
-                self._tree_stack.setCurrentIndex(1)
-            if not self._is_default_bom_advanced_filter():
-                self.apply_bom_tree_filter(self._bom_advanced_filters)
-        read_only = mode == "ebom"
+            self._load_pdm_cad_tree()
+        self.clear_details()
+        self._set_engineering_item_actions_enabled(False)
+        read_only = False
         try:
             self.add_part_btn.setEnabled(
-                not read_only and self.perm.can("manage_parts")
+                mode == "ebom" and self.perm.can("manage_parts")
             )
             self.add_folder_btn.setEnabled(
-                not read_only and self.perm.can("manage_parts")
+                mode == "ebom" and self.perm.can("manage_parts")
             )
         except Exception:
             pass
         if getattr(self, "_current_part_details", None):
             self._update_lifecycle_action_states(self._current_part_details)
+        self._update_pdm_scope_bar()
+        self._sync_visual_action_states()
+
+    def _pdm_cad_checkout_text(self, document: dict) -> str:
+        owner = document.get("checked_out_by")
+        if owner is None:
+            return "Checked in"
+        username = str(document.get("checked_out_by_username") or "").strip()
+        if not username and self.session.user_id is not None:
+            try:
+                if int(owner) == int(self.session.user_id):
+                    username = "you"
+            except Exception:
+                pass
+        return f"In Work ({username or owner})"
+
+    @staticmethod
+    def _windchill_item_label(info: dict) -> str:
+        number = str(info.get("part_number") or "").strip()
+        name = str(info.get("name") or info.get("id") or "Item").strip()
+        version = str(
+            info.get("current_version")
+            or info.get("version_label")
+            or ""
+        ).strip()
+        if not version:
+            revision = str(info.get("revision") or "").strip()
+            iteration = str(info.get("iteration_number") or "").strip()
+            version = f"{revision}.{iteration}" if revision and iteration else revision
+        view = str(info.get("item_view") or info.get("view") or "Design").strip()
+        identity = ", ".join(value for value in (number, name) if value)
+        if version:
+            identity = f"{identity}, {version}" if identity else version
+        if view:
+            identity = f"{identity} ({view.title()})" if identity else f"({view.title()})"
+        return identity or name or "Item"
+
+    def _pdm_creo_file_text(self, document: dict) -> str:
+        source_name = str(
+            document.get("latest_creo_file_name")
+            or document.get("source_file_name")
+            or ""
+        ).strip()
+        try:
+            version = document.get("latest_creo_file_version")
+            if version is None:
+                version = document.get("creo_file_version")
+            version = int(version) if version is not None and str(version).strip() else None
+        except Exception:
+            version = None
+        if source_name:
+            return source_name
+        if version is not None:
+            base_name = str(document.get("file_name") or "").strip()
+            return f"{base_name}.{version}" if base_name else f"Creo .{version}"
+        return ""
+
+    def _pdm_cad_revision_text(self, document: dict) -> str:
+        revision = f"CAD {document.get('revision') or 'A'}.{int(document.get('iteration') or 1)}"
+        creo_file = self._pdm_creo_file_text(document)
+        return f"{revision} | Creo {creo_file}" if creo_file else revision
+
+    def _pdm_related_item_text(self, document: dict) -> str:
+        association_type = str(document.get("association_type") or "").strip().upper()
+        item_number = str(document.get("item_number") or "").strip()
+        item_name = str(document.get("item_name") or "").strip()
+        related_item = " - ".join(value for value in (item_number, item_name) if value)
+        item_aes = str(document.get("item_aes_number") or "").strip()
+        item_version = str(document.get("item_version_label") or "").strip()
+        if related_item and item_aes:
+            related_item += f" | AES {item_aes}"
+        if related_item and item_version:
+            related_item += f" | Item {item_version}"
+        if association_type:
+            return f"{association_type.replace('_', ' ')}: {related_item or 'Item'}"
+        return "Unassociated"
+
+    def _add_pdm_cad_node(
+        self, document: dict, parent_item: QTreeWidgetItem | None = None
+    ) -> QTreeWidgetItem:
+        association_type = str(document.get("association_type") or "").strip().upper()
+        related_item = self._pdm_related_item_text(document)
+        revision = self._pdm_cad_revision_text(document)
+        excluded = bool(
+            document.get("member_build_excluded")
+            or document.get("build_excluded")
+        )
+        values = [
+            str(document.get("file_name") or ""),
+            str(document.get("name") or ""),
+            str(document.get("category") or ""),
+            revision,
+            str(document.get("lifecycle_state") or ""),
+            related_item,
+            self._pdm_cad_checkout_text(document),
+            "Excluded" if excluded else "Included",
+            str(max(1, int(document.get("quantity") or 1))),
+        ]
+        item = QTreeWidgetItem(values)
+        item.setData(0, PDM_OBJECT_KIND_ROLE, PDM_OBJECT_CAD)
+        item.setData(0, PDM_CAD_DOCUMENT_ID_ROLE, int(document["id"]))
+        item.setData(0, PDM_ASSOCIATION_ID_ROLE, document.get("association_id"))
+        item.setData(0, PDM_ASSOCIATION_TYPE_ROLE, association_type or None)
+        item.setData(0, PDM_ASSOCIATED_ITEM_ID_ROLE, document.get("item_id"))
+        item.setData(0, PDM_CAD_MEMBER_ID_ROLE, document.get("member_id"))
+        item.setData(0, PDM_CAD_PAYLOAD_ROLE, dict(document))
+        item.setData(0, PDM_NODE_PAYLOAD_ROLE, dict(document))
+        child_payloads = list(document.get("children") or [])
+        item.setData(0, PDM_CHILDREN_PAYLOAD_ROLE, child_payloads)
+        item.setData(0, BOM_TREE_IS_ASSEMBLY_ROLE, bool(child_payloads))
+        item.setData(0, BOM_TREE_CHILDREN_LOADED_ROLE, not bool(child_payloads))
+        item.setData(0, Qt.UserRole, document.get("item_id"))
+        item.setIcon(CAD_COL_NUMBER, _pdm_cad_icon(document.get("category")))
+        drawing_files = ", ".join(
+            str(drawing.get("file_name") or drawing.get("name") or "")
+            for drawing in document.get("related_drawings") or []
+        ) or "None"
+        item.setToolTip(
+            CAD_COL_NUMBER,
+            "CAD Document\n"
+            f"File: {document.get('file_name') or '-'}\n"
+            f"Creo file version: {self._pdm_creo_file_text(document) or '-'}\n"
+            f"Related drawing: {drawing_files}\n"
+            f"Association: {association_type.replace('_', ' ') if association_type else 'None'}\n"
+            f"Related Item: {related_item}\n"
+            f"Checkout: {self._pdm_cad_checkout_text(document)}",
+        )
+        if not association_type:
+            item.setForeground(CAD_COL_ASSOCIATION, QBrush(QColor("#b45309")))
+        if excluded:
+            item.setForeground(CAD_COL_BUILD, QBrush(QColor("#b45309")))
+        if parent_item is None:
+            self._cad_tree.addTopLevelItem(item)
+        else:
+            parent_item.addChild(item)
+        self._ensure_pdm_lazy_placeholder(item)
+        return item
+
+    def _apply_pdm_cad_tree_item_data(self, item: QTreeWidgetItem, document: dict) -> None:
+        payload = dict(item.data(0, PDM_CAD_PAYLOAD_ROLE) or {})
+        payload.update(dict(document or {}))
+        association_type = str(payload.get("association_type") or "").strip().upper()
+        related_item = self._pdm_related_item_text(payload)
+        revision = self._pdm_cad_revision_text(payload)
+        excluded = bool(payload.get("member_build_excluded") or payload.get("build_excluded"))
+        item.setText(CAD_COL_NAME, str(payload.get("file_name") or ""))
+        item.setText(CAD_COL_DESCRIPTION, str(payload.get("name") or ""))
+        item.setText(CAD_COL_CATEGORY, str(payload.get("category") or ""))
+        item.setText(CAD_COL_REV, revision)
+        item.setText(CAD_COL_STATE, str(payload.get("lifecycle_state") or ""))
+        item.setText(CAD_COL_ASSOCIATION, related_item)
+        item.setText(CAD_COL_CHECKOUT, self._pdm_cad_checkout_text(payload))
+        item.setText(CAD_COL_BUILD, "Excluded" if excluded else "Included")
+        item.setText(CAD_COL_QTY, str(max(1, int(payload.get("quantity") or 1))))
+        item.setData(0, PDM_CAD_PAYLOAD_ROLE, payload)
+        item.setData(0, PDM_NODE_PAYLOAD_ROLE, payload)
+        item.setData(0, PDM_ASSOCIATION_ID_ROLE, payload.get("association_id"))
+        item.setData(0, PDM_ASSOCIATION_TYPE_ROLE, association_type or None)
+        item.setData(0, PDM_ASSOCIATED_ITEM_ID_ROLE, payload.get("item_id"))
+        item.setData(0, Qt.UserRole, payload.get("item_id"))
+        item.setIcon(CAD_COL_NUMBER, _pdm_cad_icon(payload.get("category")))
+        drawing_files = ", ".join(
+            str(drawing.get("file_name") or drawing.get("name") or "")
+            for drawing in payload.get("related_drawings") or []
+        ) or "None"
+        item.setToolTip(
+            CAD_COL_NUMBER,
+            "CAD Document\n"
+            f"File: {payload.get('file_name') or '-'}\n"
+            f"Creo file version: {self._pdm_creo_file_text(payload) or '-'}\n"
+            f"Related drawing: {drawing_files}\n"
+            f"Association: {association_type.replace('_', ' ') if association_type else 'None'}\n"
+            f"Related Item: {related_item}\n"
+            f"Checkout: {self._pdm_cad_checkout_text(payload)}",
+        )
+
+    def _apply_ebom_cad_tree_item_data(self, item: QTreeWidgetItem, document: dict) -> None:
+        payload = dict(item.data(0, PDM_CAD_PAYLOAD_ROLE) or {})
+        payload.update(dict(document or {}))
+        association_type = str(
+            payload.get("association_type")
+            or item.data(0, PDM_ASSOCIATION_TYPE_ROLE)
+            or "CONTENT"
+        ).upper()
+        item_id = (
+            payload.get("item_id")
+            or item.data(0, PDM_ASSOCIATED_ITEM_ID_ROLE)
+            or item.data(0, Qt.UserRole)
+        )
+        revision = self._pdm_cad_revision_text(payload)
+        cad_name = str(
+            payload.get("file_name") or payload.get("name") or "CAD Document"
+        )
+        item.setText(BOM_COL_NAME, cad_name)
+        item.setText(BOM_COL_AES, association_type.replace("_", " "))
+        item.setText(BOM_COL_TYPE, f"CAD {str(payload.get('category') or '').title()}")
+        item.setText(BOM_COL_REV, revision)
+        item.setText(BOM_COL_STATUS, self._pdm_cad_checkout_text(payload))
+        try:
+            if item_id is not None:
+                item_id = int(item_id)
+                item.setData(0, Qt.UserRole, item_id)
+                item.setData(0, PDM_ASSOCIATED_ITEM_ID_ROLE, item_id)
+        except Exception:
+            pass
+        item.setData(0, PDM_ASSOCIATION_ID_ROLE, payload.get("association_id"))
+        item.setData(0, PDM_ASSOCIATION_TYPE_ROLE, association_type)
+        item.setData(0, PDM_CAD_PAYLOAD_ROLE, payload)
+        item.setData(0, PDM_NODE_PAYLOAD_ROLE, payload)
+        item.setIcon(BOM_COL_NAME, _pdm_cad_icon(payload.get("category")))
+        item.setToolTip(
+            BOM_COL_NAME,
+            "Associated CAD Document (not an EBOM usage)\n"
+            f"File: {payload.get('file_name') or '-'}\n"
+            f"Association: {association_type.replace('_', ' ')}\n"
+            f"CAD version: {payload.get('revision') or 'A'}.{int(payload.get('iteration') or 1)}\n"
+            f"Creo file version: {self._pdm_creo_file_text(payload) or '-'}\n"
+            f"Lifecycle: {payload.get('lifecycle_state') or '-'}\n"
+            f"Checkout: {self._pdm_cad_checkout_text(payload)}",
+        )
+
+    def _refresh_pdm_cad_filter(self) -> int:
+        tree = getattr(self, "_cad_tree", None)
+        if tree is None:
+            return 0
+        query = str(self.search_input.text() or "").strip().casefold()
+        if query:
+            self._materialize_pdm_tree_for_search(tree)
+        visible_count = 0
+
+        def recurse(item: QTreeWidgetItem) -> bool:
+            nonlocal visible_count
+            if self._is_lazy_placeholder(item):
+                item.setHidden(False)
+                return False
+            own_text = " ".join(
+                str(item.text(column) or "") for column in range(tree.columnCount())
+            )
+            payload = dict(item.data(0, PDM_CAD_PAYLOAD_ROLE) or {})
+            drawing_text = " ".join(
+                " ".join(
+                    str(value or "")
+                    for value in (
+                        drawing.get("file_name"),
+                        drawing.get("name"),
+                        self._pdm_creo_file_text(drawing),
+                    )
+                )
+                for drawing in payload.get("related_drawings") or []
+            )
+            own_text = f"{own_text} {drawing_text}".casefold()
+            own_match = not query or query in own_text
+            child_match = False
+            for index in range(item.childCount()):
+                child_match = recurse(item.child(index)) or child_match
+            show = own_match or child_match
+            item.setHidden(not show)
+            if own_match:
+                visible_count += 1
+            if query and child_match:
+                item.setExpanded(True)
+            return show
+
+        for index in range(tree.topLevelItemCount()):
+            recurse(tree.topLevelItem(index))
+        return visible_count
+
+    def _load_pdm_cad_tree(self) -> None:
+        tree = getattr(self, "_cad_tree", None)
+        if tree is None:
+            return
+        self._set_tree_loading(True)
+        try:
+            data = (
+                self.bom_service.get_pdm_cad_structure()
+                if self.session.project_id else {"roots": [], "document_count": 0}
+            )
+            roots = list(data.get("roots") or [])
+            self._pdm_cad_roots = roots
+            self._pdm_cad_scope_path, render_roots = self._pdm_roots_for_reload_scope(
+                "cad", roots, getattr(self, "_pdm_cad_scope_path", []) or []
+            )
+            self._render_pdm_cad_roots(render_roots)
+            all_documents = list(self.bom_service.list_pdm_cad_documents() or []) if self.session.project_id else []
+            models = [
+                row for row in all_documents
+                if str(row.get("category") or "").upper()
+                in {"ASSEMBLY", "COMPONENT"}
+            ]
+            unassociated = sum(1 for row in models if not row.get("association_id"))
+            drawing_count = int(data.get("drawing_count") or 0)
+            unbound_drawings = int(data.get("unbound_drawing_count") or 0)
+            self.bom_health_label.setText(
+                f"Models: {int(data.get('document_count') or len(models))}  |  "
+                f"Drawings: {drawing_count}  |  Unassociated: {unassociated}"
+                + (f"  |  Drawings to bind: {unbound_drawings}" if unbound_drawings else "")
+            )
+            self.bom_health_label.setStyleSheet(
+                "font-size:8pt;font-weight:700;color:#475569;background:transparent;border:none;"
+            )
+            self.bom_mode_selector.setToolTip(
+                "Native CAD Document assembly/member structure. Item delivery files and "
+                "Item integrity are intentionally shown only in EBOM / Item Structure."
+            )
+        except Exception as exc:
+            tree.clear()
+            self.show_alert(f"CAD Structure could not be loaded: {exc}", "error")
+        finally:
+            try:
+                tree.setUpdatesEnabled(True)
+            except Exception:
+                pass
+            self._set_tree_loading(False)
+
+    def _add_ebom_associated_cad_node(
+        self, document: dict, item_parent: QTreeWidgetItem, item_id: int,
+        insert_index: int | None = None,
+    ) -> QTreeWidgetItem:
+        association_type = str(document.get("association_type") or "CONTENT").upper()
+        revision = self._pdm_cad_revision_text(document)
+        cad_name = str(
+            document.get("file_name") or document.get("name") or "CAD Document"
+        )
+        cad_item = QTreeWidgetItem([""] * self._ebom_tree.columnCount())
+        cad_item.setText(BOM_COL_NAME, cad_name)
+        cad_item.setText(BOM_COL_AES, association_type.replace("_", " "))
+        cad_item.setText(BOM_COL_TYPE, f"CAD {str(document.get('category') or '').title()}")
+        cad_item.setText(BOM_COL_REV, revision)
+        cad_item.setText(BOM_COL_STATUS, self._pdm_cad_checkout_text(document))
+        cad_item.setData(0, Qt.UserRole, int(item_id))
+        cad_item.setData(0, PDM_OBJECT_KIND_ROLE, PDM_OBJECT_CAD)
+        cad_item.setData(0, PDM_CAD_DOCUMENT_ID_ROLE, int(document["id"]))
+        cad_item.setData(0, PDM_ASSOCIATION_ID_ROLE, document.get("association_id"))
+        cad_item.setData(0, PDM_ASSOCIATION_TYPE_ROLE, association_type)
+        cad_item.setData(0, PDM_ASSOCIATED_ITEM_ID_ROLE, int(item_id))
+        cad_item.setData(0, PDM_CAD_PAYLOAD_ROLE, dict(document))
+        cad_item.setData(0, PDM_NODE_PAYLOAD_ROLE, dict(document))
+        cad_item.setIcon(BOM_COL_NAME, _pdm_cad_icon(document.get("category")))
+        cad_item.setForeground(BOM_COL_NAME, QBrush(QColor("#355a73")))
+        cad_item.setToolTip(
+            BOM_COL_NAME,
+            "Associated CAD Document (not an EBOM usage)\n"
+            f"File: {document.get('file_name') or '-'}\n"
+            f"Association: {association_type.replace('_', ' ')}\n"
+            f"CAD version: {document.get('revision') or 'A'}.{int(document.get('iteration') or 1)}\n"
+            f"Creo file version: {self._pdm_creo_file_text(document) or '-'}\n"
+            f"Lifecycle: {document.get('lifecycle_state') or '-'}\n"
+            f"Checkout: {self._pdm_cad_checkout_text(document)}",
+        )
+        cad_item.setToolTip(
+            BOM_COL_AES,
+            "CAD-to-Item association type. Right-click this CAD row to change or remove it.",
+        )
+        if insert_index is None:
+            item_parent.addChild(cad_item)
+        else:
+            item_parent.insertChild(max(0, int(insert_index)), cad_item)
+        return cad_item
 
     def _add_released_ebom_node(
-        self, info: dict, parent_item: QTreeWidgetItem | None = None
+        self, info: dict, parent_item: QTreeWidgetItem | None = None,
+        associations_by_item: dict | None = None,
     ) -> QTreeWidgetItem:
         payload = dict(info or {})
         payload["id"] = int(payload.get("bom_id") or payload.get("id"))
@@ -2125,6 +2609,29 @@ class BomPage(QWidget):
         payload["_has_children"] = bool(payload.get("children"))
         item = QTreeWidgetItem([""] * self._ebom_tree.columnCount())
         self._apply_tree_item_data(item, payload)
+        item.setText(BOM_COL_AES, str(payload.get("part_number") or ""))
+        item.setToolTip(
+            BOM_COL_AES,
+            "Item Number (PLM identity)"
+            + (
+                f"\nAES delivery reference: {payload.get('aes_number')}"
+                if payload.get("aes_number")
+                else "\nAES delivery reference: not assigned"
+            ),
+        )
+        item.setData(0, PDM_OBJECT_KIND_ROLE, PDM_OBJECT_ITEM)
+        item.setData(0, PDM_NODE_PAYLOAD_ROLE, dict(payload))
+        child_payloads = list(payload.get("children") or [])
+        item.setData(0, PDM_CHILDREN_PAYLOAD_ROLE, child_payloads)
+        item.setData(0, BOM_TREE_CHILDREN_LOADED_ROLE, not bool(child_payloads))
+        item.setData(0, BOM_TREE_IS_ASSEMBLY_ROLE, bool(child_payloads))
+        item.setData(
+            0,
+            PDM_EBOM_ASSOCIATIONS_ROLE,
+            list((associations_by_item or {}).get(int(payload["id"]), [])),
+        )
+        item.setData(0, PDM_ASSOCIATIONS_SHOWN_ROLE, False)
+        item.setIcon(BOM_COL_NAME, _pdm_item_icon())
         item.setText(EBOM_COL_SOURCE_QTY, str(int(payload.get("source_quantity") or 1)))
         item.setText(
             EBOM_COL_EFFECTIVE_QTY,
@@ -2134,7 +2641,12 @@ class BomPage(QWidget):
         promotion = list(payload.get("promoted_through") or [])
         if promotion:
             labels = " > ".join(
-                str(value.get("aes_number") or value.get("name") or value.get("bom_id"))
+                str(
+                    value.get("part_number")
+                    or value.get("aes_number")
+                    or value.get("name")
+                    or value.get("bom_id")
+                )
                 for value in promotion
             )
             item.setToolTip(
@@ -2145,8 +2657,7 @@ class BomPage(QWidget):
             self._ebom_tree.addTopLevelItem(item)
         else:
             parent_item.addChild(item)
-        for child in payload.get("children") or []:
-            self._add_released_ebom_node(child, item)
+        self._ensure_pdm_lazy_placeholder(item)
         return item
 
     def _load_released_ebom_tree(self) -> None:
@@ -2156,20 +2667,47 @@ class BomPage(QWidget):
             data = self.bom_service.get_released_ebom_project(
                 int(self.session.project_id)
             ) if self.session.project_id else {"roots": []}
-            self._ebom_tree.setUpdatesEnabled(False)
-            self._ebom_tree.clear()
+            associations_by_item = defaultdict(list)
+            if self.session.project_id:
+                for document in self.bom_service.list_pdm_cad_documents() or []:
+                    if (
+                        str(document.get("category") or "").upper() != "DRAWING"
+                        and document.get("item_id") is not None
+                        and document.get("association_id")
+                    ):
+                        associations_by_item[int(document["item_id"])].append(document)
+            self._ebom_associations_by_item = associations_by_item
             visible_roots = list(data.get("roots") or [])
             excluded_roots = list(data.get("excluded_roots") or [])
             flattened_roots = list(data.get("flattened_roots") or [])
-            for root in visible_roots:
-                self._add_released_ebom_node(root)
-            self._renumber_tree_rows(self._ebom_tree)
-            self._refresh_ebom_filters()
-            self._ebom_tree.expandToDepth(1)
+            self._pdm_ebom_roots = visible_roots
+            self._pdm_ebom_scope_path, render_roots = self._pdm_roots_for_reload_scope(
+                "ebom", visible_roots, getattr(self, "_pdm_ebom_scope_path", []) or []
+            )
+            self._render_pdm_ebom_roots(render_roots)
+            try:
+                score = max(
+                    0,
+                    self.issue_service.health_score()
+                    - len(getattr(self, "missing_ids", set()) or set()),
+                )
+                color = "#2e7d32" if score >= 85 else ("#a16207" if score >= 65 else "#b91c1c")
+                self.bom_health_label.setText(f"Item health: {score}/100")
+                self.bom_health_label.setStyleSheet(
+                    f"font-size:11px;font-weight:700;color:{color};background:transparent;border:none;"
+                )
+            except Exception:
+                self.bom_health_label.setText(
+                    "Items: " + str(sum(
+                        1 for row in self._iter_tree_items(self._ebom_tree)
+                        if row.data(0, PDM_OBJECT_KIND_ROLE) != PDM_OBJECT_CAD
+                    ))
+                )
             self.bom_mode_selector.setToolTip(
-                "Released EBOM contains only NORMAL deliverable rows. "
-                f"Visible roots: {len(visible_roots)}; not-for-delivery roots hidden: "
-                f"{len(excluded_roots)}; flattened CAD roots hidden: {len(flattened_roots)}."
+                "Persisted EBOM contains Item usages. Associated CAD Documents are "
+                "available from the Visual ribbon as indented relation rows and "
+                "are not EBOM usages. "
+                f"Visible roots: {len(visible_roots)}."
             )
             if not visible_roots and (excluded_roots or flattened_roots):
                 self.show_alert(
@@ -2181,10 +2719,1188 @@ class BomPage(QWidget):
                 self.hide_alert()
         except Exception as exc:
             self._ebom_tree.clear()
-            self.show_alert(f"Released EBOM could not be resolved: {exc}", "error")
+            self.show_alert(f"Item Structure could not be loaded: {exc}", "error")
         finally:
             self._ebom_tree.setUpdatesEnabled(True)
             self._set_tree_loading(False)
+
+    def _pdm_current_item_id(self) -> int | None:
+        value = getattr(self, "current_part_id", None)
+        if value is None:
+            QMessageBox.information(
+                self, "PDM", "Select an Item in CAD Structure or Item Structure first."
+            )
+            return None
+        return int(value)
+
+    def manage_pdm_cad_structure(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("CAD Document Structure")
+        dialog.resize(920, 620)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(
+            "Managed CAD structure. CAD Documents may exist without an Item association."
+        ))
+        tree = QTreeWidget()
+        tree.setHeaderLabels([
+            "CAD File", "Name", "Category", "Association", "Rev/Iter",
+            "State", "Checkout", "Qty", "Build",
+        ])
+        tree.header().setSectionResizeMode(QHeaderView.Stretch)
+        tree.setAlternatingRowColors(True)
+        layout.addWidget(tree, 1)
+
+        editor = QGridLayout()
+        parent_input = QComboBox()
+        child_input = QComboBox()
+        quantity_input = QSpinBox()
+        quantity_input.setRange(1, 100000)
+        excluded_input = QCheckBox("Exclude this CAD member from Item Structure build")
+        editor.addWidget(QLabel("Parent assembly"), 0, 0)
+        editor.addWidget(parent_input, 0, 1)
+        editor.addWidget(QLabel("Child CAD Document"), 1, 0)
+        editor.addWidget(child_input, 1, 1)
+        editor.addWidget(QLabel("Quantity"), 0, 2)
+        editor.addWidget(quantity_input, 0, 3)
+        editor.addWidget(excluded_input, 1, 2, 1, 2)
+        layout.addLayout(editor)
+        action_row = QHBoxLayout()
+        add_btn = QPushButton("Add or update CAD member")
+        add_btn.setObjectName("primary")
+        remove_btn = QPushButton("Remove selected member")
+        remove_btn.setObjectName("secondary")
+        checkout_btn = QPushButton("Check Out")
+        checkin_btn = QPushButton("Check In")
+        revise_btn = QPushButton("New Revision")
+        release_btn = QPushButton("Release")
+        action_row.addWidget(add_btn)
+        action_row.addWidget(remove_btn)
+        action_row.addWidget(checkout_btn)
+        action_row.addWidget(checkin_btn)
+        action_row.addWidget(revise_btn)
+        action_row.addWidget(release_btn)
+        action_row.addStretch()
+        layout.addLayout(action_row)
+        close_buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        close_buttons.rejected.connect(dialog.reject)
+        layout.addWidget(close_buttons)
+        can_manage = self.perm.can("manage_parts")
+        add_btn.setEnabled(can_manage)
+        remove_btn.setEnabled(can_manage)
+        checkout_btn.setEnabled(can_manage)
+        checkin_btn.setEnabled(can_manage)
+        revise_btn.setEnabled(can_manage)
+        release_btn.setEnabled(can_manage)
+
+        def add_node(node, parent=None):
+            association = str(node.get("association_type") or "UNASSOCIATED")
+            item = QTreeWidgetItem([
+                str(node.get("file_name") or node.get("name") or ""),
+                str(node.get("name") or ""),
+                str(node.get("category") or ""),
+                association,
+                f"{node.get('revision') or 'A'}.{int(node.get('iteration') or 1)}",
+                str(node.get("lifecycle_state") or ""),
+                str(node.get("checked_out_by") or "—"),
+                str(int(node.get("quantity") or 1)),
+                "EXCLUDED" if node.get("member_build_excluded") or node.get("build_excluded") else "INCLUDED",
+            ])
+            item.setData(0, Qt.UserRole, int(node["id"]))
+            item.setData(0, Qt.UserRole + 1, node.get("member_id"))
+            if association == "UNASSOCIATED":
+                item.setForeground(3, QBrush(QColor("#b45309")))
+            if parent is None:
+                tree.addTopLevelItem(item)
+            else:
+                parent.addChild(item)
+            for child in node.get("children") or []:
+                add_node(child, item)
+
+        def refresh():
+            documents = self.bom_service.list_pdm_cad_documents() or []
+            previous_parent = parent_input.currentData()
+            previous_child = child_input.currentData()
+            parent_input.clear()
+            child_input.clear()
+            for document in documents:
+                label = str(document.get("file_name") or "")
+                name = str(document.get("name") or "").strip()
+                if name and name.casefold() != label.casefold():
+                    label = f"{label} - {name}"
+                if str(document.get("category") or "").upper() == "ASSEMBLY":
+                    parent_input.addItem(label, int(document["id"]))
+                child_input.addItem(label, int(document["id"]))
+            for combo, previous in ((parent_input, previous_parent), (child_input, previous_child)):
+                if previous is not None:
+                    index = combo.findData(previous)
+                    if index >= 0:
+                        combo.setCurrentIndex(index)
+            tree.clear()
+            for root in (self.bom_service.get_pdm_cad_structure().get("roots") or []):
+                add_node(root)
+            tree.expandToDepth(1)
+
+        def add_member():
+            parent_id = parent_input.currentData()
+            child_id = child_input.currentData()
+            if parent_id is None or child_id is None:
+                QMessageBox.information(dialog, "CAD Structure", "Select parent and child CAD Documents.")
+                return
+            try:
+                self.bom_service.add_pdm_cad_member(
+                    int(parent_id), int(child_id), quantity_input.value(),
+                    excluded_input.isChecked(),
+                )
+            except Exception as exc:
+                QMessageBox.critical(dialog, "CAD Structure", str(exc))
+                return
+            refresh()
+
+        def remove_member():
+            selected = tree.currentItem()
+            member_id = selected.data(0, Qt.UserRole + 1) if selected else None
+            if member_id is None:
+                QMessageBox.information(dialog, "CAD Structure", "Select a child CAD member, not a root.")
+                return
+            self.bom_service.remove_pdm_cad_member(int(member_id))
+            refresh()
+
+        def selected_cad_id():
+            selected = tree.currentItem()
+            return int(selected.data(0, Qt.UserRole)) if selected else None
+
+        def checkout_document():
+            cad_id = selected_cad_id()
+            if cad_id is None:
+                QMessageBox.information(dialog, "CAD Document", "Select a CAD Document.")
+                return
+            try:
+                self.bom_service.checkout_pdm_cad_document(cad_id)
+                refresh()
+            except Exception as exc:
+                QMessageBox.warning(dialog, "Check Out", str(exc))
+
+        def checkin_document():
+            cad_id = selected_cad_id()
+            if cad_id is None:
+                QMessageBox.information(dialog, "CAD Document", "Select a CAD Document.")
+                return
+            path, _filter = QFileDialog.getOpenFileName(
+                dialog, "CAD Document Check In", str(getattr(self, "working_dir", "") or ""),
+                "Creo CAD (*.asm *.asm.* *.prt *.prt.* *.drw *.drw.*);;All files (*)",
+            )
+            if not path:
+                return
+            note, accepted = QInputDialog.getText(
+                dialog, "CAD Document Check In", "Check-in note:"
+            )
+            if not accepted:
+                return
+            try:
+                self.bom_service.checkin_pdm_cad_document(cad_id, path, note)
+                refresh()
+            except Exception as exc:
+                QMessageBox.warning(dialog, "Check In", str(exc))
+
+        def revise_document():
+            cad_id = selected_cad_id()
+            if cad_id is None:
+                QMessageBox.information(dialog, "CAD Document", "Select a CAD Document.")
+                return
+            try:
+                self.bom_service.revise_pdm_cad_document(cad_id)
+                refresh()
+            except Exception as exc:
+                QMessageBox.warning(dialog, "New CAD Revision", str(exc))
+
+        def release_document():
+            cad_id = selected_cad_id()
+            if cad_id is None:
+                QMessageBox.information(dialog, "CAD Document", "Select a CAD Document.")
+                return
+            if QMessageBox.question(
+                dialog, "Release CAD Document", "Release the selected CAD Document iteration?",
+                QMessageBox.Yes | QMessageBox.No,
+            ) != QMessageBox.Yes:
+                return
+            try:
+                self.bom_service.release_pdm_cad_document(cad_id)
+                refresh()
+            except Exception as exc:
+                QMessageBox.warning(dialog, "Release CAD Document", str(exc))
+
+        add_btn.clicked.connect(add_member)
+        remove_btn.clicked.connect(remove_member)
+        checkout_btn.clicked.connect(checkout_document)
+        checkin_btn.clicked.connect(checkin_document)
+        revise_btn.clicked.connect(revise_document)
+        release_btn.clicked.connect(release_document)
+        refresh()
+        dialog.exec_()
+
+    def register_cad_document(
+        self, item_id: int | None = None, drawing_owner_cad_id: int | None = None
+    ) -> int | None:
+        if isinstance(item_id, bool):
+            item_id = None
+        if not self.perm.can("manage_parts"):
+            QMessageBox.warning(self, "Permission denied", "You cannot register CAD Documents.")
+            return
+        drawing_only = drawing_owner_cad_id is not None
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Register Related Drawing" if drawing_only else "Register CAD Document",
+            str(getattr(self, "working_dir", "") or ""),
+            (
+                "Creo Drawing (*.drw *.drw.*)"
+                if drawing_only else
+                "Creo CAD (*.asm *.asm.* *.prt *.prt.* *.drw *.drw.*);;All files (*)"
+            ),
+        )
+        if not path:
+            return
+        file_name = os.path.basename(path)
+        versionless = re.sub(r"\.\d+$", "", file_name)
+        stem, extension = os.path.splitext(versionless)
+        category = {
+            ".asm": "ASSEMBLY", ".prt": "COMPONENT", ".drw": "DRAWING"
+        }.get(extension.casefold(), "OTHER")
+        if category == "OTHER":
+            QMessageBox.warning(
+                self,
+                "Register CAD Document",
+                "Only Creo .prt, .asm, and .drw files can be registered here.",
+            )
+            return
+        if drawing_only and category != "DRAWING":
+            QMessageBox.warning(
+                self, "Register Related Drawing", "Select a Creo .drw file."
+            )
+            return
+        drawing_owner = None
+        if category == "DRAWING":
+            models = [
+                document
+                for document in (self.bom_service.list_pdm_cad_documents() or [])
+                if str(document.get("category") or "").upper()
+                in {"ASSEMBLY", "COMPONENT"}
+            ]
+            if item_id is not None:
+                models = [
+                    document for document in models
+                    if document.get("item_id") is not None
+                    and int(document.get("item_id")) == int(item_id)
+                ]
+            if drawing_owner_cad_id is not None:
+                drawing_owner = next(
+                    (
+                        document for document in models
+                        if int(document.get("id") or 0) == int(drawing_owner_cad_id)
+                    ),
+                    None,
+                )
+            else:
+                if not models:
+                    QMessageBox.warning(
+                        self,
+                        "Register Drawing",
+                        "Register or associate the owning PRT/ASM model first. "
+                        "A drawing cannot be registered as an isolated CAD node.",
+                    )
+                    return
+                labels = [
+                    f"{document.get('file_name') or document.get('name')}"
+                    + (f" - {document.get('name')}" if document.get("name") else "")
+                    for document in models
+                ]
+                selected, accepted = QInputDialog.getItem(
+                    self,
+                    "Bind Drawing to Model",
+                    "Owning PRT/ASM model:",
+                    labels,
+                    0,
+                    False,
+                )
+                if not accepted:
+                    return
+                drawing_owner = models[labels.index(selected)]
+            if drawing_owner is None:
+                QMessageBox.warning(
+                    self, "Register Drawing", "The owning PRT/ASM model was not found."
+                )
+                return
+        name, accepted = QInputDialog.getText(
+            self, "Register CAD Document", "CAD Document name:", text=stem
+        )
+        if not accepted:
+            return
+        try:
+            cad_document_id = self.bom_service.create_pdm_cad_document(
+                number=versionless, name=name, file_name=file_name,
+                category=category, authoring_application="CREO",
+                drawing_owner_cad_document_id=(
+                    int(drawing_owner["id"]) if drawing_owner else None
+                ),
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Register CAD Document", str(exc))
+            return None
+        if item_id is not None and category == "DRAWING":
+            try:
+                self.bom_service.associate_cad_document(
+                    int(item_id), int(cad_document_id), "CONTENT"
+                )
+            except Exception as exc:
+                QMessageBox.warning(
+                    self,
+                    "Drawing Registered",
+                    "The drawing was bound to its model, but its Item CONTENT "
+                    f"association could not be created:\n{exc}",
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "Drawing Registered",
+                    f"{file_name} is now related to "
+                    f"{drawing_owner.get('file_name') or drawing_owner.get('name')}. "
+                    "It is available in the model details and is not a CAD Structure node.",
+                )
+        elif item_id is not None:
+            types = [
+                ("Owner (drives structure and attributes)", "OWNER"),
+                ("Contributing image", "CONTRIBUTING_IMAGE"),
+                ("Image / alternate CAD representation", "IMAGE"),
+                ("Contributing content", "CONTRIBUTING_CONTENT"),
+                ("Content / supporting CAD", "CONTENT"),
+            ]
+            label, accepted = QInputDialog.getItem(
+                self, "Register and Associate CAD",
+                "Association to the selected Item:",
+                [value[0] for value in types], 0, False,
+            )
+            if accepted:
+                association_type = next(value for text, value in types if text == label)
+                try:
+                    self.bom_service.associate_cad_document(
+                        int(item_id), int(cad_document_id), association_type
+                    )
+                except Exception as exc:
+                    QMessageBox.warning(
+                        self, "CAD Registered",
+                        "The CAD Document was registered, but its Item association "
+                        f"could not be created:\n{exc}",
+                    )
+                    self._load_pdm_cad_tree()
+                    return int(cad_document_id)
+                QMessageBox.information(
+                    self, "Register and Associate CAD",
+                    "The CAD Document is now managed and appears beneath the selected Item.",
+                )
+            else:
+                QMessageBox.information(
+                    self, "CAD Registered",
+                    "The CAD Document was registered without an Item association.",
+                )
+        elif category == "DRAWING":
+            QMessageBox.information(
+                self,
+                "Drawing Registered",
+                f"{file_name} is now related to "
+                f"{drawing_owner.get('file_name') or drawing_owner.get('name')}. "
+                "It is shown from the model details, not as a separate tree node.",
+            )
+        else:
+            QMessageBox.information(
+                self, "Register CAD Document",
+                "The file is now a managed CAD Document and may remain CAD-only until associated from an Item.",
+            )
+        if category == "DRAWING" and drawing_owner is not None:
+            self._reload_pdm_structure_views()
+            self._reselect_cad_in_current_view(int(drawing_owner["id"]))
+        else:
+            self._load_pdm_cad_tree()
+            if item_id is not None:
+                self._load_released_ebom_tree()
+        return int(cad_document_id)
+
+    @staticmethod
+    def _item_identity_text(details: dict) -> str:
+        number = str(details.get("part_number") or "").strip()
+        name = str(details.get("name") or details.get("id") or "Item").strip()
+        aes = str(details.get("aes_number") or "").strip()
+        identity = " — ".join(value for value in (number or "No Number", name) if value)
+        return f"{identity}  |  AES {aes}" if aes else identity
+
+    def manage_cad_item_associations(self, item_id: int | None = None) -> None:
+        if isinstance(item_id, bool):
+            item_id = None
+        item_id = int(item_id) if item_id is not None else self._pdm_current_item_id()
+        if item_id is None:
+            return
+        if not self._ensure_item_checked_out_for_pdm_change(int(item_id)):
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Edit Associations")
+        dialog.resize(960, 590)
+        dialog.setStyleSheet("""
+            QDialog { background:#e9edf1; color:#1d2935; font:9pt 'Segoe UI'; }
+            QLabel#associationTitle { color:#172635; font-size:12pt; font-weight:600; }
+            QLineEdit, QComboBox {
+                background:white; border:1px solid #9eaab5; border-radius:0;
+                min-height:23px; padding:1px 5px;
+            }
+            QTableWidget {
+                background:white; alternate-background-color:#f2f5f7;
+                border:1px solid #9eaab5; gridline-color:#d4dbe1;
+            }
+            QHeaderView::section {
+                background:#d8e0e6; color:#22313e; border:0;
+                border-right:1px solid #aeb8c2; border-bottom:1px solid #9eaab5;
+                padding:4px 6px; font-weight:600;
+            }
+            QPushButton {
+                border:1px solid #8d99a4; border-radius:0; background:#e2e7eb;
+                min-height:24px; padding:2px 10px;
+            }
+            QPushButton#primary { background:#246a9b; color:white; border-color:#1d587f; }
+        """)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(7)
+        details = self.bom_service.get_part_details(item_id) or {}
+        association_title = QLabel("Edit CAD–Item Associations")
+        association_title.setObjectName("associationTitle")
+        layout.addWidget(association_title)
+        layout.addWidget(QLabel(f"Item: {self._item_identity_text(details)}"))
+        search = QLineEdit()
+        search.setPlaceholderText("Search this Item's CAD Documents and unassociated CAD...")
+        search.setClearButtonEnabled(True)
+        layout.addWidget(search)
+        table = QTableWidget(0, 6)
+        table.setHorizontalHeaderLabels([
+            "", "CAD File", "Name", "Object Type", "Association Type", "Related Item"
+        ])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setAlternatingRowColors(True)
+
+        controls = QHBoxLayout()
+        association_type = QComboBox()
+        for kind in (
+            "OWNER", "CONTRIBUTING_IMAGE", "IMAGE",
+            "CONTRIBUTING_CONTENT", "CONTENT",
+        ):
+            association_type.addItem(kind.replace("_", " "), kind)
+        controls.addWidget(QLabel("Association type:"))
+        controls.addWidget(association_type)
+        associate_btn = QPushButton("Set Association")
+        associate_btn.setObjectName("primary")
+        controls.addWidget(associate_btn)
+        remove_btn = QPushButton("Remove Association")
+        remove_btn.setObjectName("secondary")
+        controls.addWidget(remove_btn)
+        can_manage = self.perm.can("manage_parts")
+        associate_btn.setEnabled(can_manage)
+        remove_btn.setEnabled(can_manage)
+        layout.addLayout(controls)
+        layout.addWidget(table, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        def checked_rows():
+            return [
+                row for row in range(table.rowCount())
+                if table.item(row, 0) is not None
+                and table.item(row, 0).checkState() == Qt.Checked
+            ]
+
+        def populate():
+            # This dialog is opened from one EBOM Item.  Keep its scope local:
+            # existing associations for other Items are managed from those
+            # Items, never silently reassigned from here.
+            documents = [
+                document
+                for document in (self.bom_service.list_pdm_cad_documents() or [])
+                if str(document.get("category") or "").upper() != "DRAWING"
+                and (
+                    document.get("item_id") is None
+                    or int(document.get("item_id")) == int(item_id)
+                )
+            ]
+            table.setRowCount(len(documents))
+            for row, document in enumerate(documents):
+                check = QTableWidgetItem("")
+                check.setFlags(check.flags() | Qt.ItemIsUserCheckable)
+                check.setCheckState(Qt.Unchecked)
+                check.setData(Qt.UserRole, int(document["id"]))
+                check.setData(Qt.UserRole + 1, document.get("association_id"))
+                check.setData(Qt.UserRole + 2, document.get("item_id"))
+                if document.get("checked_out_by") is not None:
+                    check.setFlags(check.flags() & ~Qt.ItemIsEnabled)
+                    check.setToolTip(
+                        "Check in or undo this CAD Document before changing its Item association."
+                    )
+                table.setItem(row, 0, check)
+                values = (
+                    document.get("file_name"), document.get("name"),
+                    document.get("category"), document.get("association_type") or "UNASSOCIATED",
+                    " — ".join(value for value in (
+                        str(document.get("item_number") or "").strip(),
+                        str(document.get("item_name") or "").strip(),
+                    ) if value) or "—",
+                )
+                for column, value in enumerate(values, start=1):
+                    table.setItem(row, column, QTableWidgetItem(str(value or "")))
+            apply_filter()
+
+        def apply_filter(*_args):
+            query = str(search.text() or "").strip().casefold()
+            for row in range(table.rowCount()):
+                text = " ".join(
+                    str(table.item(row, column).text() or "")
+                    for column in range(1, table.columnCount())
+                    if table.item(row, column) is not None
+                ).casefold()
+                table.setRowHidden(row, bool(query and query not in text))
+
+        def apply_associations():
+            rows = checked_rows()
+            if not rows:
+                QMessageBox.information(dialog, "PDM", "Check one or more CAD Documents.")
+                return
+            errors = []
+            for row in rows:
+                try:
+                    self.bom_service.associate_cad_document(
+                        item_id, int(table.item(row, 0).data(Qt.UserRole)),
+                        str(association_type.currentData()),
+                    )
+                except Exception as exc:
+                    errors.append(str(exc))
+            populate()
+            if errors:
+                QMessageBox.warning(dialog, "Association results", "\n".join(dict.fromkeys(errors)))
+            else:
+                QMessageBox.information(dialog, "Association results", "CAD–Item associations updated.")
+
+        def remove_associations():
+            association_ids = [
+                table.item(row, 0).data(Qt.UserRole + 1)
+                for row in checked_rows()
+                if table.item(row, 0).data(Qt.UserRole + 1) is not None
+                and table.item(row, 0).data(Qt.UserRole + 2) is not None
+                and int(table.item(row, 0).data(Qt.UserRole + 2)) == int(item_id)
+            ]
+            if not association_ids:
+                QMessageBox.information(
+                    dialog, "PDM", "Check CAD Documents associated with this Item first."
+                )
+                return
+            if QMessageBox.question(
+                dialog,
+                "Remove CAD Associations",
+                f"Remove {len(association_ids)} selected CAD association(s) from this Item?\n\n"
+                "The CAD Documents remain managed and become unassociated.",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            ) != QMessageBox.Yes:
+                return
+            errors = []
+            for association_id in association_ids:
+                try:
+                    self.bom_service.remove_cad_item_association(int(association_id))
+                except Exception as exc:
+                    errors.append(str(exc))
+            populate()
+            if errors:
+                QMessageBox.warning(
+                    dialog, "Association results", "\n".join(dict.fromkeys(errors))
+                )
+
+        search.textChanged.connect(apply_filter)
+        associate_btn.clicked.connect(apply_associations)
+        remove_btn.clicked.connect(remove_associations)
+        populate()
+        dialog.exec_()
+        if getattr(self, "current_part_id", None):
+            self.display_details(int(self.current_part_id))
+        if str(self.bom_mode_selector.currentData() or "") == "ebom":
+            self._load_released_ebom_tree()
+
+    def auto_associate_cad_documents(self) -> None:
+        if not self.perm.can("manage_parts"):
+            QMessageBox.warning(self, "Permission denied", "You cannot change CAD–Item associations.")
+            return
+        try:
+            result = self.bom_service.auto_associate_cad_documents()
+        except Exception as exc:
+            QMessageBox.critical(self, "Auto Associate", str(exc))
+            return
+        associated = len(result.get("associated") or [])
+        unresolved = list(result.get("unresolved") or [])
+        counts = Counter(str(row.get("status") or "UNKNOWN") for row in unresolved)
+        unresolved_text = ", ".join(f"{key}: {value}" for key, value in sorted(counts.items()))
+        QMessageBox.information(
+            self, "Auto Associate",
+            f"Associated: {associated}\nUnresolved: {len(unresolved)}"
+            + (f"\n{unresolved_text}" if unresolved_text else ""),
+        )
+
+    def build_item_structure_from_cad(self) -> None:
+        if not self.perm.can("manage_parts"):
+            QMessageBox.warning(self, "Permission denied", "You cannot build the Item Structure.")
+            return
+        item_id = self._pdm_current_item_id()
+        if item_id is None:
+            return
+        if not self._ensure_item_checked_out_for_pdm_change(int(item_id)):
+            return
+        answer = QMessageBox.question(
+            self, "Build Item Structure",
+            "Build the multi-level Item Structure from the selected Item's OWNER CAD assembly?\n\n"
+            "Manual Item usages will be preserved.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            result = self.bom_service.build_item_structure_from_cad(item_id, True)
+        except Exception as exc:
+            QMessageBox.critical(self, "Build Item Structure", str(exc))
+            return
+        QMessageBox.information(
+            self, "Build Item Structure",
+            "Build completed.\n"
+            f"Created: {result.get('created', 0)}\n"
+            f"Updated: {result.get('updated', 0)}\n"
+            f"Removed: {result.get('removed', 0)}\n"
+            f"No related Item: {result.get('no_related_item', 0)}\n"
+            f"Excluded: {result.get('excluded', 0)}\n"
+            f"Conflicts: {result.get('conflicts', 0)}",
+        )
+        self.bom_mode_selector.setCurrentIndex(
+            self.bom_mode_selector.findData("ebom")
+        )
+        self._load_released_ebom_tree()
+
+    @staticmethod
+    def _find_payload_node_by_id(nodes, wanted_id: int, key: str = "id") -> dict | None:
+        for node in nodes or []:
+            try:
+                candidate = node.get(key)
+                if candidate is None and key == "bom_id":
+                    candidate = node.get("id")
+                if candidate is None and key == "id":
+                    candidate = node.get("bom_id")
+                if candidate is not None and int(candidate) == int(wanted_id):
+                    return node
+            except Exception:
+                pass
+            found = BomPage._find_payload_node_by_id(
+                node.get("children") or [], int(wanted_id), key
+            )
+            if found is not None:
+                return found
+        return None
+
+    @staticmethod
+    def _cad_label(payload: dict) -> str:
+        return str(
+            payload.get("file_name")
+            or payload.get("name")
+            or payload.get("id")
+            or "CAD Document"
+        )
+
+    @staticmethod
+    def _cad_item_label(payload: dict) -> str:
+        number = str(payload.get("item_number") or "").strip()
+        name = str(payload.get("item_name") or "").strip()
+        aes = str(payload.get("item_aes_number") or "").strip()
+        label = " - ".join(value for value in (number, name) if value)
+        if aes:
+            label = f"{label} | AES {aes}" if label else f"AES {aes}"
+        return label or "No EBOM Item"
+
+    @staticmethod
+    def _normalized_cad_category(cad_document: dict) -> str:
+        category = str(cad_document.get("category") or "").strip().upper()
+        if category:
+            return category
+        file_name = str(cad_document.get("file_name") or "").lower()
+        if ".asm" in file_name:
+            return "ASSEMBLY"
+        if ".prt" in file_name:
+            return "COMPONENT"
+        if ".drw" in file_name:
+            return "DRAWING"
+        return ""
+
+    def _cad_create_ebom_item_disabled_reason(self, cad_document: dict) -> str:
+        if not self.perm.can("manage_parts"):
+            return "You do not have permission to create EBOM Items."
+        category = self._normalized_cad_category(cad_document)
+        if category == "DRAWING":
+            return "A DRW is a related drawing of a PRT/ASM; create the EBOM Item from the owning model."
+        if category not in {"ASSEMBLY", "COMPONENT"}:
+            return "Create EBOM Items only from PRT/ASM CAD Documents."
+        item_id = cad_document.get("item_id") or cad_document.get("associated_item_id")
+        if item_id not in (None, "", 0, "0"):
+            return "This CAD Document already has an associated EBOM Item."
+        return ""
+
+    def _create_ebom_item_from_cad_document(
+        self,
+        cad_document: dict,
+        parent_item_id: int | None = None,
+        quantity: int = 1,
+    ) -> int | None:
+        if not self.perm.can("manage_parts"):
+            QMessageBox.warning(self, "Permission denied", "You cannot create EBOM Items.")
+            return None
+        if not cad_document:
+            return None
+        cad_id = cad_document.get("id") or cad_document.get("child_cad_document_id")
+        if cad_id is None:
+            QMessageBox.warning(self, "Create Item", "The CAD Document was not found.")
+            return None
+        if cad_document.get("item_id"):
+            QMessageBox.information(
+                self,
+                "Create Item",
+                "This CAD Document already has an associated EBOM Item.",
+            )
+            return None
+        category = self._normalized_cad_category(cad_document)
+        if category not in {"ASSEMBLY", "COMPONENT"}:
+            QMessageBox.warning(
+                self,
+                "Create Item",
+                "Create EBOM Items only from PRT/ASM CAD Documents.",
+            )
+            return None
+        file_name = str(cad_document.get("file_name") or "").strip()
+        stem = os.path.splitext(file_name)[0] if file_name else ""
+        part_data = {
+            "name": str(cad_document.get("name") or stem or file_name or "New Item").strip(),
+            "type": "asm" if category == "ASSEMBLY" else "prt",
+            "item_type": "MECHANICAL_PART",
+            "assembly_mode": "SEPARABLE" if category == "ASSEMBLY" else "COMPONENT",
+            "procurement_source": "MAKE",
+            "item_view": "DESIGN",
+            "default_unit": "EA",
+            "classification": "PHYSICAL",
+            "cad_control_mode": "CONTROLLED",
+            "default_ebom_behavior": "NORMAL",
+            "cad_requirement": "REQUIRED",
+            "drawing_requirement": "OPTIONAL",
+            "notes": f"Created from CAD Document {file_name or cad_id}.",
+        }
+        dialog = PartDialog(self, part_data)
+        dialog.setWindowTitle("Create EBOM Item from CAD")
+        if dialog.exec_() != QDialog.Accepted:
+            return None
+        try:
+            new_item_id = self.bom_service.add_part(dialog.get_data())
+            if not isinstance(new_item_id, int):
+                raise ValueError("The Item could not be created.")
+            self.bom_service.checkout_item(int(new_item_id))
+            self.bom_service.associate_cad_document(
+                int(new_item_id), int(cad_id), "OWNER"
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Create EBOM Item from CAD", str(exc))
+            return None
+
+        usage_message = ""
+        if parent_item_id is not None and int(parent_item_id) != int(new_item_id):
+            if QMessageBox.question(
+                self,
+                "Add to Item Structure",
+                "Add the new Item as a child usage under the corresponding parent EBOM Item?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            ) == QMessageBox.Yes:
+                if self._ensure_item_checked_out_for_pdm_change(int(parent_item_id)):
+                    try:
+                        self.bom_service.add_manual_item_usage(
+                            int(parent_item_id), int(new_item_id),
+                            max(1, int(quantity or 1)),
+                        )
+                        usage_message = "\nA child usage was added to the parent Item."
+                    except Exception as exc:
+                        usage_message = (
+                            "\nThe Item was created and associated, but the child usage "
+                            f"could not be added: {exc}"
+                        )
+        self._reload_pdm_structure_views()
+        QMessageBox.information(
+            self,
+            "Create EBOM Item from CAD",
+            f"Created Item from {file_name or cad_id} and associated it as OWNER."
+            + usage_message,
+        )
+        return int(new_item_id)
+
+    def compare_cad_to_item_structure(self) -> None:
+        item_id = self._pdm_current_item_id()
+        if item_id is None:
+            return
+        try:
+            comparison = self.bom_service.compare_cad_to_item_structure(item_id)
+            associations = self.bom_service.list_item_cad_associations(item_id)
+            owner = next(
+                (
+                    row for row in associations or []
+                    if str(row.get("association_type") or "").upper() == "OWNER"
+                    and str(row.get("category") or "").upper() != "DRAWING"
+                ),
+                None,
+            )
+            if not owner:
+                raise ValueError("This Item has no OWNER CAD Document.")
+            cad_data = self.bom_service.get_pdm_cad_structure()
+            cad_root = self._find_payload_node_by_id(
+                cad_data.get("roots") or [], int(owner["id"]), "id"
+            )
+            if cad_root is None:
+                cad_root = dict(owner, children=[])
+            ebom_data = self.bom_service.get_released_ebom_project(
+                int(self.session.project_id)
+            )
+            item_root = self._find_payload_node_by_id(
+                ebom_data.get("roots") or [], int(item_id), "bom_id"
+            )
+            if item_root is None:
+                item_root = self.bom_service.get_part_details(int(item_id)) or {}
+                item_root["children"] = []
+        except Exception as exc:
+            QMessageBox.warning(self, "Compare CAD to Item Structure", str(exc))
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Compare CAD Structure to EBOM Item Structure")
+        dialog.resize(1180, 680)
+        dialog.setStyleSheet("""
+            QDialog { background:#e9edf1; color:#1d2935; font:9pt 'Segoe UI'; }
+            QLabel#compareTitle { color:#172635; font-size:12pt; font-weight:600; }
+            QLabel#compareSubtitle { color:#536270; font-size:8.5pt; }
+            QTreeWidget {
+                background:white; alternate-background-color:#f4f6f8;
+                border:1px solid #9eaab5; gridline-color:#d4dbe1;
+            }
+            QHeaderView::section {
+                background:#d8e0e6; color:#22313e; border:0;
+                border-right:1px solid #aeb8c2; border-bottom:1px solid #9eaab5;
+                padding:4px 6px; font-weight:600;
+            }
+            QPushButton {
+                border:1px solid #8d99a4; border-radius:0; background:#e2e7eb;
+                min-height:24px; padding:2px 10px;
+            }
+        """)
+        layout = QVBoxLayout(dialog)
+        title = QLabel("CAD / EBOM Structure Compare")
+        title.setObjectName("compareTitle")
+        subtitle = QLabel(
+            "Left: OWNER CAD structure. Right: persisted EBOM Item structure. "
+            "Selecting a row locates the corresponding CAD/Item row when one exists."
+        )
+        subtitle.setObjectName("compareSubtitle")
+        subtitle.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        splitter = QSplitter(Qt.Horizontal)
+        cad_panel = QGroupBox("CAD Structure")
+        cad_layout = QVBoxLayout(cad_panel)
+        cad_tree = QTreeWidget()
+        cad_tree.setColumnCount(5)
+        cad_tree.setHeaderLabels([
+            "CAD Item", "Associated EBOM Item", "Association", "Qty", "Build Status"
+        ])
+        cad_tree.setSelectionBehavior(QAbstractItemView.SelectRows)
+        cad_tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        cad_tree.setAlternatingRowColors(True)
+        cad_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        cad_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        for column in range(1, 5):
+            cad_tree.header().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        cad_layout.addWidget(cad_tree)
+
+        item_panel = QGroupBox("EBOM Item Structure")
+        item_layout = QVBoxLayout(item_panel)
+        item_tree = QTreeWidget()
+        item_tree.setColumnCount(4)
+        item_tree.setHeaderLabels(["EBOM Item", "Qty", "Source", "Compare Status"])
+        item_tree.setSelectionBehavior(QAbstractItemView.SelectRows)
+        item_tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        item_tree.setAlternatingRowColors(True)
+        item_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        for column in range(1, 4):
+            item_tree.header().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        item_layout.addWidget(item_tree)
+        splitter.addWidget(cad_panel)
+        splitter.addWidget(item_panel)
+        splitter.setSizes([580, 580])
+        layout.addWidget(splitter, 1)
+
+        cad_rows_by_item: dict[int, list[QTreeWidgetItem]] = defaultdict(list)
+        item_rows_by_item: dict[int, list[QTreeWidgetItem]] = defaultdict(list)
+        item_edges: set[tuple[int, int]] = set()
+        expected_edges: set[tuple[int, int]] = set()
+        cad_item_ids: set[int] = set()
+
+        def collect_item_edges(node: dict, parent_id=None):
+            node_id = node.get("bom_id") or node.get("id")
+            try:
+                node_id = int(node_id)
+            except Exception:
+                node_id = None
+            if parent_id is not None and node_id is not None:
+                item_edges.add((int(parent_id), int(node_id)))
+            for child in node.get("children") or []:
+                collect_item_edges(child, node_id)
+
+        collect_item_edges(item_root)
+
+        def collect_expected_edges(node: dict, parent_item=None):
+            item_value = node.get("item_id")
+            try:
+                item_value = int(item_value) if item_value is not None else None
+            except Exception:
+                item_value = None
+            if item_value is not None:
+                cad_item_ids.add(item_value)
+            if parent_item is not None and item_value is not None:
+                expected_edges.add((int(parent_item), int(item_value)))
+            for child in node.get("children") or []:
+                collect_expected_edges(child, item_value)
+
+        collect_expected_edges(cad_root)
+
+        def status_color(status: str) -> QColor:
+            normalized = str(status or "").upper()
+            if normalized in {"OWNER", "ROOT", "MATCHED", "MATCHED CAD", "COMPLETED"}:
+                return QColor("#166534")
+            if normalized in {"NO EBOM ITEM", "MISSING IN EBOM", "STRUCTURE MISMATCH"}:
+                return QColor("#b45309")
+            if normalized in {"EXTRA EBOM ITEM", "EXCLUDED", "NOT PARTICIPATING"}:
+                return QColor("#64748b")
+            return QColor("#334155")
+
+        def add_cad_node(node: dict, parent: QTreeWidgetItem | None = None, parent_item_id=None):
+            item_value = node.get("item_id")
+            try:
+                item_value = int(item_value) if item_value is not None else None
+            except Exception:
+                item_value = None
+            quantity = max(1, int(node.get("quantity") or 1))
+            association = str(node.get("association_type") or "UNASSOCIATED").replace("_", " ")
+            participates = node.get("participates_in_structure")
+            try:
+                participates = True if participates is None else bool(int(participates))
+            except Exception:
+                participates = str(participates).strip().lower() not in {
+                    "", "0", "false", "no", "none",
+                }
+            if parent is None:
+                status = "OWNER"
+            elif node.get("member_build_excluded") or node.get("build_excluded") or node.get("document_build_excluded"):
+                status = "EXCLUDED"
+            elif item_value is None:
+                status = "NO EBOM ITEM"
+            elif not participates:
+                status = "NOT PARTICIPATING"
+            elif parent_item_id is None:
+                status = "PARENT NOT ASSOCIATED"
+            elif (int(parent_item_id), int(item_value)) in item_edges:
+                status = "MATCHED"
+            else:
+                status = "MISSING IN EBOM"
+            row = QTreeWidgetItem([
+                self._cad_label(node),
+                self._cad_item_label(node),
+                association,
+                str(quantity),
+                status,
+            ])
+            row.setData(0, COMPARE_ITEM_ID_ROLE, item_value)
+            row.setData(0, COMPARE_CAD_ID_ROLE, node.get("id"))
+            row.setData(0, COMPARE_PARENT_ITEM_ID_ROLE, parent_item_id)
+            row.setData(0, COMPARE_PAYLOAD_ROLE, dict(node))
+            row.setIcon(0, _pdm_cad_icon(node.get("category")))
+            row.setForeground(4, QBrush(status_color(status)))
+            if item_value is not None:
+                cad_rows_by_item[item_value].append(row)
+            if parent is None:
+                cad_tree.addTopLevelItem(row)
+            else:
+                parent.addChild(row)
+            for child in node.get("children") or []:
+                add_cad_node(child, row, item_value)
+            row.setExpanded(True)
+            return row
+
+        def add_item_node(node: dict, parent: QTreeWidgetItem | None = None, parent_item_id=None):
+            node_id = node.get("bom_id") or node.get("id")
+            try:
+                node_id = int(node_id)
+            except Exception:
+                node_id = None
+            quantity = max(1, int(node.get("source_quantity") or node.get("quantity") or 1))
+            if parent is None:
+                status = "ROOT"
+            elif node_id in cad_item_ids and parent_item_id is not None and (int(parent_item_id), int(node_id)) in expected_edges:
+                status = "MATCHED CAD"
+            elif node_id in cad_item_ids:
+                status = "STRUCTURE MISMATCH"
+            else:
+                status = "EXTRA EBOM ITEM"
+            row = QTreeWidgetItem([
+                self._windchill_item_label(node),
+                str(quantity),
+                str(node.get("source") or "MANUAL"),
+                status,
+            ])
+            row.setData(0, COMPARE_ITEM_ID_ROLE, node_id)
+            row.setData(0, COMPARE_PAYLOAD_ROLE, dict(node))
+            row.setIcon(0, _pdm_item_icon())
+            row.setForeground(3, QBrush(status_color(status)))
+            if node_id is not None:
+                item_rows_by_item[node_id].append(row)
+            if parent is None:
+                item_tree.addTopLevelItem(row)
+            else:
+                parent.addChild(row)
+            for child in node.get("children") or []:
+                add_item_node(child, row, node_id)
+            row.setExpanded(True)
+            return row
+
+        add_cad_node(cad_root)
+        add_item_node(item_root)
+
+        syncing = {"active": False}
+
+        def sync_from(source_tree: QTreeWidget, target_tree: QTreeWidget, target_map: dict):
+            if syncing["active"]:
+                return
+            source_item = source_tree.currentItem()
+            if source_item is None:
+                return
+            item_value = source_item.data(0, COMPARE_ITEM_ID_ROLE)
+            if item_value is None:
+                return
+            targets = target_map.get(int(item_value)) or []
+            if not targets:
+                return
+            syncing["active"] = True
+            try:
+                target = targets[0]
+                target_tree.setCurrentItem(target)
+                target_tree.scrollToItem(target)
+            finally:
+                syncing["active"] = False
+
+        cad_tree.itemSelectionChanged.connect(
+            lambda: sync_from(cad_tree, item_tree, item_rows_by_item)
+        )
+        item_tree.itemSelectionChanged.connect(
+            lambda: sync_from(item_tree, cad_tree, cad_rows_by_item)
+        )
+
+        def create_from_selected_cad_row(selected: QTreeWidgetItem, data: dict) -> None:
+            try:
+                quantity = max(1, int(data.get("quantity") or selected.text(3) or 1))
+            except Exception:
+                quantity = 1
+            new_item_id = self._create_ebom_item_from_cad_document(
+                data,
+                parent_item_id=selected.data(0, COMPARE_PARENT_ITEM_ID_ROLE),
+                quantity=quantity,
+            )
+            if new_item_id is None:
+                return
+            dialog.accept()
+            QTimer.singleShot(0, self.compare_cad_to_item_structure)
+
+        def cad_context_menu(position):
+            row = cad_tree.itemAt(position)
+            if row is None:
+                return
+            cad_tree.setCurrentItem(row)
+            payload = dict(row.data(0, COMPARE_PAYLOAD_ROLE) or {})
+            menu = QMenu(dialog)
+            create_action = menu.addAction("Create EBOM Item from CAD...")
+            create_reason = self._cad_create_ebom_item_disabled_reason(payload)
+            create_action.setEnabled(not create_reason)
+            if create_reason:
+                create_action.setToolTip(create_reason)
+            create_action.triggered.connect(
+                lambda _checked=False, selected=row, data=payload:
+                create_from_selected_cad_row(selected, data)
+            )
+            open_action = menu.addAction("Open CAD Document in CAD Structure")
+            open_action.triggered.connect(
+                lambda _checked=False, value=row.data(0, COMPARE_CAD_ID_ROLE):
+                self._select_cad_in_structure(int(value)) if value is not None else None
+            )
+            menu.exec_(cad_tree.viewport().mapToGlobal(position))
+
+        cad_tree.customContextMenuRequested.connect(cad_context_menu)
+
+        missing_edges = len([1 for edge in expected_edges if edge not in item_edges])
+        summary = QLabel(
+            f"CAD-associated Item rows: {sum(len(rows) for rows in cad_rows_by_item.values())}  |  "
+            f"Missing EBOM usages: {missing_edges}  |  "
+            f"Legacy compare rows: {len(comparison.get('rows') or [])}"
+        )
+        summary.setObjectName("compareSubtitle")
+        layout.addWidget(summary)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec_()
+
+    def add_manual_item_usage(self) -> None:
+        if not self.perm.can("manage_parts"):
+            QMessageBox.warning(self, "Permission denied", "You cannot edit the Item Structure.")
+            return
+        parent_id = self._pdm_current_item_id()
+        if parent_id is None:
+            return
+        if not self._ensure_item_checked_out_for_pdm_change(int(parent_id)):
+            return
+        items = [
+            row for row in (self.bom_service.list_pdm_items() or [])
+            if int(row.get("id") or 0) != int(parent_id)
+        ]
+        if not items:
+            QMessageBox.information(self, "Manual Item Usage", "No other Items are available.")
+            return
+        labels = [self._item_identity_text(row) for row in items]
+        selected, accepted = QInputDialog.getItem(
+            self, "Manual Item Usage", "Child Item:", labels, 0, False
+        )
+        if not accepted:
+            return
+        quantity, accepted = QInputDialog.getInt(
+            self, "Manual Item Usage", "Quantity:", 1, 1, 100000, 1
+        )
+        if not accepted:
+            return
+        child = items[labels.index(selected)]
+        try:
+            self.bom_service.add_manual_item_usage(
+                int(parent_id), int(child["id"]), int(quantity)
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Manual Item Usage", str(exc))
+            return
+        if str(self.bom_mode_selector.currentData() or "") == "ebom":
+            self._load_released_ebom_tree()
 
     def _refresh_ebom_filters(self) -> int:
         tree = getattr(self, "_ebom_tree", None)
@@ -2193,26 +3909,53 @@ class BomPage(QWidget):
         query = str(self.search_input.text() or "").strip()
         filters = self._bom_advanced_filters or self._default_bom_advanced_filters()
         advanced_active = not self._is_default_bom_advanced_filter(filters)
+        if query or advanced_active:
+            self._materialize_pdm_tree_for_search(tree)
         show_parents = bool(filters.get("show_parent_matches", True))
         visible_count = 0
 
         def recurse(item):
             nonlocal visible_count
+            if self._is_lazy_placeholder(item):
+                item.setHidden(False)
+                return False
             haystack = " ".join(
                 str(item.text(column) or "")
                 for column in range(self._ebom_tree.columnCount())
-            ) + " " + str(item.toolTip(BOM_COL_NAME) or "")
-            basic_match = matches_bom_filter_text(haystack, query)
-            advanced_match = (
-                self._bom_tree_item_matches_advanced_filter(item, filters)
-                if advanced_active else True
+            ) + " " + " ".join(
+                (
+                    str(item.toolTip(BOM_COL_NAME) or ""),
+                    str(item.toolTip(BOM_COL_AES) or ""),
+                    str(item.data(0, BOM_TREE_ITEM_NUMBER_ROLE) or ""),
+                    str(item.data(0, BOM_TREE_AES_NUMBER_ROLE) or ""),
+                )
             )
-            self_match = basic_match and advanced_match
+            basic_match = matches_bom_filter_text(haystack, query)
+            is_related_cad = item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD
+            if is_related_cad:
+                # A related CAD row is a neutral relation under its Item.  It
+                # must not make an Item pass Item-only health/document filters;
+                # it only contributes a match for an explicit search query.
+                advanced_match = True
+                self_match = bool(query) and basic_match
+            else:
+                advanced_match = (
+                    self._bom_tree_item_matches_advanced_filter(item, filters)
+                    if advanced_active else True
+                )
+                self_match = basic_match and advanced_match
             child_match = False
             for index in range(item.childCount()):
                 child_match = recurse(item.child(index)) or child_match
             show = self_match or (show_parents and child_match)
             item.setHidden(not show)
+            if show and not query and not is_related_cad:
+                # Keep related rows visible beneath an Item that itself passed;
+                # their neutral return value above prevents filter bypass.
+                for index in range(item.childCount()):
+                    child = item.child(index)
+                    if child.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+                        child.setHidden(False)
             if self_match:
                 visible_count += 1
             if child_match and (query or advanced_active):
@@ -2250,6 +3993,7 @@ class BomPage(QWidget):
         # Display the lazy root level immediately. Diagnostics are independent and
         # update badges later; disk scanning must never gate BOM navigation.
         self.load_tree()
+        self._load_pdm_cad_tree()
         try:
             if self._diag_worker is not None:
                 self._diag_worker.cancel()
@@ -2310,11 +4054,16 @@ class BomPage(QWidget):
 
     def _refresh_loaded_integrity_indicators(self) -> None:
         self._invalidate_doc_indicator()
-        for tree in (getattr(self, "tree", None), getattr(self, "_search_tree", None)):
+        for tree in (
+            getattr(self, "tree", None), getattr(self, "_search_tree", None),
+            getattr(self, "_ebom_tree", None),
+        ):
             if tree is None:
                 continue
             for item in self._iter_tree_items(tree):
                 if self._is_folder_tree_item(item) or self._is_lazy_placeholder(item):
+                    continue
+                if item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
                     continue
                 part_id = item.data(0, Qt.UserRole)
                 item.setData(
@@ -2376,7 +4125,7 @@ class BomPage(QWidget):
         search_group = QGroupBox("Search")
         search_layout = QHBoxLayout(search_group)
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Search AES, name or part number...")
+        self.search_input.setPlaceholderText("Search Item Number, name, or AES...")
         try:
             self.search_input.textChanged.connect(self._schedule_search)
         except Exception:
@@ -2424,10 +4173,10 @@ class BomPage(QWidget):
         bom_header_row.addWidget(bom_header)
         self.bom_mode_selector = QComboBox()
         self.bom_mode_selector.addItem("CAD Structure", "cad")
-        self.bom_mode_selector.addItem("Released EBOM", "ebom")
-        self.bom_mode_selector.setFixedWidth(138)
+        self.bom_mode_selector.addItem("EBOM / Item Structure", "ebom")
+        self.bom_mode_selector.setFixedWidth(175)
         self.bom_mode_selector.setToolTip(
-            "CAD Structure is authoritative and editable. Released EBOM is derived and read-only."
+            "Switch between the native CAD assembly and the independent Item/EBOM structure."
         )
         self.bom_mode_selector.currentIndexChanged.connect(
             self._on_bom_mode_changed
@@ -2438,6 +4187,35 @@ class BomPage(QWidget):
         self.bom_export_btn.setFixedHeight(24)
         self.bom_export_btn.clicked.connect(self.export_bom)
         bom_header_row.addWidget(self.bom_export_btn)
+        self.pdm_actions_btn = QPushButton("PDM")
+        self.pdm_actions_btn.setObjectName("neutral")
+        self.pdm_actions_btn.setFixedHeight(24)
+        self.pdm_actions_btn.setToolTip(
+            "Manage CAD–Item associations, compare structures, and build the Item Structure."
+        )
+        pdm_menu = QMenu(self.pdm_actions_btn)
+        register_cad_action = pdm_menu.addAction("Register CAD Document...")
+        register_cad_action.triggered.connect(self.register_cad_document)
+        cad_structure_action = pdm_menu.addAction("CAD Document Structure...")
+        cad_structure_action.triggered.connect(self.manage_pdm_cad_structure)
+        manage_associations_action = pdm_menu.addAction("CAD–Item Associations...")
+        manage_associations_action.triggered.connect(self.manage_cad_item_associations)
+        auto_associate_action = pdm_menu.addAction("Auto Associate CAD Documents")
+        auto_associate_action.triggered.connect(self.auto_associate_cad_documents)
+        pdm_menu.addSeparator()
+        compare_pdm_action = pdm_menu.addAction("Compare CAD to Item Structure...")
+        compare_pdm_action.triggered.connect(self.compare_cad_to_item_structure)
+        build_pdm_action = pdm_menu.addAction("Build Item Structure from CAD")
+        build_pdm_action.triggered.connect(self.build_item_structure_from_cad)
+        pdm_menu.addSeparator()
+        manual_usage_action = pdm_menu.addAction("Add Manual Item Usage...")
+        manual_usage_action.triggered.connect(self.add_manual_item_usage)
+        self.pdm_actions_btn.setMenu(pdm_menu)
+        bom_header_row.addWidget(self.pdm_actions_btn)
+        # Association/build commands now live on the selected Item or CAD row.
+        # Keep the legacy object for compatibility with older integrations, but
+        # do not expose a detached global PDM command bucket in the new UX.
+        self.pdm_actions_btn.hide()
         bom_header_row.addStretch()
         self.bom_health_label = QLabel("Health: --")
         self.bom_health_label.setStyleSheet(
@@ -2445,6 +4223,48 @@ class BomPage(QWidget):
         )
         bom_header_row.addWidget(self.bom_health_label)
         tree_layout.addLayout(bom_header_row)
+
+        self._bom_scope_frame = QFrame()
+        self._bom_scope_frame.setObjectName("bomScopeBar")
+        scope_layout = QHBoxLayout(self._bom_scope_frame)
+        scope_layout.setContentsMargins(6, 3, 6, 3)
+        scope_layout.setSpacing(4)
+        self._bom_scope_top_btn = QPushButton("Top Level")
+        self._bom_scope_top_btn.setObjectName("scopeTop")
+        self._bom_scope_top_btn.setFixedHeight(22)
+        self._bom_scope_top_btn.clicked.connect(self._clear_pdm_isolation)
+        scope_layout.addWidget(self._bom_scope_top_btn)
+        self._bom_scope_path_layout = QHBoxLayout()
+        self._bom_scope_path_layout.setContentsMargins(0, 0, 0, 0)
+        self._bom_scope_path_layout.setSpacing(3)
+        scope_layout.addLayout(self._bom_scope_path_layout, 1)
+        self._bom_scope_frame.setStyleSheet("""
+            QFrame#bomScopeBar {
+                background: #eef2f6;
+                border: 1px solid #c8d1dc;
+                border-radius: 2px;
+            }
+            QPushButton#scopeTop, QPushButton[scopeCrumb="true"] {
+                background: transparent;
+                border: 1px solid transparent;
+                color: #22445f;
+                font-size: 10px;
+                font-weight: 600;
+                padding: 1px 6px;
+            }
+            QPushButton#scopeTop:hover, QPushButton[scopeCrumb="true"]:hover {
+                background: #dbeafe;
+                border-color: #9bbce0;
+            }
+            QLabel[scopeSeparator="true"] {
+                color: #64748b;
+                background: transparent;
+                font-size: 10px;
+                padding: 0 1px;
+            }
+        """)
+        self._bom_scope_frame.hide()
+        tree_layout.addWidget(self._bom_scope_frame)
 
         self.tree = BomTreeWidget()
         try:
@@ -2533,11 +4353,11 @@ class BomPage(QWidget):
         self._search_tree.customContextMenuRequested.connect(self.show_tree_context_menu)
         self._tree_stack.addWidget(self._search_tree)          # index 2
 
-        # The formal EBOM is a derived immutable-iteration view. It has its own
-        # tree so CAD lazy-loading, selection, and editing state remain untouched.
+        # The persisted Item Structure has its own tree so CAD Document and Item
+        # selection/editing state remain independent.
         self._ebom_tree = QTreeWidget()
         self._ebom_tree.setHeaderLabels([
-            "#", "Name", "Files", "AES Number", "Type", "Rev/Iter",
+            "#", "Item / Related CAD", "Files", "Number / Association", "Object", "Rev/Iter",
             "Status", "Integrity", "Source Qty", "Effective Qty", "Level",
         ])
         self._ebom_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -2549,7 +4369,7 @@ class BomPage(QWidget):
         self._ebom_tree.setColumnWidth(BOM_COL_ROW, 38)
         self._ebom_tree.setColumnWidth(BOM_COL_NAME, 260)
         self._ebom_tree.setColumnWidth(BOM_COL_FILES, 100)
-        self._ebom_tree.setColumnWidth(BOM_COL_AES, 90)
+        self._ebom_tree.setColumnWidth(BOM_COL_AES, 125)
         self._ebom_tree.setColumnWidth(BOM_COL_TYPE, 60)
         self._ebom_tree.setColumnWidth(BOM_COL_REV, 65)
         self._ebom_tree.setColumnWidth(BOM_COL_STATUS, 75)
@@ -2559,8 +4379,41 @@ class BomPage(QWidget):
         self._ebom_tree.setColumnWidth(EBOM_COL_LEVEL, 45)
         self._ebom_tree.setTreePosition(BOM_COL_NAME)
         self._ebom_tree.itemClicked.connect(self.on_tree_item_clicked)
+        self._ebom_tree.itemExpanded.connect(self._on_pdm_tree_item_expanded)
+        self._ebom_tree.itemSelectionChanged.connect(self._sync_visual_action_states)
         self._ebom_tree.itemDoubleClicked.connect(self._on_tree_item_double_clicked)
+        self._ebom_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._ebom_tree.customContextMenuRequested.connect(
+            self._show_pdm_tree_context_menu
+        )
         self._tree_stack.addWidget(self._ebom_tree)             # index 3
+
+        # Managed CAD Documents have their own native structure browser.  This
+        # schema intentionally has no Item PDF/STEP or integrity columns.
+        self._cad_tree = QTreeWidget()
+        self._cad_tree.setHeaderLabels([
+            "CAD Name", "Description", "Category", "CAD / Creo Ver",
+            "Lifecycle", "Related Item", "Checkout", "Build", "Qty",
+        ])
+        self._cad_tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._cad_tree.setAlternatingRowColors(True)
+        self._cad_tree.setUniformRowHeights(True)
+        self._cad_tree.setIndentation(14)
+        self._cad_tree.setAnimated(True)
+        self._cad_tree.setMouseTracking(True)
+        self._cad_tree.setIconSize(QSize(14, 14))
+        self._cad_tree.setTreePosition(CAD_COL_NUMBER)
+        for column, width in enumerate((220, 175, 72, 130, 76, 185, 100, 65, 42)):
+            self._cad_tree.setColumnWidth(column, width)
+        self._cad_tree.itemClicked.connect(self.on_tree_item_clicked)
+        self._cad_tree.itemExpanded.connect(self._on_pdm_tree_item_expanded)
+        self._cad_tree.itemSelectionChanged.connect(self._sync_visual_action_states)
+        self._cad_tree.itemDoubleClicked.connect(self._on_tree_item_double_clicked)
+        self._cad_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._cad_tree.customContextMenuRequested.connect(
+            self._show_pdm_tree_context_menu
+        )
+        self._tree_stack.addWidget(self._cad_tree)              # index 4
 
         _bom_tree_qss = f"""
             QTreeWidget {{
@@ -2616,6 +4469,7 @@ class BomPage(QWidget):
         self.tree.setStyleSheet(_bom_tree_qss)
         self._search_tree.setStyleSheet(_bom_tree_qss)
         self._ebom_tree.setStyleSheet(_bom_tree_qss)
+        self._cad_tree.setStyleSheet(_bom_tree_qss)
 
         def _bom_tree_sel_palette(w):
             try:
@@ -2629,7 +4483,7 @@ class BomPage(QWidget):
             except Exception:
                 pass
 
-        for _tw in (self.tree, self._search_tree, self._ebom_tree):
+        for _tw in (self.tree, self._search_tree, self._ebom_tree, self._cad_tree):
             try:
                 _tw.setShowDecorationSelected(True)
             except Exception:
@@ -2649,7 +4503,7 @@ class BomPage(QWidget):
         self._ebom_tree.setItemDelegateForColumn(BOM_COL_STATUS, _BomTreeStatusDelegate(self._ebom_tree, self._ebom_tree))
         self._ebom_tree.setItemDelegateForColumn(BOM_COL_INTEGRITY, _BomTreeIntegrityDelegate(self._ebom_tree, self._ebom_tree))
 
-        self._tree_stack.setCurrentIndex(1)
+        self._tree_stack.setCurrentIndex(4)
 
         tree_layout.addWidget(self._tree_stack)
         left_layout.addWidget(tree_group)
@@ -2696,9 +4550,9 @@ class BomPage(QWidget):
         self.details_summary_card.setStyleSheet("""
             QFrame#bomDetailsSummary {
                 background: #ffffff;
-                border: 1px solid #d7dde5;
-                border-left: 4px solid #0b78d0;
-                border-radius: 6px;
+                border: 1px solid #aeb8c2;
+                border-left: 3px solid #2d6f9f;
+                border-radius: 0;
             }
             QLabel#bomDetailsTitle {
                 color: #172033;
@@ -2725,8 +4579,8 @@ class BomPage(QWidget):
             }
         """)
         summary_layout = QVBoxLayout(self.details_summary_card)
-        summary_layout.setContentsMargins(14, 12, 14, 12)
-        summary_layout.setSpacing(10)
+        summary_layout.setContentsMargins(11, 9, 11, 9)
+        summary_layout.setSpacing(7)
 
         summary_heading = QHBoxLayout()
         heading_text = QVBoxLayout()
@@ -2755,8 +4609,12 @@ class BomPage(QWidget):
         self.details_summary_grid.setVerticalSpacing(10)
         self._details_summary_fields = {}
         summary_fields = [
+            ("part_number", "Number", ("part_number",)),
             ("aes_number", "AES Number", ("aes_number",)),
-            ("part_number", "Part Number", ("part_number",)),
+            ("item_type", "Item Type", ("item_type",)),
+            ("source", "Source", ("procurement_source",)),
+            ("view", "View", ("item_view",)),
+            ("unit", "Default Unit", ("default_unit",)),
             ("drawing", "DRW Number", ("drawing_number",)),
             ("type", "Type", ("type",)),
             ("revision", "Revision / Iteration", ("current_version", "revision")),
@@ -2810,7 +4668,15 @@ class BomPage(QWidget):
         files_card_layout = QVBoxLayout(self.associated_files_card)
         files_card_layout.setContentsMargins(14, 10, 14, 10)
         files_card_layout.setSpacing(8)
-        files_card_layout.addWidget(self._details_card_label("Associated Files", "associatedFilesTitle"))
+        files_heading = QHBoxLayout()
+        files_heading.addWidget(
+            self._details_card_label("Associated CAD Documents", "associatedFilesTitle")
+        )
+        files_heading.addStretch()
+        association_hint = QLabel("Manage from the Item/CAD row context menu")
+        association_hint.setStyleSheet("color:#64748b;font-size:9px;background:transparent;")
+        files_heading.addWidget(association_hint)
+        files_card_layout.addLayout(files_heading)
 
         associated_files_grid = QGridLayout()
         associated_files_grid.setHorizontalSpacing(28)
@@ -3069,7 +4935,7 @@ class BomPage(QWidget):
         self.history_panel.open_step_requested.connect(self._open_associated_step_for_history_event)
         self.history_panel.show_diff_requested.connect(self._show_step_diff_for_history_event)
         self.history_panel._export_btn.clicked.connect(self.export_history_csv)
-        self.tabs.addTab(self.history_panel, "📜 History")
+        self.tabs.addTab(self.history_panel, "History")
 
         right_layout.addWidget(self.tabs)
 
@@ -3080,16 +4946,16 @@ class BomPage(QWidget):
         action_layout = QHBoxLayout(action_ribbon)
         action_layout.setContentsMargins(3, 2, 3, 2)
         action_layout.setSpacing(2)
-        self.add_part_btn = QPushButton("Add Part")
+        self.add_part_btn = QPushButton("New Item")
         self.add_part_btn.setObjectName("primary")
         self.add_part_btn.clicked.connect(self.add_part)
         self.add_folder_btn = QPushButton("Add Folder")
         self.add_folder_btn.setObjectName("neutral")
         self.add_folder_btn.clicked.connect(self.add_bom_folder)
-        self.edit_part_btn = QPushButton("Edit Part")
+        self.edit_part_btn = QPushButton("Edit Attributes")
         self.edit_part_btn.setObjectName("neutral")
         self.edit_part_btn.clicked.connect(self.edit_part)
-        self.delete_part_btn = QPushButton("Delete Part")
+        self.delete_part_btn = QPushButton("Delete Item")
         self.delete_part_btn.setObjectName("danger")
         self.delete_part_btn.clicked.connect(self.delete_part)
         self.undo_checkout_btn = QPushButton("Undo Checkout")
@@ -3115,6 +4981,28 @@ class BomPage(QWidget):
         self.manage_configurations_btn.setObjectName("neutral")
         self.manage_configurations_btn.clicked.connect(self.manage_assembly_configurations)
         self.manage_configurations_btn.setEnabled(bool(self.session.project_id))
+        self.register_cad_btn = QPushButton("Register CAD")
+        self.register_cad_btn.setObjectName("neutral")
+        self.register_cad_btn.clicked.connect(self.register_cad_document)
+        self.register_cad_btn.setEnabled(False)
+        self.add_cad_component_btn = QPushButton("Add Component")
+        self.add_cad_component_btn.setObjectName("neutral")
+        self.add_cad_component_btn.clicked.connect(self._add_cad_component_from_ribbon)
+        self.add_cad_component_btn.setEnabled(False)
+        self.delete_cad_btn = QPushButton("Delete CAD")
+        self.delete_cad_btn.setObjectName("danger")
+        self.delete_cad_btn.clicked.connect(
+            lambda: self._delete_selected_pdm_cad_document()
+        )
+        self.delete_cad_btn.setEnabled(False)
+        self.show_associated_cad_btn = QPushButton("Show CAD")
+        self.show_associated_cad_btn.setObjectName("neutral")
+        self.show_associated_cad_btn.clicked.connect(self._toggle_selected_ebom_cad_associations)
+        self.show_associated_cad_btn.setEnabled(False)
+        self.clear_pdm_scope_btn = QPushButton("Top Level")
+        self.clear_pdm_scope_btn.setObjectName("neutral")
+        self.clear_pdm_scope_btn.clicked.connect(self._clear_pdm_isolation)
+        self.clear_pdm_scope_btn.setEnabled(False)
 
         _can_manage = self.perm.can("manage_parts")
         self.add_part_btn.setEnabled(_can_manage)
@@ -3138,6 +5026,8 @@ class BomPage(QWidget):
             self.checkout_part_btn, self.checkin_part_btn, self.undo_checkout_btn,
             self.set_revision_btn, self.release_revision_btn,
             self.create_configuration_btn, self.manage_configurations_btn,
+            self.register_cad_btn, self.add_cad_component_btn, self.delete_cad_btn,
+            self.show_associated_cad_btn, self.clear_pdm_scope_btn,
         )
         for button in action_buttons:
             button.setFixedHeight(25)
@@ -3147,8 +5037,8 @@ class BomPage(QWidget):
 
         style = self.style()
         action_specs = (
-            (self.add_part_btn, "Add Part", QStyle.SP_FileIcon, "Add a new BOM item"),
-            (self.edit_part_btn, "Edit", QStyle.SP_FileDialogDetailedView, "Edit the selected item"),
+            (self.add_part_btn, "New Item", QStyle.SP_FileIcon, "Create an Item master"),
+            (self.edit_part_btn, "Edit Attributes", QStyle.SP_FileDialogDetailedView, "Edit the selected Item"),
             (self.delete_part_btn, "Delete", QStyle.SP_TrashIcon, "Delete the selected item"),
             (self.checkout_part_btn, "Check Out", QStyle.SP_ArrowForward, "Check out the selected item"),
             (self.checkin_part_btn, "Check In", QStyle.SP_DialogApplyButton, "Review and finish the selected checkout"),
@@ -3160,6 +5050,11 @@ class BomPage(QWidget):
             (self.release_revision_btn, "Release Revision", QStyle.SP_DialogApplyButton, "Release the current revision"),
             (self.create_configuration_btn, "Create Configuration", QStyle.SP_FileDialogNewFolder, "Create an assembly configuration"),
             (self.manage_configurations_btn, "Manage Configurations", QStyle.SP_ComputerIcon, "Manage assembly configurations"),
+            (self.register_cad_btn, "Register CAD", QStyle.SP_FileIcon, "Register a managed PRT or ASM CAD Document"),
+            (self.add_cad_component_btn, "Add Component", QStyle.SP_ArrowDown, "Add a CAD component to the selected checked-out ASM"),
+            (self.delete_cad_btn, "Delete CAD", QStyle.SP_TrashIcon, "Delete the selected CAD Document"),
+            (self.show_associated_cad_btn, "Show CAD", QStyle.SP_FileDialogDetailedView, "Show or hide associated CAD under the selected Item"),
+            (self.clear_pdm_scope_btn, "Top Level", QStyle.SP_ArrowUp, "Return the active BOM browser to the top level"),
         )
         for button, text_value, icon_type, tooltip in action_specs:
             button.setText(text_value)
@@ -3234,7 +5129,9 @@ class BomPage(QWidget):
         )
         add_action_category("New/Add To", (self.add_child_btn, self.add_folder_btn))
         add_action_category("Lifecycle", (self.revision_actions_btn,))
+        add_action_category("CAD", (self.register_cad_btn, self.add_cad_component_btn, self.delete_cad_btn))
         add_action_category("Tools", (self.compare_structure_btn, self.configuration_actions_btn))
+        add_action_category("Visual", (self.show_associated_cad_btn, self.clear_pdm_scope_btn))
         action_layout.addStretch(1)
         action_ribbon.setStyleSheet(
             "QFrame#actionRibbon { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 3px; }"
@@ -3247,6 +5144,7 @@ class BomPage(QWidget):
             "QPushButton[ribbonAction=\"true\"]:disabled { color: #9ca3af; background: transparent; }"
         )
         self._sync_action_ribbon_menus()
+        self._sync_visual_action_states()
         right_layout.addWidget(action_ribbon)
 
         splitter.addWidget(left_widget)
@@ -3268,6 +5166,652 @@ class BomPage(QWidget):
                 action.setEnabled(enabled)
                 has_enabled_action = has_enabled_action or enabled
             menu_button.setEnabled(has_enabled_action)
+
+    def _pdm_mode_for_tree(self, tree: QTreeWidget | None) -> str | None:
+        if tree is getattr(self, "_cad_tree", None):
+            return "cad"
+        if tree is getattr(self, "_ebom_tree", None):
+            return "ebom"
+        return None
+
+    def _current_pdm_tree(self) -> QTreeWidget | None:
+        if str(getattr(self, "_bom_mode", "cad")) == "ebom":
+            return getattr(self, "_ebom_tree", None)
+        return getattr(self, "_cad_tree", None)
+
+    def _pdm_name_column_for_tree(self, tree: QTreeWidget | None) -> int:
+        return CAD_COL_NAME if tree is getattr(self, "_cad_tree", None) else BOM_COL_NAME
+
+    def _ensure_pdm_lazy_placeholder(self, item: QTreeWidgetItem) -> None:
+        if item is None or not item.data(0, BOM_TREE_IS_ASSEMBLY_ROLE):
+            return
+        tree = item.treeWidget()
+        if item.data(0, BOM_TREE_CHILDREN_LOADED_ROLE):
+            return
+        for index in range(item.childCount()):
+            if self._is_lazy_placeholder(item.child(index)):
+                return
+        column_count = tree.columnCount() if tree is not None else BOM_TREE_COLUMN_COUNT
+        placeholder = QTreeWidgetItem([""] * column_count)
+        placeholder.setText(self._pdm_name_column_for_tree(tree), "Loading...")
+        placeholder.setData(0, BOM_TREE_PLACEHOLDER_ROLE, True)
+        placeholder.setDisabled(True)
+        item.addChild(placeholder)
+
+    def _remove_pdm_lazy_placeholders(self, item: QTreeWidgetItem) -> None:
+        for index in range(item.childCount() - 1, -1, -1):
+            if self._is_lazy_placeholder(item.child(index)):
+                item.takeChild(index)
+
+    def _render_pdm_cad_roots(self, roots: list[dict]) -> None:
+        tree = getattr(self, "_cad_tree", None)
+        if tree is None:
+            return
+        tree.setUpdatesEnabled(False)
+        try:
+            tree.clear()
+            for root in list(roots or []):
+                self._add_pdm_cad_node(root)
+            self._refresh_pdm_cad_filter()
+            tree.collapseAll()
+        finally:
+            tree.setUpdatesEnabled(True)
+        self._update_pdm_scope_bar()
+        self._sync_visual_action_states()
+
+    def _render_pdm_ebom_roots(self, roots: list[dict]) -> None:
+        tree = getattr(self, "_ebom_tree", None)
+        if tree is None:
+            return
+        tree.setUpdatesEnabled(False)
+        try:
+            tree.clear()
+            for root in list(roots or []):
+                self._add_released_ebom_node(
+                    root,
+                    associations_by_item=getattr(self, "_ebom_associations_by_item", {}),
+                )
+            self._renumber_tree_rows(tree)
+            self._refresh_ebom_filters()
+            tree.collapseAll()
+        finally:
+            tree.setUpdatesEnabled(True)
+        self._update_pdm_scope_bar()
+        self._sync_visual_action_states()
+
+    def _on_pdm_tree_item_expanded(self, item: QTreeWidgetItem) -> None:
+        if (
+            item is None
+            or self._is_lazy_placeholder(item)
+            or item.data(0, BOM_TREE_CHILDREN_LOADED_ROLE)
+        ):
+            return
+        self._load_pdm_lazy_children_for_item(item, refresh_filters=True)
+
+    def _load_pdm_lazy_children_for_item(
+        self, item: QTreeWidgetItem, refresh_filters: bool = False
+    ) -> None:
+        tree = item.treeWidget()
+        mode = self._pdm_mode_for_tree(tree)
+        if mode not in {"cad", "ebom"}:
+            return
+        children = list(item.data(0, PDM_CHILDREN_PAYLOAD_ROLE) or [])
+        tree.setUpdatesEnabled(False)
+        try:
+            self._remove_pdm_lazy_placeholders(item)
+            item.setData(0, BOM_TREE_CHILDREN_LOADED_ROLE, True)
+            if mode == "cad":
+                for child in children:
+                    self._add_pdm_cad_node(child, item)
+            else:
+                for child in children:
+                    self._add_released_ebom_node(
+                        child,
+                        item,
+                        getattr(self, "_ebom_associations_by_item", {}),
+                    )
+                self._renumber_tree_rows(tree)
+        finally:
+            tree.setUpdatesEnabled(True)
+            tree.viewport().update()
+        if refresh_filters:
+            if mode == "cad":
+                self._refresh_pdm_cad_filter()
+            else:
+                self._refresh_ebom_filters()
+        self._sync_visual_action_states()
+
+    def _materialize_pdm_tree_for_search(self, tree: QTreeWidget | None) -> None:
+        mode = self._pdm_mode_for_tree(tree)
+        if tree is None or mode not in {"cad", "ebom"}:
+            return
+
+        def visit(item: QTreeWidgetItem) -> None:
+            if self._is_lazy_placeholder(item):
+                return
+            if not item.data(0, BOM_TREE_CHILDREN_LOADED_ROLE):
+                self._load_pdm_lazy_children_for_item(item, refresh_filters=False)
+            for index in range(item.childCount()):
+                visit(item.child(index))
+
+        tree.setUpdatesEnabled(False)
+        try:
+            for index in range(tree.topLevelItemCount()):
+                visit(tree.topLevelItem(index))
+        finally:
+            tree.setUpdatesEnabled(True)
+            tree.viewport().update()
+
+    def _remove_direct_ebom_cad_rows(self, item: QTreeWidgetItem) -> None:
+        for index in range(item.childCount() - 1, -1, -1):
+            child = item.child(index)
+            if child.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+                item.takeChild(index)
+
+    def _show_ebom_cad_associations(
+        self, item: QTreeWidgetItem, refresh_filters: bool = True
+    ) -> None:
+        if item is None or item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+            return
+        associations = list(item.data(0, PDM_EBOM_ASSOCIATIONS_ROLE) or [])
+        if not associations:
+            return
+        try:
+            item_id = int(item.data(0, Qt.UserRole))
+        except (TypeError, ValueError):
+            return
+        tree = item.treeWidget()
+        if tree is not None:
+            tree.setUpdatesEnabled(False)
+        try:
+            self._remove_direct_ebom_cad_rows(item)
+            for document in reversed(associations):
+                self._add_ebom_associated_cad_node(
+                    document, item, item_id, insert_index=0
+                )
+            item.setData(0, PDM_ASSOCIATIONS_SHOWN_ROLE, True)
+        finally:
+            if tree is not None:
+                tree.setUpdatesEnabled(True)
+                tree.viewport().update()
+        try:
+            item.setExpanded(True)
+        except Exception:
+            pass
+        if refresh_filters:
+            self._renumber_tree_rows(getattr(self, "_ebom_tree", None))
+            self._refresh_ebom_filters()
+            self._sync_visual_action_states()
+
+    def _hide_ebom_cad_associations(
+        self, item: QTreeWidgetItem, refresh_filters: bool = True
+    ) -> None:
+        if item is None:
+            return
+        tree = item.treeWidget()
+        if tree is not None:
+            tree.setUpdatesEnabled(False)
+        try:
+            self._remove_direct_ebom_cad_rows(item)
+            item.setData(0, PDM_ASSOCIATIONS_SHOWN_ROLE, False)
+        finally:
+            if tree is not None:
+                tree.setUpdatesEnabled(True)
+                tree.viewport().update()
+        if refresh_filters:
+            self._renumber_tree_rows(getattr(self, "_ebom_tree", None))
+            self._refresh_ebom_filters()
+            self._sync_visual_action_states()
+
+    def _selected_ebom_item_for_visual_action(self) -> QTreeWidgetItem | None:
+        if str(getattr(self, "_bom_mode", "cad")) != "ebom":
+            return None
+        tree = getattr(self, "_ebom_tree", None)
+        item = tree.currentItem() if tree is not None else None
+        if item is not None and item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+            item = item.parent()
+        if (
+            item is None
+            or self._is_lazy_placeholder(item)
+            or item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD
+        ):
+            return None
+        return item
+
+    def _selected_cad_item_for_ribbon(self) -> QTreeWidgetItem | None:
+        mode = str(getattr(self, "_bom_mode", "cad"))
+        tree = (
+            getattr(self, "_cad_tree", None)
+            if mode == "cad" else
+            getattr(self, "_ebom_tree", None)
+        )
+        item = tree.currentItem() if tree is not None else None
+        if (
+            item is None
+            or self._is_lazy_placeholder(item)
+            or item.data(0, PDM_OBJECT_KIND_ROLE) != PDM_OBJECT_CAD
+        ):
+            return None
+        return item
+
+    def _add_cad_component_from_ribbon(self) -> None:
+        item = self._selected_cad_item_for_ribbon()
+        if item is None:
+            QMessageBox.information(self, "CAD Structure", "Select an ASM CAD Document.")
+            return
+        payload = dict(item.data(0, PDM_CAD_PAYLOAD_ROLE) or {})
+        if str(payload.get("category") or item.text(CAD_COL_CATEGORY)).upper() != "ASSEMBLY":
+            QMessageBox.information(self, "CAD Structure", "Only an ASM CAD Document can contain components.")
+            return
+        try:
+            checked_out_by_me = (
+                self.session.user_id is not None
+                and payload.get("checked_out_by") is not None
+                and int(payload["checked_out_by"]) == int(self.session.user_id)
+            )
+        except Exception:
+            checked_out_by_me = False
+        if not checked_out_by_me:
+            QMessageBox.information(
+                self,
+                "CAD Structure",
+                "Check out the ASM CAD Document before adding a component.",
+            )
+            return
+        cad_id = item.data(0, PDM_CAD_DOCUMENT_ID_ROLE)
+        if cad_id is not None:
+            self._add_cad_member_from_tree(int(cad_id))
+
+    def _delete_selected_pdm_cad_document(
+        self,
+        cad_id: int | None = None,
+        payload: dict | None = None,
+        *,
+        reselect_cad_id: int | None = None,
+    ) -> None:
+        if isinstance(cad_id, bool):
+            cad_id = None
+        if not self.perm.can("manage_parts"):
+            QMessageBox.warning(self, "Permission denied", "You cannot delete CAD Documents.")
+            return
+        item = None
+        if cad_id is None:
+            item = self._selected_cad_item_for_ribbon()
+            if item is None:
+                QMessageBox.information(self, "CAD Structure", "Select a CAD Document to delete.")
+                return
+            cad_id = int(item.data(0, PDM_CAD_DOCUMENT_ID_ROLE))
+            payload = dict(item.data(0, PDM_CAD_PAYLOAD_ROLE) or {})
+        else:
+            cad_id = int(cad_id)
+            payload = dict(payload or {})
+        label = str(
+            payload.get("file_name")
+            or payload.get("name")
+            or f"CAD Document {cad_id}"
+        )
+        related_drawings = list(payload.get("related_drawings") or [])
+        delete_related_drawings = False
+        if related_drawings:
+            drawing_names = "\n".join(
+                f"- {drawing.get('file_name') or drawing.get('name') or drawing.get('id')}"
+                for drawing in related_drawings[:12]
+            )
+            if len(related_drawings) > 12:
+                drawing_names += f"\n- ... and {len(related_drawings) - 12} more"
+            message = (
+                f"Delete CAD Document {label} and its related drawing CAD Document(s)?\n\n"
+                f"{drawing_names}\n\n"
+                "The EBOM Items are not deleted, but CAD associations and CAD-build usages are removed."
+            )
+            if QMessageBox.question(
+                self,
+                "Delete CAD Document",
+                message,
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            ) != QMessageBox.Yes:
+                return
+            delete_related_drawings = True
+        else:
+            if QMessageBox.question(
+                self,
+                "Delete CAD Document",
+                f"Delete CAD Document {label}?\n\n"
+                "The EBOM Item is not deleted, but CAD associations and CAD-build usages are removed.",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            ) != QMessageBox.Yes:
+                return
+        try:
+            result = self.bom_service.delete_pdm_cad_document(
+                int(cad_id), delete_related_drawings=delete_related_drawings
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Delete CAD Document", str(exc))
+            return
+        self._reload_pdm_structure_views()
+        if reselect_cad_id is not None:
+            self._reselect_cad_in_current_view(int(reselect_cad_id))
+        else:
+            self.clear_details()
+        count = int((result or {}).get("deleted_count") or 0)
+        status_message = (
+            f"Deleted {count} CAD Document{'s' if count != 1 else ''}."
+            if count else
+            "No CAD Document was deleted."
+        )
+        self.window().statusBar().showMessage(status_message, 6000)
+
+    def _toggle_selected_ebom_cad_associations(self) -> None:
+        item = self._selected_ebom_item_for_visual_action()
+        if item is None:
+            return
+        if item.data(0, PDM_ASSOCIATIONS_SHOWN_ROLE):
+            self._hide_ebom_cad_associations(item)
+        else:
+            self._show_ebom_cad_associations(item)
+
+    def _pdm_scope_path_for_mode(self, mode: str | None = None) -> list:
+        mode = str(mode or getattr(self, "_bom_mode", "cad"))
+        if mode == "ebom":
+            return list(getattr(self, "_pdm_ebom_scope_path", []) or [])
+        return list(getattr(self, "_pdm_cad_scope_path", []) or [])
+
+    @staticmethod
+    def _pdm_int_or_none(value):
+        try:
+            if value in (None, ""):
+                return None
+            return int(value)
+        except Exception:
+            return None
+
+    def _pdm_scope_identity(self, payload: dict, mode: str):
+        payload = dict(payload or {})
+        if mode == "cad":
+            cad_id = self._pdm_int_or_none(
+                payload.get("id")
+                or payload.get("cad_document_id")
+                or payload.get("child_cad_document_id")
+            )
+            member_id = self._pdm_int_or_none(payload.get("member_id"))
+            if cad_id is None:
+                return None
+            return ("cad", cad_id, member_id)
+        item_id = self._pdm_int_or_none(
+            payload.get("bom_id")
+            or payload.get("id")
+            or payload.get("item_id")
+        )
+        if item_id is None:
+            return None
+        return ("ebom", item_id)
+
+    def _pdm_payload_matches_scope_identity(self, payload: dict, identity, mode: str) -> bool:
+        candidate = self._pdm_scope_identity(payload, mode)
+        if candidate is None or identity is None:
+            return False
+        if mode == "cad":
+            _kind, wanted_cad_id, wanted_member_id = identity
+            _candidate_kind, candidate_cad_id, candidate_member_id = candidate
+            if wanted_cad_id != candidate_cad_id:
+                return False
+            if wanted_member_id is not None and candidate_member_id is not None:
+                return wanted_member_id == candidate_member_id
+            return True
+        return candidate == identity
+
+    def _find_pdm_payload_path_for_scope(
+        self, nodes: list[dict], identities: list, mode: str, depth: int = 0
+    ) -> list[dict] | None:
+        if not identities or depth >= len(identities):
+            return None
+        for node in nodes or []:
+            if not self._pdm_payload_matches_scope_identity(node, identities[depth], mode):
+                continue
+            if depth == len(identities) - 1:
+                return [dict(node)]
+            child_path = self._find_pdm_payload_path_for_scope(
+                list(node.get("children") or []), identities, mode, depth + 1
+            )
+            if child_path is not None:
+                return [dict(node)] + child_path
+        return None
+
+    def _find_pdm_payload_path_to_identity(
+        self, nodes: list[dict], identity, mode: str
+    ) -> list[dict] | None:
+        for node in nodes or []:
+            if self._pdm_payload_matches_scope_identity(node, identity, mode):
+                return [dict(node)]
+            child_path = self._find_pdm_payload_path_to_identity(
+                list(node.get("children") or []), identity, mode
+            )
+            if child_path is not None:
+                return [dict(node)] + child_path
+        return None
+
+    def _pdm_scope_entry_from_payload(self, payload: dict, mode: str) -> dict:
+        clean_payload = dict(payload or {})
+        return {
+            "label": self._pdm_payload_label(clean_payload, mode),
+            "payload": clean_payload,
+        }
+
+    def _pdm_roots_for_reload_scope(
+        self, mode: str, roots: list[dict], previous_scope_path: list
+    ) -> tuple[list, list[dict]]:
+        previous_scope_path = list(previous_scope_path or [])
+        roots = list(roots or [])
+        if not previous_scope_path:
+            return [], roots
+
+        identities = [
+            self._pdm_scope_identity(entry.get("payload") or {}, mode)
+            for entry in previous_scope_path
+        ]
+        identities = [identity for identity in identities if identity is not None]
+        fresh_path = None
+        if identities:
+            fresh_path = self._find_pdm_payload_path_for_scope(roots, identities, mode)
+            if fresh_path is None:
+                fresh_path = self._find_pdm_payload_path_to_identity(
+                    roots, identities[-1], mode
+                )
+        if fresh_path:
+            refreshed_scope_path = [
+                self._pdm_scope_entry_from_payload(payload, mode)
+                for payload in fresh_path
+            ]
+            return refreshed_scope_path, [dict(fresh_path[-1])]
+
+        # If a refresh cannot locate the scoped object in the new root data,
+        # keep the user's isolated working scope instead of silently jumping
+        # back to top level.  The user can explicitly press Top Level/change
+        # breadcrumb scope when they want to leave it.
+        stale_payload = dict(previous_scope_path[-1].get("payload") or {})
+        return previous_scope_path, ([stale_payload] if stale_payload else [])
+
+    def _pdm_payload_label(self, payload: dict, mode: str) -> str:
+        if mode == "cad":
+            label = str(
+                payload.get("file_name")
+                or payload.get("name")
+                or "CAD Document"
+            )
+        else:
+            label = str(
+                payload.get("name")
+                or payload.get("part_number")
+                or payload.get("aes_number")
+                or "Item"
+            )
+        return " ".join(label.split()) or ("CAD Document" if mode == "cad" else "Item")
+
+    def _pdm_scope_entry_from_item(self, item: QTreeWidgetItem, mode: str) -> dict | None:
+        payload = dict(item.data(0, PDM_NODE_PAYLOAD_ROLE) or {})
+        if not payload:
+            payload = dict(item.data(0, PDM_CAD_PAYLOAD_ROLE) or {})
+        if not payload:
+            return None
+        label = self._pdm_payload_label(payload, mode)
+        return {"label": label, "payload": payload}
+
+    def _pdm_path_from_item(self, item: QTreeWidgetItem, mode: str) -> list:
+        path = []
+        current = item
+        while current is not None:
+            if not self._is_lazy_placeholder(current):
+                if not (mode == "ebom" and current.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD):
+                    entry = self._pdm_scope_entry_from_item(current, mode)
+                    if entry:
+                        path.append(entry)
+            current = current.parent()
+        path.reverse()
+        return path
+
+    def _isolate_pdm_tree_item(self, item: QTreeWidgetItem) -> None:
+        tree = item.treeWidget() if item is not None else None
+        mode = self._pdm_mode_for_tree(tree)
+        if mode not in {"cad", "ebom"}:
+            return
+        if mode == "ebom" and item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+            item = item.parent()
+            if item is None:
+                return
+        path = self._pdm_path_from_item(item, mode)
+        if not path:
+            return
+        if mode == "cad":
+            self._pdm_cad_scope_path = path
+            self._render_pdm_cad_roots([dict(path[-1]["payload"])])
+            target_tree = self._cad_tree
+        else:
+            self._pdm_ebom_scope_path = path
+            self._render_pdm_ebom_roots([dict(path[-1]["payload"])])
+            target_tree = self._ebom_tree
+        try:
+            root_item = target_tree.topLevelItem(0)
+            if root_item is not None:
+                target_tree.setCurrentItem(root_item)
+                root_item.setSelected(True)
+                self.on_tree_item_clicked(root_item, self._pdm_name_column_for_tree(target_tree))
+        except Exception:
+            pass
+
+    def _open_pdm_scope_at(self, mode: str, index: int) -> None:
+        path = self._pdm_scope_path_for_mode(mode)
+        if index < 0 or index >= len(path):
+            return
+        path = path[: index + 1]
+        if mode == "cad":
+            self._pdm_cad_scope_path = path
+            self._render_pdm_cad_roots([dict(path[-1]["payload"])])
+            target_tree = self._cad_tree
+        else:
+            self._pdm_ebom_scope_path = path
+            self._render_pdm_ebom_roots([dict(path[-1]["payload"])])
+            target_tree = self._ebom_tree
+        try:
+            root_item = target_tree.topLevelItem(0)
+            if root_item is not None:
+                target_tree.setCurrentItem(root_item)
+                root_item.setSelected(True)
+                self.on_tree_item_clicked(root_item, self._pdm_name_column_for_tree(target_tree))
+        except Exception:
+            pass
+
+    def _clear_pdm_isolation(self) -> None:
+        mode = str(getattr(self, "_bom_mode", "cad"))
+        if mode == "ebom":
+            self._pdm_ebom_scope_path = []
+            self._render_pdm_ebom_roots(getattr(self, "_pdm_ebom_roots", []) or [])
+        else:
+            self._pdm_cad_scope_path = []
+            self._render_pdm_cad_roots(getattr(self, "_pdm_cad_roots", []) or [])
+        self.clear_details()
+
+    def _update_pdm_scope_bar(self) -> None:
+        frame = getattr(self, "_bom_scope_frame", None)
+        layout = getattr(self, "_bom_scope_path_layout", None)
+        if frame is None or layout is None:
+            return
+        mode = str(getattr(self, "_bom_mode", "cad"))
+        path = self._pdm_scope_path_for_mode(mode)
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        frame.setVisible(bool(path))
+        if not path:
+            return
+        for index, entry in enumerate(path):
+            if index:
+                separator = QLabel(">")
+                separator.setProperty("scopeSeparator", True)
+                layout.addWidget(separator)
+            label = str(entry.get("label") or "")
+            display_label = label if len(label) <= 34 else label[:31] + "..."
+            button = QPushButton(display_label)
+            button.setProperty("scopeCrumb", True)
+            button.setFixedHeight(22)
+            button.setToolTip(label)
+            button.clicked.connect(
+                lambda _checked=False, i=index, m=mode: self._open_pdm_scope_at(m, i)
+            )
+            layout.addWidget(button)
+        layout.addStretch(1)
+
+    def _sync_visual_action_states(self) -> None:
+        try:
+            mode = str(getattr(self, "_bom_mode", "cad"))
+            scoped = bool(self._pdm_scope_path_for_mode(mode))
+            if hasattr(self, "clear_pdm_scope_btn"):
+                self.clear_pdm_scope_btn.setEnabled(scoped)
+            item = self._selected_ebom_item_for_visual_action()
+            associations = list(item.data(0, PDM_EBOM_ASSOCIATIONS_ROLE) or []) if item is not None else []
+            shown = bool(item and item.data(0, PDM_ASSOCIATIONS_SHOWN_ROLE))
+            if hasattr(self, "show_associated_cad_btn"):
+                self.show_associated_cad_btn.setText("Hide CAD" if shown else "Show CAD")
+                self.show_associated_cad_btn.setEnabled(bool(item and associations))
+                self.show_associated_cad_btn.setToolTip(
+                    "Hide associated CAD rows for the selected Item"
+                    if shown else
+                    "Show associated CAD rows under the selected EBOM Item"
+                )
+            cad_mode = mode == "cad"
+            can_manage = self.perm.can("manage_parts")
+            cad_item = self._selected_cad_item_for_ribbon()
+            payload = dict(cad_item.data(0, PDM_CAD_PAYLOAD_ROLE) or {}) if cad_item is not None else {}
+            checked_out_by_me = False
+            try:
+                checked_out_by_me = (
+                    self.session.user_id is not None
+                    and payload.get("checked_out_by") is not None
+                    and int(payload["checked_out_by"]) == int(self.session.user_id)
+                )
+            except Exception:
+                checked_out_by_me = False
+            is_assembly = str(payload.get("category") or "").upper() == "ASSEMBLY"
+            cad_context = cad_item is not None
+            if hasattr(self, "register_cad_btn"):
+                self.register_cad_btn.setEnabled(bool(cad_mode and can_manage and self.session.project_id))
+            if hasattr(self, "add_cad_component_btn"):
+                self.add_cad_component_btn.setEnabled(bool(cad_mode and cad_context and can_manage and is_assembly and checked_out_by_me))
+            if hasattr(self, "delete_cad_btn"):
+                checked_out = payload.get("checked_out_by") is not None
+                self.delete_cad_btn.setEnabled(
+                    bool(cad_context and can_manage and not checked_out)
+                )
+                self.delete_cad_btn.setToolTip(
+                    "Check in or undo checkout before deleting this CAD Document"
+                    if checked_out else
+                    "Delete the selected CAD Document"
+                )
+        except Exception:
+            pass
 
     # -------------------------
     # Context menu / tree actions
@@ -3340,7 +5884,10 @@ class BomPage(QWidget):
         item_list = QListWidget()
         item_list.setAlternatingRowColors(True)
         for part in eligible:
-            label = f"{part.get('aes_number') or '-'}  {part.get('name') or ''}  [{part.get('type') or ''}]"
+            label = (
+                f"{part.get('part_number') or 'No Number'}  "
+                f"{part.get('name') or ''}  [{part.get('type') or ''}]"
+            )
             list_item = QListWidgetItem(label)
             list_item.setData(Qt.UserRole, int(part["id"]))
             list_item.setFlags(list_item.flags() | Qt.ItemIsUserCheckable)
@@ -3418,6 +5965,851 @@ class BomPage(QWidget):
         rename_action.triggered.connect(lambda: self._rename_bom_folder(int(folder_id)))
         delete_action.triggered.connect(lambda: self._delete_bom_folder(int(folder_id)))
         menu.exec_(tree.viewport().mapToGlobal(tree.visualItemRect(item).bottomLeft()))
+
+    @staticmethod
+    def _pdm_association_types() -> list[tuple[str, str]]:
+        return [
+            ("Owner - drives structure and attributes", "OWNER"),
+            ("Contributing image", "CONTRIBUTING_IMAGE"),
+            ("Image - alternate CAD representation", "IMAGE"),
+            ("Contributing content", "CONTRIBUTING_CONTENT"),
+            ("Content - supporting CAD", "CONTENT"),
+        ]
+
+    def _prompt_pdm_association_type(
+        self, current: str = "OWNER", title: str = "CAD-Item Association"
+    ) -> str | None:
+        values = self._pdm_association_types()
+        current = str(current or "OWNER").upper()
+        index = next(
+            (position for position, (_label, value) in enumerate(values) if value == current),
+            0,
+        )
+        selected, accepted = QInputDialog.getItem(
+            self, title, "Association type:",
+            [label for label, _value in values], index, False,
+        )
+        if not accepted:
+            return None
+        return next(value for label, value in values if label == selected)
+
+    def _ensure_item_checked_out_for_pdm_change(self, item_id: int) -> bool:
+        """Association/structure edits are Item data and require an Item checkout."""
+        details = self.bom_service.get_part_details(int(item_id)) or {}
+        if details.get("locked"):
+            lock_user_id = details.get("locked_by_user_id")
+            if (
+                lock_user_id is not None and self.session.user_id is not None
+                and int(lock_user_id) != int(self.session.user_id)
+            ):
+                QMessageBox.warning(
+                    self, "Item Checked Out",
+                    f"This Item is checked out by {details.get('locked_by_username') or 'another user'}.",
+                )
+                return False
+            if str(details.get("checkout_origin") or "ITEM").upper() == "CAD":
+                try:
+                    self.bom_service.checkout_item(int(item_id))
+                except Exception as exc:
+                    QMessageBox.warning(self, "Item Checkout", str(exc))
+                    return False
+            return True
+        answer = QMessageBox.question(
+            self,
+            "Check Out Item",
+            "This operation changes the selected Item. Check out the Item now?\n\n"
+            "The Item data is reserved and its OWNER CAD Document is checked out automatically when present.",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return False
+        state = str(
+            details.get("revision_state") or details.get("lifecycle_state") or ""
+        ).strip().lower()
+        revision_code = None
+        if state == "released":
+            try:
+                suggested = self.bom_service.suggest_next_revision(int(item_id))
+            except Exception:
+                suggested = ""
+            revision_code, accepted = QInputDialog.getText(
+                self,
+                "Check Out Released Item",
+                "The Released Item remains immutable. Enter the new revision to create:",
+                QLineEdit.Normal,
+                suggested,
+            )
+            if not accepted or not str(revision_code or "").strip():
+                return False
+        try:
+            self.bom_service.checkout_item(
+                int(item_id), released_revision_code=revision_code
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Check Out Item", str(exc))
+            return False
+        return True
+
+    def _reload_pdm_structure_views(self) -> None:
+        # Refresh the inactive model first so the active model owns the final
+        # health label, tooltip and loading-stack state.
+        if str(getattr(self, "_bom_mode", "cad")) == "ebom":
+            self._load_pdm_cad_tree()
+            self._load_released_ebom_tree()
+        else:
+            self._load_released_ebom_tree()
+            self._load_pdm_cad_tree()
+
+    def _associate_specific_cad_to_item(self, cad_id: int, item_id: int) -> None:
+        if not self._ensure_item_checked_out_for_pdm_change(int(item_id)):
+            return
+        association_type = self._prompt_pdm_association_type()
+        if association_type is None:
+            return
+        try:
+            self.bom_service.associate_cad_document(
+                int(item_id), int(cad_id), association_type
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Associate CAD Document", str(exc))
+            return
+        self._reload_pdm_structure_views()
+        self.display_details(int(item_id))
+
+    def _register_and_associate_cad(self, item_id: int) -> None:
+        if self._ensure_item_checked_out_for_pdm_change(int(item_id)):
+            self.register_cad_document(int(item_id))
+
+    def _associate_cad_to_an_item(self, cad_id: int) -> None:
+        items = list(self.bom_service.list_pdm_items() or [])
+        if not items:
+            QMessageBox.information(self, "Associate CAD Document", "No Items are available.")
+            return
+        labels = [self._item_identity_text(row) for row in items]
+        selected, accepted = QInputDialog.getItem(
+            self, "Associate CAD Document", "Target Item:", labels, 0, False
+        )
+        if not accepted:
+            return
+        self._associate_specific_cad_to_item(
+            int(cad_id), int(items[labels.index(selected)]["id"])
+        )
+
+    def _change_cad_item_association(
+        self, cad_id: int, item_id: int, association_id, current_type: str
+    ) -> None:
+        if not self._ensure_item_checked_out_for_pdm_change(int(item_id)):
+            return
+        association_type = self._prompt_pdm_association_type(
+            current_type, "Change CAD-Item Association"
+        )
+        if association_type is None or association_type == str(current_type or "").upper():
+            return
+        try:
+            self.bom_service.associate_cad_document(
+                int(item_id), int(cad_id), association_type
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Change Association", str(exc))
+            return
+        self._reload_pdm_structure_views()
+        self.display_details(int(item_id))
+
+    def _remove_cad_item_association(
+        self, association_id: int, item_id: int, cad_label: str
+    ) -> None:
+        if not self._ensure_item_checked_out_for_pdm_change(int(item_id)):
+            return
+        if QMessageBox.question(
+            self, "Remove CAD Association",
+            f"Remove the association between this Item and {cad_label}?\n\n"
+            "The CAD Document remains managed and may become unassociated.",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        ) != QMessageBox.Yes:
+            return
+        try:
+            self.bom_service.remove_cad_item_association(int(association_id))
+        except Exception as exc:
+            QMessageBox.warning(self, "Remove CAD Association", str(exc))
+            return
+        self._reload_pdm_structure_views()
+        self.display_details(int(item_id))
+
+    def _add_cad_member_from_tree(self, parent_cad_id: int) -> None:
+        documents = [
+            row for row in (self.bom_service.list_pdm_cad_documents() or [])
+            if int(row.get("id") or 0) != int(parent_cad_id)
+            and str(row.get("category") or "").upper()
+            in {"ASSEMBLY", "COMPONENT"}
+        ]
+        if not documents:
+            QMessageBox.information(self, "Add CAD Component", "No other CAD Documents are available.")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Add CAD Component")
+        layout = QGridLayout(dialog)
+        child_combo = QComboBox()
+        for document in documents:
+            label = str(document.get("file_name") or "")
+            name = str(document.get("name") or "").strip()
+            if name and name.casefold() != label.casefold():
+                label = f"{label} - {name}"
+            child_combo.addItem(
+                label,
+                int(document["id"]),
+            )
+        quantity = QSpinBox()
+        quantity.setRange(1, 100000)
+        excluded = QCheckBox("Exclude this CAD occurrence from Item Structure build")
+        layout.addWidget(QLabel("CAD component"), 0, 0)
+        layout.addWidget(child_combo, 0, 1)
+        layout.addWidget(QLabel("Quantity"), 1, 0)
+        layout.addWidget(quantity, 1, 1)
+        layout.addWidget(excluded, 2, 0, 1, 2)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons, 3, 0, 1, 2)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        try:
+            self.bom_service.add_pdm_cad_member(
+                int(parent_cad_id), int(child_combo.currentData()),
+                quantity.value(), excluded.isChecked(),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Add CAD Component", str(exc))
+            return
+        self._load_pdm_cad_tree()
+        self._reselect_cad_in_current_view(int(parent_cad_id))
+
+    def _bind_existing_drawing_to_model(self, model_cad_id: int) -> None:
+        drawings = [
+            document
+            for document in (self.bom_service.list_pdm_cad_documents() or [])
+            if str(document.get("category") or "").upper() == "DRAWING"
+            and document.get("drawing_owner_cad_document_id") is None
+        ]
+        if not drawings:
+            QMessageBox.information(
+                self, "Bind Drawing", "There are no unbound managed drawings."
+            )
+            return
+        labels = [
+            str(document.get("file_name") or document.get("name") or document["id"])
+            for document in drawings
+        ]
+        selected, accepted = QInputDialog.getItem(
+            self,
+            "Bind Existing Drawing",
+            "Drawing to bind to this PRT/ASM:",
+            labels,
+            0,
+            False,
+        )
+        if not accepted:
+            return
+        drawing = drawings[labels.index(selected)]
+        try:
+            self.bom_service.bind_pdm_drawing_to_model(
+                int(drawing["id"]), int(model_cad_id)
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Bind Drawing", str(exc))
+            return
+        self._reload_pdm_structure_views()
+        self._reselect_cad_in_current_view(int(model_cad_id))
+
+    def _remove_cad_member_from_tree(
+        self, member_id: int, label: str, parent_cad_id: int
+    ) -> None:
+        if QMessageBox.question(
+            self, "Remove CAD Component",
+            f"Remove {label} from this CAD assembly?\n\n"
+            "The CAD Document itself will remain managed.",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        ) != QMessageBox.Yes:
+            return
+        try:
+            self.bom_service.remove_pdm_cad_member(int(member_id))
+        except Exception as exc:
+            QMessageBox.warning(self, "Remove CAD Component", str(exc))
+            return
+        self._load_pdm_cad_tree()
+        self._reselect_cad_in_current_view(int(parent_cad_id))
+
+    def _edit_cad_member_from_tree(self, item: QTreeWidgetItem) -> None:
+        parent = item.parent()
+        if parent is None:
+            return
+        parent_cad_id = parent.data(0, PDM_CAD_DOCUMENT_ID_ROLE)
+        child_cad_id = item.data(0, PDM_CAD_DOCUMENT_ID_ROLE)
+        if parent_cad_id is None or child_cad_id is None:
+            return
+        payload = dict(item.data(0, PDM_CAD_PAYLOAD_ROLE) or {})
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Edit CAD Occurrence")
+        layout = QGridLayout(dialog)
+        quantity = QSpinBox()
+        quantity.setRange(1, 100000)
+        quantity.setValue(max(1, int(payload.get("quantity") or 1)))
+        excluded = QCheckBox("Exclude this occurrence from Item Structure build")
+        excluded.setChecked(bool(
+            payload.get("member_build_excluded") or payload.get("build_excluded")
+        ))
+        layout.addWidget(QLabel("CAD component"), 0, 0)
+        layout.addWidget(QLabel(str(payload.get("file_name") or item.text(CAD_COL_FILE))), 0, 1)
+        layout.addWidget(QLabel("Quantity"), 1, 0)
+        layout.addWidget(quantity, 1, 1)
+        layout.addWidget(excluded, 2, 0, 1, 2)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons, 3, 0, 1, 2)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        try:
+            self.bom_service.add_pdm_cad_member(
+                int(parent_cad_id), int(child_cad_id), quantity.value(),
+                excluded.isChecked(),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Edit CAD Occurrence", str(exc))
+            return
+        self._load_pdm_cad_tree()
+        self._reselect_cad_in_current_view(int(parent_cad_id))
+
+    def _revise_pdm_cad_document(self, cad_id: int) -> None:
+        try:
+            result = self.bom_service.revise_pdm_cad_document(int(cad_id))
+        except Exception as exc:
+            QMessageBox.warning(self, "Create CAD Revision", str(exc))
+            return
+        QMessageBox.information(
+            self, "Create CAD Revision",
+            f"Created CAD revision {result.get('revision') or '-'}.1.",
+        )
+        self._reload_pdm_structure_views()
+        self._reselect_cad_in_current_view(int(cad_id))
+
+    def _release_pdm_cad_document(self, cad_id: int) -> None:
+        if QMessageBox.question(
+            self, "Release CAD Document",
+            "Release this CAD Document iteration? Released CAD is immutable and must be revised before further work.",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        ) != QMessageBox.Yes:
+            return
+        try:
+            self.bom_service.release_pdm_cad_document(int(cad_id))
+        except Exception as exc:
+            QMessageBox.warning(self, "Release CAD Document", str(exc))
+            return
+        self._reload_pdm_structure_views()
+        self._reselect_cad_in_current_view(int(cad_id))
+
+    def _checkout_pdm_cad_document(self, cad_id: int, payload: dict | None = None) -> None:
+        payload = dict(payload or {})
+        needs_revision = (
+            str(payload.get("lifecycle_state") or "").upper() == "RELEASED"
+        )
+        item_id = payload.get("item_id") or payload.get("associated_item_id")
+        revision_code = None
+        if item_id:
+            details = self.bom_service.get_part_details(int(item_id)) or {}
+            if (
+                str(details.get("revision_state") or details.get("lifecycle_state") or "").lower()
+                == "released" and not details.get("locked")
+            ):
+                try:
+                    suggested = self.bom_service.suggest_next_revision(int(item_id))
+                except Exception:
+                    suggested = ""
+                revision_code, accepted = QInputDialog.getText(
+                    self, "Check Out Related Released Item",
+                    "CAD checkout also checks out its related Item. Enter the Item revision to create:",
+                    QLineEdit.Normal, suggested,
+                )
+                if not accepted or not str(revision_code or "").strip():
+                    return
+        message = (
+            "Released CAD iterations are immutable. Create the next CAD revision and check it out?"
+            if needs_revision else "Check out this CAD Document?"
+        )
+        if item_id:
+            message += "\n\nIts associated Item will be checked out automatically; other CAD Documents remain checked in."
+        if QMessageBox.question(
+            self, "Check Out CAD Document", message,
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Yes,
+        ) != QMessageBox.Yes:
+            return
+        revised = None
+        try:
+            if needs_revision:
+                revised = self.bom_service.revise_pdm_cad_document(int(cad_id)) or {}
+            result = self.bom_service.checkout_pdm_cad_document(
+                int(cad_id), released_item_revision_code=revision_code
+            )
+        except Exception as exc:
+            if revised is not None:
+                self._reload_pdm_structure_views()
+                self._reselect_cad_in_current_view(int(cad_id))
+                QMessageBox.warning(
+                    self,
+                    "CAD Revision Created; Checkout Failed",
+                    f"CAD revision {revised.get('revision') or '-'}.1 was created, "
+                    f"but it could not be checked out:\n{exc}",
+                )
+            else:
+                QMessageBox.warning(self, "Check Out CAD Document", str(exc))
+            return
+        suffix = ""
+        if (result or {}).get("item_checkout_auto_created"):
+            suffix = "\nThe related Item was checked out automatically."
+        QMessageBox.information(self, "Check Out CAD Document", "CAD Document checked out." + suffix)
+        self._reload_pdm_structure_views()
+        self._reselect_cad_in_current_view(int(cad_id))
+
+    def _checkin_pdm_cad_document(self, cad_id: int, payload: dict | None = None) -> None:
+        payload = dict(payload or {})
+        initial = str(getattr(self, "working_dir", "") or "")
+        file_name = str(payload.get("file_name") or "")
+        if initial and file_name:
+            candidate = os.path.join(initial, file_name)
+            initial = candidate if os.path.exists(candidate) else initial
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self, "Check In CAD Document", initial,
+            "Creo CAD (*.asm *.asm.* *.prt *.prt.* *.drw *.drw.*);;All files (*)",
+        )
+        if not path:
+            return
+        note, accepted = QInputDialog.getText(
+            self, "Check In CAD Document", "Check-in comment:"
+        )
+        if not accepted or not str(note or "").strip():
+            if accepted:
+                QMessageBox.warning(self, "Check In CAD Document", "A check-in comment is required.")
+            return
+        try:
+            result = self.bom_service.checkin_pdm_cad_document(
+                int(cad_id), path, str(note).strip()
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Check In CAD Document", str(exc))
+            return
+        message = "A new CAD Document iteration was created."
+        item_checkout = str((result or {}).get("item_checkout") or "")
+        if item_checkout in {"RETAINED_WITH_CHANGES", "RETAINED_UNVERIFIED", "RETAINED_EXPLICIT"}:
+            message += "\nThe related Item remains checked out because it has independent Item changes."
+        elif item_checkout == "AUTO_RELEASED":
+            message += "\nThe automatic Item checkout was released without creating an Item iteration."
+        QMessageBox.information(self, "Check In CAD Document", message)
+        self._reload_pdm_structure_views()
+        self._reselect_cad_in_current_view(int(cad_id))
+
+    def _undo_pdm_cad_checkout(self, cad_id: int) -> None:
+        if QMessageBox.question(
+            self, "Undo CAD Checkout",
+            "Discard the CAD working state and undo this checkout?",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        ) != QMessageBox.Yes:
+            return
+        try:
+            self.bom_service.undo_checkout_pdm_cad_document(
+                int(cad_id), "Discarded from CAD Structure"
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Undo CAD Checkout", str(exc))
+            return
+        self._reload_pdm_structure_views()
+        self._reselect_cad_in_current_view(int(cad_id))
+
+    def _reselect_cad_in_current_view(self, cad_id: int) -> bool:
+        """Restore the CAD inspector and lifecycle buttons after a tree reload."""
+        tree = (
+            self._ebom_tree
+            if str(getattr(self, "_bom_mode", "cad")) == "ebom"
+            else self._cad_tree
+        )
+        if tree is getattr(self, "_cad_tree", None):
+            self._materialize_pdm_tree_for_search(tree)
+        for item in self._iter_tree_items(tree):
+            if (
+                item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD
+                and item.data(0, PDM_CAD_DOCUMENT_ID_ROLE) == int(cad_id)
+            ):
+                tree.setCurrentItem(item)
+                item.setSelected(True)
+                tree.scrollToItem(item)
+                self._show_pdm_cad_selection(item)
+                return True
+        self.clear_details()
+        return False
+
+    def _select_item_in_ebom(self, item_id: int) -> None:
+        """Navigate from a related CAD row to its owning EBOM Item context."""
+        target_index = self.bom_mode_selector.findData("ebom")
+        if target_index >= 0:
+            self.bom_mode_selector.setCurrentIndex(target_index)
+        self._materialize_pdm_tree_for_search(getattr(self, "_ebom_tree", None))
+        for item in self._iter_tree_items(self._ebom_tree):
+            if (
+                item.data(0, PDM_OBJECT_KIND_ROLE) != PDM_OBJECT_CAD
+                and item.data(0, Qt.UserRole) == int(item_id)
+            ):
+                self._ebom_tree.setCurrentItem(item)
+                item.setSelected(True)
+                self._ebom_tree.scrollToItem(item)
+                self.display_details(int(item_id))
+                return
+        self.display_details(int(item_id))
+
+    def _select_cad_in_structure(self, cad_id: int) -> None:
+        self.bom_mode_selector.setCurrentIndex(self.bom_mode_selector.findData("cad"))
+        self._materialize_pdm_tree_for_search(getattr(self, "_cad_tree", None))
+        for item in self._iter_tree_items(self._cad_tree):
+            if item.data(0, PDM_CAD_DOCUMENT_ID_ROLE) == int(cad_id):
+                self._cad_tree.setCurrentItem(item)
+                item.setSelected(True)
+                self._cad_tree.scrollToItem(item)
+                self._show_pdm_cad_selection(item)
+                return
+
+    def _show_pdm_tree_context_menu(self, position) -> None:
+        tree = self.sender()
+        if not isinstance(tree, QTreeWidget):
+            return
+        item = tree.itemAt(position)
+        menu = QMenu(self)
+        can_manage = self.perm.can("manage_parts")
+        if item is None:
+            if tree is self._cad_tree and can_manage:
+                action = menu.addAction("Register CAD Document...")
+                action.triggered.connect(lambda: self.register_cad_document())
+                menu.exec_(tree.viewport().mapToGlobal(position))
+            return
+        tree.setCurrentItem(item)
+        kind = item.data(0, PDM_OBJECT_KIND_ROLE) or PDM_OBJECT_ITEM
+        if kind == PDM_OBJECT_CAD:
+            cad_id = int(item.data(0, PDM_CAD_DOCUMENT_ID_ROLE))
+            item_id = item.data(0, PDM_ASSOCIATED_ITEM_ID_ROLE)
+            association_id = item.data(0, PDM_ASSOCIATION_ID_ROLE)
+            association_type = str(item.data(0, PDM_ASSOCIATION_TYPE_ROLE) or "")
+            payload = dict(item.data(0, PDM_CAD_PAYLOAD_ROLE) or {})
+            payload.setdefault("id", cad_id)
+            payload.setdefault("item_id", item_id)
+            parent_item_id = None
+            if item.parent() is not None:
+                parent_item_id = (
+                    item.parent().data(0, PDM_ASSOCIATED_ITEM_ID_ROLE)
+                    or item.parent().data(0, Qt.UserRole)
+                )
+
+            def create_item_from_cad_context(data: dict, parent_value) -> None:
+                try:
+                    quantity = max(1, int(data.get("quantity") or 1))
+                except Exception:
+                    quantity = 1
+                self._create_ebom_item_from_cad_document(
+                    data,
+                    parent_item_id=parent_value,
+                    quantity=quantity,
+                )
+
+            view_action = menu.addAction("View CAD Document Information")
+            view_action.triggered.connect(lambda: self._show_pdm_cad_selection(item))
+            isolate_action = menu.addAction("Isolate")
+            isolate_action.triggered.connect(
+                lambda _checked=False, row=item: self._isolate_pdm_tree_item(row)
+            )
+            if tree is self._ebom_tree:
+                locate_action = menu.addAction("Open in CAD Structure")
+                locate_action.triggered.connect(
+                    lambda _checked=False, value=cad_id: self._select_cad_in_structure(value)
+                )
+            if item_id is not None:
+                item_action = menu.addAction("Open Associated Item")
+                item_action.triggered.connect(
+                    lambda _checked=False, value=int(item_id): self._select_item_in_ebom(value)
+                )
+            menu.addSeparator()
+            checked_out = payload.get("checked_out_by") is not None
+            try:
+                checked_out_by_me = (
+                    checked_out and self.session.user_id is not None
+                    and int(payload.get("checked_out_by")) == int(self.session.user_id)
+                )
+            except Exception:
+                checked_out_by_me = False
+            checkout_action = menu.addAction(
+                "Revise and Check Out CAD..."
+                if str(payload.get("lifecycle_state") or "").upper() == "RELEASED"
+                else "Check Out CAD"
+            )
+            checkout_action.setEnabled(can_manage and not checked_out)
+            checkout_action.triggered.connect(
+                lambda _checked=False, value=cad_id, data=payload:
+                self._checkout_pdm_cad_document(value, data)
+            )
+            checkin_action = menu.addAction("Check In CAD...")
+            checkin_action.setEnabled(can_manage and checked_out_by_me)
+            checkin_action.triggered.connect(
+                lambda _checked=False, value=cad_id, data=payload:
+                self._checkin_pdm_cad_document(value, data)
+            )
+            undo_action = menu.addAction("Undo CAD Checkout")
+            undo_action.setEnabled(can_manage and checked_out_by_me)
+            undo_action.triggered.connect(
+                lambda _checked=False, value=cad_id: self._undo_pdm_cad_checkout(value)
+            )
+            lifecycle_menu = menu.addMenu("CAD Lifecycle")
+            revise_action = lifecycle_menu.addAction("Create New CAD Revision")
+            revise_action.setEnabled(can_manage and not checked_out)
+            revise_action.triggered.connect(
+                lambda _checked=False, value=cad_id: self._revise_pdm_cad_document(value)
+            )
+            release_action = lifecycle_menu.addAction("Release CAD Iteration")
+            release_action.setEnabled(
+                can_manage and not checked_out
+                and str(payload.get("lifecycle_state") or "").upper() != "RELEASED"
+            )
+            release_action.triggered.connect(
+                lambda _checked=False, value=cad_id: self._release_pdm_cad_document(value)
+            )
+            delete_document_action = menu.addAction("Delete CAD Document")
+            delete_document_action.setEnabled(can_manage and not checked_out)
+            if checked_out:
+                delete_document_action.setToolTip(
+                    "Check in or undo checkout before deleting this CAD Document."
+                )
+            delete_document_action.triggered.connect(
+                lambda _checked=False, value=cad_id, data=payload:
+                self._delete_selected_pdm_cad_document(value, data)
+            )
+            menu.addSeparator()
+            category = str(
+                payload.get("category") or item.text(CAD_COL_CATEGORY)
+            ).upper()
+            if category in {"ASSEMBLY", "COMPONENT"}:
+                drawing_menu = menu.addMenu("Related Drawings")
+                related_drawings = list(payload.get("related_drawings") or [])
+                if related_drawings:
+                    for drawing in related_drawings:
+                        drawing_label = (
+                            f"{drawing.get('file_name') or drawing.get('name')}  "
+                            f"[{drawing.get('revision') or 'A'}."
+                            f"{int(drawing.get('iteration') or 1)} - "
+                            f"{drawing.get('lifecycle_state') or 'IN_WORK'}]"
+                        )
+                        drawing_row_menu = drawing_menu.addMenu(drawing_label)
+                        info_action = drawing_row_menu.addAction("Managed DRW CAD Document")
+                        info_action.setEnabled(False)
+                        delete_drawing_action = drawing_row_menu.addAction("Delete Drawing CAD Document")
+                        delete_drawing_action.setEnabled(
+                            can_manage and drawing.get("checked_out_by") is None
+                        )
+                        if drawing.get("checked_out_by") is not None:
+                            delete_drawing_action.setToolTip(
+                                "Check in or undo this drawing checkout before deleting it."
+                            )
+                        delete_drawing_action.triggered.connect(
+                            lambda _checked=False, drawing_row=dict(drawing), owner_id=cad_id:
+                            self._delete_selected_pdm_cad_document(
+                                int(drawing_row["id"]),
+                                drawing_row,
+                                reselect_cad_id=owner_id,
+                            )
+                        )
+                    drawing_menu.addSeparator()
+                else:
+                    none_action = drawing_menu.addAction("No drawing linked")
+                    none_action.setEnabled(False)
+                    drawing_menu.addSeparator()
+                register_drawing_action = drawing_menu.addAction(
+                    "Register Related Drawing..."
+                )
+                register_drawing_action.setEnabled(can_manage)
+                register_drawing_action.triggered.connect(
+                    lambda _checked=False, value=cad_id:
+                    self.register_cad_document(drawing_owner_cad_id=value)
+                )
+                bind_drawing_action = drawing_menu.addAction(
+                    "Bind Existing Drawing..."
+                )
+                bind_drawing_action.setEnabled(can_manage)
+                bind_drawing_action.triggered.connect(
+                    lambda _checked=False, value=cad_id:
+                    self._bind_existing_drawing_to_model(value)
+                )
+                menu.addSeparator()
+            association_menu = menu.addMenu("CAD-Item Association")
+            if association_id is not None and item_id is not None:
+                change_action = association_menu.addAction("Change Association Type...")
+                change_action.setEnabled(can_manage and not checked_out)
+                change_action.triggered.connect(
+                    lambda _checked=False, cid=cad_id, iid=int(item_id), aid=association_id,
+                           kind_value=association_type:
+                    self._change_cad_item_association(cid, iid, aid, kind_value)
+                )
+                remove_action = association_menu.addAction("Remove Association")
+                remove_action.setEnabled(can_manage and not checked_out)
+                remove_action.triggered.connect(
+                    lambda _checked=False, aid=int(association_id), iid=int(item_id),
+                           label=str(payload.get("file_name") or payload.get("name") or "CAD Document"):
+                    self._remove_cad_item_association(aid, iid, label)
+                )
+            else:
+                associate_action = association_menu.addAction("Associate with Item...")
+                associate_action.setEnabled(can_manage and not checked_out)
+                associate_action.triggered.connect(
+                    lambda _checked=False, value=cad_id: self._associate_cad_to_an_item(value)
+                )
+            create_item_action = association_menu.addAction("Create EBOM Item from CAD...")
+            create_reason = self._cad_create_ebom_item_disabled_reason(payload)
+            create_item_action.setEnabled(not create_reason)
+            if create_reason:
+                create_item_action.setToolTip(create_reason)
+            create_item_action.triggered.connect(
+                lambda _checked=False, data=payload, parent_value=parent_item_id:
+                create_item_from_cad_context(data, parent_value)
+            )
+            if tree is self._cad_tree:
+                if category == "ASSEMBLY":
+                    menu.addSeparator()
+                    add_member_action = menu.addAction("Add CAD Component...")
+                    add_member_action.setEnabled(can_manage and checked_out_by_me)
+                    add_member_action.setToolTip(
+                        "The parent CAD assembly must be checked out by you."
+                    )
+                    add_member_action.triggered.connect(
+                        lambda _checked=False, value=cad_id: self._add_cad_member_from_tree(value)
+                    )
+                member_id = item.data(0, PDM_CAD_MEMBER_ID_ROLE)
+                if member_id is not None:
+                    parent_payload = dict(
+                        item.parent().data(0, PDM_CAD_PAYLOAD_ROLE) or {}
+                    ) if item.parent() is not None else {}
+                    try:
+                        parent_checked_out_by_me = (
+                            self.session.user_id is not None
+                            and parent_payload.get("checked_out_by") is not None
+                            and int(parent_payload["checked_out_by"]) == int(self.session.user_id)
+                        )
+                    except Exception:
+                        parent_checked_out_by_me = False
+                    edit_member_action = menu.addAction("Edit CAD Occurrence...")
+                    edit_member_action.setEnabled(can_manage and parent_checked_out_by_me)
+                    edit_member_action.triggered.connect(
+                        lambda _checked=False, row=item: self._edit_cad_member_from_tree(row)
+                    )
+                    remove_member_action = menu.addAction("Remove from CAD Assembly")
+                    remove_member_action.setEnabled(can_manage and parent_checked_out_by_me)
+                    remove_member_action.triggered.connect(
+                        lambda _checked=False, value=int(member_id), label=item.text(CAD_COL_FILE),
+                               parent_id=int(item.parent().data(0, PDM_CAD_DOCUMENT_ID_ROLE)):
+                        self._remove_cad_member_from_tree(value, label, parent_id)
+                    )
+            menu.exec_(tree.viewport().mapToGlobal(position))
+            return
+
+        item_id = item.data(0, Qt.UserRole)
+        if item_id is None:
+            return
+        item_id = int(item_id)
+        view_action = menu.addAction("View Item Details")
+        view_action.triggered.connect(lambda: self.display_details(item_id))
+        isolate_action = menu.addAction("Isolate")
+        isolate_action.triggered.connect(
+            lambda _checked=False, row=item: self._isolate_pdm_tree_item(row)
+        )
+        compare_top_action = menu.addAction("Compare with OWNER CAD...")
+        compare_top_action.triggered.connect(
+            lambda _checked=False, value=item_id: (
+                setattr(self, "current_part_id", value),
+                self.compare_cad_to_item_structure(),
+            )
+        )
+        menu.addSeparator()
+        details = self.bom_service.get_part_details(item_id) or {}
+        locked = bool(details.get("locked"))
+        try:
+            active_cad = self.bom_service.checked_out_cad_for_item(item_id) or []
+        except Exception:
+            active_cad = []
+        checkout_origin = str(details.get("checkout_origin") or "ITEM").upper()
+        lock_owner_id = details.get("locked_by_user_id")
+        lock_is_mine = (
+            lock_owner_id is None or self.session.user_id is None
+            or int(lock_owner_id) == int(self.session.user_id)
+        )
+        can_finish_checkout = lock_is_mine or self.perm.can("merge")
+        checkout_action = menu.addAction("Check Out Item")
+        if locked and checkout_origin == "CAD":
+            checkout_action.setText("Make Item Checkout Explicit")
+        checkout_action.setEnabled(
+            not locked or (checkout_origin == "CAD" and lock_is_mine)
+        )
+        checkout_action.triggered.connect(lambda: self.checkout_part(item_id))
+        checkin_action = menu.addAction("Check In Item...")
+        checkin_action.setEnabled(locked and can_finish_checkout and not active_cad)
+        if active_cad:
+            checkin_action.setToolTip("Associated CAD Documents must be checked in or undone first.")
+        checkin_action.triggered.connect(lambda: self.checkin_part(item_id))
+        undo_action = menu.addAction("Undo Item Checkout")
+        undo_action.setEnabled(locked and can_finish_checkout and not active_cad)
+        if active_cad:
+            undo_action.setToolTip("Associated CAD Documents must be checked in or undone first.")
+        undo_action.triggered.connect(lambda: self.undo_checkout(item_id))
+        menu.addSeparator()
+        cad_menu = menu.addMenu("Associated CAD Documents")
+        associate_action = cad_menu.addAction("Associate Existing CAD...")
+        associate_action.setEnabled(can_manage)
+        associate_action.triggered.connect(
+            lambda _checked=False, value=item_id: self.manage_cad_item_associations(value)
+        )
+        register_action = cad_menu.addAction("Register and Associate CAD...")
+        register_action.setEnabled(can_manage)
+        register_action.triggered.connect(
+            lambda _checked=False, value=item_id: self._register_and_associate_cad(value)
+        )
+        structure_menu = menu.addMenu("Item Structure")
+        add_usage_action = structure_menu.addAction("Add Manual Item Usage...")
+        add_usage_action.setEnabled(can_manage)
+        add_usage_action.triggered.connect(
+            lambda _checked=False, value=item_id: (
+                setattr(self, "current_part_id", value), self.add_manual_item_usage()
+            )
+        )
+        compare_action = structure_menu.addAction("Compare with OWNER CAD...")
+        compare_action.triggered.connect(
+            lambda _checked=False, value=item_id: (
+                setattr(self, "current_part_id", value), self.compare_cad_to_item_structure()
+            )
+        )
+        build_action = structure_menu.addAction("Build Item Structure from OWNER CAD")
+        build_action.setEnabled(can_manage)
+        build_action.triggered.connect(
+            lambda _checked=False, value=item_id: (
+                setattr(self, "current_part_id", value), self.build_item_structure_from_cad()
+            )
+        )
+        files_menu = menu.addMenu("Item Delivery Files")
+        preview_pdf = files_menu.addAction("Preview PDF")
+        preview_pdf.triggered.connect(lambda: self.preview_part_pdf(item_id))
+        open_pdf = files_menu.addAction("Open PDF")
+        open_pdf.triggered.connect(lambda: self.open_part_pdf(item_id))
+        open_step = files_menu.addAction("Open STEP")
+        open_step.triggered.connect(lambda: self.open_part_step(item_id))
+        issues_action = menu.addAction("Open Item Issues")
+        issues_action.triggered.connect(
+            lambda _checked=False, value=item_id: self.issue_requested.emit(value)
+        )
+        menu.exec_(tree.viewport().mapToGlobal(position))
 
     def show_tree_context_menu(self, position):
         tree = self.sender()
@@ -3507,9 +6899,9 @@ class BomPage(QWidget):
                 action.setEnabled(self.perm.can("manage_parts"))
                 reorder_menu.addAction(action)
         menu.addSeparator()
-        edit_action = QAction("Edit Part", self)
+        edit_action = QAction("Edit Attributes", self)
         edit_action.triggered.connect(lambda: self.edit_part(item_id))
-        delete_action = QAction("Delete Part", self)
+        delete_action = QAction("Delete Item", self)
         delete_action.triggered.connect(lambda: self.delete_part(item_id))
         add_child_action = QAction("Add Child", self)
         add_child_action.triggered.connect(
@@ -4080,6 +7472,8 @@ class BomPage(QWidget):
                 continue
             try:
                 for item in self._iter_tree_items(tree):
+                    if item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+                        continue
                     value = str(item.text(column) or "").strip()
                     if value:
                         values.add(value)
@@ -4090,6 +7484,8 @@ class BomPage(QWidget):
     def _current_tree_for_filtering(self) -> QTreeWidget:
         if getattr(self, "_bom_mode", "cad") == "ebom":
             return getattr(self, "_ebom_tree", self.tree)
+        if getattr(self, "_bom_mode", "cad") == "cad":
+            return getattr(self, "_cad_tree", self.tree)
         if getattr(self, "_in_search_mode", False):
             return getattr(self, "_search_tree", self.tree)
         return self.tree
@@ -4160,7 +7556,10 @@ class BomPage(QWidget):
                 return False
 
         structure = str(filters.get("structure") or "Any")
-        is_assembly = bool(item.data(0, BOM_TREE_IS_ASSEMBLY_ROLE)) or item.childCount() > 0
+        is_assembly = bool(item.data(0, BOM_TREE_IS_ASSEMBLY_ROLE)) or any(
+            item.child(index).data(0, PDM_OBJECT_KIND_ROLE) != PDM_OBJECT_CAD
+            for index in range(item.childCount())
+        )
         if structure == "Assemblies only" and not is_assembly:
             return False
         if structure == "Leaf parts only" and is_assembly:
@@ -4446,7 +7845,10 @@ class BomPage(QWidget):
                     item.setHidden(False)
             except Exception:
                 pass
-        if getattr(self, "_bom_mode", "cad") == "ebom":
+        if getattr(self, "_bom_mode", "cad") == "cad":
+            self._refresh_pdm_cad_filter()
+            self._tree_stack.setCurrentIndex(4)
+        elif getattr(self, "_bom_mode", "cad") == "ebom":
             self._refresh_ebom_filters()
         elif was_flat_filter:
             try:
@@ -4821,12 +8223,7 @@ class BomPage(QWidget):
                 int(self.current_part_id)
             )
             values = {
-                "item": " - ".join(
-                    value for value in (
-                        str(details.get("aes_number") or "").strip(),
-                        str(details.get("name") or "").strip(),
-                    ) if value
-                ) or str(self.current_part_id),
+                "item": self._item_identity_text(details),
                 "version": str(context.get("version_label") or "-"),
                 "state": str(context.get("state") or "-"),
                 "lock": self.managed_file_service._username(lock.user_id) if lock else "Not checked out",
@@ -6090,10 +9487,14 @@ class BomPage(QWidget):
                 labels = []
                 by_label = {}
                 for option in options:
-                    aes = str(option.get("parent_aes_number") or "").strip()
+                    number = str(
+                        option.get("parent_part_number")
+                        or option.get("parent_aes_number")
+                        or ""
+                    ).strip()
                     name = str(option.get("parent_name") or "").strip()
                     quantity = int(option.get("quantity") or 1)
-                    label = f"{aes} - {name} (Qty {quantity})" if aes else f"{name} (Qty {quantity})"
+                    label = f"{number} - {name} (Qty {quantity})" if number else f"{name} (Qty {quantity})"
                     labels.append(label)
                     by_label[label] = option
                 selected_label, ok = QInputDialog.getItem(
@@ -6316,6 +9717,15 @@ class BomPage(QWidget):
 
     def _perform_search_now(self):
         query = self.search_input.text().strip()
+        if getattr(self, "_bom_mode", "cad") == "cad":
+            visible = self._refresh_pdm_cad_filter()
+            self._tree_stack.setCurrentIndex(4)
+            try:
+                self.clear_filter_btn.setEnabled(bool(query))
+                self.search_btn.setText(f"Search ({visible})" if query else "Search")
+            except Exception:
+                pass
+            return
         if getattr(self, "_bom_mode", "cad") == "ebom":
             visible = self._refresh_ebom_filters()
             if not self._is_default_bom_advanced_filter():
@@ -6710,13 +10120,27 @@ class BomPage(QWidget):
             row_text = item.text(BOM_COL_ROW)
         item.setText(BOM_COL_ROW, row_text)
         item.setTextAlignment(BOM_COL_ROW, Qt.AlignCenter)
-        item.setText(BOM_COL_NAME, str(info.get("name", "") or ""))
+        is_ebom_item_row = (
+            item.treeWidget() is getattr(self, "_ebom_tree", None)
+            or "bom_id" in info
+            or "version_label" in info
+            or "source_quantity" in info
+        )
+        item.setText(
+            BOM_COL_NAME,
+            self._windchill_item_label(info)
+            if is_ebom_item_row else str(info.get("name", "") or ""),
+        )
         item.setData(0, BOM_TREE_INWORK_ROLE, locked_txt)
         has_lazy_metadata = "_has_children" in info
+        has_structural_children = any(
+            item.child(index).data(0, PDM_OBJECT_KIND_ROLE) != PDM_OBJECT_CAD
+            for index in range(item.childCount())
+        )
         is_asm = (
             bool(info.get("_has_children"))
             if has_lazy_metadata
-            else existing_is_assembly or bool((info.get("children") or [])) or item.childCount() > 0
+            else existing_is_assembly or bool((info.get("children") or [])) or has_structural_children
         )
         item.setData(0, BOM_TREE_IS_ASSEMBLY_ROLE, is_asm)
         item.setData(0, BOM_TREE_PATH_ROLE, str(info.get("_tree_path") or existing_path))
@@ -6755,7 +10179,24 @@ class BomPage(QWidget):
             0, BOM_TREE_PROMOTION_ROLE, list(info.get("promoted_through") or [])
         )
         item.setText(BOM_COL_FILES, "")
-        item.setText(BOM_COL_AES, str(info.get("aes_number", "") or ""))
+        item.setData(0, BOM_TREE_ITEM_NUMBER_ROLE, str(info.get("part_number") or ""))
+        item.setData(0, BOM_TREE_AES_NUMBER_ROLE, str(info.get("aes_number") or ""))
+        visible_number = (
+            info.get("part_number")
+            if item.treeWidget() is getattr(self, "_ebom_tree", None)
+            else info.get("aes_number")
+        )
+        item.setText(BOM_COL_AES, str(visible_number or ""))
+        if item.treeWidget() is getattr(self, "_ebom_tree", None):
+            item.setToolTip(
+                BOM_COL_AES,
+                "Item Number (PLM identity)"
+                + (
+                    f"\nAES delivery reference: {info.get('aes_number')}"
+                    if info.get("aes_number")
+                    else "\nAES delivery reference: not assigned"
+                ),
+            )
         item.setText(BOM_COL_TYPE, str(info.get("type", "") or ""))
         item.setText(BOM_COL_REV, str(info.get("current_version") or info.get("revision", "") or ""))
         item.setText(BOM_COL_STATUS, str(info.get("status", "") or ""))
@@ -6828,8 +10269,9 @@ class BomPage(QWidget):
             if promoted_through:
                 labels = " > ".join(
                     str(
-                        value.get("aes_number")
+                        value.get("part_number")
                         or value.get("name")
+                        or value.get("aes_number")
                         or value.get("bom_id")
                     )
                     for value in promoted_through
@@ -6873,7 +10315,9 @@ class BomPage(QWidget):
         def recurse(item: QTreeWidgetItem, ancestors_visible: bool = True):
             nonlocal row_no, row_map
             visible = True if update_full_map else (ancestors_visible and not item.isHidden())
-            if visible:
+            is_related_cad = item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD
+            is_placeholder = self._is_lazy_placeholder(item)
+            if visible and not is_related_cad and not is_placeholder:
                 row_no += 1
                 item.setText(BOM_COL_ROW, str(row_no))
                 if update_full_map:
@@ -6973,13 +10417,18 @@ class BomPage(QWidget):
             pid = int(part_id)
         except Exception:
             return []
-        widgets = [tree_widget] if tree_widget is not None else [getattr(self, "tree", None), getattr(self, "_search_tree", None)]
+        widgets = [tree_widget] if tree_widget is not None else [
+            getattr(self, "tree", None), getattr(self, "_search_tree", None),
+            getattr(self, "_ebom_tree", None),
+        ]
         matches = []
         for widget in widgets:
             if widget is None:
                 continue
             for item in self._iter_tree_items(widget):
                 try:
+                    if item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+                        continue
                     if int(item.data(0, Qt.UserRole)) == pid:
                         matches.append(item)
                 except Exception:
@@ -7006,7 +10455,8 @@ class BomPage(QWidget):
             node = {
                 "id": part_id,
                 "name": item.text(BOM_COL_NAME),
-                "aes_number": item.text(BOM_COL_AES),
+                "part_number": item.data(0, BOM_TREE_ITEM_NUMBER_ROLE) or "",
+                "aes_number": item.data(0, BOM_TREE_AES_NUMBER_ROLE) or item.text(BOM_COL_AES),
                 "type": item.text(BOM_COL_TYPE),
                 "revision": item.text(BOM_COL_REV),
                 "status": item.text(BOM_COL_STATUS),
@@ -7024,7 +10474,7 @@ class BomPage(QWidget):
             query = ""
         if not query:
             return False
-        for key in ("aes_number", "name", "part_number"):
+        for key in ("part_number", "name", "aes_number"):
             if query in str(info.get(key, "") or "").lower():
                 return True
         return False
@@ -7382,8 +10832,7 @@ class BomPage(QWidget):
         moved_items = result.get("moved_to_root_items") or []
         if moved_items:
             moved_names = "\n".join(
-                f"- {row.get('aes_number') + ' - ' if row.get('aes_number') else ''}{row.get('name') or row.get('id')}"
-                for row in moved_items
+                f"- {self._item_identity_text(row)}" for row in moved_items
             )
             QMessageBox.warning(
                 self,
@@ -7681,6 +11130,9 @@ class BomPage(QWidget):
             return {}
         for item in self._find_tree_items(int(part_id)):
             self._apply_tree_item_data(item, info)
+            if item.treeWidget() is getattr(self, "_ebom_tree", None):
+                item.setData(0, PDM_OBJECT_KIND_ROLE, PDM_OBJECT_ITEM)
+                item.setIcon(BOM_COL_NAME, _pdm_item_icon())
         try:
             if getattr(self, "_in_search_mode", False) and self._part_matches_current_search(info):
                 if not self._find_tree_items(int(part_id), self._search_tree):
@@ -7692,7 +11144,10 @@ class BomPage(QWidget):
                 self.apply_bom_tree_filter(self._bom_advanced_filters)
         except Exception:
             pass
-        for tree in (getattr(self, "tree", None), getattr(self, "_search_tree", None)):
+        for tree in (
+            getattr(self, "tree", None), getattr(self, "_search_tree", None),
+            getattr(self, "_ebom_tree", None),
+        ):
             try:
                 tree.viewport().update()
             except Exception:
@@ -7724,6 +11179,110 @@ class BomPage(QWidget):
         except Exception:
             pass
 
+    def _find_pdm_cad_items(self, cad_document_ids) -> list[QTreeWidgetItem]:
+        wanted = set()
+        for cad_id in cad_document_ids or []:
+            try:
+                wanted.add(int(cad_id))
+            except Exception:
+                continue
+        if not wanted:
+            return []
+        matches = []
+        for tree in (getattr(self, "_cad_tree", None), getattr(self, "_ebom_tree", None)):
+            if tree is None:
+                continue
+            for item in self._iter_tree_items(tree):
+                if self._is_lazy_placeholder(item):
+                    continue
+                if item.data(0, PDM_OBJECT_KIND_ROLE) != PDM_OBJECT_CAD:
+                    continue
+                try:
+                    cad_id = int(item.data(0, PDM_CAD_DOCUMENT_ID_ROLE))
+                except Exception:
+                    continue
+                if cad_id in wanted:
+                    matches.append(item)
+        return matches
+
+    def refresh_cad_documents_after_merge(self, cad_document_ids) -> None:
+        """Refresh only loaded CAD rows affected by a successful merge/check-in."""
+        requested = set()
+        for cad_id in cad_document_ids or []:
+            try:
+                requested.add(int(cad_id))
+            except Exception:
+                continue
+        if not requested:
+            return
+        try:
+            documents = {}
+            for document in self.bom_service.list_pdm_cad_documents() or []:
+                try:
+                    cad_id = int(document.get("id"))
+                except Exception:
+                    continue
+                if cad_id in requested:
+                    documents[cad_id] = document
+        except Exception:
+            documents = {}
+        if not documents:
+            return
+
+        touched_trees = set()
+        for item in self._find_pdm_cad_items(requested):
+            try:
+                cad_id = int(item.data(0, PDM_CAD_DOCUMENT_ID_ROLE))
+            except Exception:
+                continue
+            document = documents.get(cad_id)
+            if not document:
+                continue
+            tree = item.treeWidget()
+            if tree is getattr(self, "_cad_tree", None):
+                self._apply_pdm_cad_tree_item_data(item, document)
+            elif tree is getattr(self, "_ebom_tree", None):
+                self._apply_ebom_cad_tree_item_data(item, document)
+            if tree is not None:
+                touched_trees.add(tree)
+
+        try:
+            associations = getattr(self, "_ebom_associations_by_item", {})
+            for rows in associations.values():
+                for index, row in enumerate(list(rows or [])):
+                    try:
+                        cad_id = int(row.get("id"))
+                    except Exception:
+                        continue
+                    if cad_id in documents:
+                        updated = dict(row)
+                        updated.update(documents[cad_id])
+                        rows[index] = updated
+        except Exception:
+            pass
+
+        for tree in touched_trees:
+            try:
+                tree.viewport().update()
+            except Exception:
+                pass
+        try:
+            current_cad = getattr(self, "current_cad_document_id", None)
+            if current_cad is not None and int(current_cad) in requested:
+                selected = self._current_tree_for_filtering().currentItem()
+                if selected and selected.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+                    self._show_pdm_cad_selection(selected)
+        except Exception:
+            pass
+        self._sync_visual_action_states()
+
+    def refresh_after_pdm_merge(self, part_ids=None, cad_document_ids=None) -> None:
+        """Refresh only affected Item and CAD Document rows after push to master."""
+        if part_ids:
+            self.refresh_parts_after_merge(part_ids)
+        if cad_document_ids:
+            self.refresh_cad_documents_after_merge(cad_document_ids)
+
     def refresh_issue_indicators(self, affected_part_ids=None) -> None:
         """Repaint only BOM nodes whose propagated issue summary changed."""
         try:
@@ -7750,6 +11309,9 @@ class BomPage(QWidget):
                     continue
                 for item in self._find_tree_items(int(part_id)):
                     self._apply_tree_item_data(item, info)
+                    if item.treeWidget() is getattr(self, "_ebom_tree", None):
+                        item.setData(0, PDM_OBJECT_KIND_ROLE, PDM_OBJECT_ITEM)
+                        item.setIcon(BOM_COL_NAME, _pdm_item_icon())
             except Exception:
                 continue
 
@@ -7760,10 +11322,11 @@ class BomPage(QWidget):
                 - len(getattr(self, "missing_ids", set()) or set()),
             )
             color = "#2e7d32" if score >= 85 else ("#a16207" if score >= 65 else "#b91c1c")
-            self.bom_health_label.setText(f"Health: {score}/100")
-            self.bom_health_label.setStyleSheet(
-                f"font-size:11px;font-weight:700;color:{color};background:transparent;border:none;"
-            )
+            if getattr(self, "_bom_mode", "cad") == "ebom":
+                self.bom_health_label.setText(f"Item health: {score}/100")
+                self.bom_health_label.setStyleSheet(
+                    f"font-size:11px;font-weight:700;color:{color};background:transparent;border:none;"
+                )
         except Exception:
             pass
 
@@ -7821,7 +11384,7 @@ class BomPage(QWidget):
 
     def add_part(self):
         if not self.perm.can("manage_parts"):
-            return QMessageBox.warning(self, "Permission", "You do not have permission to add parts.")
+            return QMessageBox.warning(self, "Permission", "You do not have permission to create Items.")
         dialog = PartDialog(self)
         if dialog.exec_() == QDialog.Accepted:
             part_data = dialog.get_data()
@@ -7832,30 +11395,31 @@ class BomPage(QWidget):
                 added= self.bom_service.add_part(part_data)
                 if type(added) == int:
                     self._add_part_to_tree(int(added))
+                    if str(self.bom_mode_selector.currentData() or "") == "ebom":
+                        self._load_released_ebom_tree()
+                        self._select_item_in_ebom(int(added))
                     self.display_details(int(added))
-                    QMessageBox.information(self, "Success", "Part added successfully.")
-                    self.window().statusBar().showMessage("Part added successfully.")
-                elif added == "existing":
-                    QMessageBox.warning(self, "Duplicate AES", "Part with this AES number already exists.")
-                    self.window().statusBar().showMessage("Adding part failed.")
+                    created = self.bom_service.get_part_details(int(added)) or {}
+                    number = created.get("part_number") or added
+                    self.window().statusBar().showMessage(f"Item {number} created.", 6000)
                 else:
-                    QMessageBox.warning(self, "Error", "An unexpected error occurred while adding the part.")
-                    self.window().statusBar().showMessage("Adding part failed.")
+                    QMessageBox.warning(self, "New Item", "An unexpected error occurred while creating the Item.")
+                    self.window().statusBar().showMessage("Item creation failed.")
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to add part: {str(e)}")
+                QMessageBox.critical(self, "New Item", f"Could not create Item:\n{str(e)}")
 
     def edit_part(self, id=None):
         if not self.perm.can("manage_parts"):
-            return QMessageBox.warning(self, "Permission", "You do not have permission to edit parts.")
+            return QMessageBox.warning(self, "Permission", "You do not have permission to edit Items.")
         if not id:
             if not self.current_part_id:
-                QMessageBox.warning(self, "No Selection", "Please select a part to edit.")
+                QMessageBox.warning(self, "No Selection", "Select an Item to edit.")
                 return
             id = self.current_part_id
 
         part_data = self.bom_service.get_part_details(id)
         if not part_data:
-            QMessageBox.warning(self, "Not Found", f"Part with AES {id} not found.")
+            QMessageBox.warning(self, "Not Found", f"Item {id} was not found.")
             return
 
         dialog = PartDialog(self, part_data)
@@ -7867,34 +11431,42 @@ class BomPage(QWidget):
             try:
                 self.bom_service.update_part(id, updated_data)
                 self._refresh_part_in_tree(int(id))
-                QMessageBox.information(self, "Success", "Part updated successfully.")
+                if str(self.bom_mode_selector.currentData() or "") == "ebom":
+                    self._load_released_ebom_tree()
+                    self._select_item_in_ebom(int(id))
+                number = updated_data.get("part_number") or id
+                self.window().statusBar().showMessage(
+                    f"Item {number} attributes updated.", 6000
+                )
                 self.display_details(id)
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to update part: {str(e)}")
+                QMessageBox.critical(self, "Edit Attributes", f"Could not update Item:\n{str(e)}")
 
     def delete_part(self, id=None):
         if not self.perm.can("manage_parts"):
-            return QMessageBox.warning(self, "Permission", "You do not have permission to delete parts.")
+            return QMessageBox.warning(self, "Permission", "You do not have permission to delete Items.")
         if not id:
             if not self.current_part_id:
-                QMessageBox.warning(self, "No Selection", "Please select a part to delete.")
+                QMessageBox.warning(self, "No Selection", "Select an Item to delete.")
                 return
             id = self.current_part_id
 
         reply = QMessageBox.question(
             self,
-            "Confirm Delete",
-            f"Are you sure you want to delete part {id}? This action cannot be undone.",
+            "Delete Item",
+            f"Delete Item {id}? This action cannot be undone.",
             QMessageBox.Yes | QMessageBox.No
         )
         if reply == QMessageBox.Yes:
             try:
                 self.bom_service.delete_part(id)
                 self._remove_part_from_trees(int(id))
-                QMessageBox.information(self, "Success", "Part deleted successfully.")
+                if str(self.bom_mode_selector.currentData() or "") == "ebom":
+                    self._load_released_ebom_tree()
+                self.window().statusBar().showMessage("Item deleted.", 6000)
                 self.clear_details()
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to delete part: {str(e)}")
+                QMessageBox.critical(self, "Delete Item", f"Could not delete Item:\n{str(e)}")
 
     def _refresh_current_tree_item_lock_state(self, part_id: int | None = None):
         """Refresh the selected part row in every visible BOM tree representation."""
@@ -7945,12 +11517,17 @@ class BomPage(QWidget):
     def checkin_part(self, part_id=None):
         if isinstance(part_id, bool):
             part_id = None
+        if part_id is None and getattr(self, "current_cad_document_id", None) is not None:
+            self._checkin_pdm_cad_document(
+                int(self.current_cad_document_id), getattr(self, "_current_cad_payload", {})
+            )
+            return
         part_id = part_id or getattr(self, "current_part_id", None)
         if not part_id:
             QMessageBox.warning(self, "Check In", "Select a checked-out BOM item.")
             return
         try:
-            analysis = self.bom_service.analyze_checkout(int(part_id))
+            analysis = self.bom_service.analyze_item_checkout(int(part_id))
         except (ValueError, PermissionError) as exc:
             QMessageBox.warning(self, "Check In", str(exc))
             return
@@ -7975,7 +11552,7 @@ class BomPage(QWidget):
             return
 
         try:
-            result = self.bom_service.checkin_non_cad_changes(
+            result = self.bom_service.checkin_item_data(
                 int(part_id), dialog.comment()
             )
             context = (result or {}).get("context") or {}
@@ -7983,13 +11560,14 @@ class BomPage(QWidget):
                 self,
                 "Check In",
                 f"Checkout completed as {context.get('version_label') or analysis.get('next_version')}.\n"
-                "Unchanged native CAD and drawing content were inherited.",
+                "The Item iteration was created independently; associated CAD Documents were not checked in.",
             )
             for affected_id in (result or {}).get("affected_part_ids") or [int(part_id)]:
                 self._refresh_loaded_part_branch(int(affected_id))
                 self._invalidate_doc_indicator(int(affected_id))
             self._renumber_full_bom_tree_rows()
             self._sync_search_tree_row_numbers()
+            self._load_released_ebom_tree()
             self.display_details(int(part_id))
         except (ValueError, PermissionError) as exc:
             QMessageBox.warning(self, "Check In", str(exc))
@@ -7997,6 +11575,11 @@ class BomPage(QWidget):
             QMessageBox.critical(self, "Check In", f"Check-in failed:\n{exc}")
 
     def undo_checkout(self, part_id=None):
+        if isinstance(part_id, bool):
+            part_id = None
+        if part_id is None and getattr(self, "current_cad_document_id", None) is not None:
+            self._undo_pdm_cad_checkout(int(self.current_cad_document_id))
+            return
         if not part_id:
             if not self.current_part_id:
                 QMessageBox.warning(self, "No Selection", "Please select a checked-out item.")
@@ -8013,9 +11596,10 @@ class BomPage(QWidget):
         if answer != QMessageBox.Yes:
             return
         try:
-            self.bom_service.undo_checkout(int(part_id))
+            self.bom_service.undo_item_checkout(int(part_id))
             QMessageBox.information(self, "Undo Checkout", "Checkout undone. No iteration was created.")
-            self._refresh_lock_family_rows(int(part_id), refresh_loaded_branches=True)
+            self._refresh_current_tree_item_lock_state(int(part_id))
+            self._load_released_ebom_tree()
             try:
                 self.display_details(int(part_id))
             except Exception:
@@ -8028,6 +11612,13 @@ class BomPage(QWidget):
             QMessageBox.critical(self, "Undo Checkout", f"Failed to undo checkout: {str(e)}")
 
     def checkout_part(self, part_id=None):
+        if isinstance(part_id, bool):
+            part_id = None
+        if part_id is None and getattr(self, "current_cad_document_id", None) is not None:
+            self._checkout_pdm_cad_document(
+                int(self.current_cad_document_id), getattr(self, "_current_cad_payload", {})
+            )
+            return
         if not part_id:
             if not self.current_part_id:
                 QMessageBox.warning(self, "No Selection", "Please select a part to check out.")
@@ -8035,6 +11626,39 @@ class BomPage(QWidget):
             part_id = self.current_part_id
 
         details = self.bom_service.get_part_details(int(part_id)) or {}
+        checkout_origin = str(details.get("checkout_origin") or "ITEM").upper()
+        lock_owner_id = details.get("locked_by_user_id")
+        auto_checkout_is_mine = bool(
+            details.get("locked") and checkout_origin == "CAD"
+            and (
+                lock_owner_id is None or self.session.user_id is None
+                or int(lock_owner_id) == int(self.session.user_id)
+            )
+        )
+        if auto_checkout_is_mine:
+            if QMessageBox.question(
+                self,
+                "Make Item Checkout Explicit",
+                "Keep this automatically reserved Item as an explicit Item checkout?\n\n"
+                "The active associated CAD Document remains checked out and must still be "
+                "checked in or undone separately.",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Yes,
+            ) != QMessageBox.Yes:
+                return
+            try:
+                self.bom_service.checkout_item(int(part_id))
+            except (ValueError, PermissionError) as exc:
+                QMessageBox.warning(self, "Item Checkout", str(exc))
+                return
+            QMessageBox.information(
+                self,
+                "Item Checkout",
+                "The Item checkout is now explicit. The associated CAD checkout remains active.",
+            )
+            self._load_released_ebom_tree()
+            self.display_details(int(part_id))
+            return
         state = str(
             details.get("revision_state") or details.get("lifecycle_state") or ""
         ).strip().lower()
@@ -8062,7 +11686,7 @@ class BomPage(QWidget):
 
         as_user_id = None
         # Master/Admin can check out as a project-assigned user.
-        if self.perm.can("merge") and self.session.project_id:
+        if self.perm.can("merge") and self.session.project_id and not details.get("locked"):
             users = self.project_service.get_users_for_project(self.session.project_id) or []
             choices = []
             choice_to_id = {}
@@ -8106,7 +11730,8 @@ class BomPage(QWidget):
             f"The Released iteration will not change. The next completed commit will create "
             f"{released_revision_code}.1."
             if released_revision_code else
-            f"Are you sure you want to check out part {part_id}? This part will be blocked for work."
+            f"Check out Item {part_id}?\n\nThe Item data will be reserved and its OWNER CAD "
+            "Document will be checked out automatically when one is associated."
         )
         reply = QMessageBox.question(
             self,
@@ -8116,13 +11741,17 @@ class BomPage(QWidget):
         )
         if reply == QMessageBox.Yes:
             try:
-                self.bom_service.checkout_part(
+                self.bom_service.checkout_item(
                     part_id,
                     as_user_id=as_user_id,
                     released_revision_code=released_revision_code,
                 )
-                QMessageBox.information(self, "Success", "Part checked out successfully.")
-                self._refresh_lock_family_rows(int(part_id))
+                QMessageBox.information(
+                    self, "Success",
+                    "Item checked out. OWNER CAD Document checkout was applied when available.",
+                )
+                self._refresh_current_tree_item_lock_state(int(part_id))
+                self._load_released_ebom_tree()
                 self._refresh_current_tree_item_indicator()
                 try:
                     self.display_details(int(part_id))
@@ -8815,12 +12444,165 @@ class BomPage(QWidget):
             self.tree.viewport().update()
 
     def on_tree_item_clicked(self, item, column):
+        if item is not None and item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+            self._show_pdm_cad_selection(item)
+            self._sync_visual_action_states()
+            return
         folder_id = item.data(0, BOM_TREE_FOLDER_ROLE) if item is not None else None
         if folder_id:
             self._show_folder_selection(item, int(folder_id))
+            self._sync_visual_action_states()
             return
         item_id = item.data(0, Qt.UserRole)
+        self._selected_pdm_kind = PDM_OBJECT_ITEM
+        self.current_cad_document_id = None
+        self._current_cad_payload = {}
         self.display_details(item_id)
+        self._sync_visual_action_states()
+
+    @staticmethod
+    def _item_summary_field_titles() -> dict[str, str]:
+        return {
+            "part_number": "Number",
+            "aes_number": "AES Number",
+            "item_type": "Item Type",
+            "source": "Source",
+            "view": "View",
+            "unit": "Default Unit",
+            "drawing": "DRW Number",
+            "type": "Type",
+            "revision": "Revision / Iteration",
+            "state": "Lifecycle",
+            "material": "Material",
+            "categories": "Categories",
+        }
+
+    def _set_summary_field_titles(self, titles: dict[str, str]) -> None:
+        for key, (field_label, _value_label, _detail_keys) in self._details_summary_fields.items():
+            field_label.setText(str(titles.get(key) or key).upper())
+
+    def _show_pdm_cad_selection(self, item: QTreeWidgetItem) -> None:
+        payload = dict(item.data(0, PDM_CAD_PAYLOAD_ROLE) or {})
+        cad_id = item.data(0, PDM_CAD_DOCUMENT_ID_ROLE)
+        if cad_id is None:
+            return
+        payload.setdefault("id", int(cad_id))
+        payload.setdefault("item_id", item.data(0, PDM_ASSOCIATED_ITEM_ID_ROLE))
+        payload.setdefault("association_id", item.data(0, PDM_ASSOCIATION_ID_ROLE))
+        payload.setdefault("association_type", item.data(0, PDM_ASSOCIATION_TYPE_ROLE))
+        self._selected_pdm_kind = PDM_OBJECT_CAD
+        self.current_cad_document_id = int(cad_id)
+        self.current_associated_item_id = payload.get("item_id")
+        self._current_cad_payload = payload
+        self.current_part_id = None
+        self.current_folder_id = None
+        self._current_part_details = {}
+        self.details_summary_card.show()
+        self.associated_files_card.hide()
+        self.details_alert_frame.hide()
+        self.view_full_details_btn.setEnabled(False)
+        self.edit_categories_btn.setEnabled(False)
+        self.details_name_label.setText(
+            str(payload.get("name") or payload.get("file_name") or "CAD Document")
+        )
+        identity = ["CAD DOCUMENT"]
+        if payload.get("file_name"):
+            identity.append(str(payload["file_name"]))
+        if payload.get("category"):
+            identity.append(str(payload["category"]).replace("_", " "))
+        self.details_identity_label.setText("  |  ".join(identity))
+        self._set_summary_field_titles({
+            "aes_number": "CAD File",
+            "part_number": "Approved Creo File",
+            "drawing": "Related DRW",
+            "type": "CAD Category",
+            "revision": "CAD Revision / Iteration",
+            "state": "Lifecycle",
+            "material": "Association",
+            "categories": "Related Item / Version",
+        })
+        related_item = self._pdm_related_item_text(payload)
+        if related_item == "Unassociated":
+            related_item = "Not associated"
+        association_type = str(payload.get("association_type") or "None").replace("_", " ")
+        revision = f"{payload.get('revision') or 'A'}.{int(payload.get('iteration') or 1)}"
+        creo_file = self._pdm_creo_file_text(payload) or "No approved file yet"
+        related_drawings = list(payload.get("related_drawings") or [])
+        drawing_text = "\n".join(
+            f"{drawing.get('file_name') or drawing.get('name')} "
+            f"({drawing.get('revision') or 'A'}.{int(drawing.get('iteration') or 1)}, "
+            f"{drawing.get('lifecycle_state') or 'IN_WORK'}"
+            + (
+                f", Creo {self._pdm_creo_file_text(drawing)}"
+                if self._pdm_creo_file_text(drawing) else ""
+            )
+            + ")"
+            for drawing in related_drawings
+        ) or "Not linked"
+        values = {
+            "aes_number": str(payload.get("file_name") or "-"),
+            "part_number": creo_file,
+            "drawing": drawing_text,
+            "type": str(payload.get("category") or "OTHER"),
+            "revision": f"CAD {revision}\nIndependent from linked Item version",
+            "state": str(payload.get("lifecycle_state") or "-"),
+            "material": association_type,
+            "categories": related_item,
+        }
+        for key, (_label, value_label, _keys) in self._details_summary_fields.items():
+            value_label.setText(values.get(key, "-"))
+            if key in {"item_type", "source", "view", "unit"}:
+                _label.hide()
+                value_label.hide()
+            else:
+                _label.show()
+                value_label.show()
+        self.uses_tree.clear()
+        self.where_used_tree.clear()
+        self.effective_where_used_tree.clear()
+        self.structure_summary_label.setText(
+            "CAD membership is shown in CAD Structure; the related Item hierarchy remains independent."
+        )
+        self.notes_view.setText(
+            "This is a managed PRT/ASM CAD model. Related native DRW files are shown in "
+            "the model details and never appear as independent CAD Structure nodes. "
+            "The CAD Document revision/iteration is intentionally independent from the "
+            "associated EBOM Item revision/iteration; the OWNER/IMAGE/CONTENT association "
+            "is the link between them. "
+            "Item PDF/STEP delivery content, Item integrity and Item issues are intentionally "
+            "not evaluated on this CAD structure row."
+        )
+        try:
+            self.part_issues_table.setRowCount(0)
+            self.history_panel.clear()
+            self.files_table.setRowCount(0)
+            self.versions_table.setRowCount(0)
+        except Exception:
+            pass
+        self._set_engineering_item_actions_enabled(False)
+        checked_out = payload.get("checked_out_by") is not None
+        try:
+            checked_out_by_me = (
+                checked_out and self.session.user_id is not None
+                and int(payload.get("checked_out_by")) == int(self.session.user_id)
+            )
+        except Exception:
+            checked_out_by_me = False
+        can_manage = self.perm.can("manage_parts")
+        self.checkout_part_btn.setEnabled(can_manage and not checked_out)
+        self.checkin_part_btn.setEnabled(can_manage and checked_out_by_me)
+        self.undo_checkout_btn.setEnabled(can_manage and checked_out_by_me)
+        self.checkout_part_btn.setToolTip(
+            "Check out this CAD Document and automatically reserve its associated Item"
+        )
+        self.checkin_part_btn.setToolTip("Create the next CAD Document iteration")
+        self.undo_checkout_btn.setToolTip("Discard this CAD Document checkout")
+        self._sync_action_ribbon_menus()
+        try:
+            self.tabs.setCurrentIndex(0)
+        except Exception:
+            pass
+        self._sync_visual_action_states()
 
     def _set_engineering_item_actions_enabled(self, enabled: bool) -> None:
         can_manage = self.perm.can("manage_parts")
@@ -8828,6 +12610,7 @@ class BomPage(QWidget):
         self.delete_part_btn.setEnabled(bool(enabled and can_manage))
         self.add_child_btn.setEnabled(bool(enabled and can_manage))
         self.checkout_part_btn.setEnabled(bool(enabled))
+        self.checkin_part_btn.setEnabled(bool(enabled))
         self.undo_checkout_btn.setEnabled(bool(enabled))
         self.set_revision_btn.setEnabled(bool(enabled and self.perm.can("set_revision")))
         self.release_revision_btn.setEnabled(bool(enabled and self.perm.can("set_revision")))
@@ -8917,6 +12700,7 @@ class BomPage(QWidget):
         try:
             self.tree.viewport().update()
             self._search_tree.viewport().update()
+            self._ebom_tree.viewport().update()
         except Exception:
             pass
 
@@ -8931,7 +12715,7 @@ class BomPage(QWidget):
         tree = QTreeWidget()
         tree.setColumnCount(10)
         tree.setHeaderLabels([
-            "Name", "AES Number", "Relation", "Qty", "Type", "Current",
+            "Name", "Number", "Relation", "Qty", "Type", "Current",
             "Bound", "Latest", "Binding", "Lifecycle",
         ])
         tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -8959,7 +12743,7 @@ class BomPage(QWidget):
         quantity = node.get("quantity")
         item = QTreeWidgetItem([
             str(node.get("name") or ""),
-            str(node.get("aes_number") or ""),
+            str(node.get("part_number") or node.get("aes_number") or ""),
             str(node.get("relation") or ""),
             "" if quantity is None else str(quantity),
             str(node.get("type") or ""),
@@ -9071,12 +12855,15 @@ class BomPage(QWidget):
         for column in range(1, 5):
             table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
         for row_index, row in enumerate(rows):
-            child_label = str(row.get("aes_number") or row.get("part_number") or "").strip()
+            child_label = str(row.get("part_number") or row.get("aes_number") or "").strip()
             name = str(row.get("name") or "").strip()
             if child_label and name:
                 child_label = f"{child_label} - {name}"
             else:
                 child_label = child_label or name
+            aes_number = str(row.get("aes_number") or "").strip()
+            if aes_number and aes_number.casefold() != str(row.get("part_number") or "").strip().casefold():
+                child_label += f"  |  AES {aes_number}"
             values = [
                 child_label,
                 str(row.get("bound_version") or ""),
@@ -9211,6 +12998,9 @@ class BomPage(QWidget):
         self.display_details(int(part_id))
 
     def _on_tree_item_double_clicked(self, item, column):
+        if item is not None and item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+            self._show_pdm_cad_selection(item)
+            return
         item_id = item.data(0, Qt.UserRole)
         if not item_id:
             return
@@ -9236,6 +13026,14 @@ class BomPage(QWidget):
     def display_details(self, item_id):
         if item_id is None:
             return
+        self._selected_pdm_kind = PDM_OBJECT_ITEM
+        self.current_cad_document_id = None
+        self.current_associated_item_id = None
+        self._current_cad_payload = {}
+        self._set_summary_field_titles(self._item_summary_field_titles())
+        self.checkout_part_btn.setToolTip("Check out the selected Item only")
+        self.checkin_part_btn.setToolTip("Review and finish the selected Item checkout")
+        self.undo_checkout_btn.setToolTip("Undo the selected Item checkout")
         self.current_folder_id = None
         self.details_summary_card.show()
         self.associated_files_card.show()
@@ -9283,9 +13081,15 @@ class BomPage(QWidget):
 
         self.notes_view.setText(details.get("notes", ""))
         self.refresh_issues_tab()
+        self._sync_visual_action_states()
 
     def clear_details(self):
         self.current_part_id = None
+        self.current_cad_document_id = None
+        self.current_associated_item_id = None
+        self._current_cad_payload = {}
+        self._selected_pdm_kind = None
+        self._set_summary_field_titles(self._item_summary_field_titles())
         self._update_details_summary({})
         self.uses_tree.clear()
         self.where_used_tree.clear()
@@ -9305,6 +13109,7 @@ class BomPage(QWidget):
         except Exception:
             pass
         self.refresh_files_tab()
+        self._sync_visual_action_states()
 
     @staticmethod
     def _details_card_label(text: str, object_name: str) -> QLabel:
@@ -9326,7 +13131,7 @@ class BomPage(QWidget):
         self.view_full_details_btn.setEnabled(has_details)
         self.edit_categories_btn.setEnabled(has_details and bool(getattr(self, "current_part_id", None)))
 
-        name = self._details_value(self._current_part_details, ("name", "aes_number", "part_number"))
+        name = self._details_value(self._current_part_details, ("name", "part_number", "aes_number"))
         self.details_name_label.setText(name or "Select a BOM item")
 
         identity_parts = []
@@ -9334,10 +13139,10 @@ class BomPage(QWidget):
         part_number = self._details_value(self._current_part_details, ("part_number",))
         part_type = self._details_value(self._current_part_details, ("type",))
         current_version = self._details_value(self._current_part_details, ("current_version", "revision"))
+        if part_number:
+            identity_parts.append(f"NUMBER {part_number}")
         if aes_number:
             identity_parts.append(f"AES {aes_number}")
-        if part_number:
-            identity_parts.append(f"Part {part_number}")
         if part_type:
             identity_parts.append(part_type.upper())
         if current_version:
@@ -9357,7 +13162,11 @@ class BomPage(QWidget):
         if self._current_part_details.get("represented_part_id"):
             target_label = self._details_value(
                 self._current_part_details,
-                ("represented_part_name", "represented_part_aes"),
+                (
+                    "represented_part_number",
+                    "represented_part_name",
+                    "represented_part_aes",
+                ),
             )
             identity_parts.append(
                 f"CAD REP OF {target_label or ('#' + str(self._current_part_details['represented_part_id']))}"
@@ -9380,11 +13189,50 @@ class BomPage(QWidget):
         drawing_file = self._details_value(
             self._current_part_details, ("drawing", "base_drw_name", "drawing_number")
         )
-        self.associated_cad_file_label.setText(cad_file or "Not linked")
-        self.associated_drawing_file_label.setText(drawing_file or "Not linked")
+        try:
+            pdm_documents = self.bom_service.list_item_cad_associations(
+                int(self.current_part_id)
+            ) if self.current_part_id is not None else []
+        except Exception:
+            pdm_documents = []
+        model_links = [
+            (
+                f"{row.get('file_name') or row.get('name') or 'CAD Document'} "
+                f"[{row.get('association_type')}; {self._pdm_cad_revision_text(row)}]"
+            )
+            for row in pdm_documents
+            if str(row.get("category") or "").upper() != "DRAWING"
+        ]
+        drawing_links = [
+            (
+                f"{row.get('file_name') or row.get('name') or 'CAD Drawing'} "
+                f"[{row.get('association_type')}; {self._pdm_cad_revision_text(row)}]"
+            )
+            for row in pdm_documents
+            if str(row.get("category") or "").upper() == "DRAWING"
+        ]
+        for model in pdm_documents:
+            for drawing in model.get("related_drawings") or []:
+                label = (
+                    f"{drawing.get('file_name') or drawing.get('name') or 'CAD Drawing'} "
+                    f"[RELATED TO {model.get('file_name') or model.get('name') or 'CAD Model'}; "
+                    f"{self._pdm_cad_revision_text(drawing)}]"
+                )
+                if label not in drawing_links:
+                    drawing_links.append(label)
+        self.associated_cad_file_label.setText(
+            "\n".join(model_links) if model_links else (cad_file or "Not linked")
+        )
+        self.associated_drawing_file_label.setText(
+            "\n".join(drawing_links) if drawing_links else (drawing_file or "Not linked")
+        )
 
         for _field_key, (field_label, value_label, detail_keys) in self._details_summary_fields.items():
             value = self._details_value(self._current_part_details, detail_keys)
+            if _field_key in {"item_type", "source", "view"} and value:
+                value = value.replace("_", " ").title()
+            elif _field_key == "unit" and value.upper() == "EA":
+                value = "each"
             field_label.show()
             value_label.show()
             value_label.setText(value)
@@ -9403,19 +13251,62 @@ class BomPage(QWidget):
         is_assembly = str(details.get("type") or "").strip().lower() in {"asm", "assembly"}
         can_manage = self.perm.can("manage_parts")
         can_revision = self.perm.can("set_revision")
-        read_only_ebom = getattr(self, "_bom_mode", "cad") == "ebom"
-        self.checkout_part_btn.setEnabled(
-            has_item and not locked and not obsolete and not read_only_ebom
+        # Item Structure is an engineering workspace, not a read-only report.
+        # Item locks remain independent from CAD Document locks.
+        read_only_ebom = False
+        try:
+            active_cad = (
+                self.bom_service.checked_out_cad_for_item(int(self.current_part_id))
+                if has_item else []
+            )
+        except Exception:
+            active_cad = []
+        checkout_origin = str(details.get("checkout_origin") or "ITEM").upper()
+        lock_is_mine = (
+            details.get("locked_by_user_id") is None
+            or self.session.user_id is None
+            or int(details.get("locked_by_user_id")) == int(self.session.user_id)
         )
-        self.undo_checkout_btn.setEnabled(has_item and locked and not read_only_ebom)
+        can_promote_auto_checkout = bool(
+            locked and checkout_origin == "CAD" and lock_is_mine
+        )
+        can_finish_checkout = bool(lock_is_mine or self.perm.can("merge"))
+        self.checkout_part_btn.setEnabled(
+            has_item and (not locked or can_promote_auto_checkout)
+            and not obsolete and not read_only_ebom
+        )
+        self.checkin_part_btn.setEnabled(
+            has_item and locked and can_finish_checkout
+            and not active_cad and not read_only_ebom
+        )
+        self.undo_checkout_btn.setEnabled(
+            has_item and locked and can_finish_checkout
+            and not active_cad and not read_only_ebom
+        )
+        if active_cad:
+            labels = ", ".join(
+                str(row.get("file_name") or row.get("name") or "CAD")
+                for row in active_cad[:3]
+            )
+            self.checkin_part_btn.setToolTip(
+                f"Check in or undo associated CAD first: {labels}"
+            )
+            self.undo_checkout_btn.setToolTip(
+                f"Check in or undo associated CAD first: {labels}"
+            )
+        elif can_promote_auto_checkout:
+            self.checkout_part_btn.setToolTip(
+                "Convert the automatic CAD-origin reservation into an explicit Item checkout"
+            )
         self.edit_part_btn.setEnabled(
-            has_item and locked and can_manage and editable_checkout and not read_only_ebom
+            has_item and locked and can_finish_checkout and can_manage
+            and editable_checkout and not read_only_ebom
         )
         self.delete_part_btn.setEnabled(
             has_item and can_manage and editable_checkout and not read_only_ebom
         )
         self.add_child_btn.setEnabled(
-            has_item and locked and can_manage and is_assembly
+            has_item and locked and can_finish_checkout and can_manage and is_assembly
             and editable_checkout and not read_only_ebom
         )
         self.compare_iterations_btn.setEnabled(has_item and is_assembly)
@@ -9423,7 +13314,8 @@ class BomPage(QWidget):
             has_item and is_assembly and not read_only_ebom
         )
         self.update_child_versions_btn.setEnabled(
-            has_item and locked and is_assembly and editable_checkout and not read_only_ebom
+            has_item and locked and can_finish_checkout and is_assembly
+            and editable_checkout and not read_only_ebom
         )
         self.set_revision_btn.setEnabled(
             has_item and not locked and released and not pending_revision
@@ -9496,7 +13388,7 @@ class BomPage(QWidget):
 
             parts_table = QTableWidget()
             parts_table.setColumnCount(4)
-            parts_table.setHorizontalHeaderLabels(["AES Number", "Name", "Part Number", "Type"])
+            parts_table.setHorizontalHeaderLabels(["Number", "Name", "AES Number", "Type"])
             parts_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
             for column in (0, 2, 3):
                 parts_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
@@ -9505,9 +13397,9 @@ class BomPage(QWidget):
             parts_table.setRowCount(len(parts))
             for row, part in enumerate(parts):
                 values = (
-                    part.get("aes_number") or "",
-                    part.get("name") or "",
                     part.get("part_number") or "",
+                    part.get("name") or "",
+                    part.get("aes_number") or "",
                     part.get("type") or "",
                 )
                 for column, value in enumerate(values):
@@ -9643,7 +13535,9 @@ class BomPage(QWidget):
         if not details:
             return
 
-        title = self._details_value(details, ("name", "aes_number", "part_number")) or "BOM Item"
+        number = self._details_value(details, ("part_number",))
+        name = self._details_value(details, ("name",))
+        title = " — ".join(value for value in (number, name) if value) or "Item"
         dlg = QDialog(self)
         dlg.setWindowTitle(f"Full Details - {title}")
         dlg.resize(820, 560)
@@ -10013,7 +13907,9 @@ class BomPage(QWidget):
             ("Approved Version", details.get("approved_version")),
             ("PR Path", details.get("pr_path")),
             ("Signature", details.get("signature")),
-            ("Selected BOM Part", first.get("part_name") or first.get("part_id")),
+            ("Item Number", first.get("part_number")),
+            ("AES Number", first.get("aes_number")),
+            ("Selected Item", first.get("part_name") or first.get("part_id")),
         ]
         rows = [(k, v) for k, v in rows if v not in (None, "")]
         table.setRowCount(len(rows))
@@ -10047,9 +13943,10 @@ class BomPage(QWidget):
                 ("Commit ID", item.get("commit_id")),
                 ("Status", item.get("status")),
                 ("Type", item.get("type")),
-                ("Part", item.get("part_name") or item.get("part_id")),
-                ("Part ID", item.get("part_id")),
-                ("AES", item.get("aes_number")),
+                ("Item", item.get("part_name") or item.get("part_id")),
+                ("Item Number", item.get("part_number")),
+                ("AES Number", item.get("aes_number")),
+                ("Internal Item ID", item.get("part_id")),
                 ("Revision", item.get("part_revision")),
                 ("Source Path", item.get("file_path")),
                 ("PR Path", item.get("pr_path")),
@@ -10376,7 +14273,8 @@ class BomPage(QWidget):
             rows.append({
                 "level": level,
                 "name": item.text(BOM_COL_NAME),
-                "aes_number": item.text(BOM_COL_AES),
+                "part_number": item.data(0, BOM_TREE_ITEM_NUMBER_ROLE) or "",
+                "aes_number": item.data(0, BOM_TREE_AES_NUMBER_ROLE) or "",
                 "type": item.text(BOM_COL_TYPE),
                 "revision": item.text(BOM_COL_REV),
                 "categories": ", ".join(item.data(0, BOM_TREE_CATEGORY_ROLE) or []),
@@ -10398,7 +14296,7 @@ class BomPage(QWidget):
 
     def _export_visible_bom_csv(self, file_path: str, rows: list[dict]) -> None:
         fieldnames = [
-            "level", "name", "aes_number", "type", "revision", "categories", "status",
+            "level", "part_number", "name", "aes_number", "type", "revision", "categories", "status",
             "work_state", "pdf", "step", "integrity", "issues", "part_id", "details",
         ]
         with open(file_path, "w", newline="", encoding="utf-8-sig") as handle:
@@ -10418,6 +14316,7 @@ class BomPage(QWidget):
 
         headers = [
             ("level", "Level"),
+            ("part_number", "Number"),
             ("name", "Name"),
             ("aes_number", "AES Number"),
             ("type", "Type"),
@@ -10429,7 +14328,7 @@ class BomPage(QWidget):
             ("step", "STEP"),
             ("integrity", "Integrity"),
             ("issues", "Issues"),
-            ("part_id", "Part ID"),
+            ("part_id", "Internal Item ID"),
             ("details", "Details"),
         ]
         wb = Workbook()
@@ -10498,7 +14397,7 @@ class BomPage(QWidget):
                 selected = self._ebom_tree.topLevelItem(0)
             if selected is None:
                 QMessageBox.warning(
-                    self, "Export Released EBOM", "There is no resolved EBOM to export."
+                    self, "Export Item Structure", "There is no Item Structure to export."
                 )
                 return
             while selected.parent() is not None:
@@ -10506,8 +14405,8 @@ class BomPage(QWidget):
             root_bom_id = selected.data(0, Qt.UserRole)
             file_path, _selected_filter = QFileDialog.getSaveFileName(
                 self,
-                "Export Released EBOM",
-                "released_ebom.csv",
+                "Export Item Structure",
+                "item_structure.csv",
                 "CSV Files (*.csv)",
             )
             if not file_path:
@@ -10515,16 +14414,68 @@ class BomPage(QWidget):
             if not file_path.lower().endswith(".csv"):
                 file_path += ".csv"
             try:
-                result = self.bom_service.export_released_ebom(
+                result = self.bom_service.export_item_structure(
                     int(root_bom_id), file_path
                 )
                 QMessageBox.information(
                     self,
-                    "Export Released EBOM",
-                    f"Exported {result['row_count']} effective EBOM row(s) to {file_path}.",
+                    "Export Item Structure",
+                    f"Exported {result['row_count']} persisted Item row(s) to {file_path}.",
                 )
             except Exception as exc:
-                QMessageBox.critical(self, "Export Released EBOM", str(exc))
+                QMessageBox.critical(self, "Export Item Structure", str(exc))
+            return
+        if getattr(self, "_bom_mode", "cad") == "cad":
+            file_path, _selected_filter = QFileDialog.getSaveFileName(
+                self,
+                "Export CAD Structure",
+                "cad_structure.csv",
+                "CSV Files (*.csv)",
+            )
+            if not file_path:
+                return
+            if not file_path.lower().endswith(".csv"):
+                file_path += ".csv"
+            rows = []
+
+            def collect(item: QTreeWidgetItem, level: int, parent_path: str) -> None:
+                if item.isHidden():
+                    return
+                payload = dict(item.data(0, PDM_CAD_PAYLOAD_ROLE) or {})
+                label = str(item.text(CAD_COL_NAME) or "")
+                path = f"{parent_path}/{label}" if parent_path else label
+                rows.append({
+                    "level": level,
+                    "path": path,
+                    "cad_file": item.text(CAD_COL_NAME),
+                    "description": item.text(CAD_COL_DESCRIPTION),
+                    "category": item.text(CAD_COL_CATEGORY),
+                    "cad_creo_version": item.text(CAD_COL_REV),
+                    "lifecycle": item.text(CAD_COL_STATE),
+                    "related_item": item.text(CAD_COL_ASSOCIATION),
+                    "checkout": item.text(CAD_COL_CHECKOUT),
+                    "build": item.text(CAD_COL_BUILD),
+                    "quantity": item.text(CAD_COL_QTY),
+                })
+                for index in range(item.childCount()):
+                    collect(item.child(index), level + 1, path)
+
+            for index in range(self._cad_tree.topLevelItemCount()):
+                collect(self._cad_tree.topLevelItem(index), 0, "")
+            if not rows:
+                QMessageBox.warning(self, "Export CAD Structure", "There are no visible CAD rows to export.")
+                return
+            try:
+                with open(file_path, "w", newline="", encoding="utf-8-sig") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+                    writer.writeheader()
+                    writer.writerows(rows)
+                QMessageBox.information(
+                    self, "Export CAD Structure",
+                    f"Exported {len(rows)} CAD Document occurrence(s) to {file_path}.",
+                )
+            except Exception as exc:
+                QMessageBox.critical(self, "Export CAD Structure", str(exc))
             return
         default_name = "bom_filtered.xlsx" if not self._is_default_bom_advanced_filter() else "bom.xlsx"
         file_path, selected_filter = QFileDialog.getSaveFileName(

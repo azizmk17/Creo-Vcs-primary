@@ -88,13 +88,24 @@ class MergeDialog(QDialog):
 
         # ✅ use IDs directly
         try:
-            affected_part_ids = self.merge_service.excute_merge(selected_ids, message)
+            merge_result = self.merge_service.excute_merge(selected_ids, message)
         except Exception as exc:
             QMessageBox.warning(self, "Merge Blocked", str(exc))
             return
-        if affected_part_ids:
+        if isinstance(merge_result, dict):
+            affected_part_ids = merge_result.get("affected_part_ids") or []
+            affected_cad_document_ids = merge_result.get("affected_cad_document_ids") or []
+        else:
+            affected_part_ids = merge_result or []
+            affected_cad_document_ids = []
+        if affected_part_ids or affected_cad_document_ids:
             parent = self.parent()
-            if hasattr(parent, "_refresh_bom_rows_for_parts"):
+            if hasattr(parent, "_refresh_pdm_rows_after_merge"):
+                parent._refresh_pdm_rows_after_merge(
+                    affected_part_ids,
+                    affected_cad_document_ids,
+                )
+            elif hasattr(parent, "_refresh_bom_rows_for_parts"):
                 parent._refresh_bom_rows_for_parts(affected_part_ids)
             parent.refresh()
             QMessageBox.information(self, "Merge Complete", f"Merged {selected_ids} commits to Master.")

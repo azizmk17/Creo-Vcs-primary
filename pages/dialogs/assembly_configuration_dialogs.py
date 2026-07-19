@@ -182,7 +182,7 @@ class AssemblyConfigurationEditorDialog(QDialog):
         source_layout.addWidget(QLabel("Project BOM Components"))
         source_search_row = QHBoxLayout()
         self.source_search = QLineEdit()
-        self.source_search.setPlaceholderText("Search AES, name, or part number...")
+        self.source_search.setPlaceholderText("Search item number, name, or AES...")
         self.source_search.returnPressed.connect(self._load_source_components)
         search_button = QPushButton("Search")
         search_button.clicked.connect(self._load_source_components)
@@ -192,8 +192,10 @@ class AssemblyConfigurationEditorDialog(QDialog):
 
         self.source_tree = QTreeWidget()
         self.source_tree.setProperty("nexusBomSource", True)
-        self.source_tree.setColumnCount(4)
-        self.source_tree.setHeaderLabels(["Name", "AES Number", "Type", "Latest"])
+        self.source_tree.setColumnCount(5)
+        self.source_tree.setHeaderLabels([
+            "Name", "Item Number", "AES Number", "Type", "Latest",
+        ])
         self.source_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.source_tree.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.source_tree.setDragEnabled(True)
@@ -202,7 +204,7 @@ class AssemblyConfigurationEditorDialog(QDialog):
         self.source_tree.setUniformRowHeights(True)
         source_header = self.source_tree.header()
         source_header.setSectionResizeMode(0, QHeaderView.Stretch)
-        for column in (1, 2, 3):
+        for column in (1, 2, 3, 4):
             source_header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
         source_layout.addWidget(self.source_tree, 1)
         add_button = QPushButton("Add to Selected Parent")
@@ -215,9 +217,10 @@ class AssemblyConfigurationEditorDialog(QDialog):
         structure_layout.addWidget(QLabel("Configuration BOM"))
         self.structure_tree = _ConfigurationDropTree()
         self.structure_tree.drop_handler = self._add_source_items
-        self.structure_tree.setColumnCount(7)
+        self.structure_tree.setColumnCount(8)
         self.structure_tree.setHeaderLabels([
-            "Name", "AES Number", "Version", "Qty", "Type", "Creo File", "Drawing",
+            "Name", "Item Number", "AES Number", "Version", "Qty", "Type",
+            "Creo File", "Drawing",
         ])
         self.structure_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.structure_tree.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -225,9 +228,9 @@ class AssemblyConfigurationEditorDialog(QDialog):
         self.structure_tree.setUniformRowHeights(True)
         structure_header = self.structure_tree.header()
         structure_header.setSectionResizeMode(0, QHeaderView.Stretch)
-        structure_header.setSectionResizeMode(5, QHeaderView.Stretch)
         structure_header.setSectionResizeMode(6, QHeaderView.Stretch)
-        for column in (1, 2, 3, 4):
+        structure_header.setSectionResizeMode(7, QHeaderView.Stretch)
+        for column in (1, 2, 3, 4, 5):
             structure_header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
         structure_layout.addWidget(self.structure_tree, 1)
 
@@ -278,9 +281,7 @@ class AssemblyConfigurationEditorDialog(QDialog):
             )
         elif self.bom_service:
             details = self.bom_service.get_part_details(self.root_bom_id) or {}
-            identity = str(
-                details.get("aes_number") or details.get("part_number") or ""
-            ).strip()
+            identity = str(details.get("part_number") or "").strip()
             default_name = str(details.get("name") or "").strip()
             if identity and default_name:
                 self.name_edit.setPlaceholderText(f"{identity} - {default_name} configuration")
@@ -362,6 +363,7 @@ class AssemblyConfigurationEditorDialog(QDialog):
                 continue
             item = QTreeWidgetItem([
                 str(component.get("name") or ""),
+                str(component.get("part_number") or ""),
                 str(component.get("aes_number") or ""),
                 str(component.get("type") or ""),
                 str(component.get("version_label") or ""),
@@ -385,6 +387,7 @@ class AssemblyConfigurationEditorDialog(QDialog):
             path = str(member.get("occurrence_path") or "")
             item = QTreeWidgetItem([
                 str(member.get("name") or ""),
+                str(member.get("part_number") or ""),
                 str(member.get("aes_number") or ""),
                 str(member.get("version_label") or ""),
                 str(member.get("quantity") or 1),
@@ -775,9 +778,10 @@ class ManageAssemblyConfigurationsDialog(QDialog):
         self.structure_label = QLabel("Configuration Structure")
         member_layout.addWidget(self.structure_label)
         self.member_tree = QTreeWidget()
-        self.member_tree.setColumnCount(7)
+        self.member_tree.setColumnCount(8)
         self.member_tree.setHeaderLabels([
-            "Name", "AES Number", "Version", "Qty", "Type", "Creo File", "Drawing",
+            "Name", "Item Number", "AES Number", "Version", "Qty", "Type",
+            "Creo File", "Drawing",
         ])
         self.member_tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.member_tree.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -785,9 +789,9 @@ class ManageAssemblyConfigurationsDialog(QDialog):
         self.member_tree.setUniformRowHeights(True)
         member_header = self.member_tree.header()
         member_header.setSectionResizeMode(0, QHeaderView.Stretch)
-        member_header.setSectionResizeMode(5, QHeaderView.Stretch)
         member_header.setSectionResizeMode(6, QHeaderView.Stretch)
-        for column in (1, 2, 3, 4):
+        member_header.setSectionResizeMode(7, QHeaderView.Stretch)
+        for column in (1, 2, 3, 4, 5):
             member_header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
         member_layout.addWidget(self.member_tree)
 
@@ -937,6 +941,7 @@ class ManageAssemblyConfigurationsDialog(QDialog):
         for member in members:
             item = QTreeWidgetItem([
                 str(member.get("name") or ""),
+                str(member.get("part_number") or ""),
                 str(member.get("aes_number") or ""),
                 str(member.get("version_label") or ""),
                 str(member.get("quantity") or 1),

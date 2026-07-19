@@ -32,7 +32,7 @@ _DOC_BADGE_STYLE = {
 class PackagePartsDialog(QDialog):
     def __init__(self, parent=None, project_id=None, preselected_ids=None):
         super().__init__(parent)
-        self.setWindowTitle("Select Parts")
+        self.setWindowTitle("Select Items")
         self.setModal(True)
         self.resize(860, 620)
         self.setMinimumSize(720, 520)
@@ -43,7 +43,7 @@ class PackagePartsDialog(QDialog):
         self._rebuilding = False
 
         self.bom_repo = BomRepository()
-        self._all_parts = []  # list of dicts {id,aes,name,type}
+        self._all_parts = []
         self._doc_status_cache = {}
 
         self._build_ui()
@@ -55,14 +55,16 @@ class PackagePartsDialog(QDialog):
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
 
-        title = QLabel("Select parts")
+        title = QLabel("Select Items")
         title.setStyleSheet("font-size:16px;font-weight:700;color:#172033;")
         layout.addWidget(title)
         layout.addWidget(QLabel("Selections are preserved while searching and filtering."))
 
         search_row = QHBoxLayout()
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Filter by AES / name / type...")
+        self.search_input.setPlaceholderText(
+            "Filter by Item Number, name, AES, or type..."
+        )
         self.search_input.textChanged.connect(self._apply_filter)
         search_row.addWidget(self.search_input)
 
@@ -78,7 +80,7 @@ class PackagePartsDialog(QDialog):
 
         summary = QFrame()
         summary.setStyleSheet(
-            "QFrame{background:#f4f7fb;border:1px solid #dbe3ec;border-radius:5px;}"
+            "QFrame{background:#f4f7fb;border:1px solid #b7c1ca;border-radius:0;}"
             "QLabel{background:transparent;border:none;}"
         )
         summary_row = QHBoxLayout(summary)
@@ -114,20 +116,23 @@ class PackagePartsDialog(QDialog):
 
         columns = QFrame()
         columns.setStyleSheet(
-            "QFrame{background:#edf1f5;border:1px solid #d8dee6;border-radius:4px;}"
+            "QFrame{background:#dfe5ea;border:1px solid #aeb8c2;border-radius:0;}"
             "QLabel{background:transparent;border:none;color:#526071;font-size:10px;font-weight:700;}"
         )
         columns_layout = QHBoxLayout(columns)
         columns_layout.setContentsMargins(34, 5, 7, 5)
         columns_layout.setSpacing(8)
-        aes_header = QLabel("AES / NUMBER")
-        aes_header.setFixedWidth(130)
-        name_header = QLabel("PART NAME")
+        number_header = QLabel("ITEM NUMBER")
+        number_header.setFixedWidth(105)
+        aes_header = QLabel("AES NUMBER")
+        aes_header.setFixedWidth(90)
+        name_header = QLabel("ITEM NAME")
         name_header.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         type_header = QLabel("TYPE")
-        type_header.setFixedWidth(72)
+        type_header.setFixedWidth(115)
         docs_header = QLabel("DOCUMENT STATUS")
         docs_header.setFixedWidth(126)
+        columns_layout.addWidget(number_header)
         columns_layout.addWidget(aes_header)
         columns_layout.addWidget(name_header, 1)
         columns_layout.addWidget(type_header)
@@ -153,19 +158,21 @@ class PackagePartsDialog(QDialog):
         parts = self.bom_repo.get_all(self.project_id)
         rows = []
         for p in parts:
+            if getattr(p, "represented_part_id", None) is not None:
+                continue
             rows.append(
                 {
                     "id": int(p.id),
+                    "part_number": (p.part_number or ""),
                     "aes_number": (p.aes_number or ""),
                     "name": (p.name or ""),
-                    "type": (p.type or ""),
+                    "type": (p.item_type or p.type or ""),
                     "pdf": self._document_status(int(p.id), "pdf"),
                     "step": self._document_status(int(p.id), "step"),
                 }
             )
 
-        # simple sort: AES then name
-        rows.sort(key=lambda r: (r["aes_number"].lower(), r["name"].lower()))
+        rows.sort(key=lambda r: (r["part_number"].lower(), r["name"].lower()))
         self._all_parts = rows
         for part_type in sorted({row["type"] for row in rows if row["type"]}, key=str.lower):
             self.type_filter.addItem(part_type, part_type)
@@ -181,7 +188,10 @@ class PackagePartsDialog(QDialog):
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
         for p in self._all_parts:
-            label = f"{p['aes_number']} | {p['name']} | {p['type']}"
+            label = (
+                f"{p['part_number']} | {p['name']} | "
+                f"{p['aes_number']} | {p['type']}"
+            )
             if q and q not in label.lower():
                 continue
             if part_type and p["type"].lower() != part_type:
@@ -254,24 +264,30 @@ class PackagePartsDialog(QDialog):
         layout.setContentsMargins(28, 2, 6, 2)
         layout.setSpacing(8)
 
+        number = QLabel(part["part_number"] or "-")
+        number.setFixedWidth(105)
+        number.setStyleSheet("background:transparent;color:#172033;font-size:11px;font-weight:700;")
         aes = QLabel(part["aes_number"] or "-")
-        aes.setFixedWidth(130)
+        aes.setFixedWidth(90)
         aes.setStyleSheet("background:transparent;color:#334155;font-size:11px;font-weight:600;")
         name = QLabel(part["name"] or "-")
         name.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         name.setStyleSheet("background:transparent;color:#172033;font-size:11px;font-weight:600;")
         name.setToolTip(part["name"] or "")
         part_type = QLabel(part["type"] or "-")
-        part_type.setFixedWidth(72)
+        part_type.setFixedWidth(115)
         part_type.setStyleSheet("background:transparent;color:#64748b;font-size:10px;")
 
+        layout.addWidget(number)
         layout.addWidget(aes)
         layout.addWidget(name, 1)
         layout.addWidget(part_type)
         layout.addWidget(self._document_badge("PDF", part["pdf"]))
         layout.addWidget(self._document_badge("STEP", part["step"]))
         row.setToolTip(
-            f"{part['aes_number']} | {part['name']} | {part['type']}\n"
+            f"{part['part_number']} — {part['name']}"
+            + (f" | AES {part['aes_number']}" if part['aes_number'] else "")
+            + f" | {part['type']}\n"
             f"{part['pdf']['tooltip']}\n{part['step']['tooltip']}"
         )
         return row
@@ -284,7 +300,7 @@ class PackagePartsDialog(QDialog):
         badge.setAlignment(Qt.AlignCenter)
         badge.setToolTip(str((status or {}).get("tooltip") or f"{label}: unknown"))
         badge.setStyleSheet(
-            f"background:{bg};color:{fg};border:1px solid {dot};border-radius:4px;"
+            f"background:{bg};color:{fg};border:1px solid {dot};border-radius:0;"
             f"font-size:10px;font-weight:700;"
         )
         return badge

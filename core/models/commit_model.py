@@ -9,7 +9,7 @@ class Commit:
     id: int
     commit_id: str
     title: str
-    part_id: int
+    part_id: Optional[int]
     type: str
     filename: str
     file_path: Optional[str] = None
@@ -35,3 +35,5 @@ class Commit:
     step_error: Optional[str] = None
     step_face_map_path: Optional[str] = None
     object_iteration_id: Optional[int] = None
+    cad_document_id: Optional[int] = None
+    creo_file_version: Optional[int] = None

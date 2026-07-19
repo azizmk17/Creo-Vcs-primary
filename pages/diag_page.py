@@ -344,7 +344,11 @@ class DiagPage(QDialog):
             )
             owner = " — ".join(
                 value for value in (
-                    str(dependency.get("owner_aes_number") or "").strip(),
+                    str(
+                        dependency.get("owner_item_number")
+                        or dependency.get("owner_aes_number")
+                        or ""
+                    ).strip(),
                     str(dependency.get("owner_name") or "").strip(),
                 ) if value
             )
@@ -392,7 +396,8 @@ class DiagPage(QDialog):
             )
             return
         labels = [
-            f"{row.get('aes_number') or 'No AES'} — {row.get('name') or row.get('id')} ({int(row.get('dependency_count') or 0)} files)"
+            f"{row.get('part_number') or 'No Number'} — {row.get('name') or row.get('id')} "
+            f"({int(row.get('dependency_count') or 0)} files)"
             for row in packages
         ]
         selected_label, ok = QInputDialog.getItem(
@@ -414,7 +419,8 @@ class DiagPage(QDialog):
         QMessageBox.information(
             self,
             "Dependencies assigned",
-            f"Assigned {count} CAD file(s) to {package.get('aes_number') or package.get('name')}.\n"
+            f"Assigned {count} CAD file(s) to "
+            f"{package.get('part_number') or package.get('name')}.\n"
             "They are no longer checked as individual BOM files.",
         )
         self.refresh_status()

@@ -250,12 +250,12 @@ class AffectedBomDropCard(QFrame):
         self.setStyleSheet("""
             AffectedBomDropCard {
                 background: #ffffff;
-                border: 1px solid #d1d5db;
-                border-radius: 8px;
+                border: 1px solid #aeb8c2;
+                border-radius: 0;
             }
             AffectedBomDropCard:hover {
-                border-color: #2563eb;
-                background: #eff6ff;
+                border-color: #55768f;
+                background: #f1f4f6;
             }
             QLabel {
                 background: transparent;
@@ -266,10 +266,13 @@ class AffectedBomDropCard(QFrame):
         layout.setContentsMargins(10, 7, 10, 7)
         layout.setSpacing(2)
 
-        title = QLabel(
-            f"{self.part_info.get('name') or 'BOM item'}"
-            f"  |  {self.part_info.get('aes_number') or ''}"
-        )
+        item_number = str(self.part_info.get("part_number") or "No Number").strip()
+        item_name = str(self.part_info.get("name") or "Item").strip()
+        aes_number = str(self.part_info.get("aes_number") or "").strip()
+        identity = f"{item_number} — {item_name}"
+        if aes_number:
+            identity += f"  |  AES {aes_number}"
+        title = QLabel(identity)
         title.setStyleSheet("font-size: 11px; font-weight: 700; color: #111827;")
         title.setFixedHeight(18)
         title.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -1022,7 +1025,7 @@ class CommitPage(QWidget):
         self.step_compare_checkbox.setChecked(False)
         self.step_compare_checkbox.setEnabled(False)
         self.step_compare_checkbox.setToolTip(
-            "Run STEP comparison using the STEP file attached to each affected BOM item."
+            "Run STEP comparison using the STEP file attached to each affected Item."
         )
         self.attached_step_compare_checkbox = self.step_compare_checkbox
         file_btns.addWidget(self.step_compare_checkbox)
@@ -1494,34 +1497,116 @@ class CommitPage(QWidget):
     def _clear_affected_bom_items(self):
         return
 
+    @staticmethod
+    def _optional_int(value):
+        try:
+            return int(value) if value is not None else None
+        except Exception:
+            return None
+
+    def _staged_creo_files_for_commit(self):
+        rows = []
+        for staged in self.uncommitted_parts or []:
+            path = str(staged.get("path") or staged.get("filename") or "")
+            filename = os.path.basename(path)
+            if not filename or not is_creo_file(filename):
+                continue
+            clean_filename = self._clean_creo_file_name(filename)
+            rows.append({
+                "path": path,
+                "filename": filename,
+                "clean_filename": clean_filename,
+                "base_stem": os.path.splitext(clean_filename)[0],
+            })
+        return rows
+
+    def _pdm_document_indexes_for_affected_items(self, project_id: int):
+        documents = []
+        try:
+            documents = self.bom_service.list_pdm_cad_documents(int(project_id)) or []
+        except Exception:
+            documents = []
+        by_file = {}
+        by_base = {}
+        by_id = {}
+        for document in documents:
+            doc_id = self._optional_int(document.get("id"))
+            if doc_id is not None:
+                by_id[doc_id] = document
+            file_name = self._clean_creo_file_name(document.get("file_name") or "")
+            if file_name:
+                by_file[file_name.casefold()] = document
+                by_base[os.path.splitext(file_name)[0].casefold()] = document
+            base_name = str(document.get("base_file_name") or "").strip()
+            if base_name:
+                by_base[base_name.casefold()] = document
+        return by_file, by_base, by_id
+
+    def _item_id_for_pdm_document_in_commit_page(self, document: dict, documents_by_id: dict) -> int | None:
+        item_id = self._optional_int(document.get("item_id"))
+        if item_id is not None:
+            return item_id
+        owner_id = self._optional_int(document.get("drawing_owner_cad_document_id"))
+        if owner_id is not None:
+            owner_document = documents_by_id.get(owner_id)
+            if owner_document:
+                owner_item_id = self._optional_int(owner_document.get("item_id"))
+                if owner_item_id is not None:
+                    return owner_item_id
+        return None
+
+    def _legacy_affected_bom_items_for_staged_file(self, staged_file: dict, project_id: int, designer_id):
+        filename = staged_file.get("filename") or ""
+        clean_filename = staged_file.get("clean_filename") or filename
+        base_name = clean_filename
+        ext = os.path.splitext(clean_filename)[1].lstrip(".").lower()
+        try:
+            if ext == "drw":
+                bom = self.bom_repo.get_by_drawing_file_name_for_commit(
+                    base_name,
+                    int(project_id),
+                    designer_id,
+                )
+                return [bom] if bom else []
+            return self.bom_repo.get_all_by_base_file_name_for_commit(
+                base_name,
+                int(project_id),
+                designer_id,
+            ) or []
+        except Exception:
+            return []
+
     def _affected_bom_items_for_staging(self):
         project_id = self.session.project_id
         if not project_id:
             return []
         designer_id = self._designer_id_for_commit()
+        staged_creo_files = self._staged_creo_files_for_commit()
+        cad_by_file, cad_by_base, cad_by_id = self._pdm_document_indexes_for_affected_items(int(project_id))
         result = {}
-        for staged in self.uncommitted_parts or []:
-            filename = os.path.basename(staged.get("path") or staged.get("filename") or "")
-            if not filename or not is_creo_file(filename):
-                continue
-            base_name = ".".join(filename.split(".")[:-1])
-            ext = ".".join(base_name.split(".")[1:]).lower()
-            try:
-                if ext == "drw":
-                    bom = self.bom_repo.get_by_drawing_file_name_for_commit(
-                        base_name,
-                        int(project_id),
-                        designer_id,
-                    )
-                    boms = [bom] if bom else []
-                else:
-                    boms = self.bom_repo.get_all_by_base_file_name_for_commit(
-                        base_name,
-                        int(project_id),
-                        designer_id,
-                    ) or []
-            except Exception:
-                boms = []
+        for staged in staged_creo_files:
+            clean_filename = staged.get("clean_filename") or staged.get("filename") or ""
+            cad_document = cad_by_file.get(clean_filename.casefold())
+            if cad_document is None:
+                cad_document = cad_by_base.get((staged.get("base_stem") or "").casefold())
+            item_id = (
+                self._item_id_for_pdm_document_in_commit_page(cad_document, cad_by_id)
+                if cad_document else None
+            )
+            if item_id is not None:
+                try:
+                    info = self.bom_service.get_part_details(int(item_id)) or {}
+                except Exception:
+                    info = {}
+                if info:
+                    result[int(item_id)] = info
+                    continue
+
+            boms = self._legacy_affected_bom_items_for_staged_file(
+                staged,
+                int(project_id),
+                designer_id,
+            )
             for bom in boms:
                 if not bom:
                     continue
@@ -1534,6 +1619,7 @@ class CommitPage(QWidget):
         if not hasattr(self, "attach_affected_btn"):
             return
         items = self._affected_bom_items_for_staging()
+        staged_creo_count = len(self._staged_creo_files_for_commit())
         active_part_ids = {int(item.get("id")) for item in items if item.get("id") is not None}
         pending = getattr(self, "_pending_engineering_attachments", {})
         for part_id in list(pending.keys()):
@@ -1541,16 +1627,19 @@ class CommitPage(QWidget):
                 pending.pop(part_id, None)
         count = len(items)
         pending_count = sum(len(v or []) for v in getattr(self, "_pending_engineering_attachments", {}).values())
-        enabled = count > 0 and not getattr(self, "_processing_action", False)
-        self.attach_affected_btn.setEnabled(enabled)
+        action_enabled = staged_creo_count > 0 and not getattr(self, "_processing_action", False)
+        step_enabled = count > 0 and not getattr(self, "_processing_action", False)
+        self.attach_affected_btn.setEnabled(action_enabled)
         if hasattr(self, "attached_step_compare_checkbox"):
-            self.attached_step_compare_checkbox.setEnabled(enabled)
-            if not enabled:
+            self.attached_step_compare_checkbox.setEnabled(step_enabled)
+            if not step_enabled:
                 self.attached_step_compare_checkbox.setChecked(False)
         if count and pending_count:
             text = f"Attach docs to affected BOM ({count}, {pending_count} staged)..."
         elif count:
             text = f"Attach docs to affected BOM ({count})..."
+        elif staged_creo_count:
+            text = "Attach docs to affected BOM..."
         else:
             text = "Attach docs to affected BOM..."
         self.attach_affected_btn.setText(text)
@@ -1558,15 +1647,27 @@ class CommitPage(QWidget):
     def _open_affected_bom_attachment_dialog(self):
         items = self._affected_bom_items_for_staging()
         if not items:
-            QMessageBox.information(self, "Affected BOM", "Stage Creo files first to resolve affected BOM items.")
+            if self._staged_creo_files_for_commit():
+                QMessageBox.information(
+                    self,
+                    "Affected Items",
+                    "The staged Creo files do not resolve to an associated EBOM Item. "
+                    "Register the CAD Document and associate it to an Item, or bind a DRW to its owning PRT/ASM.",
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "Affected Items",
+                    "Stage Creo files first to resolve affected Items.",
+                )
             return
 
         dialog = QDialog(self)
-        dialog.setWindowTitle("Attach Documents to Affected BOM Items")
+        dialog.setWindowTitle("Attach Documents to Affected Items")
         dialog.resize(560, 420)
         layout = QVBoxLayout(dialog)
         intro = QLabel(
-            "Drop PDF, STEP, or validation documents onto the correct BOM item. Files are staged with this commit and will be added to the vault only after push to master."
+            "Drop PDF, STEP, or validation documents onto the correct Item. Files are staged with this commit and will be added to the vault only after push to master."
         )
         intro.setWordWrap(True)
         intro.setStyleSheet("font-size: 10px; color: #374151;")
@@ -1689,7 +1790,7 @@ class CommitPage(QWidget):
             self._refresh_affected_bom_items()
             try:
                 self.window().statusBar().showMessage(
-                    f"{added} file(s) staged for the affected BOM item."
+                    f"{added} file(s) staged for the affected Item."
                 )
             except Exception:
                 pass
@@ -2121,10 +2222,15 @@ class CommitPage(QWidget):
                 ("Commit ID", item.get("commit_id")),
                 ("Status", item.get("status")),
                 ("Type", item.get("type")),
-                ("Part", item.get("part_name") or item.get("part_id")),
-                ("Part ID", item.get("part_id")),
-                ("AES", item.get("aes_number")),
-                ("Part Number", item.get("part_number")),
+                ("Item Number", item.get("part_number")),
+                ("AES Number", item.get("aes_number")),
+                ("Item", item.get("part_name") or item.get("part_id")),
+                ("Internal Item ID", item.get("part_id")),
+                ("CAD Document ID", item.get("cad_document_id")),
+                ("Approved Creo Version", (
+                    f".{item.get('approved_version')}"
+                    if item.get("approved_version") is not None else ""
+                )),
                 ("Drawing Number", item.get("drawing_number")),
                 ("Revision", item.get("part_revision")),
                 ("Lifecycle", item.get("part_lifecycle_state")),
@@ -3003,13 +3109,15 @@ class CommitPage(QWidget):
 
             def on_commit_error(exc):
                 error_str = str(exc)
-                if error_str.startswith("cad404:"):
+                if error_str.startswith("cad_register_required:"):
                     missing_file = error_str.split(":", 1)[1]
-                    self.ask_new_part_action(missing_file)
+                    self.ask_register_cad_document_action(missing_file)
+                elif error_str.startswith("cad404:"):
+                    missing_file = error_str.split(":", 1)[1]
+                    self.ask_register_cad_document_action(missing_file)
                 elif error_str.startswith("drw404:"):
                     missing_file = error_str.split(":", 1)[1]
-                    QMessageBox.warning(self, "Commit Failed",
-                        f"Drawing file {missing_file} is not associated to any part.")
+                    self.ask_register_cad_document_action(missing_file)
                 elif error_str.startswith(("Commit blocked:", "Error:", "STEP compare failed")):
                     QMessageBox.warning(self, "Commit Blocked", error_str)
                 else:
@@ -3028,36 +3136,149 @@ class CommitPage(QWidget):
             pass
         QMessageBox.information(self, "Issue", "Open Issue Center to create a new issue.")
 
-    def ask_new_part_action(self, base_file_name: str):
+    def _clean_creo_file_name(self, filename: str) -> str:
+        name = os.path.basename(str(filename or "").replace("\\", "/")).strip()
+        match = re.match(r"^(.*\.(?:asm|prt|drw))\.\d+$", name, flags=re.IGNORECASE)
+        return match.group(1) if match else name
+
+    def _staged_path_for_file(self, file_name: str) -> str | None:
+        target = os.path.basename(str(file_name or ""))
+        for staged in self.uncommitted_parts or []:
+            path = str(staged.get("path") or staged.get("filename") or "")
+            if os.path.basename(path) == target:
+                return path
+        return None
+
+    def ask_register_cad_document_action(self, file_name: str):
         msg = QMessageBox(self)
         msg.setIcon(QMessageBox.Warning)
-        msg.setWindowTitle("Missing BOM Entry")
-        msg.setText(f"No BOM item found for:\n{base_file_name}")
+        msg.setWindowTitle("CAD Document Not Registered")
+        msg.setText(f"No managed CAD Document exists for:\n{file_name}")
         msg.setInformativeText(
-            "Would you like to create a new part for this file?")
-        create_btn = msg.addButton("New Part", QMessageBox.AcceptRole)
+            "Register this staged Creo file as a CAD Document? "
+            "No EBOM Item will be created automatically.")
+        register_btn = msg.addButton("Register CAD Document", QMessageBox.AcceptRole)
         msg.addButton("Cancel", QMessageBox.RejectRole)
         msg.exec_()
-        if msg.clickedButton() == create_btn:
-            self.add_part(base_file_name)
+        if msg.clickedButton() == register_btn:
+            self.register_staged_cad_document(file_name)
+
+    def register_staged_cad_document(self, file_name: str):
+        source_path = self._staged_path_for_file(file_name)
+        if not source_path:
+            QMessageBox.warning(
+                self,
+                "Register CAD Document",
+                f"The staged file is no longer available:\n{file_name}",
+            )
+            return
+        clean_file = self._clean_creo_file_name(os.path.basename(source_path))
+        stem, extension = os.path.splitext(clean_file)
+        category = {
+            ".asm": "ASSEMBLY",
+            ".prt": "COMPONENT",
+            ".drw": "DRAWING",
+        }.get(extension.casefold(), "OTHER")
+        if category == "OTHER":
+            QMessageBox.warning(
+                self,
+                "Register CAD Document",
+                "Only Creo .prt, .asm, and .drw files can be registered here.",
+            )
+            return
+
+        drawing_owner_id = None
+        if category == "DRAWING":
+            models = [
+                document
+                for document in (self.bom_service.list_pdm_cad_documents() or [])
+                if str(document.get("category") or "").upper()
+                in {"ASSEMBLY", "COMPONENT"}
+            ]
+            if not models:
+                QMessageBox.warning(
+                    self,
+                    "Register Drawing",
+                    "Register the owning PRT/ASM CAD Document first. "
+                    "A drawing cannot be registered as an isolated CAD Document.",
+                )
+                return
+            labels = [
+                f"{document.get('file_name') or document.get('name') or document.get('id')}"
+                + (
+                    f" - {document.get('name')}"
+                    if document.get("name")
+                    and str(document.get("name")).casefold()
+                    != str(document.get("file_name") or "").casefold()
+                    else ""
+                )
+                for document in models
+            ]
+            selected, accepted = QInputDialog.getItem(
+                self,
+                "Bind Drawing to Model",
+                "Owning PRT/ASM CAD Document:",
+                labels,
+                0,
+                False,
+            )
+            if not accepted:
+                return
+            drawing_owner_id = int(models[labels.index(selected)]["id"])
+
+        name, accepted = QInputDialog.getText(
+            self,
+            "Register CAD Document",
+            "CAD Document name:",
+            text=stem,
+        )
+        if not accepted:
+            return
+        try:
+            cad_document_id = self.bom_service.create_pdm_cad_document(
+                number=clean_file,
+                name=str(name or stem).strip(),
+                file_name=clean_file,
+                category=category,
+                authoring_application="CREO",
+                drawing_owner_cad_document_id=drawing_owner_id,
+            )
+            self.bom_service.checkout_pdm_cad_document(int(cad_document_id))
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Register CAD Document",
+                f"Could not register/check out the CAD Document:\n{exc}",
+            )
+            return
+        self.window().statusBar().showMessage(
+            f"CAD Document {clean_file} registered and checked out.",
+            6000,
+        )
+        self.commit_changes()
 
     def add_part(self, filename):
         dialog = PartDialog(self, filename=filename)
         if dialog.exec_() == QDialog.Accepted:
             part_data = dialog.get_data()
             if not part_data["name"]:
-                QMessageBox.warning(self, "Validation",
+                QMessageBox.warning(self, "Item Validation",
                     "Name is required.")
                 return
             try:
                 added_part_id = self.bom_service.add_part(part_data)
-                QMessageBox.information(self, "Success",
-                    "Part added successfully.")
+                if not isinstance(added_part_id, int):
+                    raise ValueError("The Item could not be created.")
+                created = self.bom_service.get_part_details(added_part_id) or {}
+                self.window().statusBar().showMessage(
+                    f"Item {created.get('part_number') or added_part_id} created and associated.",
+                    6000,
+                )
                 self.bom_service.checkout_part(int(added_part_id))
                 self.commit_changes()
             except Exception as e:
-                QMessageBox.critical(self, "Error",
-                    f"Failed to add part: {str(e)}")
+                QMessageBox.critical(self, "Create Item",
+                    f"Could not create Item: {str(e)}")
 
     # ═══════════════════════════════════════════════════════════════════
     #  WORKFLOW ACTIONS
@@ -3091,9 +3312,16 @@ class CommitPage(QWidget):
             )
             return
         def do_push():
-            affected_part_ids = self.merge_service.excute_merge_by_commit_id(group["commit_id"])
+            merge_result = self.merge_service.excute_merge_by_commit_id(group["commit_id"])
+            if isinstance(merge_result, dict):
+                affected_part_ids = merge_result.get("affected_part_ids") or []
+                affected_cad_document_ids = merge_result.get("affected_cad_document_ids") or []
+            else:
+                affected_part_ids = merge_result or []
+                affected_cad_document_ids = []
             return {
                 "affected_part_ids": affected_part_ids,
+                "affected_cad_document_ids": affected_cad_document_ids,
                 "history": self.commit_service.get_commit_history() or [],
                 "pending": self.commit_service.get_pending_commits_grouped(
                     self.session.project_id, self.session.user_id, self.is_designer
@@ -3104,7 +3332,10 @@ class CommitPage(QWidget):
             result = result or {}
             return {
                 "steps": [
-                    lambda: self._refresh_bom_rows_for_parts(result.get("affected_part_ids")),
+                    lambda: self._refresh_pdm_rows_after_merge(
+                        result.get("affected_part_ids"),
+                        result.get("affected_cad_document_ids"),
+                    ),
                     lambda: self._set_pending_commit_groups(result.get("pending") or []),
                     lambda: self._set_commit_history_rows(result.get("history") or []),
                 ],
@@ -3213,6 +3444,23 @@ class CommitPage(QWidget):
             main_window = self.window()
             bom_page = getattr(main_window, "bom_page", None)
             if bom_page and hasattr(bom_page, "refresh_parts_after_merge"):
+                bom_page.refresh_parts_after_merge(part_ids)
+        except Exception:
+            pass
+
+    def _refresh_pdm_rows_after_merge(self, part_ids=None, cad_document_ids=None):
+        try:
+            main_window = self.window()
+            bom_page = getattr(main_window, "bom_page", None)
+            if not bom_page:
+                return
+            if hasattr(bom_page, "refresh_after_pdm_merge"):
+                bom_page.refresh_after_pdm_merge(
+                    part_ids or [],
+                    cad_document_ids or [],
+                )
+                return
+            if part_ids and hasattr(bom_page, "refresh_parts_after_merge"):
                 bom_page.refresh_parts_after_merge(part_ids)
         except Exception:
             pass

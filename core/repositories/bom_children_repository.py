@@ -177,6 +177,7 @@ class BomChildrenRepository:
                        b.type,
                        bc.parent_id,
                        parent.name AS parent_name,
+                       parent.part_number AS parent_part_number,
                        parent.aes_number AS parent_aes_number,
                        COALESCE(bc.quantity, 1) AS quantity,
                        bc.id AS usage_id,

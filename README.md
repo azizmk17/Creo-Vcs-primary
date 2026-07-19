@@ -1,5 +1,9 @@
 # Nexus (BOM Manager)
 
+> **New PDM architecture:** Start with [README_PDM.md](README_PDM.md) for the
+> CAD Document, Item, association, CAD-to-EBOM build, supplier package, and
+> migration workflows.
+
 Desktop (PyQt5) application for managing a Creo-based BOM with a lightweight, PLM-inspired workflow:
 
 - Multi-project BOM management (parts + assemblies + parent/child relationships)

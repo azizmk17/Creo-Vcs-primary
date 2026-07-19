@@ -20,9 +20,11 @@ from core.services.permission_decorators import require_permission
 from core.services.issue_service import IssueService
 from core.services.traceability_service import TraceabilityService
 from core.services.part_file_service import PartFileService
+from core.services.pdm_service import PdmService
 
 from utils import (
     is_creo_file,
+    get_version_number,
     ensure_dir_exists,
     safe_copy2,
     safe_exists,
@@ -43,6 +45,7 @@ class CommitService(BaseService):
         self.issue_service = IssueService()
         self.traceability_service = TraceabilityService()
         self.part_file_service = PartFileService()
+        self.pdm_service = PdmService()
 
         self.session = SessionManager()
 
@@ -57,6 +60,86 @@ class CommitService(BaseService):
     def _canonical_part_root(self, value: str) -> str:
         base = os.path.basename(value or "")
         return (base.split(".")[0] if base else "").strip().lower()
+
+    def _clean_creo_file_name(self, filename: str) -> str:
+        name = os.path.basename(str(filename or "").replace("\\", "/")).strip()
+        match = re.match(r"^(.*\.(?:asm|prt|drw))\.\d+$", name, flags=re.IGNORECASE)
+        return match.group(1) if match else name
+
+    def _cad_category_for_file(self, filename: str) -> str:
+        clean_file = self._clean_creo_file_name(filename)
+        extension = os.path.splitext(clean_file)[1].casefold()
+        if extension == ".asm":
+            return "ASSEMBLY"
+        if extension == ".prt":
+            return "COMPONENT"
+        if extension == ".drw":
+            return "DRAWING"
+        return "OTHER"
+
+    def _item_id_for_cad_commit(self, cad_document: dict) -> int | None:
+        cad_document_id = int(cad_document["id"])
+        association = self.pdm_service.repo.get_active_association_for_cad(
+            cad_document_id
+        )
+        if association and association.get("item_id") is not None:
+            return int(association["item_id"])
+        owner_id = cad_document.get("drawing_owner_cad_document_id")
+        if owner_id is not None:
+            owner_association = self.pdm_service.repo.get_active_association_for_cad(
+                int(owner_id)
+            )
+            if owner_association and owner_association.get("item_id") is not None:
+                return int(owner_association["item_id"])
+        return None
+
+    def _cad_document_label(self, cad_document: dict | None, fallback: str = "CAD Document") -> str:
+        if not cad_document:
+            return fallback
+        return (
+            cad_document.get("file_name")
+            or cad_document.get("name")
+            or fallback
+        )
+
+    def _ensure_drawing_checkout_from_owner(
+        self,
+        cad_document: dict,
+        designer_id: int,
+        staged_filename: str,
+    ) -> dict:
+        """Allow a managed DRW commit when its owning PRT/ASM is already checked out."""
+        label = self._cad_document_label(cad_document, staged_filename)
+        checkout_owner = cad_document.get("checked_out_by")
+        if checkout_owner is not None:
+            return cad_document
+
+        owner_id = cad_document.get("drawing_owner_cad_document_id")
+        owner_document = (
+            self.pdm_service.repo.get_cad_document(int(owner_id))
+            if owner_id is not None else None
+        )
+        owner_label = self._cad_document_label(owner_document, "owning model")
+        owner_checkout = owner_document.get("checked_out_by") if owner_document else None
+        if owner_checkout is None:
+            raise ValueError(
+                f"Commit blocked: drawing CAD Document {label} is not checked out, "
+                f"and its owning model {owner_label} is not checked out."
+            )
+        if int(owner_checkout) != int(designer_id):
+            raise ValueError(
+                f"Commit blocked: drawing CAD Document {label} is not checked out, "
+                f"and its owning model {owner_label} is checked out by another user."
+            )
+        try:
+            return self.pdm_service.repo.checkout_cad_document(
+                int(cad_document["id"]), int(designer_id)
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"Commit blocked: drawing CAD Document {label} could not be checked out "
+                f"from the owning model checkout: {exc}"
+            )
 
     def _step_summary(self, diff_obj) -> dict:
         return {
@@ -305,13 +388,13 @@ class CommitService(BaseService):
 
         user_dir = os.path.join(commit_dir, designer)
         commit_user_dir = os.path.join(user_dir, f"{title}_{commit_id}")
-        uncommitted_bases = [".".join(os.path.basename(f).split(".")[:-1]) for f in uncommitted_parts]
         commit_plan = []
 
         # Phase 1: preflight every file before creating commit artifacts.
         for filepath in uncommitted_parts:
             print(f"Processing file: {filepath}")
             filename = os.path.basename(filepath)
+            clean_filename = self._clean_creo_file_name(filename)
 
             if not safe_exists(filepath):
                 raise ValueError(f"Commit blocked: source file is missing: {filename}")
@@ -319,43 +402,29 @@ class CommitService(BaseService):
             if not is_creo_file(filename):
                 raise ValueError(f"Error: {filename} is not a valid Creo file")
 
-            base_f_name = ".".join(filename.split(".")[:-1])
-            file_extension = ".".join(base_f_name.split(".")[1:])
+            base_stem = os.path.splitext(clean_filename)[0]
+            base_f_name = clean_filename
+            category = self._cad_category_for_file(filename)
+            file_extension = os.path.splitext(clean_filename)[1].lstrip(".").lower()
+            creo_file_version = get_version_number(filename)
             print(f"Base file name: {base_f_name}, Extension: {file_extension}")
             if self.commit_repository.is_duplicate_commit(base_f_name, self.session.project_id):
                 raise ValueError(f"Commit already exists for {base_f_name}. Use --force to overwrite.")
 
-            if file_extension.lower() == "drw":
-                bom_entry = self.bom_repo.get_by_drawing_file_name_for_commit(
-                    base_f_name,
-                    self.session.project_id,
-                    designer_id,
-                )
-                if bom_entry:
-                    cad_file = bom_entry.base_file_name
-                    print(f"Related CAD file for drawing {filename} is {cad_file}")
-                    print(f"Uncommitted parts: {uncommitted_bases}")
-                    if cad_file not in uncommitted_bases:
-                        raise ValueError(f"Error: Cannot Commit drawing without its related CAD,\n Please provide the CAD file {cad_file} related to drawing {filename} in the uncommitted parts.")
-                part_type = "Drw"
-                bom_entries = [bom_entry] if bom_entry else []
-                print(f"Identified as Drawing file: {filename}")
-            else:
-                part_type = "Cad"
-                bom_entries = self.bom_repo.get_all_by_base_file_name_for_commit(
-                    base_f_name,
-                    self.session.project_id,
-                    designer_id,
-                ) or []
-                bom_entry = bom_entries[0] if bom_entries else None
-
-            if not bom_entry:
+            part_type = "Drw" if category == "DRAWING" else "Cad"
+            cad_document = self.pdm_service.repo.get_cad_document_by_file(
+                int(self.session.project_id), clean_filename
+            )
+            if not cad_document:
                 dependency_owner = self.bom_repo.get_dependency_owner(
                     int(self.session.project_id), base_f_name
+                ) or self.bom_repo.get_dependency_owner(
+                    int(self.session.project_id), base_stem
                 )
                 if dependency_owner:
                     owner_label = (
-                        dependency_owner.get("aes_number")
+                        dependency_owner.get("part_number")
+                        or dependency_owner.get("aes_number")
                         or dependency_owner.get("name")
                         or dependency_owner.get("owner_bom_id")
                     )
@@ -364,28 +433,51 @@ class CommitService(BaseService):
                         f"{owner_label}. Commit the owning assembly when its controlled CAD changes; "
                         "this dependency does not require an individual BOM commit."
                     )
-                if part_type == "Cad":
-                    raise ValueError(f"cad404:{filename}")
-                elif part_type == "Drw":
-                    raise ValueError(f"drw404:{filename}")
+                raise ValueError(f"cad_register_required:{filename}")
 
-            for bom in bom_entries:
-                part_id = int(bom.id)
-                locked = self.lock_repo.get_by_part(part_id)
-                if not locked:
-                    raise ValueError(f"Commit blocked: {filename} is not checked out for {bom.aes_number or bom.name or part_id}.")
-                elif locked.user_id != designer_id:
-                    print(locked.user_id)
-                    raise ValueError(f"Commit blocked: {filename} is checked out by another user for {bom.aes_number or bom.name or part_id}.")
+            document_category = str(cad_document.get("category") or "").upper()
+            if category == "DRAWING" and document_category != "DRAWING":
+                raise ValueError(
+                    f"Commit blocked: {filename} is staged as a drawing, but the managed CAD Document is {document_category or 'unclassified'}."
+                )
+            if category in {"ASSEMBLY", "COMPONENT"} and document_category == "DRAWING":
+                raise ValueError(
+                    f"Commit blocked: {filename} is staged as a model, but the managed CAD Document is a drawing."
+                )
+            if category == "DRAWING" and cad_document.get("drawing_owner_cad_document_id") is None:
+                raise ValueError(
+                    f"Commit blocked: drawing {filename} is managed but is not bound to an owning PRT/ASM CAD Document."
+                )
 
-                commit_plan.append({
-                    "filepath": filepath,
-                    "filename": filename,
-                    "dest_path": os.path.join(commit_user_dir, filename),
-                    "base_f_name": base_f_name,
-                    "part_type": part_type,
-                    "part_id": part_id,
-                })
+            if category == "DRAWING":
+                cad_document = self._ensure_drawing_checkout_from_owner(
+                    cad_document,
+                    int(designer_id),
+                    filename,
+                )
+            checkout_owner = cad_document.get("checked_out_by")
+            label = self._cad_document_label(cad_document, filename)
+            if checkout_owner is None:
+                raise ValueError(
+                    f"Commit blocked: CAD Document {label} is not checked out. "
+                    "Check out the CAD Document, then commit the file."
+                )
+            if int(checkout_owner) != int(designer_id):
+                raise ValueError(
+                    f"Commit blocked: CAD Document {label} is checked out by another user."
+                )
+
+            part_id = self._item_id_for_cad_commit(cad_document)
+            commit_plan.append({
+                "filepath": filepath,
+                "filename": filename,
+                "dest_path": os.path.join(commit_user_dir, filename),
+                "base_f_name": base_f_name,
+                "part_type": part_type,
+                "part_id": part_id,
+                "cad_document_id": int(cad_document["id"]),
+                "creo_file_version": creo_file_version,
+            })
 
         delayed_attachments = self._normalize_engineering_attachments(engineering_attachments)
         step_attachment_by_part = {}
@@ -424,9 +516,18 @@ class CommitService(BaseService):
                     "step_face_map_path": None,
                 }
                 step_source_path = step_file_path
-                if bool(step_compare_enabled) and item["part_type"] == "Cad":
+                if (
+                    bool(step_compare_enabled)
+                    and item["part_type"] == "Cad"
+                    and item.get("part_id") is not None
+                ):
                     step_source_path = (step_attachment_by_part.get(int(item["part_id"])) or {}).get("source_path")
-                if bool(step_compare_enabled) and item["part_type"] == "Cad" and step_source_path:
+                if (
+                    bool(step_compare_enabled)
+                    and item["part_type"] == "Cad"
+                    and item.get("part_id") is not None
+                    and step_source_path
+                ):
                     try:
                         previous_step_commit = self.commit_repository.get_latest_step_commit_for_part(
                             int(item["part_id"]),
@@ -446,6 +547,7 @@ class CommitService(BaseService):
                             metadata={
                                 "project_id": self.session.project_id,
                                 "part_id": int(item["part_id"]),
+                                "cad_document_id": int(item["cad_document_id"]),
                                 "base_file_name": item["base_f_name"],
                                 "filename": item["filename"],
                                 "commit_id": str(commit_id),
@@ -496,7 +598,11 @@ class CommitService(BaseService):
             self._write_engineering_attachment_manifest(
                 commit_user_dir,
                 delayed_attachments,
-                {int(item["part_id"]) for item in commit_plan},
+                {
+                    int(item["part_id"])
+                    for item in commit_plan
+                    if item.get("part_id") is not None
+                },
                 commit_id,
             )
 
@@ -525,7 +631,12 @@ class CommitService(BaseService):
                     step_diff_status=step_meta.get("step_diff_status"),
                     step_error=step_meta.get("step_error"),
                     step_face_map_path=step_meta.get("step_face_map_path"),
-                    object_iteration_id=self._object_iteration_id(item["part_id"]),
+                    object_iteration_id=(
+                        self._object_iteration_id(item["part_id"])
+                        if item.get("part_id") is not None else None
+                    ),
+                    cad_document_id=item.get("cad_document_id"),
+                    creo_file_version=item.get("creo_file_version"),
                 )
                 inserted_any = True
 
@@ -552,7 +663,7 @@ class CommitService(BaseService):
             except Exception:
                 pass
             msg = str(e)
-            if msg.startswith(("cad404:", "drw404:", "Error:", "Commit blocked:", "STEP compare failed")):
+            if msg.startswith(("cad404:", "drw404:", "cad_register_required:", "Error:", "Commit blocked:", "STEP compare failed")):
                 raise ValueError(msg)
             raise ValueError(f"Commit failed: {msg}")
         return {
@@ -597,6 +708,8 @@ class CommitService(BaseService):
                 "title": c.title,
                 "project_id": c.project_id,
                 "part_id": c.part_id,
+                "cad_document_id": c.cad_document_id,
+                "creo_file_version": c.creo_file_version,
                 "type": c.type,
                 "date": c.committed_at,
                 "designed_by": designer.username if designer else "Unknown",
@@ -627,6 +740,8 @@ class CommitService(BaseService):
                 "id": c.id,
                 "status": c.status,
                 "filename": c.filename,
+                "cad_document_id": c.cad_document_id,
+                "creo_file_version": c.creo_file_version,
                 "date": c.committed_at,
                 "designed_by": designer.username if designer else "Unknown",
                 "checked_by": checker.username if checker else "Unknown",

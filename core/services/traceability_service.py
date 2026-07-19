@@ -266,23 +266,24 @@ class TraceabilityService(BaseService):
                 commit_file_rows.append([
                     commit.get("commit_id"), f.get("commit_row_id"), f.get("filename"),
                     f.get("change_type"), f.get("type"), f.get("status"),
-                    f.get("part_id"), f.get("part_name"), f.get("aes_number"),
+                    f.get("part_id"), f.get("part_name"), f.get("part_number"),
+                    f.get("aes_number"),
                     f.get("base_file_name"), f.get("file_path"), f.get("committed_at"),
                 ])
         add_sheet(
             "Commit Files",
             ["Commit ID", "Row ID", "Filename", "Change Type", "Type", "Status", "Part ID",
-             "Part Name", "AES", "Base File", "Source Path", "Committed At"],
+             "Part Name", "Item Number", "AES Number", "Base File", "Source Path", "Committed At"],
             commit_file_rows,
             "Every file row changed by linked commits.",
         )
         add_sheet(
             "Native Creo Files",
             ["Part ID", "Name", "Type", "Filename", "Drawing", "Base CAD", "Base DRW",
-             "AES", "Part Number", "Drawing Number", "Revision", "Lifecycle"],
+             "Item Number", "AES Number", "Drawing Number", "Revision", "Lifecycle"],
             [[p.get("id"), p.get("name"), p.get("type"), p.get("filename"), p.get("drawing"),
-              p.get("base_file_name"), p.get("base_drw_name"), p.get("aes_number"),
-             p.get("part_number"), p.get("drawing_number"), p.get("revision"), p.get("lifecycle_state")]
+              p.get("base_file_name"), p.get("base_drw_name"), p.get("part_number"),
+             p.get("aes_number"), p.get("drawing_number"), p.get("revision"), p.get("lifecycle_state")]
              for p in report.get("native_creo_files") or []],
             "Native Creo files affected by or related to the issue.",
         )

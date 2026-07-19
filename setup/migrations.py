@@ -1598,6 +1598,1068 @@ def _migration_31(conn):
             )
 
 
+def _migration_32(conn):
+    """Separate CAD Documents, Item usages, and typed PDM associations.
+
+    The legacy ``bom`` table remains the Item master so existing commits,
+    baselines, revisions, and integrations keep their stable identifiers.
+    Existing file-bearing BOM rows are projected into first-class CAD
+    Documents and the old CAD tree is copied into CAD member links.  A
+    persisted Item structure is then seeded from the legacy delivery policy.
+    """
+    conn.row_factory = sqlite3.Row
+    tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "bom" not in tables:
+        return
+    _ensure_column(conn, "bom", "revision", "revision TEXT DEFAULT 'A'")
+    _ensure_column(conn, "bom", "current_iteration_id", "current_iteration_id INTEGER")
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS cad_documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            number TEXT NOT NULL COLLATE NOCASE,
+            name TEXT NOT NULL,
+            file_name TEXT NOT NULL COLLATE NOCASE,
+            base_file_name TEXT NOT NULL COLLATE NOCASE,
+            authoring_application TEXT NOT NULL DEFAULT 'CREO',
+            category TEXT NOT NULL DEFAULT 'COMPONENT',
+            document_type TEXT NOT NULL DEFAULT 'CAD_DOCUMENT',
+            lifecycle_state TEXT NOT NULL DEFAULT 'IN_WORK',
+            revision TEXT NOT NULL DEFAULT 'A',
+            iteration INTEGER NOT NULL DEFAULT 1,
+            build_excluded INTEGER NOT NULL DEFAULT 0,
+            supplier_owner_item_id INTEGER,
+            legacy_bom_id INTEGER,
+            drawing_owner_cad_document_id INTEGER,
+            checked_out_by INTEGER,
+            checked_out_at TEXT,
+            latest_creo_file_version INTEGER,
+            latest_creo_file_name TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            modified_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(project_id, file_name),
+            FOREIGN KEY (supplier_owner_item_id) REFERENCES bom(id),
+            FOREIGN KEY (legacy_bom_id) REFERENCES bom(id),
+            FOREIGN KEY (drawing_owner_cad_document_id) REFERENCES cad_documents(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS cad_document_iterations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cad_document_id INTEGER NOT NULL,
+            revision TEXT NOT NULL DEFAULT 'A',
+            iteration INTEGER NOT NULL DEFAULT 1,
+            lifecycle_state TEXT NOT NULL DEFAULT 'IN_WORK',
+            primary_path TEXT,
+            sha256 TEXT,
+            size_bytes INTEGER,
+            source_commit_id TEXT,
+            checkin_note TEXT,
+            created_by INTEGER,
+            creo_file_version INTEGER,
+            source_file_name TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(cad_document_id, revision, iteration),
+            FOREIGN KEY (cad_document_id) REFERENCES cad_documents(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS cad_document_contents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cad_document_id INTEGER NOT NULL,
+            content_role TEXT NOT NULL DEFAULT 'SECONDARY',
+            format TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            storage_path TEXT,
+            delivery_required INTEGER NOT NULL DEFAULT 0,
+            derived_from_content_id INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(cad_document_id, content_role, format, file_name),
+            FOREIGN KEY (cad_document_id) REFERENCES cad_documents(id),
+            FOREIGN KEY (derived_from_content_id) REFERENCES cad_document_contents(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS cad_document_members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            parent_cad_document_id INTEGER NOT NULL,
+            child_cad_document_id INTEGER NOT NULL,
+            quantity INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            reference_designator TEXT,
+            component_path TEXT,
+            build_excluded INTEGER NOT NULL DEFAULT 0,
+            legacy_usage_id INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(parent_cad_document_id, child_cad_document_id),
+            FOREIGN KEY (parent_cad_document_id) REFERENCES cad_documents(id),
+            FOREIGN KEY (child_cad_document_id) REFERENCES cad_documents(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS cad_item_associations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            item_id INTEGER NOT NULL,
+            cad_document_id INTEGER NOT NULL,
+            association_type TEXT NOT NULL,
+            drives_structure INTEGER NOT NULL DEFAULT 0,
+            drives_attributes INTEGER NOT NULL DEFAULT 0,
+            participates_in_structure INTEGER NOT NULL DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_by INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            modified_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (item_id) REFERENCES bom(id),
+            FOREIGN KEY (cad_document_id) REFERENCES cad_documents(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS item_usages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            parent_item_id INTEGER NOT NULL,
+            child_item_id INTEGER NOT NULL,
+            quantity INTEGER NOT NULL DEFAULT 1,
+            unit TEXT NOT NULL DEFAULT 'EA',
+            line_number INTEGER,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'MANUAL',
+            cad_member_id INTEGER,
+            build_status TEXT NOT NULL DEFAULT 'COMPLETED',
+            legacy_usage_id INTEGER,
+            created_by INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            modified_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (parent_item_id) REFERENCES bom(id),
+            FOREIGN KEY (child_item_id) REFERENCES bom(id),
+            FOREIGN KEY (cad_member_id) REFERENCES cad_document_members(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS item_occurrences (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_usage_id INTEGER NOT NULL,
+            occurrence_name TEXT,
+            reference_designator TEXT,
+            component_path TEXT,
+            transform_json TEXT,
+            source_cad_member_id INTEGER,
+            build_status TEXT NOT NULL DEFAULT 'COMPLETED',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (item_usage_id) REFERENCES item_usages(id),
+            FOREIGN KEY (source_cad_member_id) REFERENCES cad_document_members(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS pdm_build_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            root_cad_document_id INTEGER NOT NULL,
+            direction TEXT NOT NULL DEFAULT 'CAD_TO_EBOM',
+            multi_level INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'RUNNING',
+            created_by INTEGER,
+            started_at TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at TEXT,
+            summary_json TEXT,
+            FOREIGN KEY (root_cad_document_id) REFERENCES cad_documents(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS pdm_build_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            build_run_id INTEGER NOT NULL,
+            cad_member_id INTEGER,
+            parent_item_id INTEGER,
+            child_item_id INTEGER,
+            status TEXT NOT NULL,
+            message TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (build_run_id) REFERENCES pdm_build_runs(id),
+            FOREIGN KEY (cad_member_id) REFERENCES cad_document_members(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS item_structure_iterations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            parent_item_id INTEGER NOT NULL,
+            structure_iteration INTEGER NOT NULL,
+            item_revision TEXT NOT NULL DEFAULT 'A',
+            item_iteration_id INTEGER,
+            source TEXT NOT NULL,
+            build_run_id INTEGER,
+            structure_json TEXT NOT NULL,
+            created_by INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(parent_item_id, structure_iteration),
+            FOREIGN KEY (parent_item_id) REFERENCES bom(id),
+            FOREIGN KEY (build_run_id) REFERENCES pdm_build_runs(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_cad_documents_project
+            ON cad_documents(project_id, base_file_name);
+        CREATE INDEX IF NOT EXISTS idx_cad_members_parent
+            ON cad_document_members(parent_cad_document_id, sort_order, id);
+        CREATE INDEX IF NOT EXISTS idx_cad_members_child
+            ON cad_document_members(child_cad_document_id);
+        CREATE INDEX IF NOT EXISTS idx_cad_assoc_item
+            ON cad_item_associations(item_id, active, association_type);
+        CREATE INDEX IF NOT EXISTS idx_cad_assoc_document
+            ON cad_item_associations(cad_document_id, active);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_active_cad_item_association
+            ON cad_item_associations(cad_document_id) WHERE active=1;
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_active_owner_per_item
+            ON cad_item_associations(item_id)
+            WHERE active=1 AND association_type='OWNER';
+        CREATE INDEX IF NOT EXISTS idx_item_usages_parent
+            ON item_usages(parent_item_id, sort_order, id);
+        CREATE INDEX IF NOT EXISTS idx_item_usages_child
+            ON item_usages(child_item_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_item_usage_cad_member
+            ON item_usages(cad_member_id)
+            WHERE source='CAD_BUILD' AND cad_member_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_item_structure_iterations_parent
+            ON item_structure_iterations(parent_item_id, structure_iteration);
+        """
+    )
+    _ensure_column(conn, "cad_documents", "checked_out_by", "checked_out_by INTEGER")
+    _ensure_column(conn, "cad_documents", "checked_out_at", "checked_out_at TEXT")
+
+    bom_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(bom)").fetchall()
+    }
+
+    def value(row, column, default=""):
+        return row[column] if column in bom_columns and row[column] is not None else default
+
+    def base_name(raw):
+        text = os.path.basename(str(raw or "").replace("\\", "/")).strip()
+        return os.path.splitext(text)[0].casefold()
+
+    def file_name(raw, fallback_base, extension):
+        text = os.path.basename(str(raw or "").replace("\\", "/")).strip()
+        if text:
+            match = re.match(
+                r"^(.*\.(?:asm|prt|drw))\.\d+$", text, flags=re.IGNORECASE
+            )
+            return match.group(1) if match else text
+        return f"{fallback_base}{extension}" if fallback_base else ""
+
+    items = conn.execute("SELECT * FROM bom ORDER BY id").fetchall()
+    primary_docs = {}
+    for row in items:
+        item_id = int(row["id"])
+        project_id = int(value(row, "project_id", 0) or 0)
+        raw_file = value(row, "filename") or value(row, "base_file_name")
+        raw_base = value(row, "base_file_name") or base_name(raw_file)
+        normalized_base = base_name(raw_base) or base_name(raw_file)
+        if not normalized_base:
+            continue
+        item_type = str(value(row, "type", "prt") or "prt").strip().lower()
+        extension = ".asm" if item_type in {"asm", "assembly"} else ".prt"
+        actual_file = file_name(raw_file, normalized_base, extension)
+        iteration_match = re.match(
+            r"^.*\.(?:asm|prt|drw)\.(\d+)$",
+            os.path.basename(str(raw_file or "").replace("\\", "/")),
+            flags=re.IGNORECASE,
+        )
+        legacy_creo_version = int(iteration_match.group(1)) if iteration_match else None
+        legacy_creo_file = (
+            os.path.basename(str(raw_file or "").replace("\\", "/")).strip()
+            if legacy_creo_version is not None else None
+        )
+        category = "ASSEMBLY" if item_type in {"asm", "assembly"} else "COMPONENT"
+        represented_id = value(row, "represented_part_id", None)
+        association_item_id = int(represented_id) if represented_id else item_id
+        association_type = "IMAGE" if represented_id else "OWNER"
+        flags = {
+            "OWNER": (1, 1, 1),
+            "IMAGE": (0, 0, 1),
+        }[association_type]
+        build_excluded = 1 if str(value(row, "default_ebom_behavior", "NORMAL")).upper() == "EXCLUDE" else 0
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO cad_documents(
+                project_id,number,name,file_name,base_file_name,category,
+                lifecycle_state,revision,iteration,build_excluded,legacy_bom_id,
+                latest_creo_file_version,latest_creo_file_name
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                project_id,
+                actual_file,
+                str(value(row, "name") or normalized_base),
+                actual_file,
+                normalized_base,
+                category,
+                str(value(row, "lifecycle_state", "IN_WORK") or "IN_WORK"),
+                str(value(row, "revision", "A") or "A"),
+                1,
+                build_excluded,
+                item_id,
+                legacy_creo_version,
+                legacy_creo_file,
+            ),
+        )
+        doc = conn.execute(
+            "SELECT id FROM cad_documents WHERE project_id=? AND file_name=?",
+            (project_id, actual_file),
+        ).fetchone()
+        if not doc:
+            continue
+        doc_id = int(doc[0])
+        primary_docs[item_id] = doc_id
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO cad_document_iterations(
+                cad_document_id,revision,iteration,lifecycle_state,primary_path,
+                creo_file_version,source_file_name
+            ) VALUES(?,?,?,?,?,?,?)
+            """,
+            (
+                doc_id,
+                str(value(row, "revision", "A") or "A"),
+                1,
+                str(value(row, "lifecycle_state", "IN_WORK") or "IN_WORK"),
+                actual_file,
+                legacy_creo_version,
+                legacy_creo_file,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO cad_item_associations(
+                project_id,item_id,cad_document_id,association_type,
+                drives_structure,drives_attributes,participates_in_structure
+            ) VALUES(?,?,?,?,?,?,?)
+            """,
+            (project_id, association_item_id, doc_id, association_type, *flags),
+        )
+        for fmt, path_value in (
+            ("PDF", value(row, "pdf_path")),
+            ("STEP", value(row, "step_path")),
+        ):
+            if not path_value:
+                continue
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO cad_document_contents(
+                    cad_document_id,content_role,format,file_name,storage_path,
+                    delivery_required
+                ) VALUES(?,?,?,?,?,?)
+                """,
+                (
+                    doc_id, "DERIVED", fmt,
+                    os.path.basename(str(path_value).replace("\\", "/")),
+                    str(path_value),
+                    1 if association_type == "OWNER" else 0,
+                ),
+            )
+
+        raw_drawing = value(row, "drawing") or value(row, "base_drw_name")
+        drawing_base = base_name(value(row, "base_drw_name") or raw_drawing)
+        if drawing_base:
+            drawing_file = file_name(raw_drawing, drawing_base, ".drw")
+            drawing_version_match = re.match(
+                r"^.*\.drw\.(\d+)$",
+                os.path.basename(str(raw_drawing or "").replace("\\", "/")),
+                flags=re.IGNORECASE,
+            )
+            drawing_creo_version = (
+                int(drawing_version_match.group(1)) if drawing_version_match else None
+            )
+            drawing_creo_file = (
+                os.path.basename(str(raw_drawing or "").replace("\\", "/")).strip()
+                if drawing_creo_version is not None else None
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO cad_documents(
+                    project_id,number,name,file_name,base_file_name,category,
+                    lifecycle_state,revision,legacy_bom_id,
+                    drawing_owner_cad_document_id,
+                    latest_creo_file_version,latest_creo_file_name
+                ) VALUES(?,?,?,?,?,'DRAWING',?,?,?,?,?,?)
+                """,
+                (
+                    project_id, drawing_file, f"{value(row, 'name') or drawing_base} drawing",
+                    drawing_file, drawing_base,
+                    str(value(row, "lifecycle_state", "IN_WORK") or "IN_WORK"),
+                    str(value(row, "revision", "A") or "A"), item_id,
+                    doc_id,
+                    drawing_creo_version,
+                    drawing_creo_file,
+                ),
+            )
+            drawing_doc = conn.execute(
+                "SELECT id FROM cad_documents WHERE project_id=? AND file_name=?",
+                (project_id, drawing_file),
+            ).fetchone()
+            if drawing_doc:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO cad_document_iterations(
+                        cad_document_id,revision,iteration,lifecycle_state,primary_path,
+                        creo_file_version,source_file_name
+                    ) VALUES(?,?,?,?,?,?,?)
+                    """,
+                    (
+                        int(drawing_doc[0]),
+                        str(value(row, "revision", "A") or "A"),
+                        1,
+                        str(value(row, "lifecycle_state", "IN_WORK") or "IN_WORK"),
+                        drawing_file,
+                        drawing_creo_version,
+                        drawing_creo_file,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO cad_item_associations(
+                        project_id,item_id,cad_document_id,association_type,
+                        drives_structure,drives_attributes,participates_in_structure
+                    ) VALUES(?,?,?,'CONTENT',0,0,0)
+                    """,
+                    (project_id, association_item_id, int(drawing_doc[0])),
+                )
+
+    member_by_usage = {}
+    seed_item_usages = (
+        int(conn.execute("SELECT COUNT(*) FROM item_usages").fetchone()[0]) == 0
+    )
+    if "bom_children" in tables:
+        child_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(bom_children)").fetchall()
+        }
+        relations = conn.execute("SELECT * FROM bom_children ORDER BY id").fetchall()
+        for rel in relations:
+            parent_doc = primary_docs.get(int(rel["parent_id"]))
+            child_doc = primary_docs.get(int(rel["child_id"]))
+            if not parent_doc or not child_doc:
+                continue
+            quantity = max(1, int(rel["quantity"] or 1))
+            sort_order = int(rel["sort_order"] or rel["id"]) if "sort_order" in child_columns else int(rel["id"])
+            behavior = str(rel["ebom_behavior"] or "INHERIT").upper() if "ebom_behavior" in child_columns else "INHERIT"
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO cad_document_members(
+                    parent_cad_document_id,child_cad_document_id,quantity,
+                    sort_order,build_excluded,legacy_usage_id
+                ) VALUES(?,?,?,?,?,?)
+                """,
+                (parent_doc, child_doc, quantity, sort_order, 1 if behavior == "EXCLUDE" else 0, int(rel["id"])),
+            )
+            member = conn.execute(
+                "SELECT id FROM cad_document_members WHERE legacy_usage_id=?",
+                (int(rel["id"]),),
+            ).fetchone()
+            if member:
+                member_by_usage[int(rel["id"])] = int(member[0])
+
+        item_by_id = {int(row["id"]): row for row in items}
+        children = {}
+        for rel in relations:
+            children.setdefault(int(rel["parent_id"]), []).append(rel)
+
+        def resolved_behavior(rel):
+            behavior = str(rel["ebom_behavior"] or "INHERIT").upper() if "ebom_behavior" in child_columns else "INHERIT"
+            if behavior != "INHERIT":
+                return behavior
+            child = item_by_id.get(int(rel["child_id"]))
+            return str(value(child, "default_ebom_behavior", "NORMAL") if child else "NORMAL").upper()
+
+        for parent_id, parent_row in item_by_id.items():
+            project_id = int(value(parent_row, "project_id", 0) or 0)
+            aggregated = {}
+
+            def collect(source_parent_id, multiplier=1, ancestors=()):
+                if source_parent_id in ancestors:
+                    return
+                for rel in children.get(source_parent_id, []):
+                    behavior = resolved_behavior(rel)
+                    if behavior == "EXCLUDE":
+                        continue
+                    qty = multiplier * max(1, int(rel["quantity"] or 1))
+                    child_id = int(rel["child_id"])
+                    if behavior == "FLATTEN":
+                        collect(child_id, qty, (*ancestors, source_parent_id))
+                        continue
+                    key = child_id
+                    entry = aggregated.setdefault(key, {
+                        "quantity": 0,
+                        "sort_order": int(rel["sort_order"] or rel["id"]) if "sort_order" in child_columns else int(rel["id"]),
+                        "legacy_usage_id": int(rel["id"]) if source_parent_id == parent_id else None,
+                        "cad_member_id": member_by_usage.get(int(rel["id"])) if source_parent_id == parent_id else None,
+                    })
+                    entry["quantity"] += qty
+
+            collect(parent_id)
+            for child_id, entry in aggregated.items():
+                if not seed_item_usages:
+                    continue
+                if child_id == parent_id:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO item_usages(
+                        project_id,parent_item_id,child_item_id,quantity,
+                        sort_order,source,cad_member_id,legacy_usage_id
+                    ) VALUES(?,?,?,?,?,'CAD_BUILD',?,?)
+                    """,
+                    (
+                        project_id, parent_id, child_id, entry["quantity"],
+                        entry["sort_order"], entry["cad_member_id"],
+                        entry["legacy_usage_id"],
+                    ),
+                )
+
+    if "bom_cad_dependencies" in tables:
+        dependencies = conn.execute(
+            "SELECT * FROM bom_cad_dependencies ORDER BY id"
+        ).fetchall()
+        for dep in dependencies:
+            project_id = int(dep["project_id"])
+            owner_item_id = int(dep["owner_bom_id"])
+            normalized_base = base_name(dep["base_file_name"] or dep["original_filename"])
+            if not normalized_base:
+                continue
+            actual_file = file_name(dep["original_filename"], normalized_base, ".prt")
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO cad_documents(
+                    project_id,number,name,file_name,base_file_name,category,
+                    build_excluded,supplier_owner_item_id
+                ) VALUES(?,?,?,?,?,'COMPONENT',1,?)
+                """,
+                (project_id, normalized_base, normalized_base, actual_file, normalized_base, owner_item_id),
+            )
+            doc = conn.execute(
+                "SELECT id FROM cad_documents WHERE project_id=? AND file_name=?",
+                (project_id, actual_file),
+            ).fetchone()
+            if doc:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO cad_item_associations(
+                        project_id,item_id,cad_document_id,association_type,
+                        drives_structure,drives_attributes,participates_in_structure
+                    ) VALUES(?,?,?,'CONTENT',0,0,0)
+                    """,
+                    (project_id, owner_item_id, int(doc[0])),
+                )
+
+
+def _migration_33(conn):
+    """Coordinate Item and CAD Document working-copy ownership.
+
+    Item locks remain in the legacy ``locks`` table so existing permission and
+    history screens continue to work.  ``checkout_origin`` distinguishes a
+    deliberate Item checkout from the temporary Item checkout opened by a CAD
+    Document.  The CAD master stores the associated Item at checkout time so a
+    later association edit cannot change which Item owns the working copy.
+    """
+    tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "locks" in tables:
+        _ensure_column(
+            conn,
+            "locks",
+            "checkout_origin",
+            "checkout_origin TEXT NOT NULL DEFAULT 'ITEM'",
+        )
+        _ensure_column(conn, "locks", "checked_out_at", "checked_out_at TEXT")
+        conn.execute(
+            "UPDATE locks SET checkout_origin='ITEM' "
+            "WHERE checkout_origin IS NULL OR trim(checkout_origin)=''"
+        )
+    if "cad_documents" not in tables:
+        return
+
+    _ensure_column(
+        conn,
+        "cad_documents",
+        "checkout_item_id",
+        "checkout_item_id INTEGER",
+    )
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS cad_document_checkout_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cad_document_id INTEGER NOT NULL,
+            item_id INTEGER,
+            user_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            cad_iteration_id INTEGER,
+            note TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (cad_document_id) REFERENCES cad_documents(id),
+            FOREIGN KEY (item_id) REFERENCES bom(id),
+            FOREIGN KEY (cad_iteration_id) REFERENCES cad_document_iterations(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_cad_checkout_logs_document
+            ON cad_document_checkout_logs(cad_document_id, created_at DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_cad_checkout_logs_item
+            ON cad_document_checkout_logs(item_id, created_at DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_cad_documents_checkout_item
+            ON cad_documents(checkout_item_id, checked_out_by);
+        """
+    )
+    # Preserve the association that owns any working copies created before this
+    # migration.  New checkouts always set this value explicitly.
+    conn.execute(
+        """
+        UPDATE cad_documents
+        SET checkout_item_id=(
+            SELECT a.item_id
+            FROM cad_item_associations a
+            WHERE a.cad_document_id=cad_documents.id AND a.active=1
+            ORDER BY a.id DESC LIMIT 1
+        )
+        WHERE checked_out_by IS NOT NULL AND checkout_item_id IS NULL
+        """
+    )
+
+
+def _migration_34(conn):
+    """Bind native drawings to their PRT/ASM CAD Document.
+
+    Drawings are managed CAD data, but they are not structural CAD nodes.  A
+    drawing therefore owns no independent position in the CAD assembly tree;
+    it is related to exactly one model and is presented from that model's
+    details.
+    """
+    conn.row_factory = sqlite3.Row
+    tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "cad_documents" not in tables:
+        return
+    _ensure_column(
+        conn,
+        "cad_documents",
+        "drawing_owner_cad_document_id",
+        "drawing_owner_cad_document_id INTEGER",
+    )
+    conn.execute(
+        "UPDATE cad_documents SET category='DRAWING' "
+        "WHERE upper(category)<>'DRAWING' AND "
+        "(lower(file_name) LIKE '%.drw' OR lower(file_name) GLOB '*.drw.[0-9]*')"
+    )
+
+    drawings = conn.execute(
+        """
+        SELECT id,project_id,base_file_name,legacy_bom_id
+        FROM cad_documents
+        WHERE upper(category)='DRAWING'
+          AND drawing_owner_cad_document_id IS NULL
+        ORDER BY id
+        """
+    ).fetchall()
+    for drawing in drawings:
+        owner = None
+        if drawing["legacy_bom_id"] is not None:
+            owner = conn.execute(
+                """
+                SELECT id FROM cad_documents
+                WHERE project_id=? AND legacy_bom_id=?
+                  AND upper(category) IN ('ASSEMBLY','COMPONENT')
+                ORDER BY CASE upper(category) WHEN 'ASSEMBLY' THEN 0 ELSE 1 END,id
+                LIMIT 1
+                """,
+                (int(drawing["project_id"]), int(drawing["legacy_bom_id"])),
+            ).fetchone()
+        if owner is None:
+            owner = conn.execute(
+                """
+                SELECT id FROM cad_documents
+                WHERE project_id=? AND lower(base_file_name)=lower(?)
+                  AND upper(category) IN ('ASSEMBLY','COMPONENT')
+                ORDER BY id LIMIT 1
+                """,
+                (int(drawing["project_id"]), str(drawing["base_file_name"] or "")),
+            ).fetchone()
+        if owner is None and "cad_item_associations" in tables:
+            candidates = conn.execute(
+                """
+                SELECT DISTINCT model.id,model_assoc.association_type
+                FROM cad_item_associations drawing_assoc
+                JOIN cad_item_associations model_assoc
+                  ON model_assoc.item_id=drawing_assoc.item_id
+                 AND model_assoc.active=1
+                JOIN cad_documents model ON model.id=model_assoc.cad_document_id
+                WHERE drawing_assoc.cad_document_id=?
+                  AND drawing_assoc.active=1
+                  AND upper(model.category) IN ('ASSEMBLY','COMPONENT')
+                ORDER BY model.id
+                """,
+                (int(drawing["id"]),),
+            ).fetchall()
+            owner_candidates = [
+                candidate for candidate in candidates
+                if str(candidate["association_type"] or "").upper() == "OWNER"
+            ]
+            if len(owner_candidates) == 1:
+                owner = owner_candidates[0]
+            elif len(candidates) == 1:
+                owner = candidates[0]
+        if owner is not None:
+            conn.execute(
+                "UPDATE cad_documents SET drawing_owner_cad_document_id=? WHERE id=?",
+                (int(owner["id"]), int(drawing["id"])),
+            )
+
+    # Native drawings must never be assembly occurrences.
+    if "cad_document_members" in tables:
+        conn.execute(
+            """
+            DELETE FROM cad_document_members
+            WHERE parent_cad_document_id IN (
+                SELECT id FROM cad_documents WHERE upper(category)='DRAWING'
+            ) OR child_cad_document_id IN (
+                SELECT id FROM cad_documents WHERE upper(category)='DRAWING'
+            )
+            """
+        )
+    conn.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_cad_documents_drawing_owner
+            ON cad_documents(drawing_owner_cad_document_id,category,id);
+
+        CREATE TRIGGER IF NOT EXISTS trg_cad_drawing_model_insert
+        BEFORE INSERT ON cad_documents
+        WHEN upper(NEW.category)='DRAWING' AND (
+            NEW.drawing_owner_cad_document_id IS NULL OR NOT EXISTS (
+                SELECT 1 FROM cad_documents model
+                WHERE model.id=NEW.drawing_owner_cad_document_id
+                  AND model.project_id=NEW.project_id
+                  AND upper(model.category) IN ('ASSEMBLY','COMPONENT')
+            )
+        )
+        BEGIN
+            SELECT RAISE(ABORT,'A drawing must be bound to a PRT or ASM CAD Document.');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_cad_drawing_model_update
+        BEFORE UPDATE OF category,drawing_owner_cad_document_id,project_id
+        ON cad_documents
+        WHEN upper(NEW.category)='DRAWING' AND (
+            NEW.drawing_owner_cad_document_id IS NULL OR NOT EXISTS (
+                SELECT 1 FROM cad_documents model
+                WHERE model.id=NEW.drawing_owner_cad_document_id
+                  AND model.project_id=NEW.project_id
+                  AND upper(model.category) IN ('ASSEMBLY','COMPONENT')
+            )
+        )
+        BEGIN
+            SELECT RAISE(ABORT,'A drawing must be bound to a PRT or ASM CAD Document.');
+        END;
+        """
+    )
+
+
+def _migration_35(conn):
+    """Add Windchill-style Item master attributes and generated numbering."""
+    tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "bom" not in tables:
+        return
+    _ensure_column(conn, "bom", "part_number", "part_number TEXT")
+    _ensure_column(conn, "bom", "project_id", "project_id INTEGER")
+    _ensure_column(conn, "bom", "represented_part_id", "represented_part_id INTEGER")
+    for name, definition in (
+        ("item_type", "item_type TEXT NOT NULL DEFAULT 'MECHANICAL_PART'"),
+        ("assembly_mode", "assembly_mode TEXT NOT NULL DEFAULT 'COMPONENT'"),
+        ("procurement_source", "procurement_source TEXT NOT NULL DEFAULT 'MAKE'"),
+        ("item_view", "item_view TEXT NOT NULL DEFAULT 'DESIGN'"),
+        ("default_unit", "default_unit TEXT NOT NULL DEFAULT 'EA'"),
+    ):
+        _ensure_column(conn, "bom", name, definition)
+    conn.execute(
+        """
+        UPDATE bom SET assembly_mode='SEPARABLE'
+        WHERE lower(COALESCE(type,'')) IN ('asm','assembly')
+          AND assembly_mode='COMPONENT'
+        """
+    )
+    if "bom_iterations" in tables and "bom_revisions" in tables:
+        rows = conn.execute(
+            """
+            SELECT i.id, i.object_data_json, b.part_number, b.item_type,
+                   b.assembly_mode, b.procurement_source, b.item_view,
+                   b.default_unit
+            FROM bom_iterations i
+            JOIN bom_revisions r ON r.id=i.revision_id
+            JOIN bom b ON b.id=r.bom_id
+            ORDER BY i.id
+            """
+        ).fetchall()
+        allowed_values = {
+            "item_type": ({
+                "MECHANICAL_PART", "SOFTWARE_PART", "PURCHASED_PART",
+                "REFERENCE_PART",
+            }, "MECHANICAL_PART"),
+            "assembly_mode": ({"COMPONENT", "SEPARABLE", "INSEPARABLE"}, "COMPONENT"),
+            "procurement_source": ({"MAKE", "BUY", "MAKE_OR_BUY"}, "MAKE"),
+            "item_view": ({"DESIGN", "MANUFACTURING", "SERVICE"}, "DESIGN"),
+            "default_unit": ({"EA", "KG", "M", "MM", "L", "SET"}, "EA"),
+        }
+        for row in rows:
+            try:
+                payload = json.loads(str(row[1] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            if not str(payload.get("part_number") or "").strip():
+                payload["part_number"] = str(row[2] or "").strip()
+            current_values = {
+                "item_type": row[3],
+                "assembly_mode": row[4],
+                "procurement_source": row[5],
+                "item_view": row[6],
+                "default_unit": row[7],
+            }
+            for key, (allowed, fallback) in allowed_values.items():
+                value = str(
+                    payload.get(key) or current_values.get(key) or fallback
+                ).strip().upper()
+                payload[key] = value if value in allowed else fallback
+            conn.execute(
+                "UPDATE bom_iterations SET object_data_json=? WHERE id=?",
+                (
+                    json.dumps(
+                        payload, ensure_ascii=True, sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    int(row[0]),
+                ),
+            )
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS item_number_sequence (
+            id INTEGER PRIMARY KEY CHECK(id=1),
+            next_value INTEGER NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        """
+    )
+    if conn.execute(
+        "SELECT 1 FROM item_number_sequence WHERE id=1"
+    ).fetchone() is None:
+        highest = 49_999_999
+        for row in conn.execute(
+            "SELECT part_number FROM bom WHERE part_number IS NOT NULL"
+        ).fetchall():
+            raw = str(row[0] or "").strip()
+            if raw.isdigit():
+                highest = max(highest, int(raw))
+        conn.execute(
+            "INSERT INTO item_number_sequence(id,next_value) VALUES(1,?)",
+            (max(50_000_000, highest + 1),),
+        )
+    try:
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_bom_project_item_number
+            ON bom(project_id, part_number COLLATE NOCASE)
+            WHERE part_number IS NOT NULL AND trim(part_number)<>''
+              AND represented_part_id IS NULL
+            """
+        )
+    except sqlite3.IntegrityError:
+        # Existing duplicate numbers are surfaced by Diagnostics/release
+        # validation and must be resolved deliberately; never renumber them here.
+        pass
+    if "cad_documents" in tables:
+        try:
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_cad_documents_project_number
+                ON cad_documents(project_id, number COLLATE NOCASE)
+                """
+            )
+        except sqlite3.IntegrityError:
+            # Preserve legacy CAD identities for deliberate resolution. New
+            # registrations still reject duplicate Numbers in the repository.
+            pass
+
+
+def _migration_36(conn):
+    """Make commit rows CAD-document aware and allow CAD-only commits."""
+    def repair_backup_commit_foreign_keys() -> None:
+        stale_name = "commits_part_id_not_null_backup"
+        rows = conn.execute(
+            """
+            SELECT name,sql FROM sqlite_master
+            WHERE type='table' AND sql LIKE ?
+            ORDER BY name
+            """,
+            (f"%{stale_name}%",),
+        ).fetchall()
+        for row in rows:
+            table_name = str(row[0])
+            create_sql = str(row[1])
+            if table_name == "commits":
+                continue
+            temp_table = f"{table_name}_fk_rebuild"
+            conn.execute(f"DROP TABLE IF EXISTS {temp_table}")
+            repaired_sql = (
+                create_sql
+                .replace(f'"{stale_name}"', "commits")
+                .replace(stale_name, "commits")
+            )
+            repaired_sql = repaired_sql.replace(
+                f"CREATE TABLE {table_name}",
+                f"CREATE TABLE {temp_table}",
+                1,
+            ).replace(
+                f'CREATE TABLE "{table_name}"',
+                f'CREATE TABLE "{temp_table}"',
+                1,
+            )
+            conn.execute(repaired_sql)
+            columns = [
+                str(col[1])
+                for col in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+            ]
+            if columns:
+                column_csv = ", ".join(columns)
+                conn.execute(
+                    f"INSERT INTO {temp_table} ({column_csv}) "
+                    f"SELECT {column_csv} FROM {table_name}"
+                )
+            conn.execute(f"DROP TABLE {table_name}")
+            conn.execute(f"ALTER TABLE {temp_table} RENAME TO {table_name}")
+
+    tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "commits" not in tables:
+        restored = False
+        for table_name in ("commits_part_id_not_null_backup", "commits_nullable_rebuild"):
+            if table_name in tables:
+                conn.execute(f"ALTER TABLE {table_name} RENAME TO commits")
+                restored = True
+                break
+        if not restored:
+            return
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+    repair_backup_commit_foreign_keys()
+    for table_name in ("commits_part_id_not_null_backup", "commits_nullable_rebuild"):
+        if table_name in tables:
+            conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+    _ensure_column(conn, "commits", "cad_document_id", "cad_document_id INTEGER")
+    _ensure_column(conn, "commits", "creo_file_version", "creo_file_version INTEGER")
+    columns = conn.execute("PRAGMA table_info(commits)").fetchall()
+    part_column = next((col for col in columns if col[1] == "part_id"), None)
+    if part_column is not None and int(part_column[3] or 0):
+        temp_table = "commits_nullable_rebuild"
+        conn.execute(f"DROP TABLE IF EXISTS {temp_table}")
+        column_defs = []
+        column_names = []
+        for col in columns:
+            name = str(col[1])
+            column_names.append(name)
+            col_type = str(col[2] or "TEXT")
+            if int(col[5] or 0):
+                column_defs.append(
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT"
+                    if name == "id" else
+                    f"{name} {col_type} PRIMARY KEY"
+                )
+                continue
+            definition = f"{name} {col_type}"
+            if name != "part_id" and int(col[3] or 0):
+                definition += " NOT NULL"
+            default_value = col[4]
+            if default_value is not None:
+                definition += f" DEFAULT {default_value}"
+            column_defs.append(definition)
+        conn.execute(f"CREATE TABLE {temp_table} ({', '.join(column_defs)})")
+        column_csv = ", ".join(column_names)
+        conn.execute(
+            f"INSERT INTO {temp_table} ({column_csv}) SELECT {column_csv} FROM commits"
+        )
+        conn.execute("DROP TABLE commits")
+        conn.execute(f"ALTER TABLE {temp_table} RENAME TO commits")
+    conn.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_commits_cad_document
+            ON commits(cad_document_id, project_id);
+        CREATE INDEX IF NOT EXISTS idx_commits_step_part_project
+            ON commits(part_id, project_id);
+        """
+    )
+
+
+def _migration_37(conn):
+    """Track Creo source file versions independently from CAD/Item iterations."""
+    tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "commits" in tables:
+        _ensure_column(conn, "commits", "creo_file_version", "creo_file_version INTEGER")
+        conn.execute(
+            """
+            UPDATE commits
+            SET creo_file_version=CAST(substr(filename, length(base_file_name) + 2) AS INTEGER)
+            WHERE creo_file_version IS NULL
+              AND base_file_name IS NOT NULL
+              AND filename LIKE base_file_name || '.%'
+              AND substr(filename, length(base_file_name) + 2) GLOB '[0-9]*'
+            """
+        )
+    if "cad_documents" in tables:
+        _ensure_column(
+            conn,
+            "cad_documents",
+            "latest_creo_file_version",
+            "latest_creo_file_version INTEGER",
+        )
+        _ensure_column(
+            conn,
+            "cad_documents",
+            "latest_creo_file_name",
+            "latest_creo_file_name TEXT",
+        )
+    if "cad_document_iterations" in tables:
+        _ensure_column(
+            conn,
+            "cad_document_iterations",
+            "creo_file_version",
+            "creo_file_version INTEGER",
+        )
+        _ensure_column(
+            conn,
+            "cad_document_iterations",
+            "source_file_name",
+            "source_file_name TEXT",
+        )
+
+
 MIGRATIONS = {
     1: """
     CREATE TABLE IF NOT EXISTS users (
@@ -1970,6 +3032,18 @@ WHERE r.name = 'designer' AND p.name = 'manage_issues';
     30: _migration_30,
 
     31: _migration_31,
+
+    32: _migration_32,
+
+    33: _migration_33,
+
+    34: _migration_34,
+
+    35: _migration_35,
+
+    36: _migration_36,
+
+    37: _migration_37,
 
 }
 

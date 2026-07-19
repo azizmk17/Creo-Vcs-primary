@@ -22,18 +22,21 @@ class BomRevisionRepository:
         "default_ebom_behavior", "cad_requirement", "drawing_requirement",
         "represented_part_id",
         "cad_control_mode",
+        "item_type", "assembly_mode", "procurement_source", "item_view",
+        "default_unit",
     )
     _CHECKIN_METADATA_FIELDS = (
-        "type", "name", "part_number", "drawing_number", "aes_number",
+        "type", "name", "drawing_number", "aes_number",
         "material", "weight", "notes", "classification",
         "default_ebom_behavior", "cad_requirement", "drawing_requirement",
         "represented_part_id",
         "cad_control_mode",
+        "item_type", "assembly_mode", "procurement_source", "item_view",
+        "default_unit",
     )
     _CHECKIN_METADATA_LABELS = {
         "type": "Type",
         "name": "Name",
-        "part_number": "Part number",
         "drawing_number": "Drawing number",
         "aes_number": "AES number",
         "material": "Material",
@@ -45,6 +48,11 @@ class BomRevisionRepository:
         "drawing_requirement": "Drawing requirement",
         "represented_part_id": "Deliverable physical part",
         "cad_control_mode": "CAD control mode",
+        "item_type": "Item type",
+        "assembly_mode": "Assembly mode",
+        "procurement_source": "Source",
+        "item_view": "View",
+        "default_unit": "Default unit",
     }
 
     def __init__(self, db_name=DB_NAME):
@@ -128,6 +136,11 @@ class BomRevisionRepository:
                     "cad_control_mode",
                     "cad_control_mode TEXT NOT NULL DEFAULT 'CONTROLLED'",
                 ),
+                ("item_type", "item_type TEXT NOT NULL DEFAULT 'MECHANICAL_PART'"),
+                ("assembly_mode", "assembly_mode TEXT NOT NULL DEFAULT 'COMPONENT'"),
+                ("procurement_source", "procurement_source TEXT NOT NULL DEFAULT 'MAKE'"),
+                ("item_view", "item_view TEXT NOT NULL DEFAULT 'DESIGN'"),
+                ("default_unit", "default_unit TEXT NOT NULL DEFAULT 'EA'"),
             ):
                 if name not in columns:
                     conn.execute(f"ALTER TABLE bom ADD COLUMN {definition}")

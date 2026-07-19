@@ -740,8 +740,8 @@ class EbomService:
 
 class EbomExportService:
     FIELDNAMES = (
-        "occurrence_path", "level", "parent_bom_id", "bom_id", "aes_number",
-        "name", "part_number", "type", "classification", "version",
+        "occurrence_path", "level", "parent_bom_id", "bom_id", "part_number",
+        "name", "aes_number", "type", "classification", "version",
         "source_quantity", "effective_quantity", "occurrence_behavior",
         "resolved_behavior", "promoted_through",
     )
@@ -752,7 +752,12 @@ class EbomExportService:
     @staticmethod
     def _export_row(row: dict) -> dict:
         promoted = " > ".join(
-            str(value.get("aes_number") or value.get("name") or value.get("bom_id"))
+            str(
+                value.get("part_number")
+                or value.get("aes_number")
+                or value.get("name")
+                or value.get("bom_id")
+            )
             for value in (row.get("promoted_through") or [])
         )
         return {

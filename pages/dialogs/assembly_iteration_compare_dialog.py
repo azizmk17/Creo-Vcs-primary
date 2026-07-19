@@ -35,7 +35,7 @@ class AssemblyIterationCompareDialog(QDialog):
         self._comparison = {}
 
         details = self.bom_service.get_part_details(self.assembly_id) or {}
-        identity = str(details.get("aes_number") or details.get("part_number") or "").strip()
+        identity = str(details.get("part_number") or "").strip()
         name = str(details.get("name") or f"Assembly {self.assembly_id}").strip()
         self.setObjectName("assemblyIterationCompareDialog")
         self.setWindowTitle("Compare Assembly Iterations")
@@ -151,9 +151,9 @@ class AssemblyIterationCompareDialog(QDialog):
 
         self.table = QTableWidget()
         headers = [
-            "Change", "Name", "AES Number", "Usage", "Left Version", "Right Version",
-            "Left Qty", "Right Qty", "Left Position", "Right Position", "Left Creo Files",
-            "Right Creo Files",
+            "Change", "Name", "Item Number", "AES Number", "Usage", "Left Version",
+            "Right Version", "Left Qty", "Right Qty", "Left Position", "Right Position",
+            "Left Creo Files", "Right Creo Files",
         ]
         self.table.setColumnCount(len(headers))
         self.table.setHorizontalHeaderLabels(headers)
@@ -167,8 +167,8 @@ class AssemblyIterationCompareDialog(QDialog):
         for column in range(len(headers)):
             header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.Stretch)
-        header.setSectionResizeMode(10, QHeaderView.Stretch)
         header.setSectionResizeMode(11, QHeaderView.Stretch)
+        header.setSectionResizeMode(12, QHeaderView.Stretch)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_row_context_menu)
         layout.addWidget(self.table, 1)
@@ -300,6 +300,7 @@ class AssemblyIterationCompareDialog(QDialog):
                 values = [
                     str(row.get("change") or ""),
                     self._identity_text(left, right, "name"),
+                    self._identity_text(left, right, "part_number"),
                     self._identity_text(left, right, "aes_number"),
                     str(row.get("usage_id") or "Legacy"),
                     str((left or {}).get("child_version") or "-"),
@@ -336,7 +337,7 @@ class AssemblyIterationCompareDialog(QDialog):
                         (right or {}).get("child_iteration_id"),
                     )
                     self.table.setItem(row_index, column, item)
-                self.table.setRowHeight(row_index, 34 if "\n" in values[10] or "\n" in values[11] else 24)
+                self.table.setRowHeight(row_index, 34 if "\n" in values[11] or "\n" in values[12] else 24)
         finally:
             self.table.setUpdatesEnabled(True)
 
@@ -350,8 +351,8 @@ class AssemblyIterationCompareDialog(QDialog):
             return
         menu = QMenu(self.table)
         for label, role, version_column in (
-            ("Left child", LEFT_CHILD_ITERATION_ROLE, 4),
-            ("Right child", RIGHT_CHILD_ITERATION_ROLE, 5),
+            ("Left child", LEFT_CHILD_ITERATION_ROLE, 5),
+            ("Right child", RIGHT_CHILD_ITERATION_ROLE, 6),
         ):
             iteration_id = anchor.data(role)
             if iteration_id is None:

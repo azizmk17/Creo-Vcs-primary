@@ -98,8 +98,14 @@ class SnapshotService:
 
         config1 = data1.get("object_configuration") or {}
         config2 = data2.get("object_configuration") or {}
-        objects1 = {str(row.get("aes_number") or row.get("id")): row for row in config1.get("objects", [])}
-        objects2 = {str(row.get("aes_number") or row.get("id")): row for row in config2.get("objects", [])}
+        objects1 = {
+            str(row.get("part_number") or row.get("aes_number") or row.get("id")): row
+            for row in config1.get("objects", [])
+        }
+        objects2 = {
+            str(row.get("part_number") or row.get("aes_number") or row.get("id")): row
+            for row in config2.get("objects", [])
+        }
         object_versions_changed = sorted(
             key for key in set(objects1) & set(objects2)
             if objects1[key].get("iteration_id") != objects2[key].get("iteration_id")
