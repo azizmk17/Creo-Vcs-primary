@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 
 # Application version — bump this string with each release.
-APP_VERSION = "2.2.0"
+APP_VERSION = "3.0.0"
 
 # ---------------------------------------------------------------------------
 # Database path
