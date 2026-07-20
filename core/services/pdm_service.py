@@ -753,8 +753,22 @@ class PdmService:
             int(project_id), int(owner_item_id), base_name
         )
 
-    def checkout_cad_document(self, cad_document_id: int, actor_id: int) -> dict:
-        return self.repo.checkout_cad_document(int(cad_document_id), int(actor_id))
+    def checkout_cad_document(
+        self,
+        cad_document_id: int,
+        actor_id: int,
+        *,
+        workspace_id: str | None = None,
+        workspace_name: str | None = None,
+        workspace_machine_id: str | None = None,
+    ) -> dict:
+        return self.repo.checkout_cad_document(
+            int(cad_document_id),
+            int(actor_id),
+            workspace_id=workspace_id,
+            workspace_name=workspace_name,
+            workspace_machine_id=workspace_machine_id,
+        )
 
     def checkin_cad_document(
         self, cad_document_id: int, actor_id: int, source_path: str,

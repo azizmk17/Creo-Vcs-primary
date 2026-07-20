@@ -24,20 +24,22 @@ class AdminMetricCard(QFrame):
         super().__init__(parent)
         self.setObjectName("adminMetricCard")
         self.setProperty("accent", accent)
-        self.setMinimumWidth(130)
-        self.setFixedHeight(72)
+        self.setMinimumWidth(120)
+        self.setFixedHeight(42)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 10, 14, 10)
-        layout.setSpacing(0)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 3, 10, 3)
+        layout.setSpacing(8)
         self.value_label = QLabel("-")
         self.value_label.setObjectName("adminMetricValue")
         self.value_label.setStyleSheet(f"color: {accent};")
+        self.value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         label_widget = QLabel(label)
         label_widget.setObjectName("adminMetricLabel")
-        layout.addWidget(self.value_label)
         layout.addWidget(label_widget)
+        layout.addStretch(1)
+        layout.addWidget(self.value_label)
 
     def set_value(self, value):
         self.value_label.setText(str(value))
@@ -60,23 +62,28 @@ class AdminPage(QWidget):
         self.setObjectName("adminPage")
         self.setStyleSheet(self._page_stylesheet())
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(12)
+        layout.setContentsMargins(10, 8, 10, 10)
+        layout.setSpacing(7)
 
         layout.addWidget(self.create_header())
 
-        metrics = QHBoxLayout()
-        metrics.setSpacing(10)
-        self.user_metric = AdminMetricCard("User accounts", "#2563eb")
-        self.role_metric = AdminMetricCard("Security roles", "#7c3aed")
-        self.permission_metric = AdminMetricCard("Permissions", "#0891b2")
-        self.project_metric = AdminMetricCard("Projects", "#16a34a")
+        metrics_frame = QFrame()
+        metrics_frame.setObjectName("adminMetricsStrip")
+        metrics = QHBoxLayout(metrics_frame)
+        metrics.setContentsMargins(0, 0, 0, 0)
+        metrics.setSpacing(0)
+        self.user_metric = AdminMetricCard("USER ACCOUNTS", "#176f9d")
+        self.role_metric = AdminMetricCard("SECURITY ROLES", "#176f9d")
+        self.permission_metric = AdminMetricCard("PERMISSIONS", "#176f9d")
+        self.project_metric = AdminMetricCard("PROJECTS", "#176f9d")
         for card in (self.user_metric, self.role_metric, self.permission_metric, self.project_metric):
             metrics.addWidget(card)
-        layout.addLayout(metrics)
+        layout.addWidget(metrics_frame)
 
         self.tabs = QTabWidget()
         self.tabs.setObjectName("adminTabs")
+        self.tabs.setDocumentMode(True)
+        self.tabs.setUsesScrollButtons(True)
         self.tabs.addTab(self.create_user_role_tab(), "Users")
         self.tabs.addTab(self.create_role_perm_tab(), "Access Control")
         self.tabs.addTab(self.create_project_tab(), "Projects")
@@ -88,14 +95,14 @@ class AdminPage(QWidget):
         frame = QFrame()
         frame.setObjectName("adminHeader")
         hbox = QHBoxLayout(frame)
-        hbox.setContentsMargins(16, 12, 16, 12)
-        hbox.setSpacing(12)
+        hbox.setContentsMargins(10, 5, 8, 5)
+        hbox.setSpacing(10)
 
         text = QVBoxLayout()
         text.setSpacing(1)
-        title = QLabel("Administration")
+        title = QLabel("SYSTEM ADMINISTRATION")
         title.setObjectName("adminTitle")
-        subtitle = QLabel("Workspace access, project membership, and security policy")
+        subtitle = QLabel("Workspace access  |  Project membership  |  Security policy")
         subtitle.setObjectName("adminSubtitle")
         text.addWidget(title)
         text.addWidget(subtitle)
@@ -146,63 +153,229 @@ class AdminPage(QWidget):
 
     def _page_stylesheet(self):
         return """
-        QWidget#adminPage { background: #f4f6f8; }
+        QWidget#adminPage {
+            background-color: #e9edf0;
+        }
+
         QFrame#adminHeader {
-            background: #ffffff; border: 1px solid #dfe3e8; border-radius: 6px;
+            background-color: #d8dfe5;
+            border: 1px solid #aab5bf;
+            border-radius: 0;
+            min-height: 38px;
         }
-        QLabel#adminTitle { color: #172033; font-size: 20px; font-weight: 700; }
-        QLabel#adminSubtitle { color: #687386; font-size: 11px; font-weight: 400; }
-        QLabel#adminStatus { color: #526071; font-size: 10px; font-weight: 600; }
+        QLabel#adminTitle {
+            color: #263c4d;
+            font-size: 9pt;
+            font-weight: bold;
+            letter-spacing: 0.7px;
+        }
+        QLabel#adminSubtitle {
+            color: #61717e;
+            font-size: 8pt;
+            font-weight: normal;
+        }
+        QLabel#adminStatus {
+            color: #4b5d6b;
+            border-left: 1px solid #aeb8c0;
+            font-size: 8pt;
+            font-weight: bold;
+            padding: 0 8px;
+        }
+
+        QFrame#adminMetricsStrip {
+            background-color: #f7f8f9;
+            border: 1px solid #b8c2ca;
+            border-radius: 0;
+        }
         QFrame#adminMetricCard {
-            background: #ffffff; border: 1px solid #dfe3e8; border-radius: 6px;
+            background-color: transparent;
+            border: 0;
+            border-right: 1px solid #c5cdd3;
+            border-radius: 0;
         }
-        QLabel#adminMetricValue { font-size: 21px; font-weight: 700; background: transparent; }
-        QLabel#adminMetricLabel { color: #687386; font-size: 10px; font-weight: 600; background: transparent; }
+        QLabel#adminMetricValue {
+            background-color: transparent;
+            font-size: 12pt;
+            font-weight: bold;
+        }
+        QLabel#adminMetricLabel {
+            background-color: transparent;
+            color: #596a77;
+            font-size: 7.5pt;
+            font-weight: bold;
+            letter-spacing: 0.4px;
+        }
+
         QTabWidget#adminTabs::pane {
-            background: #ffffff; border: 1px solid #dfe3e8; border-radius: 0 6px 6px 6px;
+            background-color: #f3f5f6;
+            border: 1px solid #aeb8c0;
+            border-radius: 0;
+            top: -1px;
         }
         QTabWidget#adminTabs QTabBar::tab {
-            min-width: 112px; padding: 9px 16px; margin-right: 2px;
-            background: #e9edf2; color: #526071; border: 1px solid #dfe3e8;
-            border-bottom: none; border-radius: 5px 5px 0 0; font-weight: 600;
+            background-color: #d8dfe4;
+            border: 1px solid #aeb8c0;
+            border-bottom: 0;
+            border-radius: 0;
+            color: #435563;
+            font-size: 8pt;
+            min-width: 100px;
+            padding: 5px 11px;
+            margin-right: 1px;
         }
-        QTabWidget#adminTabs QTabBar::tab:selected { background: #ffffff; color: #1d4ed8; }
+        QTabWidget#adminTabs QTabBar::tab:hover {
+            background-color: #e9edef;
+            color: #223847;
+        }
+        QTabWidget#adminTabs QTabBar::tab:selected {
+            background-color: #f3f5f6;
+            border-top: 3px solid #167ba8;
+            color: #172b3a;
+            font-weight: bold;
+            padding-top: 3px;
+        }
+
         QFrame#adminPanel {
-            background: #ffffff; border: 1px solid #dfe3e8; border-radius: 6px;
+            background-color: #ffffff;
+            border: 1px solid #b8c2ca;
+            border-radius: 0;
         }
-        QLabel#sectionTitle { color: #172033; font-size: 13px; font-weight: 700; }
-        QLabel#sectionCaption { color: #738094; font-size: 10px; font-weight: 400; }
-        QLabel#fieldLabel { color: #526071; font-size: 10px; font-weight: 600; }
-        QComboBox, QLineEdit, QPlainTextEdit {
-            min-height: 24px; background: #ffffff; border: 1px solid #cfd6df;
-            border-radius: 4px; padding: 3px 7px; color: #172033;
+        QLabel#sectionTitle {
+            color: #213645;
+            font-size: 9pt;
+            font-weight: bold;
         }
-        QComboBox:focus, QLineEdit:focus, QPlainTextEdit:focus { border-color: #2563eb; }
-        QListWidget, QTableWidget {
-            background: #ffffff; border: 1px solid #dfe3e8; border-radius: 4px;
-            alternate-background-color: #f8fafc; selection-background-color: #e5efff;
-            selection-color: #172033; outline: none;
+        QLabel#sectionCaption {
+            color: #697986;
+            font-size: 8pt;
+            font-weight: normal;
         }
-        QListWidget::item { min-height: 24px; padding: 3px 7px; }
-        QListWidget::item:selected { border-left: 3px solid #2563eb; }
-        QTableWidget::item { padding: 5px 7px; border-bottom: 1px solid #edf0f3; }
+        QLabel#fieldLabel {
+            color: #4a5d6b;
+            font-size: 7.5pt;
+            font-weight: bold;
+            letter-spacing: 0.3px;
+        }
+
+        QComboBox,
+        QLineEdit,
+        QPlainTextEdit {
+            background-color: #ffffff;
+            border: 1px solid #aeb9c2;
+            border-radius: 1px;
+            color: #192630;
+            min-height: 22px;
+            padding: 1px 6px;
+            selection-background-color: #176f9d;
+            selection-color: #ffffff;
+        }
+        QComboBox:hover,
+        QLineEdit:hover,
+        QPlainTextEdit:hover {
+            border-color: #7f929f;
+        }
+        QComboBox:focus,
+        QLineEdit:focus,
+        QPlainTextEdit:focus {
+            border-color: #087dad;
+        }
+
+        QListWidget,
+        QTableWidget {
+            alternate-background-color: #f4f6f7;
+            background-color: #ffffff;
+            border: 1px solid #aeb9c2;
+            border-radius: 0;
+            color: #1a2731;
+            outline: 0;
+            selection-background-color: #176f9d;
+            selection-color: #ffffff;
+        }
+        QListWidget::item {
+            min-height: 20px;
+            padding: 1px 5px;
+        }
+        QListWidget::item:hover {
+            background-color: #e1ebf1;
+            color: #14222e;
+        }
+        QListWidget::item:selected {
+            background-color: #176f9d;
+            color: #ffffff;
+        }
+        QTableWidget::item {
+            padding: 2px 5px;
+        }
         QHeaderView::section {
-            background: #f3f5f7; color: #526071; border: none;
-            border-bottom: 1px solid #dfe3e8; padding: 7px; font-size: 10px; font-weight: 700;
+            background-color: #d8dfe4;
+            border: 0;
+            border-right: 1px solid #b0bac2;
+            border-bottom: 1px solid #9daab4;
+            color: #263b4b;
+            font-size: 8pt;
+            font-weight: bold;
+            min-height: 21px;
+            padding: 2px 5px;
         }
-        QPushButton { min-height: 26px; padding: 3px 10px; border-radius: 4px; font-weight: 600; }
-        QPushButton#primary { background: #2563eb; color: #ffffff; border: 1px solid #2563eb; }
-        QPushButton#primary:hover { background: #1d4ed8; }
-        QPushButton#neutral { background: #ffffff; color: #334155; border: 1px solid #cfd6df; }
-        QPushButton#neutral:hover { background: #f3f5f7; }
-        QPushButton#danger { background: #ffffff; color: #b42318; border: 1px solid #e6b8b3; }
-        QPushButton#danger:hover { background: #fff1f0; }
-        QSplitter::handle { background: #edf0f3; }
+
+        QPushButton {
+            background-color: #e2e7eb;
+            border: 1px solid #9eabb5;
+            border-radius: 1px;
+            color: #20313f;
+            font-weight: normal;
+            min-height: 23px;
+            padding: 1px 9px;
+        }
+        QPushButton:hover {
+            background-color: #eef1f3;
+            border-color: #718695;
+        }
+        QPushButton#primary {
+            background-color: #176f9d;
+            border-color: #0d5f88;
+            color: #ffffff;
+            font-weight: bold;
+        }
+        QPushButton#primary:hover {
+            background-color: #0e7eae;
+        }
+        QPushButton#neutral {
+            background-color: #f8f9fa;
+            border-color: #9ba8b2;
+            color: #253642;
+        }
+        QPushButton#neutral:hover {
+            background-color: #e8edf0;
+        }
+        QPushButton#danger {
+            background-color: #f8f9fa;
+            border-color: #b88a86;
+            color: #92372f;
+            font-weight: bold;
+        }
+        QPushButton#danger:hover {
+            background-color: #f4e9e8;
+            border-color: #a95c56;
+        }
+        QPushButton:disabled {
+            background-color: #e3e7ea;
+            border-color: #c4ccd2;
+            color: #8b969e;
+        }
+
+        QSplitter::handle {
+            background-color: #b9c3ca;
+            margin: 1px;
+        }
+        QSplitter::handle:hover {
+            background-color: #7d929f;
+        }
         """
 
     def _section_header(self, title, caption, actions=None):
         row = QHBoxLayout()
-        row.setSpacing(8)
+        row.setSpacing(6)
         text = QVBoxLayout()
         text.setSpacing(1)
         title_label = QLabel(title)
@@ -231,8 +404,8 @@ class AdminPage(QWidget):
     def create_user_role_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
         btn_new_user = self.create_button("New User", "primary", self.create_user)
         btn_edit_user = self.create_button("Edit User", "neutral", self.edit_user)
@@ -248,8 +421,8 @@ class AdminPage(QWidget):
 
         assigned_panel = self._panel()
         assigned_layout = QVBoxLayout(assigned_panel)
-        assigned_layout.setContentsMargins(12, 12, 12, 12)
-        assigned_layout.setSpacing(8)
+        assigned_layout.setContentsMargins(8, 8, 8, 8)
+        assigned_layout.setSpacing(6)
         assigned_layout.addWidget(self._field_label("Selected user"))
         self.user_combo = QComboBox()
         self.user_combo.setMinimumWidth(220)
@@ -266,9 +439,13 @@ class AdminPage(QWidget):
 
         available_panel = self._panel()
         available_layout = QVBoxLayout(available_panel)
-        available_layout.setContentsMargins(12, 12, 12, 12)
-        available_layout.setSpacing(8)
+        available_layout.setContentsMargins(8, 8, 8, 8)
+        available_layout.setSpacing(6)
         assign = self.create_button("Assign Role", "primary", self.assign_role_to_user)
+        available_layout.addLayout(self._section_header(
+            "Role assignment",
+            "Add a security role to the selected account",
+        ))
         available_layout.addWidget(assign, 0, Qt.AlignLeft)
         available_layout.addStretch()
         splitter.addWidget(available_panel)
@@ -403,8 +580,8 @@ class AdminPage(QWidget):
     def create_role_perm_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
         btn_new_role = self.create_button("New Role", "primary", self.create_role)
         btn_rename_role = self.create_button("Rename Role", "neutral", self.rename_role)
@@ -420,8 +597,8 @@ class AdminPage(QWidget):
 
         assigned_panel = self._panel()
         assigned_layout = QVBoxLayout(assigned_panel)
-        assigned_layout.setContentsMargins(12, 12, 12, 12)
-        assigned_layout.setSpacing(8)
+        assigned_layout.setContentsMargins(8, 8, 8, 8)
+        assigned_layout.setSpacing(6)
         assigned_layout.addWidget(self._field_label("Selected role"))
         self.role_perm_combo = QComboBox()
         for r in self.role_service.get_all_roles():
@@ -437,11 +614,15 @@ class AdminPage(QWidget):
 
         available_panel = self._panel()
         available_layout = QVBoxLayout(available_panel)
-        available_layout.setContentsMargins(12, 12, 12, 12)
-        available_layout.setSpacing(8)
+        available_layout.setContentsMargins(8, 8, 8, 8)
+        available_layout.setSpacing(6)
         add = self.create_button("Add Permission", "primary", self.add_permission_to_role)
         btn_new_perm = self.create_button("New Permission", "neutral", self.create_permission)
         btn_del_perm = self.create_button("Delete Permission", "danger", self.delete_permission)
+        available_layout.addLayout(self._section_header(
+            "Permission catalog",
+            "Assign or maintain controlled permissions",
+        ))
         available_layout.addWidget(add, 0, Qt.AlignLeft)
         available_layout.addStretch()
         permission_actions = QHBoxLayout()
@@ -549,8 +730,8 @@ class AdminPage(QWidget):
     def create_project_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
         btn_add = self.create_button("New Project", "primary", self.create_project)
         btn_edit = self.create_button("Edit Project", "neutral", self.edit_project)
@@ -565,8 +746,8 @@ class AdminPage(QWidget):
         splitter.setChildrenCollapsible(False)
         project_panel = self._panel()
         project_layout = QVBoxLayout(project_panel)
-        project_layout.setContentsMargins(10, 10, 10, 10)
-        project_layout.setSpacing(8)
+        project_layout.setContentsMargins(8, 8, 8, 8)
+        project_layout.setSpacing(6)
         self.project_search = QLineEdit()
         self.project_search.setPlaceholderText("Search projects")
         self.project_search.setClearButtonEnabled(True)
@@ -584,15 +765,15 @@ class AdminPage(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(32)
+        self.table.verticalHeader().setDefaultSectionSize(24)
         self.table.setSortingEnabled(True)
         project_layout.addWidget(self.table)
         splitter.addWidget(project_panel)
 
         members_panel = self._panel()
         members_layout = QVBoxLayout(members_panel)
-        members_layout.setContentsMargins(10, 10, 10, 10)
-        members_layout.setSpacing(8)
+        members_layout.setContentsMargins(8, 8, 8, 8)
+        members_layout.setSpacing(6)
         members_layout.addLayout(self._section_header("Project members", "Membership for the selected project"))
         members_top = QHBoxLayout()
         btn_add_user = self.create_button("Add Member", "primary", self.add_user_to_project)
@@ -617,8 +798,8 @@ class AdminPage(QWidget):
     def create_configuration_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
         refresh_btn = self.create_button("Refresh", "neutral", self.load_configuration_admin)
         layout.addLayout(self._section_header(
@@ -632,8 +813,8 @@ class AdminPage(QWidget):
 
         paths_panel = self._panel()
         paths_layout = QVBoxLayout(paths_panel)
-        paths_layout.setContentsMargins(10, 10, 10, 10)
-        paths_layout.setSpacing(8)
+        paths_layout.setContentsMargins(8, 8, 8, 8)
+        paths_layout.setSpacing(6)
         self.config_summary_label = QLabel("Application version: -")
         self.config_summary_label.setObjectName("sectionCaption")
         paths_layout.addWidget(self.config_summary_label)
@@ -647,7 +828,7 @@ class AdminPage(QWidget):
         self.config_paths_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.config_paths_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.config_paths_table.verticalHeader().setVisible(False)
-        self.config_paths_table.verticalHeader().setDefaultSectionSize(30)
+        self.config_paths_table.verticalHeader().setDefaultSectionSize(24)
         paths_layout.addWidget(self.config_paths_table, 1)
         path_actions = QHBoxLayout()
         path_actions.addStretch()
@@ -659,8 +840,8 @@ class AdminPage(QWidget):
 
         metadata_panel = self._panel()
         metadata_layout = QVBoxLayout(metadata_panel)
-        metadata_layout.setContentsMargins(10, 10, 10, 10)
-        metadata_layout.setSpacing(8)
+        metadata_layout.setContentsMargins(8, 8, 8, 8)
+        metadata_layout.setSpacing(6)
         warning = QLabel(
             "Metadata edits are immediate. Version and signed licensing keys can affect startup checks."
         )
@@ -677,7 +858,7 @@ class AdminPage(QWidget):
         editor_right.addWidget(self._field_label("Value"))
         self.metadata_value_input = QPlainTextEdit()
         self.metadata_value_input.setPlaceholderText("Metadata value")
-        self.metadata_value_input.setFixedHeight(62)
+        self.metadata_value_input.setFixedHeight(48)
         editor_right.addWidget(self.metadata_value_input)
         editor_row.addLayout(editor_left, 1)
         editor_row.addLayout(editor_right, 2)
@@ -700,7 +881,7 @@ class AdminPage(QWidget):
         self.metadata_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.metadata_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.metadata_table.verticalHeader().setVisible(False)
-        self.metadata_table.verticalHeader().setDefaultSectionSize(30)
+        self.metadata_table.verticalHeader().setDefaultSectionSize(24)
         self.metadata_table.itemSelectionChanged.connect(self.load_selected_metadata_item)
         metadata_layout.addWidget(self.metadata_table, 1)
         splitter.addWidget(metadata_panel)

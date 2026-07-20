@@ -9,6 +9,7 @@ from PyQt5.QtWidgets import (
     QDialog,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -28,6 +29,11 @@ from PyQt5.QtWidgets import (
 )
 
 from core.services.assembly_configuration_service import ConfigurationCancelled
+from pages.dialogs.professional_style import (
+    apply_professional_dialog_style,
+    make_dialog_header,
+    make_section_title,
+)
 from utils import safe_exists, safe_startfile
 
 
@@ -38,33 +44,7 @@ OCCURRENCE_PATH_ROLE = Qt.UserRole + 804
 
 
 def _apply_dialog_style(dialog: QDialog) -> None:
-    dialog.setStyleSheet(
-        """
-        QDialog { background:#f5f7fa; color:#172033; font-size:10px; }
-        QLabel { color:#172033; background:transparent; font-size:10px; }
-        QLineEdit, QComboBox, QPlainTextEdit {
-            color:#172033; background:#ffffff; border:1px solid #b8c2cf;
-            border-radius:3px; padding:3px 5px; font-size:10px;
-        }
-        QPushButton {
-            color:#172033; background:#ffffff; border:1px solid #b8c2cf;
-            border-radius:3px; min-height:22px; padding:2px 8px; font-size:10px;
-        }
-        QPushButton#primary { color:#ffffff; background:#1676d2; border-color:#1265b4; }
-        QPushButton#danger { color:#ffffff; background:#c63d32; border-color:#a93229; }
-        QTableWidget, QTreeWidget {
-            color:#172033; background:#ffffff; alternate-background-color:#f7f9fc;
-            gridline-color:#d8dee8; selection-color:#172033;
-            selection-background-color:#cfe5fb; border:1px solid #c7d0dc;
-            font-size:10px;
-        }
-        QHeaderView::section {
-            color:#172033; background:#e9edf2; border:0;
-            border-right:1px solid #c7d0dc; border-bottom:1px solid #c7d0dc;
-            padding:4px; font-size:10px; font-weight:600;
-        }
-        """
-    )
+    apply_professional_dialog_style(dialog)
 
 
 def _show_error(parent, title: str, message: str) -> None:
@@ -152,11 +132,27 @@ class AssemblyConfigurationEditorDialog(QDialog):
         self._load_editor()
 
     def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(7)
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        root_layout.addWidget(
+            make_dialog_header(
+                "Edit Configuration Draft" if self.configuration_id else "Create Configuration",
+                "Select exact Item iterations and define the controlled assembly configuration.",
+                kicker="CONFIGURATION MANAGEMENT",
+            )
+        )
 
-        form = QFormLayout()
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(10, 9, 10, 9)
+        layout.setSpacing(7)
+        root_layout.addWidget(body, 1)
+
+        attribute_panel = QFrame()
+        attribute_panel.setObjectName("professionalSection")
+        form = QFormLayout(attribute_panel)
+        form.setContentsMargins(9, 7, 9, 7)
         form.setSpacing(6)
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("Example: Prototype housing trial")
@@ -173,13 +169,13 @@ class AssemblyConfigurationEditorDialog(QDialog):
         self.description_edit = QPlainTextEdit()
         self.description_edit.setFixedHeight(54)
         form.addRow("Description", self.description_edit)
-        layout.addLayout(form)
+        layout.addWidget(attribute_panel)
 
         splitter = QSplitter(Qt.Horizontal)
         source_panel = QWidget()
         source_layout = QVBoxLayout(source_panel)
         source_layout.setContentsMargins(0, 0, 0, 0)
-        source_layout.addWidget(QLabel("Project BOM Components"))
+        source_layout.addWidget(make_section_title("PROJECT ITEM ITERATIONS"))
         source_search_row = QHBoxLayout()
         self.source_search = QLineEdit()
         self.source_search.setPlaceholderText("Search item number, name, or AES...")
@@ -214,7 +210,7 @@ class AssemblyConfigurationEditorDialog(QDialog):
         structure_panel = QWidget()
         structure_layout = QVBoxLayout(structure_panel)
         structure_layout.setContentsMargins(0, 0, 0, 0)
-        structure_layout.addWidget(QLabel("Configuration BOM"))
+        structure_layout.addWidget(make_section_title("CONFIGURATION STRUCTURE"))
         self.structure_tree = _ConfigurationDropTree()
         self.structure_tree.drop_handler = self._add_source_items
         self.structure_tree.setColumnCount(8)
@@ -253,7 +249,11 @@ class AssemblyConfigurationEditorDialog(QDialog):
         splitter.setSizes([440, 760])
         layout.addWidget(splitter, 1)
 
-        buttons = QHBoxLayout()
+        footer = QFrame()
+        footer.setObjectName("professionalFooter")
+        buttons = QHBoxLayout(footer)
+        buttons.setContentsMargins(8, 6, 8, 6)
+        buttons.setSpacing(6)
         cancel_button = QPushButton("Cancel")
         cancel_button.clicked.connect(self.reject)
         save_button = QPushButton("Save Draft")
@@ -265,7 +265,7 @@ class AssemblyConfigurationEditorDialog(QDialog):
         buttons.addWidget(cancel_button)
         buttons.addWidget(save_button)
         buttons.addWidget(freeze_button)
-        layout.addLayout(buttons)
+        layout.addWidget(footer)
 
     def _load_editor(self) -> None:
         if self.configuration_id:
@@ -742,15 +742,28 @@ class ManageAssemblyConfigurationsDialog(QDialog):
         self._load_configurations()
 
     def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        root_layout.addWidget(
+            make_dialog_header(
+                "Assembly Configurations",
+                "Review, version, freeze, and build controlled configuration baselines.",
+                kicker="CONFIGURATION MANAGEMENT",
+            )
+        )
+
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(10, 9, 10, 9)
         layout.setSpacing(7)
+        root_layout.addWidget(body, 1)
 
         splitter = QSplitter(Qt.Vertical)
         config_panel = QWidget()
         config_layout = QVBoxLayout(config_panel)
         config_layout.setContentsMargins(0, 0, 0, 0)
-        config_layout.addWidget(QLabel("Configuration Versions"))
+        config_layout.addWidget(make_section_title("CONFIGURATION VERSIONS"))
         self.configuration_table = QTableWidget()
         self.configuration_table.setColumnCount(11)
         self.configuration_table.setHorizontalHeaderLabels([
@@ -762,6 +775,7 @@ class ManageAssemblyConfigurationsDialog(QDialog):
         self.configuration_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.configuration_table.setAlternatingRowColors(True)
         self.configuration_table.verticalHeader().setVisible(False)
+        self.configuration_table.verticalHeader().setDefaultSectionSize(24)
         header = self.configuration_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         header.setSectionResizeMode(4, QHeaderView.Stretch)
@@ -775,7 +789,7 @@ class ManageAssemblyConfigurationsDialog(QDialog):
         member_panel = QWidget()
         member_layout = QVBoxLayout(member_panel)
         member_layout.setContentsMargins(0, 0, 0, 0)
-        self.structure_label = QLabel("Configuration Structure")
+        self.structure_label = make_section_title("CONFIGURATION STRUCTURE")
         member_layout.addWidget(self.structure_label)
         self.member_tree = QTreeWidget()
         self.member_tree.setColumnCount(8)
@@ -800,7 +814,11 @@ class ManageAssemblyConfigurationsDialog(QDialog):
         splitter.setSizes([300, 370])
         layout.addWidget(splitter, 1)
 
-        action_row = QHBoxLayout()
+        action_bar = QFrame()
+        action_bar.setObjectName("professionalFooter")
+        action_row = QHBoxLayout(action_bar)
+        action_row.setContentsMargins(8, 6, 8, 6)
+        action_row.setSpacing(6)
         self.edit_button = QPushButton("Edit Draft")
         self.edit_button.clicked.connect(self._edit_selected)
         self.freeze_button = QPushButton("Freeze")
@@ -834,7 +852,7 @@ class ManageAssemblyConfigurationsDialog(QDialog):
         action_row.addWidget(self.delete_button)
         action_row.addStretch(1)
         action_row.addWidget(close_button)
-        layout.addLayout(action_row)
+        layout.addWidget(action_bar)
 
     def _selected_configuration_id(self):
         rows = self.configuration_table.selectionModel().selectedRows()

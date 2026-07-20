@@ -6,7 +6,13 @@ import sqlite3
 from typing import Optional
 
 from config import DB_NAME
-from setup.migrations import _migration_32, _migration_33, _migration_34, _migration_35
+from setup.migrations import (
+    _migration_32,
+    _migration_33,
+    _migration_34,
+    _migration_35,
+    _migration_38,
+)
 from utils import get_base_name, get_version_number, is_creo_file
 
 
@@ -63,6 +69,7 @@ class PdmRepository:
                 )
             if not migration_35_applied:
                 _migration_35(conn)
+            _migration_38(conn)
             if conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cad_documents'"
             ).fetchone():
@@ -579,6 +586,27 @@ class PdmRepository:
             self._attach_related_drawings(conn, [record])
             return record
 
+    def get_current_cad_iteration(self, cad_document_id: int) -> Optional[dict]:
+        with self.get_conn() as conn:
+            document = conn.execute(
+                "SELECT revision,iteration FROM cad_documents WHERE id=?",
+                (int(cad_document_id),),
+            ).fetchone()
+            if not document:
+                return None
+            return self._dict(conn.execute(
+                """
+                SELECT * FROM cad_document_iterations
+                WHERE cad_document_id=? AND revision=? AND iteration=?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (
+                    int(cad_document_id),
+                    str(document["revision"] or "A"),
+                    int(document["iteration"] or 1),
+                ),
+            ).fetchone())
+
     def get_cad_document_by_file(self, project_id: int, file_name: str) -> Optional[dict]:
         clean_file = os.path.basename(str(file_name or "").replace("\\", "/")).strip()
         version_match = re.match(
@@ -826,7 +854,15 @@ class PdmRepository:
             digits.insert(0, 0)
         return "".join(chr(value + ord("A")) for value in digits)
 
-    def checkout_cad_document(self, cad_document_id: int, user_id: int) -> dict:
+    def checkout_cad_document(
+        self,
+        cad_document_id: int,
+        user_id: int,
+        *,
+        workspace_id: str | None = None,
+        workspace_name: str | None = None,
+        workspace_machine_id: str | None = None,
+    ) -> dict:
         with self.get_conn() as conn:
             row = conn.execute(
                 "SELECT * FROM cad_documents WHERE id=?", (int(cad_document_id),)
@@ -864,10 +900,30 @@ class PdmRepository:
             checkout_item_id = int(association["item_id"]) if association else None
             if owner is not None:
                 # Repeated checkout by the owner is intentionally idempotent.
+                updates = []
+                params = []
                 if row["checkout_item_id"] is None and checkout_item_id is not None:
+                    updates.append("checkout_item_id=?")
+                    params.append(checkout_item_id)
+                if workspace_id:
+                    current_workspace = str(row["checkout_workspace_id"] or "").strip()
+                    if current_workspace and current_workspace != str(workspace_id):
+                        raise ValueError(
+                            "The CAD Document is already checked out in another workspace."
+                        )
+                    updates.extend([
+                        "checkout_workspace_id=?",
+                        "checkout_workspace_name=?",
+                        "checkout_workspace_machine_id=?",
+                    ])
+                    params.extend([
+                        str(workspace_id), str(workspace_name or ""),
+                        str(workspace_machine_id or ""),
+                    ])
+                if updates:
                     conn.execute(
-                        "UPDATE cad_documents SET checkout_item_id=? WHERE id=?",
-                        (checkout_item_id, int(cad_document_id)),
+                        f"UPDATE cad_documents SET {', '.join(updates)} WHERE id=?",
+                        (*params, int(cad_document_id)),
                     )
                 return self._dict(conn.execute(
                     "SELECT * FROM cad_documents WHERE id=?", (int(cad_document_id),)
@@ -875,18 +931,32 @@ class PdmRepository:
             conn.execute(
                 """
                 UPDATE cad_documents SET checked_out_by=?,
-                    checked_out_at=datetime('now'),checkout_item_id=?
+                    checked_out_at=datetime('now'),checkout_item_id=?,
+                    checkout_workspace_id=?,checkout_workspace_name=?,
+                    checkout_workspace_machine_id=?
                 WHERE id=?
                 """,
-                (int(user_id), checkout_item_id, int(cad_document_id)),
+                (
+                    int(user_id), checkout_item_id,
+                    str(workspace_id or "") or None,
+                    str(workspace_name or "") or None,
+                    str(workspace_machine_id or "") or None,
+                    int(cad_document_id),
+                ),
             )
             conn.execute(
                 """
                 INSERT INTO cad_document_checkout_logs(
-                    cad_document_id,item_id,user_id,action
-                ) VALUES(?,?,?,'CHECKOUT')
+                    cad_document_id,item_id,user_id,action,workspace_id,
+                    workspace_name,workspace_machine_id
+                ) VALUES(?,?,?,'CHECKOUT',?,?,?)
                 """,
-                (int(cad_document_id), checkout_item_id, int(user_id)),
+                (
+                    int(cad_document_id), checkout_item_id, int(user_id),
+                    str(workspace_id or "") or None,
+                    str(workspace_name or "") or None,
+                    str(workspace_machine_id or "") or None,
+                ),
             )
         return self.get_cad_document(int(cad_document_id))
 
@@ -969,6 +1039,8 @@ class PdmRepository:
                 """
                 UPDATE cad_documents SET iteration=?,lifecycle_state='IN_WORK',
                     checked_out_by=NULL,checked_out_at=NULL,checkout_item_id=NULL,
+                    checkout_workspace_id=NULL,checkout_workspace_name=NULL,
+                    checkout_workspace_machine_id=NULL,
                     latest_creo_file_version=?,latest_creo_file_name=?,
                     modified_at=datetime('now')
                 WHERE id=?
@@ -978,12 +1050,15 @@ class PdmRepository:
             conn.execute(
                 """
                 INSERT INTO cad_document_checkout_logs(
-                    cad_document_id,item_id,user_id,action,cad_iteration_id,note
-                ) VALUES(?,?,?,'CHECKIN',?,?)
+                    cad_document_id,item_id,user_id,action,cad_iteration_id,note,
+                    workspace_id,workspace_name,workspace_machine_id
+                ) VALUES(?,?,?,'CHECKIN',?,?,?,?,?)
                 """,
                 (
                     int(cad_document_id), checkout_item_id, int(user_id),
                     iteration_id, str(note or "").strip() or None,
+                    row["checkout_workspace_id"], row["checkout_workspace_name"],
+                    row["checkout_workspace_machine_id"],
                 ),
             )
         return {**self.get_cad_document(int(cad_document_id)), "iteration_id": iteration_id}
@@ -1011,6 +1086,8 @@ class PdmRepository:
                 """
                 UPDATE cad_documents
                 SET checked_out_by=NULL,checked_out_at=NULL,checkout_item_id=NULL,
+                    checkout_workspace_id=NULL,checkout_workspace_name=NULL,
+                    checkout_workspace_machine_id=NULL,
                     modified_at=datetime('now')
                 WHERE id=?
                 """,
@@ -1019,15 +1096,31 @@ class PdmRepository:
             conn.execute(
                 """
                 INSERT INTO cad_document_checkout_logs(
-                    cad_document_id,item_id,user_id,action,note
-                ) VALUES(?,?,?,'UNDO_CHECKOUT',?)
+                    cad_document_id,item_id,user_id,action,note,workspace_id,
+                    workspace_name,workspace_machine_id
+                ) VALUES(?,?,?,'UNDO_CHECKOUT',?,?,?,?)
                 """,
                 (
                     int(cad_document_id), checkout_item_id, int(user_id),
                     str(note or "").strip() or None,
+                    row["checkout_workspace_id"], row["checkout_workspace_name"],
+                    row["checkout_workspace_machine_id"],
                 ),
             )
         return self.get_cad_document(int(cad_document_id))
+
+    def list_checked_out_cad_by_workspace(self, workspace_id: str) -> list[dict]:
+        with self.get_conn() as conn:
+            return [
+                dict(row) for row in conn.execute(
+                    """
+                    SELECT * FROM cad_documents
+                    WHERE checked_out_by IS NOT NULL AND checkout_workspace_id=?
+                    ORDER BY lower(file_name),id
+                    """,
+                    (str(workspace_id),),
+                ).fetchall()
+            ]
 
     def list_checked_out_cad_for_item(self, item_id: int) -> list[dict]:
         """Return active CAD working copies tied to one Item checkout."""

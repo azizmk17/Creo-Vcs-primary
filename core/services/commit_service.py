@@ -5,6 +5,7 @@ import shutil
 from datetime import datetime
 import uuid
 import json
+import hashlib
 from dataclasses import asdict
 from core.repositories.commit_repository import CommitRepository
 from core.repositories.bom_repository import BomRepository
@@ -60,6 +61,14 @@ class CommitService(BaseService):
     def _canonical_part_root(self, value: str) -> str:
         base = os.path.basename(value or "")
         return (base.split(".")[0] if base else "").strip().lower()
+
+    @staticmethod
+    def _sha256(path: str) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
 
     def _clean_creo_file_name(self, filename: str) -> str:
         name = os.path.basename(str(filename or "").replace("\\", "/")).strip()
@@ -374,6 +383,7 @@ class CommitService(BaseService):
         jira_key: str | None = None,
         jira_url: str | None = None,
         engineering_attachments=None,
+        workspace_expectations=None,
     ):
 
         commit_id = f"commit_{uuid.uuid4().hex[:8]}"
@@ -389,6 +399,11 @@ class CommitService(BaseService):
         user_dir = os.path.join(commit_dir, designer)
         commit_user_dir = os.path.join(user_dir, f"{title}_{commit_id}")
         commit_plan = []
+        expected_by_path = {
+            os.path.normcase(os.path.abspath(str(item.get("path") or ""))): dict(item)
+            for item in (workspace_expectations or [])
+            if item.get("path")
+        }
 
         # Phase 1: preflight every file before creating commit artifacts.
         for filepath in uncommitted_parts:
@@ -398,6 +413,17 @@ class CommitService(BaseService):
 
             if not safe_exists(filepath):
                 raise ValueError(f"Commit blocked: source file is missing: {filename}")
+
+            workspace_expected = expected_by_path.get(
+                os.path.normcase(os.path.abspath(str(filepath)))
+            )
+            if workspace_expected:
+                expected_hash = str(workspace_expected.get("sha256") or "").strip()
+                if expected_hash and self._sha256(filepath).casefold() != expected_hash.casefold():
+                    raise ValueError(
+                        f"Commit blocked: {filename} changed after workspace staging. "
+                        "Review the workspace and stage it again."
+                    )
 
             if not is_creo_file(filename):
                 raise ValueError(f"Error: {filename} is not a valid Creo file")
@@ -434,6 +460,27 @@ class CommitService(BaseService):
                         "this dependency does not require an individual BOM commit."
                     )
                 raise ValueError(f"cad_register_required:{filename}")
+
+            if workspace_expected:
+                expected_cad_id = workspace_expected.get("cad_document_id")
+                if (
+                    expected_cad_id is not None
+                    and int(cad_document["id"]) != int(expected_cad_id)
+                ):
+                    raise ValueError(
+                        f"Commit blocked: {filename} no longer resolves to the CAD Document "
+                        "selected from the workspace."
+                    )
+                expected_workspace_id = str(
+                    workspace_expected.get("workspace_id") or ""
+                ).strip()
+                if expected_workspace_id and str(
+                    cad_document.get("checkout_workspace_id") or ""
+                ).strip() != expected_workspace_id:
+                    raise ValueError(
+                        f"Commit blocked: {filename} is no longer checked out in the "
+                        "workspace from which it was staged."
+                    )
 
             document_category = str(cad_document.get("category") or "").upper()
             if category == "DRAWING" and document_category != "DRAWING":

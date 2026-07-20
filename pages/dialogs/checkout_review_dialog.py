@@ -10,8 +10,14 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QTextEdit,
     QVBoxLayout,
+    QWidget,
 )
 
+from pages.dialogs.professional_style import (
+    apply_professional_dialog_style,
+    make_dialog_header,
+    set_banner_style,
+)
 from utils import safe_startfile
 
 
@@ -24,13 +30,16 @@ class CheckoutReviewDialog(QDialog):
         super().__init__(parent)
         self.analysis = dict(analysis or {})
         self.action = self.ACTION_CANCEL
+        item_number = str(self.analysis.get("part_number") or "").strip()
+        item_name = str(self.analysis.get("name") or "").strip()
         self.setWindowTitle(
-            f"Check In - {self.analysis.get('name') or self.analysis.get('aes_number') or 'BOM Item'} "
+            f"Check In - {item_number or item_name or 'Item'} "
             f"{self.analysis.get('current_version') or ''}"
         )
         self.setModal(True)
         self.setMinimumWidth(560)
         self.setMaximumWidth(700)
+        apply_professional_dialog_style(self)
         self._build_ui()
 
     @property
@@ -44,17 +53,34 @@ class CheckoutReviewDialog(QDialog):
         return "no_changes"
 
     def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(9)
-
-        title = QLabel(
-            f"<b>CHECK IN - {html.escape(self.analysis.get('aes_number') or '')} "
-            f"{html.escape(self.analysis.get('name') or '')} "
-            f"{html.escape(self.analysis.get('current_version') or '')}</b>"
+        item_number = str(self.analysis.get("part_number") or "").strip()
+        aes_number = str(self.analysis.get("aes_number") or "").strip()
+        item_name = str(self.analysis.get("name") or "").strip()
+        version = str(self.analysis.get("current_version") or "").strip()
+        identity = " — ".join(value for value in (item_number, item_name) if value)
+        context = "  |  ".join(
+            value for value in (
+                f"Iteration {version}" if version else "",
+                f"AES {aes_number}" if aes_number else "",
+            ) if value
         )
-        title.setStyleSheet("font-size: 12px;")
-        layout.addWidget(title)
+
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        root_layout.addWidget(
+            make_dialog_header(
+                identity or "Item Check In",
+                context or "Review controlled changes before check-in.",
+                kicker="WORKSPACE CONTROL",
+            )
+        )
+
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
+        root_layout.addWidget(body)
         layout.addWidget(self._section("Detected changes", self._change_rows()))
 
         if self.mode == "blocked_structure":
@@ -63,22 +89,14 @@ class CheckoutReviewDialog(QDialog):
                 "This assembly uses CAD-controlled structure. Update the native assembly "
                 "before check-in."
             )
-            warning.setWordWrap(True)
-            warning.setStyleSheet(
-                "background:#fff7d6; color:#7a4b00; border:1px solid #e7bd47; "
-                "border-radius:3px; padding:8px;"
-            )
+            set_banner_style(warning, "warning")
             layout.addWidget(warning)
         elif self.mode == "commit":
             info = QLabel(
                 "Native Creo content changed. Nexus will continue in the Commit page so the "
                 "CAD files can follow the existing review and push-to-master workflow."
             )
-            info.setWordWrap(True)
-            info.setStyleSheet(
-                "background:#eaf3ff; color:#164f86; border:1px solid #9fc2e8; "
-                "border-radius:3px; padding:8px;"
-            )
+            set_banner_style(info, "info")
             layout.addWidget(info)
         elif self.mode == "checkin":
             native_name = self.analysis.get("native_cad", {}).get("baseline_filename") or "None"
@@ -89,20 +107,13 @@ class CheckoutReviewDialog(QDialog):
                 f"Native CAD inherited: {html.escape(native_name)}<br>"
                 f"Drawing inherited: {html.escape(drawing_name)}"
             )
-            result.setStyleSheet(
-                "background:#eef8f0; color:#155b2a; border:1px solid #a9d6b4; "
-                "border-radius:3px; padding:8px;"
-            )
+            set_banner_style(result, "success")
             layout.addWidget(result)
         else:
             info = QLabel(
                 "No controlled changes were detected. Use Undo Checkout if the work should be discarded."
             )
-            info.setWordWrap(True)
-            info.setStyleSheet(
-                "background:#f3f4f6; color:#4b5563; border:1px solid #d1d5db; "
-                "border-radius:3px; padding:8px;"
-            )
+            set_banner_style(info, "neutral")
             layout.addWidget(info)
 
         self.comment_edit = QTextEdit()
@@ -112,7 +123,10 @@ class CheckoutReviewDialog(QDialog):
             layout.addWidget(QLabel("Comment:"))
             layout.addWidget(self.comment_edit)
 
-        actions = QHBoxLayout()
+        action_bar = QFrame()
+        action_bar.setObjectName("professionalFooter")
+        actions = QHBoxLayout(action_bar)
+        actions.setContentsMargins(8, 6, 8, 6)
         actions.setSpacing(6)
         if self.mode in {"blocked_structure", "commit"}:
             folder_button = QPushButton("Open Working Folder")
@@ -136,16 +150,16 @@ class CheckoutReviewDialog(QDialog):
             checkin_button.setObjectName("primary")
             checkin_button.clicked.connect(self._choose_checkin)
             actions.addWidget(checkin_button)
-        layout.addLayout(actions)
+        layout.addWidget(action_bar)
 
     def _section(self, title: str, rows: list[tuple[str, bool, list[str]]]) -> QFrame:
         frame = QFrame()
-        frame.setStyleSheet("QFrame { border:1px solid #d5dae2; border-radius:3px; background:white; }")
+        frame.setObjectName("professionalSection")
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(9, 7, 9, 7)
         layout.setSpacing(4)
         heading = QLabel(f"<b>{html.escape(title)}</b>")
-        heading.setStyleSheet("border:0; background:transparent;")
+        heading.setObjectName("professionalSectionTitle")
         layout.addWidget(heading)
         for label, changed, details in rows:
             status = "CHANGED" if changed else "UNCHANGED"
@@ -154,7 +168,7 @@ class CheckoutReviewDialog(QDialog):
                 f"<span style='color:{color}; font-weight:600'>{status}</span>&nbsp;&nbsp;"
                 f"{html.escape(label)}"
             )
-            line.setStyleSheet("border:0; background:transparent;")
+            line.setStyleSheet("border:0; background:transparent; padding:1px 3px;")
             layout.addWidget(line)
             for detail in details:
                 detail_label = QLabel(f"&nbsp;&nbsp;&nbsp;&nbsp;{html.escape(str(detail))}")

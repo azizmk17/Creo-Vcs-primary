@@ -1,6 +1,7 @@
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QPushButton, QLabel, QTableWidget,
-    QTableWidgetItem, QMessageBox, QHeaderView, QHBoxLayout, QFileDialog, QComboBox, QSizePolicy, QTextEdit, QDialog, QProgressDialog
+    QTableWidgetItem, QMessageBox, QHeaderView, QHBoxLayout, QFileDialog, QComboBox, QSizePolicy, QTextEdit, QDialog, QProgressDialog,
+    QFrame, QAbstractItemView
 )
 from PyQt5.QtCore import Qt, QTimer
 from core.services.snapshot_service import SnapshotService
@@ -34,27 +35,44 @@ class SnapshotPage(QWidget):
 
     # -------------------- UI SETUP --------------------
     def init_ui(self):
-        layout = QVBoxLayout()
+        self.setObjectName("snapshotPage")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 7, 8, 8)
+        layout.setSpacing(6)
 
-        # --- Title & Summary ---
-        self.lbl_title = QLabel("<h2>Project Snapshots</h2>")
-        self.lbl_summary = QLabel("<b>Status:</b> No snapshots yet.")
-        layout.addWidget(self.lbl_title)
-        layout.addWidget(self.lbl_summary)
-
-        # --- Table ---
-        self.table = QTableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["ID", "Name", "Created By", "Created At"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table.cellDoubleClicked.connect(self.show_snapshot_details)
-        layout.addWidget(self.table)
-
-        # --- Buttons ---
-        btn_layout = QHBoxLayout()
+        header = QFrame()
+        header.setObjectName("snapshotHeader")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(11, 8, 11, 8)
+        header_layout.setSpacing(10)
+        header_text = QVBoxLayout()
+        header_text.setSpacing(1)
+        self.lbl_title = QLabel("Project Snapshots")
+        self.lbl_title.setObjectName("snapshotTitle")
+        self.lbl_summary = QLabel("Status: No snapshots yet.")
+        self.lbl_summary.setObjectName("snapshotSummary")
+        self.lbl_summary.setWordWrap(True)
+        header_text.addWidget(self.lbl_title)
+        header_text.addWidget(self.lbl_summary)
+        header_layout.addLayout(header_text, 1)
 
         self.btn_new = QPushButton("Create Snapshot")
         self.btn_new.setObjectName("primary")
+        self.btn_new.setToolTip("Capture the current controlled project state")
+        header_layout.addWidget(self.btn_new)
+        layout.addWidget(header)
+
+        action_strip = QFrame()
+        action_strip.setObjectName("snapshotActionStrip")
+        action_strip_layout = QVBoxLayout(action_strip)
+        action_strip_layout.setContentsMargins(5, 3, 5, 3)
+        action_strip_layout.setSpacing(3)
+        btn_layout = QHBoxLayout()
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_layout.setSpacing(4)
+        action_caption = QLabel("SNAPSHOT")
+        action_caption.setObjectName("snapshotActionCaption")
+        btn_layout.addWidget(action_caption)
         self.btn_view = QPushButton("View Details")
         self.btn_view.setObjectName("neutral")
         self.btn_delete = QPushButton("Delete Snapshot")
@@ -67,29 +85,107 @@ class SnapshotPage(QWidget):
         self.btn_delete.clicked.connect(self.delete_snapshot)
         self.btn_export.clicked.connect(self.export_snapshot)
 
-        btn_layout.addWidget(self.btn_new)
         btn_layout.addWidget(self.btn_view)
-        btn_layout.addWidget(self.btn_delete)
         btn_layout.addWidget(self.btn_export)
-        layout.addLayout(btn_layout)
+        btn_layout.addWidget(self.btn_delete)
+        btn_layout.addStretch(1)
+        action_strip_layout.addLayout(btn_layout)
 
-        # --- Compare Section ---
-        compare_layout = QHBoxLayout()
         self.combo_from = QComboBox()
         self.combo_to = QComboBox()
         self.btn_compare = QPushButton("Compare Snapshots")
-        self.btn_compare.setObjectName("primary")
+        self.btn_compare.setObjectName("neutral")
 
-        compare_layout.addWidget(QLabel("From:"))
-        compare_layout.addWidget(self.combo_from)
-        compare_layout.addWidget(QLabel("To:"))
-        compare_layout.addWidget(self.combo_to)
+        compare_layout = QHBoxLayout()
+        compare_layout.setContentsMargins(0, 0, 0, 0)
+        compare_layout.setSpacing(4)
+        compare_caption = QLabel("COMPARE")
+        compare_caption.setObjectName("snapshotActionCaption")
+        compare_layout.addWidget(compare_caption)
+        compare_layout.addWidget(QLabel("From"))
+        compare_layout.addWidget(self.combo_from, 1)
+        compare_layout.addWidget(QLabel("To"))
+        compare_layout.addWidget(self.combo_to, 1)
         compare_layout.addWidget(self.btn_compare)
+        compare_layout.addStretch(1)
+        action_strip_layout.addLayout(compare_layout)
 
         self.btn_compare.clicked.connect(self.compare_snapshots)
-        layout.addLayout(compare_layout)
+        layout.addWidget(action_strip)
 
-        self.setLayout(layout)
+        self.table = QTableWidget()
+        self.table.setObjectName("snapshotTable")
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["ID", "Snapshot Name", "Created By", "Created At"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(24)
+        self.table.cellDoubleClicked.connect(
+            lambda row, _column: self.show_snapshot_details(
+                int(self.table.item(row, 0).text())
+            ) if self.table.item(row, 0) else None
+        )
+        layout.addWidget(self.table, 1)
+
+        self.setStyleSheet("""
+            QWidget#snapshotPage { background: #e1e5e9; }
+            QFrame#snapshotHeader {
+                background: #ffffff;
+                border: 1px solid #aeb9c5;
+                border-left: 4px solid #2f75a4;
+            }
+            QLabel#snapshotTitle {
+                color: #172c3f;
+                font-size: 14px;
+                font-weight: 700;
+            }
+            QLabel#snapshotSummary {
+                color: #586b7d;
+                font-size: 10px;
+            }
+            QFrame#snapshotActionStrip {
+                background: #eef1f4;
+                border: 1px solid #aeb9c5;
+            }
+            QLabel#snapshotActionCaption {
+                color: #4d6276;
+                font-size: 9px;
+                font-weight: 700;
+                padding: 0 4px;
+            }
+            QFrame#snapshotActionSeparator { color: #aeb9c5; }
+            QFrame#snapshotActionStrip QPushButton,
+            QFrame#snapshotActionStrip QComboBox {
+                min-height: 23px;
+                border-radius: 0;
+                padding: 1px 7px;
+            }
+            QTableWidget#snapshotTable {
+                background: #ffffff;
+                alternate-background-color: #f6f8f9;
+                border: 1px solid #aeb9c5;
+                border-radius: 0;
+                selection-background-color: #dbe9f4;
+                selection-color: #172c3f;
+            }
+            QTableWidget#snapshotTable QHeaderView::section {
+                background: #e5e9ed;
+                color: #30475b;
+                border: 0;
+                border-right: 1px solid #c4cdd6;
+                border-bottom: 1px solid #aeb9c5;
+                padding: 4px 6px;
+                font-weight: 600;
+            }
+        """)
         QTimer.singleShot(0, self.load_snapshots)
 
         # Initial state

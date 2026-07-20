@@ -19,6 +19,10 @@ from PyQt5.QtCore import QSize
 
 from core.repositories.bom_repository import BomRepository
 from core.session_manager import SessionManager
+from pages.dialogs.professional_style import (
+    apply_professional_dialog_style,
+    make_dialog_header,
+)
 
 
 _DOC_BADGE_STYLE = {
@@ -36,6 +40,7 @@ class PackagePartsDialog(QDialog):
         self.setModal(True)
         self.resize(860, 620)
         self.setMinimumSize(720, 520)
+        apply_professional_dialog_style(self)
 
         self.session = SessionManager()
         self.project_id = project_id or self.session.project_id
@@ -51,14 +56,22 @@ class PackagePartsDialog(QDialog):
         self._apply_filter()
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(10)
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        root_layout.addWidget(
+            make_dialog_header(
+                "Select Items",
+                "Build the package scope. Selections remain active while searching and filtering.",
+                kicker="DELIVERY PACKAGE",
+            )
+        )
 
-        title = QLabel("Select Items")
-        title.setStyleSheet("font-size:16px;font-weight:700;color:#172033;")
-        layout.addWidget(title)
-        layout.addWidget(QLabel("Selections are preserved while searching and filtering."))
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(7)
+        root_layout.addWidget(body, 1)
 
         search_row = QHBoxLayout()
         self.search_input = QLineEdit()
@@ -79,6 +92,7 @@ class PackagePartsDialog(QDialog):
         layout.addLayout(search_row)
 
         summary = QFrame()
+        summary.setObjectName("professionalCommandBar")
         summary.setStyleSheet(
             "QFrame{background:#f4f7fb;border:1px solid #b7c1ca;border-radius:0;}"
             "QLabel{background:transparent;border:none;}"
@@ -145,10 +159,19 @@ class PackagePartsDialog(QDialog):
         self.list_widget.itemDoubleClicked.connect(self._toggle_item)
         layout.addWidget(self.list_widget)
 
+        footer = QFrame()
+        footer.setObjectName("professionalFooter")
+        footer_layout = QHBoxLayout(footer)
+        footer_layout.setContentsMargins(8, 6, 8, 6)
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        apply_button = button_box.button(QDialogButtonBox.Ok)
+        apply_button.setText("Apply Selection")
+        apply_button.setObjectName("primary")
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
-        layout.addWidget(button_box)
+        footer_layout.addStretch(1)
+        footer_layout.addWidget(button_box)
+        layout.addWidget(footer)
 
     def _load_parts(self):
         if not self.project_id:
@@ -204,7 +227,7 @@ class PackagePartsDialog(QDialog):
             item.setCheckState(Qt.Checked if p["id"] in self._selected_ids else Qt.Unchecked)
             item.setData(Qt.UserRole, p["id"])
             item.setText("")
-            item.setSizeHint(QSize(0, 34))
+            item.setSizeHint(QSize(0, 30))
             self.list_widget.addItem(item)
             self.list_widget.setItemWidget(item, self._part_row_widget(p))
         self.list_widget.blockSignals(False)
@@ -296,7 +319,7 @@ class PackagePartsDialog(QDialog):
         kind = str((status or {}).get("kind") or "na")
         bg, fg, dot = _DOC_BADGE_STYLE.get(kind, _DOC_BADGE_STYLE["na"])
         badge = QLabel(label)
-        badge.setFixedSize(59, 22)
+        badge.setFixedSize(59, 20)
         badge.setAlignment(Qt.AlignCenter)
         badge.setToolTip(str((status or {}).get("tooltip") or f"{label}: unknown"))
         badge.setStyleSheet(

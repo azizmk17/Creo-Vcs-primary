@@ -45,6 +45,11 @@ from core.services.commit_service import CommitService
 from pages.dialogs.package_parts_dialog import PackagePartsDialog
 from pages.dialogs.assembly_iteration_compare_dialog import AssemblyIterationCompareDialog
 from pages.dialogs.checkout_review_dialog import CheckoutReviewDialog
+from pages.dialogs.cad_workspace_dialogs import (
+    WorkspaceManagerDialog,
+    WorkspaceSelectionDialog,
+)
+from core.services.cad_workspace_service import CadWorkspaceService
 from pages.dialogs.assembly_configuration_dialogs import (
     CreateAssemblyConfigurationDialog,
     ManageAssemblyConfigurationsDialog,
@@ -2875,7 +2880,8 @@ class BomPage(QWidget):
                 QMessageBox.information(dialog, "CAD Document", "Select a CAD Document.")
                 return
             try:
-                self.bom_service.checkout_pdm_cad_document(cad_id)
+                document = self.bom_service.pdm_service.repo.get_cad_document(cad_id) or {}
+                self._checkout_pdm_cad_document(cad_id, document)
                 refresh()
             except Exception as exc:
                 QMessageBox.warning(dialog, "Check Out", str(exc))
@@ -3624,9 +3630,12 @@ class BomPage(QWidget):
         cad_tree.setSelectionMode(QAbstractItemView.SingleSelection)
         cad_tree.setAlternatingRowColors(True)
         cad_tree.setContextMenuPolicy(Qt.CustomContextMenu)
-        cad_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
-        for column in range(1, 5):
-            cad_tree.header().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        cad_header = cad_tree.header()
+        cad_header.setSectionResizeMode(QHeaderView.Interactive)
+        cad_header.setStretchLastSection(False)
+        cad_header.setMinimumSectionSize(45)
+        for column, width in enumerate((320, 260, 110, 55, 130)):
+            cad_tree.setColumnWidth(column, width)
         cad_layout.addWidget(cad_tree)
 
         item_panel = QGroupBox("EBOM Item Structure")
@@ -3637,9 +3646,12 @@ class BomPage(QWidget):
         item_tree.setSelectionBehavior(QAbstractItemView.SelectRows)
         item_tree.setSelectionMode(QAbstractItemView.SingleSelection)
         item_tree.setAlternatingRowColors(True)
-        item_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
-        for column in range(1, 4):
-            item_tree.header().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        item_header = item_tree.header()
+        item_header.setSectionResizeMode(QHeaderView.Interactive)
+        item_header.setStretchLastSection(False)
+        item_header.setMinimumSectionSize(45)
+        for column, width in enumerate((300, 55, 100, 150)):
+            item_tree.setColumnWidth(column, width)
         item_layout.addWidget(item_tree)
         splitter.addWidget(cad_panel)
         splitter.addWidget(item_panel)
@@ -4088,14 +4100,23 @@ class BomPage(QWidget):
         
 
     def init_ui(self):
-        layout = QHBoxLayout(self)
+        self.setObjectName("pdmWorkspace")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 5, 6, 6)
+        layout.setSpacing(5)
 
         splitter = QSplitter(Qt.Horizontal)
-        layout.addWidget(splitter)
+        splitter.setObjectName("pdmWorkspaceSplitter")
+        splitter.setHandleWidth(4)
+        splitter.setChildrenCollapsible(False)
+        layout.addWidget(splitter, 1)
 
         # Left panel
         left_widget = QWidget()
+        left_widget.setObjectName("structureWorkspace")
         left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 2, 0)
+        left_layout.setSpacing(5)
 
         # Alert section (hidden by default)
         self.alert_frame = QFrame()
@@ -4103,14 +4124,15 @@ class BomPage(QWidget):
         self.alert_frame.setFrameShadow(QFrame.Raised)
         self.alert_frame.setStyleSheet("""
             QFrame {
-                background-color: #fee2e2;  /* light red background */
-                border: 1px solid #f87171;
-                border-radius: 6px;
+                background-color: #fff4f2;
+                border: 1px solid #d98b82;
+                border-left: 4px solid #b42318;
+                border-radius: 0;
             }
             QLabel {
-                color: #991b1b;
-                font-weight: bold;
-                padding: 6px;
+                color: #7a271a;
+                font-weight: 600;
+                padding: 4px 6px;
             }
         """)
         self.alert_label = QLabel("")
@@ -4122,8 +4144,11 @@ class BomPage(QWidget):
         
 
         # Search group
-        search_group = QGroupBox("Search")
+        search_group = QGroupBox("FIND IN STRUCTURE")
+        search_group.setObjectName("structureSearch")
         search_layout = QHBoxLayout(search_group)
+        search_layout.setContentsMargins(7, 8, 7, 6)
+        search_layout.setSpacing(5)
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search Item Number, name, or AES...")
         try:
@@ -4133,6 +4158,7 @@ class BomPage(QWidget):
         self.search_input.returnPressed.connect(self._perform_search_now)
         self.search_btn = QPushButton("Search")
         self.search_btn.setObjectName("primary")
+        self.search_btn.setFixedHeight(25)
         self.search_btn.clicked.connect(self._perform_search_now)
         search_layout.addWidget(self.search_input)
         search_layout.addWidget(self.search_btn)
@@ -4140,10 +4166,13 @@ class BomPage(QWidget):
 
         filter_row = QHBoxLayout()
         self.advanced_filter_btn = QPushButton("Advanced Filter")
+        self.advanced_filter_btn.setProperty("structureTool", True)
         self.advanced_filter_btn.clicked.connect(self.show_advanced_filter_dialog)
         self.saved_filters_btn = QPushButton("Saved Filters")
+        self.saved_filters_btn.setProperty("structureTool", True)
         self.saved_filters_btn.clicked.connect(self.show_saved_bom_filters_menu)
         self.clear_filter_btn = QPushButton("Clear")
+        self.clear_filter_btn.setProperty("structureTool", True)
         self.clear_filter_btn.clicked.connect(self.clear_bom_tree_filter)
         self.clear_filter_btn.setEnabled(False)
         filter_row.addWidget(self.advanced_filter_btn)
@@ -4153,16 +4182,16 @@ class BomPage(QWidget):
 
         # Tree (BOM structure)
         tree_group = QFrame()
-        tree_group.setStyleSheet("QFrame { background-color: #F5F5F5; border: none; }")
+        tree_group.setObjectName("structureBrowser")
         tree_layout = QVBoxLayout(tree_group)
-        tree_layout.setContentsMargins(8, 8, 8, 8)
-        tree_layout.setSpacing(6)
-        bom_header = QLabel("BOM STRUCTURE")
+        tree_layout.setContentsMargins(7, 6, 7, 7)
+        tree_layout.setSpacing(5)
+        bom_header = QLabel("PRODUCT STRUCTURE")
         bom_header.setStyleSheet("""
             QLabel {
                 font-size: 8pt;
                 font-weight: 700;
-                color: #6b7280;
+                color: #3f5368;
                 letter-spacing: 0.08em;
                 background: transparent;
                 border: none;
@@ -4170,11 +4199,17 @@ class BomPage(QWidget):
             }
         """)
         bom_header_row = QHBoxLayout()
+        bom_header_row.setSpacing(5)
         bom_header_row.addWidget(bom_header)
+        view_caption = QLabel("VIEW")
+        view_caption.setObjectName("structureViewCaption")
+        bom_header_row.addWidget(view_caption)
         self.bom_mode_selector = QComboBox()
         self.bom_mode_selector.addItem("CAD Structure", "cad")
         self.bom_mode_selector.addItem("EBOM / Item Structure", "ebom")
-        self.bom_mode_selector.setFixedWidth(175)
+        self.bom_mode_selector.setObjectName("structureViewSelector")
+        self.bom_mode_selector.setFixedWidth(190)
+        self.bom_mode_selector.setFixedHeight(24)
         self.bom_mode_selector.setToolTip(
             "Switch between the native CAD assembly and the independent Item/EBOM structure."
         )
@@ -4185,6 +4220,7 @@ class BomPage(QWidget):
         self.bom_export_btn = QPushButton("Export")
         self.bom_export_btn.setObjectName("neutral")
         self.bom_export_btn.setFixedHeight(24)
+        self.bom_export_btn.setProperty("structureTool", True)
         self.bom_export_btn.clicked.connect(self.export_bom)
         bom_header_row.addWidget(self.bom_export_btn)
         self.pdm_actions_btn = QPushButton("PDM")
@@ -4219,7 +4255,8 @@ class BomPage(QWidget):
         bom_header_row.addStretch()
         self.bom_health_label = QLabel("Health: --")
         self.bom_health_label.setStyleSheet(
-            "font-size:8pt;font-weight:700;color:#475569;background:transparent;border:none;"
+            "font-size:8pt;font-weight:600;color:#40566d;background:#edf2f6;"
+            "border:1px solid #c7d1dc;padding:2px 6px;"
         )
         bom_header_row.addWidget(self.bom_health_label)
         tree_layout.addLayout(bom_header_row)
@@ -4240,21 +4277,22 @@ class BomPage(QWidget):
         scope_layout.addLayout(self._bom_scope_path_layout, 1)
         self._bom_scope_frame.setStyleSheet("""
             QFrame#bomScopeBar {
-                background: #eef2f6;
-                border: 1px solid #c8d1dc;
-                border-radius: 2px;
+                background: #edf2f6;
+                border: 1px solid #bcc8d4;
+                border-left: 3px solid #4f81a8;
+                border-radius: 0;
             }
             QPushButton#scopeTop, QPushButton[scopeCrumb="true"] {
                 background: transparent;
                 border: 1px solid transparent;
-                color: #22445f;
+                color: #174f78;
                 font-size: 10px;
                 font-weight: 600;
                 padding: 1px 6px;
             }
             QPushButton#scopeTop:hover, QPushButton[scopeCrumb="true"]:hover {
-                background: #dbeafe;
-                border-color: #9bbce0;
+                background: #d9e8f4;
+                border-color: #8fb2ce;
             }
             QLabel[scopeSeparator="true"] {
                 color: #64748b;
@@ -4418,10 +4456,10 @@ class BomPage(QWidget):
         _bom_tree_qss = f"""
             QTreeWidget {{
                 background: #FFFFFF;
-                border: 1px solid #d1d5db;
-                border-radius: 6px;
+                border: 1px solid #aeb9c5;
+                border-radius: 0;
                 font-size: 10px;
-                gridline-color: #e5e7eb;
+                gridline-color: #d9dfe6;
                 font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", system-ui, sans-serif;
                 font-weight: 400;
                 letter-spacing: 0;
@@ -4429,27 +4467,27 @@ class BomPage(QWidget):
                 show-decoration-selected: 1;
             }}
             QHeaderView::section {{
-                background-color: #EEEEEE;
+                background-color: #e7ebef;
                 font-size: 10px;
-                color: #374151;
-                font-weight: 700;
-                text-transform: uppercase;
-                border-bottom: 0.5px solid #DDDDDD;
-                padding: 4px;
-                border-right: 1px solid #d1d5db;
+                color: #2f4152;
+                font-weight: 600;
+                border-top: 1px solid #f7f9fa;
+                border-bottom: 1px solid #aeb9c5;
+                padding: 4px 5px;
+                border-right: 1px solid #c4cdd6;
             }}
             QTreeWidget::item {{
-                height: 22px;
+                height: 23px;
                 border: none;
-                border-bottom: 1px solid #EEEEEE;
+                border-bottom: 1px solid #e5e9ed;
                 background: #FFFFFF;
                 color: {_BOM_TREE_ROW_TEXT};
             }}
             QTreeWidget::item:alternate {{
-                background: #FAFAFA;
+                background: #f7f8fa;
             }}
             QTreeWidget::item:hover {{
-                background: #f3f4f6;
+                background: #eaf2f8;
             }}
             QTreeWidget::item:selected {{
                 background: {_BOM_TREE_SEL_BG};
@@ -4510,10 +4548,15 @@ class BomPage(QWidget):
 
         # Right panel
         right_widget = QWidget()
+        right_widget.setObjectName("objectWorkspace")
         right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(2, 0, 0, 0)
+        right_layout.setSpacing(5)
 
         # Tabs for details
         self.tabs = QTabWidget()
+        self.tabs.setObjectName("objectWorkspaceTabs")
+        self.tabs.setDocumentMode(True)
 
         # Details tab: compact engineering summary with an on-demand full attribute view.
         details_tab = QWidget()
@@ -4528,14 +4571,15 @@ class BomPage(QWidget):
         self.details_alert_frame.setFrameShadow(QFrame.Raised)
         self.details_alert_frame.setStyleSheet("""
             QFrame {
-                background-color: #fee2e2;  /* light red background */
-                border: 1px solid #f87171;
-                border-radius: 6px;
+                background-color: #fff4f2;
+                border: 1px solid #d98b82;
+                border-left: 4px solid #b42318;
+                border-radius: 0;
             }
             QLabel {
-                color: #991b1b;
-                font-weight: bold;
-                padding: 6px;
+                color: #7a271a;
+                font-weight: 600;
+                padding: 4px 6px;
             }
         """)
         self.details_alert_label = QLabel("")
@@ -4643,8 +4687,8 @@ class BomPage(QWidget):
         self.associated_files_card.setStyleSheet("""
             QFrame#associatedFilesCard {
                 background: #ffffff;
-                border: 1px solid #d7dde5;
-                border-radius: 6px;
+                border: 1px solid #c4cdd6;
+                border-radius: 0;
             }
             QLabel#associatedFilesTitle {
                 color: #172033;
@@ -4666,8 +4710,8 @@ class BomPage(QWidget):
             }
         """)
         files_card_layout = QVBoxLayout(self.associated_files_card)
-        files_card_layout.setContentsMargins(14, 10, 14, 10)
-        files_card_layout.setSpacing(8)
+        files_card_layout.setContentsMargins(11, 8, 11, 8)
+        files_card_layout.setSpacing(6)
         files_heading = QHBoxLayout()
         files_heading.addWidget(
             self._details_card_label("Associated CAD Documents", "associatedFilesTitle")
@@ -4710,6 +4754,7 @@ class BomPage(QWidget):
         structure_layout.addWidget(self.structure_summary_label)
 
         self.structure_views = QTabWidget()
+        self.structure_views.setDocumentMode(True)
         self.uses_tree = self._create_structure_relation_tree()
         self.where_used_tree = self._create_structure_relation_tree()
         self.effective_where_used_tree = self._create_structure_relation_tree()
@@ -4939,13 +4984,14 @@ class BomPage(QWidget):
 
         right_layout.addWidget(self.tabs)
 
-        # Compact, category-based action ribbon.
+        # Contextual object ribbon.  Its groups follow the selected Item or CAD
+        # Document and remain part of the workspace chrome, above both panes.
         action_ribbon = QFrame()
         action_ribbon.setObjectName("actionRibbon")
-        action_ribbon.setFixedHeight(52)
+        action_ribbon.setFixedHeight(58)
         action_layout = QHBoxLayout(action_ribbon)
-        action_layout.setContentsMargins(3, 2, 3, 2)
-        action_layout.setSpacing(2)
+        action_layout.setContentsMargins(4, 2, 4, 2)
+        action_layout.setSpacing(1)
         self.add_part_btn = QPushButton("New Item")
         self.add_part_btn.setObjectName("primary")
         self.add_part_btn.clicked.connect(self.add_part)
@@ -5030,15 +5076,15 @@ class BomPage(QWidget):
             self.show_associated_cad_btn, self.clear_pdm_scope_btn,
         )
         for button in action_buttons:
-            button.setFixedHeight(25)
+            button.setFixedHeight(30)
             button.setIconSize(QSize(14, 14))
             button.setProperty("ribbonAction", True)
             button.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
 
         style = self.style()
         action_specs = (
-            (self.add_part_btn, "New Item", QStyle.SP_FileIcon, "Create an Item master"),
-            (self.edit_part_btn, "Edit Attributes", QStyle.SP_FileDialogDetailedView, "Edit the selected Item"),
+            (self.add_part_btn, "New", QStyle.SP_FileIcon, "Create an Item master"),
+            (self.edit_part_btn, "Edit", QStyle.SP_FileDialogDetailedView, "Edit the selected Item attributes"),
             (self.delete_part_btn, "Delete", QStyle.SP_TrashIcon, "Delete the selected item"),
             (self.checkout_part_btn, "Check Out", QStyle.SP_ArrowForward, "Check out the selected item"),
             (self.checkin_part_btn, "Check In", QStyle.SP_DialogApplyButton, "Review and finish the selected checkout"),
@@ -5050,9 +5096,9 @@ class BomPage(QWidget):
             (self.release_revision_btn, "Release Revision", QStyle.SP_DialogApplyButton, "Release the current revision"),
             (self.create_configuration_btn, "Create Configuration", QStyle.SP_FileDialogNewFolder, "Create an assembly configuration"),
             (self.manage_configurations_btn, "Manage Configurations", QStyle.SP_ComputerIcon, "Manage assembly configurations"),
-            (self.register_cad_btn, "Register CAD", QStyle.SP_FileIcon, "Register a managed PRT or ASM CAD Document"),
+            (self.register_cad_btn, "Register", QStyle.SP_FileIcon, "Register a managed PRT or ASM CAD Document"),
             (self.add_cad_component_btn, "Add Component", QStyle.SP_ArrowDown, "Add a CAD component to the selected checked-out ASM"),
-            (self.delete_cad_btn, "Delete CAD", QStyle.SP_TrashIcon, "Delete the selected CAD Document"),
+            (self.delete_cad_btn, "Delete", QStyle.SP_TrashIcon, "Delete the selected CAD Document"),
             (self.show_associated_cad_btn, "Show CAD", QStyle.SP_FileDialogDetailedView, "Show or hide associated CAD under the selected Item"),
             (self.clear_pdm_scope_btn, "Top Level", QStyle.SP_ArrowUp, "Return the active BOM browser to the top level"),
         )
@@ -5066,7 +5112,7 @@ class BomPage(QWidget):
         def make_menu_button(text_value, tooltip, icon_type, entries):
             button = QPushButton(text_value)
             button.setProperty("ribbonAction", True)
-            button.setFixedHeight(25)
+            button.setFixedHeight(30)
             button.setIconSize(QSize(14, 14))
             button.setIcon(style.standardIcon(icon_type))
             button.setToolTip(tooltip)
@@ -5107,7 +5153,7 @@ class BomPage(QWidget):
             category = QFrame()
             category.setObjectName("actionCategory")
             category_layout = QVBoxLayout(category)
-            category_layout.setContentsMargins(3, 0, 3, 1)
+            category_layout.setContentsMargins(4, 0, 4, 0)
             category_layout.setSpacing(0)
             title_label = QLabel(title)
             title_label.setObjectName("actionCategoryTitle")
@@ -5118,8 +5164,8 @@ class BomPage(QWidget):
             command_layout.setSpacing(1)
             for button in buttons:
                 command_layout.addWidget(button)
-            category_layout.addWidget(title_label)
             category_layout.addLayout(command_layout)
+            category_layout.addWidget(title_label)
             action_layout.addWidget(category)
 
         add_action_category("Editing", (self.add_part_btn, self.edit_part_btn, self.delete_part_btn))
@@ -5134,29 +5180,137 @@ class BomPage(QWidget):
         add_action_category("Visual", (self.show_associated_cad_btn, self.clear_pdm_scope_btn))
         action_layout.addStretch(1)
         action_ribbon.setStyleSheet(
-            "QFrame#actionRibbon { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 3px; }"
-            "QFrame#actionCategory { background: transparent; border: 0; border-right: 1px solid #cbd5e1; }"
-            "QLabel#actionCategoryTitle { color: #4f6f94; font-size: 9px; font-weight: 600; border: 0; }"
-            "QPushButton[ribbonAction=\"true\"] { background: transparent; color: #1f2937; border: 1px solid transparent; "
-            "font-size: 10px; padding: 1px 4px; }"
-            "QPushButton[ribbonAction=\"true\"]:hover { background: #e7f0fb; border-color: #a9c7e8; }"
-            "QPushButton[ribbonAction=\"true\"]:pressed { background: #d7e7f8; }"
-            "QPushButton[ribbonAction=\"true\"]:disabled { color: #9ca3af; background: transparent; }"
+            "QFrame#actionRibbon { background: #eef1f4; border: 1px solid #aeb9c5; border-radius: 0; }"
+            "QFrame#actionCategory { background: transparent; border: 0; border-right: 1px solid #bcc6d0; }"
+            "QLabel#actionCategoryTitle { color: #4d6276; font-size: 9px; font-weight: 600; border: 0; }"
+            "QPushButton[ribbonAction=\"true\"] { background: transparent; color: #1f3447; border: 1px solid transparent; "
+            "border-radius: 0; font-size: 10px; padding: 2px 5px; }"
+            "QPushButton[ribbonAction=\"true\"]:hover { background: #dce9f3; border-color: #8eafc8; }"
+            "QPushButton[ribbonAction=\"true\"]:pressed { background: #cbddea; border-color: #6f98b6; }"
+            "QPushButton[ribbonAction=\"true\"]:disabled { color: #98a3ad; background: transparent; border-color: transparent; }"
         )
         self._sync_action_ribbon_menus()
         self._sync_visual_action_states()
-        right_layout.addWidget(action_ribbon)
+        layout.insertWidget(0, action_ribbon)
 
         splitter.addWidget(left_widget)
         splitter.addWidget(right_widget)
 
         # Set minimum widths
-        left_widget.setMinimumWidth(600)
-        right_widget.setMinimumWidth(600)
+        left_widget.setMinimumWidth(540)
+        right_widget.setMinimumWidth(460)
 
-        # Equal stretch = 50% / 50%
-        splitter.setStretchFactor(0, 1)  # left
-        splitter.setStretchFactor(1, 1)  # right
+        splitter.setStretchFactor(0, 6)
+        splitter.setStretchFactor(1, 5)
+        splitter.setSizes([720, 580])
+
+        self.setStyleSheet("""
+            QWidget#pdmWorkspace {
+                background: #dfe4e9;
+            }
+            QWidget#structureWorkspace,
+            QWidget#objectWorkspace {
+                background: #f4f5f6;
+            }
+            QSplitter#pdmWorkspaceSplitter::handle {
+                background: #aeb9c5;
+            }
+            QSplitter#pdmWorkspaceSplitter::handle:hover {
+                background: #7695ad;
+            }
+            QGroupBox#structureSearch {
+                background: #eef1f4;
+                border: 1px solid #aeb9c5;
+                border-radius: 0;
+                margin-top: 7px;
+                color: #3f5368;
+                font-size: 9px;
+                font-weight: 700;
+            }
+            QGroupBox#structureSearch::title {
+                subcontrol-origin: margin;
+                left: 7px;
+                padding: 0 3px;
+            }
+            QGroupBox#structureSearch QLineEdit {
+                min-height: 23px;
+                padding: 0 6px;
+                background: #ffffff;
+                border: 1px solid #9daab7;
+                border-radius: 0;
+            }
+            QGroupBox#structureSearch QLineEdit:focus {
+                border: 1px solid #2f75a4;
+            }
+            QGroupBox#structureSearch QPushButton#primary {
+                min-height: 23px;
+                background: #2f75a4;
+                color: #ffffff;
+                border: 1px solid #245f86;
+                border-radius: 0;
+                padding: 0 12px;
+            }
+            QGroupBox#structureSearch QPushButton#primary:hover {
+                background: #3e86b5;
+            }
+            QFrame#structureBrowser {
+                background: #eef1f4;
+                border: 1px solid #aeb9c5;
+            }
+            QLabel#structureViewCaption {
+                color: #607286;
+                font-size: 9px;
+                font-weight: 700;
+                padding-left: 8px;
+            }
+            QComboBox#structureViewSelector {
+                background: #ffffff;
+                border: 1px solid #9daab7;
+                border-radius: 0;
+                padding: 1px 6px;
+                color: #1f3447;
+                font-weight: 600;
+            }
+            QPushButton[structureTool="true"] {
+                min-height: 22px;
+                background: #eef1f4;
+                border: 1px solid #aeb9c5;
+                border-radius: 0;
+                color: #253b4f;
+                padding: 1px 8px;
+            }
+            QPushButton[structureTool="true"]:hover {
+                background: #dce9f3;
+                border-color: #7fa4bf;
+            }
+            QPushButton[structureTool="true"]:disabled {
+                color: #99a3ad;
+                background: #eceff2;
+                border-color: #ccd3da;
+            }
+            QTabWidget#objectWorkspaceTabs::pane {
+                border: 1px solid #aeb9c5;
+                background: #ffffff;
+                top: -1px;
+            }
+            QTabWidget#objectWorkspaceTabs QTabBar::tab {
+                background: #dfe4e9;
+                border: 1px solid #aeb9c5;
+                border-radius: 0;
+                padding: 6px 12px;
+                color: #344a5f;
+                font-weight: 600;
+            }
+            QTabWidget#objectWorkspaceTabs QTabBar::tab:selected {
+                background: #ffffff;
+                color: #173f5e;
+                border-top: 2px solid #2f75a4;
+                border-bottom-color: #ffffff;
+            }
+            QTabWidget#objectWorkspaceTabs QTabBar::tab:hover:!selected {
+                background: #eaf0f4;
+            }
+        """)
 
     def _sync_action_ribbon_menus(self) -> None:
         for menu_button, bindings in getattr(self, "_action_ribbon_menu_bindings", []):
@@ -6018,7 +6172,7 @@ class BomPage(QWidget):
             self,
             "Check Out Item",
             "This operation changes the selected Item. Check out the Item now?\n\n"
-            "The Item data is reserved and its OWNER CAD Document is checked out automatically when present.",
+            "The Item data is reserved. You can check out its OWNER CAD Document separately when needed.",
             QMessageBox.Yes | QMessageBox.Cancel,
             QMessageBox.Yes,
         )
@@ -6044,7 +6198,8 @@ class BomPage(QWidget):
                 return False
         try:
             self.bom_service.checkout_item(
-                int(item_id), released_revision_code=revision_code
+                int(item_id), released_revision_code=revision_code,
+                include_owner_cad=False,
             )
         except Exception as exc:
             QMessageBox.warning(self, "Check Out Item", str(exc))
@@ -6311,12 +6466,41 @@ class BomPage(QWidget):
         self._reload_pdm_structure_views()
         self._reselect_cad_in_current_view(int(cad_id))
 
+    def _local_cad_workspaces(self) -> CadWorkspaceService:
+        service = getattr(self, "_cad_workspace_service", None)
+        if service is None:
+            service = CadWorkspaceService()
+            self._cad_workspace_service = service
+        return service
+
+    def _choose_local_cad_workspace(self, title="Select CAD Workspace"):
+        return WorkspaceSelectionDialog.choose(
+            self._local_cad_workspaces(), self, title=title
+        )
+
+    def manage_local_cad_workspaces(self) -> None:
+        WorkspaceManagerDialog(self._local_cad_workspaces(), self).exec_()
+
     def _checkout_pdm_cad_document(self, cad_id: int, payload: dict | None = None) -> None:
         payload = dict(payload or {})
+        document = self.bom_service.pdm_service.repo.get_cad_document(int(cad_id)) or {}
+        for key, value in document.items():
+            payload.setdefault(key, value)
+        workspace = self._choose_local_cad_workspace("CAD Checkout Workspace")
+        if not workspace:
+            return
+        workspace_service = self._local_cad_workspaces()
+        workspace_descriptor = workspace_service.checkout_descriptor(workspace["id"])
         needs_revision = (
             str(payload.get("lifecycle_state") or "").upper() == "RELEASED"
         )
         item_id = payload.get("item_id") or payload.get("associated_item_id")
+        if item_id is None:
+            association = self.bom_service.pdm_service.repo.get_active_association_for_cad(
+                int(cad_id)
+            )
+            if association:
+                item_id = association.get("item_id")
         revision_code = None
         if item_id:
             details = self.bom_service.get_part_details(int(item_id)) or {}
@@ -6352,9 +6536,24 @@ class BomPage(QWidget):
             if needs_revision:
                 revised = self.bom_service.revise_pdm_cad_document(int(cad_id)) or {}
             result = self.bom_service.checkout_pdm_cad_document(
-                int(cad_id), released_item_revision_code=revision_code
+                int(cad_id), released_item_revision_code=revision_code,
+                **workspace_descriptor,
+            )
+            materialized = workspace_service.materialize_cad_document(
+                workspace["id"], int(cad_id)
             )
         except Exception as exc:
+            try:
+                current = self.bom_service.pdm_service.repo.get_cad_document(int(cad_id)) or {}
+                if (
+                    current.get("checked_out_by") is not None
+                    and str(current.get("checkout_workspace_id") or "") == workspace["id"]
+                ):
+                    self.bom_service.undo_checkout_pdm_cad_document(
+                        int(cad_id), "Workspace materialization failed"
+                    )
+            except Exception:
+                pass
             if revised is not None:
                 self._reload_pdm_structure_views()
                 self._reselect_cad_in_current_view(int(cad_id))
@@ -6370,7 +6569,12 @@ class BomPage(QWidget):
         suffix = ""
         if (result or {}).get("item_checkout_auto_created"):
             suffix = "\nThe related Item was checked out automatically."
-        QMessageBox.information(self, "Check Out CAD Document", "CAD Document checked out." + suffix)
+        QMessageBox.information(
+            self,
+            "Check Out CAD Document",
+            "CAD Document checked out." + suffix
+            + f"\n\nWorkspace: {workspace['name']}\nFile: {materialized['path']}",
+        )
         self._reload_pdm_structure_views()
         self._reselect_cad_in_current_view(int(cad_id))
 
@@ -11659,6 +11863,35 @@ class BomPage(QWidget):
             self._load_released_ebom_tree()
             self.display_details(int(part_id))
             return
+
+        owner_cad = self.bom_service.pdm_service.owner_cad_for_item(int(part_id))
+        include_owner_cad = False
+        workspace = None
+        workspace_descriptor = {}
+        if owner_cad:
+            choice = QMessageBox(self)
+            choice.setIcon(QMessageBox.Question)
+            choice.setWindowTitle("Item Checkout Scope")
+            choice.setText("What do you want to check out?")
+            choice.setInformativeText(
+                f"Item metadata/structure can be edited without checking out "
+                f"{owner_cad.get('file_name') or 'the OWNER CAD Document'}."
+            )
+            item_and_cad = choice.addButton("Item + OWNER CAD", QMessageBox.AcceptRole)
+            item_only = choice.addButton("Item Only", QMessageBox.ActionRole)
+            choice.addButton(QMessageBox.Cancel)
+            choice.setDefaultButton(item_and_cad)
+            choice.exec_()
+            if choice.clickedButton() == item_and_cad:
+                include_owner_cad = True
+                workspace = self._choose_local_cad_workspace("Item and CAD Checkout Workspace")
+                if not workspace:
+                    return
+                workspace_descriptor = self._local_cad_workspaces().checkout_descriptor(
+                    workspace["id"]
+                )
+            elif choice.clickedButton() != item_only:
+                return
         state = str(
             details.get("revision_state") or details.get("lifecycle_state") or ""
         ).strip().lower()
@@ -11730,8 +11963,13 @@ class BomPage(QWidget):
             f"The Released iteration will not change. The next completed commit will create "
             f"{released_revision_code}.1."
             if released_revision_code else
-            f"Check out Item {part_id}?\n\nThe Item data will be reserved and its OWNER CAD "
-            "Document will be checked out automatically when one is associated."
+            f"Check out Item {part_id}?\n\n"
+            + (
+                f"The Item and OWNER CAD Document {owner_cad.get('file_name') or ''} "
+                f"will be reserved in workspace {workspace.get('name')}."
+                if include_owner_cad and owner_cad and workspace else
+                "Only Item metadata and structure will be reserved; CAD remains checked in."
+            )
         )
         reply = QMessageBox.question(
             self,
@@ -11740,15 +11978,43 @@ class BomPage(QWidget):
             QMessageBox.Yes | QMessageBox.No
         )
         if reply == QMessageBox.Yes:
+            revised_cad = None
             try:
+                if (
+                    include_owner_cad and owner_cad
+                    and str(owner_cad.get("lifecycle_state") or "").upper() == "RELEASED"
+                ):
+                    revised_cad = self.bom_service.revise_pdm_cad_document(
+                        int(owner_cad["id"])
+                    )
                 self.bom_service.checkout_item(
                     part_id,
                     as_user_id=as_user_id,
                     released_revision_code=released_revision_code,
+                    include_owner_cad=include_owner_cad,
+                    **workspace_descriptor,
                 )
+                materialized = None
+                if include_owner_cad and owner_cad and workspace:
+                    try:
+                        materialized = self._local_cad_workspaces().materialize_cad_document(
+                            workspace["id"], int(owner_cad["id"])
+                        )
+                    except Exception:
+                        try:
+                            self.bom_service.undo_checkout_pdm_cad_document(
+                                int(owner_cad["id"]), "Workspace materialization failed"
+                            )
+                        except Exception:
+                            pass
+                        raise
                 QMessageBox.information(
                     self, "Success",
-                    "Item checked out. OWNER CAD Document checkout was applied when available.",
+                    "Item checked out for metadata/structure changes."
+                    + (
+                        f"\nOWNER CAD was copied to {materialized['path']}."
+                        if materialized else "\nCAD Documents remain checked in."
+                    ),
                 )
                 self._refresh_current_tree_item_lock_state(int(part_id))
                 self._load_released_ebom_tree()
@@ -11758,7 +12024,12 @@ class BomPage(QWidget):
                 except Exception:
                     pass
             except ValueError as e:
-                QMessageBox.warning(self, "Check Out Failed", str(e))
+                suffix = (
+                    "\n\nThe Item checkout remains active for metadata changes."
+                    if include_owner_cad and self.bom_service.lock_repo.get_by_part(int(part_id))
+                    else ""
+                )
+                QMessageBox.warning(self, "Check Out Failed", str(e) + suffix)
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to check out part: {str(e)}")
     # -------------------------

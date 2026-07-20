@@ -83,15 +83,29 @@ class DiagPage(QDialog):
     def setup_ui(self):
         # (same design code you pasted — unchanged)
         # just remove demo population part and store tab references
+        self.setObjectName("diagnosticWorkspace")
         layout = QVBoxLayout(self)
-        header = QLabel("Commit Synchronization & Integrity Dashboard")
-        header.setFont(QFont("Segoe UI", 16, QFont.Bold))
-        header.setAlignment(Qt.AlignCenter)
-        layout.addWidget(header)
+        layout.setContentsMargins(8, 7, 8, 8)
+        layout.setSpacing(6)
+        header_frame = QFrame()
+        header_frame.setObjectName("diagnosticHeader")
+        header_layout = QVBoxLayout(header_frame)
+        header_layout.setContentsMargins(11, 7, 11, 7)
+        header_layout.setSpacing(1)
+        header = QLabel("Commit Synchronization & Integrity")
+        header.setObjectName("diagnosticTitle")
+        subtitle = QLabel("Controlled-file reconciliation, workspace integrity, and supplier package scope")
+        subtitle.setObjectName("diagnosticSubtitle")
+        header_layout.addWidget(header)
+        header_layout.addWidget(subtitle)
+        layout.addWidget(header_frame)
 
         # summary
         status_frame = QFrame()
+        status_frame.setObjectName("diagnosticStatusStrip")
         hbox = QHBoxLayout(status_frame)
+        hbox.setContentsMargins(5, 5, 5, 5)
+        hbox.setSpacing(5)
         self.lbl_status_db = self.create_status_box("Database ↔ Commits Folder", "Waiting", "#7f8c8d")
         self.lbl_status_working = self.create_status_box("Working Directory", "Waiting", "#7f8c8d")
         self.lbl_status_orphan = self.create_status_box("Orphan Files", "Waiting", "#7f8c8d")
@@ -99,7 +113,12 @@ class DiagPage(QDialog):
             hbox.addWidget(w)
         layout.addWidget(status_frame)
 
-        filter_row = QHBoxLayout()
+        filter_frame = QFrame()
+        filter_frame.setObjectName("diagnosticFilterStrip")
+        filter_row = QHBoxLayout(filter_frame)
+        filter_row.setContentsMargins(6, 4, 6, 4)
+        filter_row.setSpacing(6)
+        filter_row.addWidget(QLabel("FIND"))
         self.table_search_input = QLineEdit()
         self.table_search_input.setPlaceholderText(
             "Search the current diagnostic tab..."
@@ -111,10 +130,12 @@ class DiagPage(QDialog):
         self.checked_count_label = QLabel("0 selected")
         self.checked_count_label.setStyleSheet("color: #6b7280; font-weight: 600;")
         filter_row.addWidget(self.checked_count_label)
-        layout.addLayout(filter_row)
+        layout.addWidget(filter_frame)
 
         # tabs
         self.tabs = QTabWidget()
+        self.tabs.setObjectName("diagnosticTabs")
+        self.tabs.setDocumentMode(True)
         self.tab_db = self.create_tab_table("Database vs Commits Folder")
         self.tab_working = self.create_tab_table("Working Directory Validation")
         self.tab_orphan = self.create_tab_table("Untracked / Orphan Files")
@@ -123,10 +144,15 @@ class DiagPage(QDialog):
         self.tabs.addTab(self.tab_working, "Working Dir Check")
         self.tabs.addTab(self.tab_orphan, "Orphan Files")
         self.tabs.addTab(self.tab_supplier, "Supplier Packages")
-        layout.addWidget(self.tabs)
+        layout.addWidget(self.tabs, 3)
 
         # Actions for unexpected parts
-        action_row = QHBoxLayout()
+        action_frame = QFrame()
+        action_frame.setObjectName("diagnosticActionStrip")
+        action_row = QHBoxLayout(action_frame)
+        action_row.setContentsMargins(5, 3, 5, 3)
+        action_row.setSpacing(4)
+        action_row.addWidget(QLabel("ACTIONS"))
         self.btn_assign_supplier = QPushButton("Assign selected to supplier package")
         self.btn_assign_supplier.setObjectName("primary")
         self.btn_assign_supplier.setToolTip(
@@ -156,13 +182,14 @@ class DiagPage(QDialog):
         action_row.addWidget(self.btn_delete_selected)
 
         action_row.addStretch(1)
-        layout.addLayout(action_row)
+        layout.addWidget(action_frame)
 
         # console
         self.console = QTextEdit()
         self.console.setReadOnly(True)
         self.console.setObjectName("console")
-        layout.addWidget(self.console)
+        self.console.setMinimumHeight(95)
+        layout.addWidget(self.console, 1)
 
         # buttons
         btns = QHBoxLayout()
@@ -172,11 +199,96 @@ class DiagPage(QDialog):
         self.btn_refresh.setObjectName("neutral")
         self.btn_scan.setObjectName("primary")
         self.btn_close.setObjectName("neutral")
+        btns.addStretch(1)
         for b in [self.btn_refresh, self.btn_scan, self.btn_close]:
             btns.addWidget(b)
         layout.addLayout(btns)
 
         self.btn_close.clicked.connect(self.close)
+        self.setStyleSheet("""
+            QDialog#diagnosticWorkspace { background: #e1e5e9; }
+            QFrame#diagnosticHeader {
+                background: #ffffff;
+                border: 1px solid #aeb9c5;
+                border-left: 4px solid #2f75a4;
+            }
+            QLabel#diagnosticTitle {
+                color: #172c3f;
+                font-size: 14px;
+                font-weight: 700;
+            }
+            QLabel#diagnosticSubtitle {
+                color: #586b7d;
+                font-size: 10px;
+            }
+            QFrame#diagnosticStatusStrip,
+            QFrame#diagnosticFilterStrip,
+            QFrame#diagnosticActionStrip {
+                background: #eef1f4;
+                border: 1px solid #aeb9c5;
+            }
+            QFrame#diagnosticStatusBox {
+                background: #ffffff;
+                border: 1px solid #c2cbd4;
+                border-left: 3px solid #6689a5;
+            }
+            QFrame#diagnosticFilterStrip QLabel,
+            QFrame#diagnosticActionStrip QLabel {
+                color: #53687c;
+                font-size: 9px;
+                font-weight: 700;
+            }
+            QFrame#diagnosticFilterStrip QLineEdit,
+            QFrame#diagnosticActionStrip QPushButton {
+                min-height: 23px;
+                border-radius: 0;
+                padding: 1px 7px;
+            }
+            QTabWidget#diagnosticTabs::pane {
+                background: #ffffff;
+                border: 1px solid #aeb9c5;
+            }
+            QTabWidget#diagnosticTabs QTabBar::tab {
+                background: #dfe4e9;
+                border: 1px solid #aeb9c5;
+                border-radius: 0;
+                padding: 5px 10px;
+                color: #344a5f;
+                font-weight: 600;
+            }
+            QTabWidget#diagnosticTabs QTabBar::tab:selected {
+                background: #ffffff;
+                color: #173f5e;
+                border-top: 2px solid #2f75a4;
+                border-bottom-color: #ffffff;
+            }
+            QTableWidget[diagnosticTable="true"] {
+                background: #ffffff;
+                alternate-background-color: #f6f8f9;
+                border: 0;
+                gridline-color: #d9dfe6;
+                selection-background-color: #dbe9f4;
+                selection-color: #172c3f;
+            }
+            QTableWidget[diagnosticTable="true"] QHeaderView::section {
+                background: #e5e9ed;
+                color: #30475b;
+                border: 0;
+                border-right: 1px solid #c4cdd6;
+                border-bottom: 1px solid #aeb9c5;
+                padding: 4px 6px;
+                font-weight: 600;
+            }
+            QTextEdit#console {
+                background: #202b35;
+                color: #d8e2ea;
+                border: 1px solid #111a22;
+                border-radius: 0;
+                font-family: "Cascadia Mono", Consolas, monospace;
+                font-size: 9px;
+                padding: 5px;
+            }
+        """)
 
     def connect_events(self):
         self.btn_refresh.clicked.connect(self.refresh_status)
@@ -191,7 +303,10 @@ class DiagPage(QDialog):
 
     def create_status_box(self, title, value, color):
         frame = QFrame()
+        frame.setObjectName("diagnosticStatusBox")
         vbox = QVBoxLayout(frame)
+        vbox.setContentsMargins(8, 5, 8, 5)
+        vbox.setSpacing(1)
         lbl_title = QLabel(title)
         lbl_value = QLabel(value)
         lbl_value.setFont(QFont("Segoe UI", 14, QFont.Bold))
@@ -206,9 +321,14 @@ class DiagPage(QDialog):
     def create_tab_table(self, title):
         frame = QFrame()
         vbox = QVBoxLayout(frame)
+        vbox.setContentsMargins(0, 0, 0, 0)
         table = QTableWidget(0, 3)
+        table.setProperty("diagnosticTable", True)
         table.setHorizontalHeaderLabels(["Item", "Status", "Details"])
         table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(24)
         # enable row selection for force-integrate
         table.setSelectionBehavior(QTableWidget.SelectRows)
         table.setSelectionMode(QTableWidget.ExtendedSelection)

@@ -102,6 +102,20 @@ class PdmCheckoutCoordinationTests(unittest.TestCase):
             self.repo.get_cad_document(int(self.owner_cad["id"]))["checked_out_by"]
         )
 
+    def test_item_checkout_can_explicitly_include_owner_cad_workspace(self):
+        self.service.checkout_item(
+            1,
+            include_owner_cad=True,
+            workspace_id="b" * 32,
+            workspace_name="Motor update",
+            workspace_machine_id="DESIGN-08",
+        )
+        item_lock = self.service.lock_repo.get_by_part(1)
+        self.assertEqual(item_lock.checkout_origin, "ITEM")
+        document = self.repo.get_cad_document(int(self.owner_cad["id"]))
+        self.assertEqual(document["checked_out_by"], 1)
+        self.assertEqual(document["checkout_workspace_id"], "b" * 32)
+
     def test_ebom_item_rows_include_vault_iteration_and_checkout_owner(self):
         self.service.checkout_item(1)
 
@@ -134,6 +148,25 @@ class PdmCheckoutCoordinationTests(unittest.TestCase):
         self.assertIsNone(result["associated_item_id"])
         self.assertFalse(result["item_checkout_auto_created"])
         self.assertIsNone(self.service.lock_repo.get_by_part(1))
+
+    def test_cad_checkout_records_and_clears_local_workspace_identity(self):
+        cad_id = int(self.owner_cad["id"])
+        result = self.service.checkout_pdm_cad_document(
+            cad_id,
+            workspace_id="a" * 32,
+            workspace_name="Gearbox redesign",
+            workspace_machine_id="DESIGN-07",
+        )
+        self.assertEqual(result["checkout_workspace_id"], "a" * 32)
+        self.assertEqual(result["checkout_workspace_name"], "Gearbox redesign")
+        self.assertEqual(result["checkout_workspace_machine_id"], "DESIGN-07")
+
+        self.service.undo_checkout_pdm_cad_document(cad_id, "cancel")
+        document = self.repo.get_cad_document(cad_id)
+        self.assertIsNone(document["checkout_workspace_id"])
+        history = self.repo.list_cad_checkout_history(cad_id)
+        self.assertEqual(history[0]["workspace_id"], "a" * 32)
+        self.assertEqual(history[1]["workspace_name"], "Gearbox redesign")
 
     def test_cad_undo_releases_clean_auto_item_checkout(self):
         self.service.checkout_pdm_cad_document(int(self.owner_cad["id"]))

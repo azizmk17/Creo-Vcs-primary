@@ -2398,7 +2398,7 @@ def _migration_35(conn):
             """
             SELECT i.id, i.object_data_json, b.part_number, b.item_type,
                    b.assembly_mode, b.procurement_source, b.item_view,
-                   b.default_unit
+                   b.default_unit, b.type
             FROM bom_iterations i
             JOIN bom_revisions r ON r.id=i.revision_id
             JOIN bom b ON b.id=r.bom_id
@@ -2431,6 +2431,18 @@ def _migration_35(conn):
                 "item_view": row[6],
                 "default_unit": row[7],
             }
+            if (
+                str(row[8] or "").strip().lower() in {"asm", "assembly"}
+                and str(payload.get("assembly_mode") or "").strip().upper()
+                == "COMPONENT"
+                and str(row[4] or "").strip().upper() == "SEPARABLE"
+            ):
+                # BomRevisionRepository may have captured the newly added
+                # column's temporary COMPONENT default before this migration
+                # applied the assembly-aware SEPARABLE default.  Keep the
+                # checked-in snapshot aligned so a CAD-only checkout does not
+                # look like an Item metadata edit.
+                payload["assembly_mode"] = "SEPARABLE"
             for key, (allowed, fallback) in allowed_values.items():
                 value = str(
                     payload.get(key) or current_values.get(key) or fallback
@@ -2657,6 +2669,46 @@ def _migration_37(conn):
             "cad_document_iterations",
             "source_file_name",
             "source_file_name TEXT",
+        )
+
+
+def _migration_38(conn):
+    """Associate active CAD checkouts with a named machine-local workspace."""
+    tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "cad_documents" in tables:
+        _ensure_column(
+            conn, "cad_documents", "checkout_workspace_id",
+            "checkout_workspace_id TEXT",
+        )
+        _ensure_column(
+            conn, "cad_documents", "checkout_workspace_name",
+            "checkout_workspace_name TEXT",
+        )
+        _ensure_column(
+            conn, "cad_documents", "checkout_workspace_machine_id",
+            "checkout_workspace_machine_id TEXT",
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cad_documents_checkout_workspace "
+            "ON cad_documents(checkout_workspace_id, checked_out_by)"
+        )
+    if "cad_document_checkout_logs" in tables:
+        _ensure_column(
+            conn, "cad_document_checkout_logs", "workspace_id",
+            "workspace_id TEXT",
+        )
+        _ensure_column(
+            conn, "cad_document_checkout_logs", "workspace_name",
+            "workspace_name TEXT",
+        )
+        _ensure_column(
+            conn, "cad_document_checkout_logs", "workspace_machine_id",
+            "workspace_machine_id TEXT",
         )
 
 
@@ -3044,6 +3096,8 @@ WHERE r.name = 'designer' AND p.name = 'manage_issues';
     36: _migration_36,
 
     37: _migration_37,
+
+    38: _migration_38,
 
 }
 

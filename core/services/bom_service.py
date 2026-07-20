@@ -754,8 +754,12 @@ class BomService(BaseService):
         *,
         as_user_id: int | None = None,
         released_revision_code: str | None = None,
+        include_owner_cad: bool = False,
+        workspace_id: str | None = None,
+        workspace_name: str | None = None,
+        workspace_machine_id: str | None = None,
     ) -> bool:
-        """Check out exactly one EBOM Item and its OWNER CAD Document when present."""
+        """Check out one EBOM Item, optionally including its OWNER CAD Document."""
         item_id = int(item_id)
         existing_lock = self.lock_repo.get_by_part(item_id)
         checked_out = bool(self.checkout_part(
@@ -766,13 +770,16 @@ class BomService(BaseService):
             checkout_origin="ITEM",
         ))
         owner_cad = self.pdm_service.owner_cad_for_item(item_id)
-        if not owner_cad:
+        if not include_owner_cad or not owner_cad:
             return checked_out
         try:
             self.checkout_pdm_cad_document(
                 int(owner_cad["id"]),
                 released_item_revision_code=released_revision_code,
                 as_user_id=as_user_id,
+                workspace_id=workspace_id,
+                workspace_name=workspace_name,
+                workspace_machine_id=workspace_machine_id,
             )
         except Exception:
             if existing_lock is None:
@@ -2527,6 +2534,9 @@ class BomService(BaseService):
         *,
         released_item_revision_code: str | None = None,
         as_user_id: int | None = None,
+        workspace_id: str | None = None,
+        workspace_name: str | None = None,
+        workspace_machine_id: str | None = None,
     ) -> Dict:
         """Check out one CAD Document and ensure its associated Item is owned."""
         cad_document_id = int(cad_document_id)
@@ -2579,7 +2589,11 @@ class BomService(BaseService):
 
         try:
             result = self.pdm_service.checkout_cad_document(
-                cad_document_id, actor_id
+                cad_document_id,
+                actor_id,
+                workspace_id=workspace_id,
+                workspace_name=workspace_name,
+                workspace_machine_id=workspace_machine_id,
             )
         except Exception:
             if auto_item_checkout and associated_item_id is not None:
@@ -2631,6 +2645,13 @@ class BomService(BaseService):
         item_result = self._release_auto_item_checkout_after_cad(
             associated_item_id, actor_id
         )
+        try:
+            from core.services.cad_workspace_service import CadWorkspaceService
+            CadWorkspaceService().release_cad_document(
+                document.get("checkout_workspace_id"), cad_document_id
+            )
+        except Exception:
+            pass
         return {**result, **item_result}
 
     def undo_checkout_pdm_cad_document(
@@ -2651,6 +2672,13 @@ class BomService(BaseService):
         item_result = self._release_auto_item_checkout_after_cad(
             associated_item_id, actor_id
         )
+        try:
+            from core.services.cad_workspace_service import CadWorkspaceService
+            CadWorkspaceService().release_cad_document(
+                document.get("checkout_workspace_id"), cad_document_id
+            )
+        except Exception:
+            pass
         return {**result, **item_result}
 
     def revise_pdm_cad_document(self, cad_document_id: int) -> Dict:

@@ -6,6 +6,7 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -16,6 +17,13 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem,
     QToolButton,
     QVBoxLayout,
+    QWidget,
+)
+
+from pages.dialogs.professional_style import (
+    apply_professional_dialog_style,
+    make_dialog_header,
+    set_banner_style,
 )
 
 
@@ -40,58 +48,7 @@ class AssemblyIterationCompareDialog(QDialog):
         self.setObjectName("assemblyIterationCompareDialog")
         self.setWindowTitle("Compare Assembly Iterations")
         self.resize(1180, 650)
-        self.setStyleSheet(
-            """
-            QDialog#assemblyIterationCompareDialog {
-                background: #f5f7fa;
-                color: #172033;
-                font-size: 10px;
-            }
-            QDialog#assemblyIterationCompareDialog QLabel,
-            QDialog#assemblyIterationCompareDialog QCheckBox {
-                color: #172033;
-                background: transparent;
-                font-size: 10px;
-            }
-            QDialog#assemblyIterationCompareDialog QComboBox,
-            QDialog#assemblyIterationCompareDialog QToolButton,
-            QDialog#assemblyIterationCompareDialog QPushButton {
-                color: #172033;
-                background: #ffffff;
-                border: 1px solid #b8c2cf;
-                border-radius: 3px;
-                min-height: 22px;
-                padding: 2px 6px;
-                font-size: 10px;
-            }
-            QDialog#assemblyIterationCompareDialog QComboBox QAbstractItemView {
-                color: #172033;
-                background: #ffffff;
-                selection-color: #ffffff;
-                selection-background-color: #1676d2;
-            }
-            QDialog#assemblyIterationCompareDialog QTableWidget {
-                color: #172033;
-                background: #ffffff;
-                alternate-background-color: #f7f9fc;
-                gridline-color: #d8dee8;
-                selection-color: #172033;
-                selection-background-color: #cfe5fb;
-                border: 1px solid #c7d0dc;
-                font-size: 10px;
-            }
-            QDialog#assemblyIterationCompareDialog QHeaderView::section {
-                color: #172033;
-                background: #e9edf2;
-                border: 0;
-                border-right: 1px solid #c7d0dc;
-                border-bottom: 1px solid #c7d0dc;
-                padding: 4px;
-                font-size: 10px;
-                font-weight: 600;
-            }
-            """
-        )
+        apply_professional_dialog_style(self)
         self._build_ui(identity, name)
         self._populate_iteration_selectors()
         self._refresh_comparison()
@@ -109,15 +66,28 @@ class AssemblyIterationCompareDialog(QDialog):
         return "  |  ".join(parts)
 
     def _build_ui(self, identity: str, name: str) -> None:
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        root_layout.addWidget(
+            make_dialog_header(
+                f"{identity} — {name}" if identity else name,
+                "Compare immutable direct-child configurations between two Item iterations.",
+                kicker="CONFIGURATION CONTROL",
+            )
+        )
 
-        heading = QLabel(f"{identity} - {name}" if identity else name)
-        heading.setStyleSheet("font-weight:700;")
-        layout.addWidget(heading)
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(7)
+        root_layout.addWidget(body, 1)
 
-        selector_row = QHBoxLayout()
+        selector_bar = QFrame()
+        selector_bar.setObjectName("professionalCommandBar")
+        selector_row = QHBoxLayout(selector_bar)
+        selector_row.setContentsMargins(8, 6, 8, 6)
+        selector_row.setSpacing(6)
         selector_row.addWidget(QLabel("Left iteration"))
         self.left_combo = QComboBox()
         self.left_combo.setMinimumWidth(270)
@@ -135,17 +105,15 @@ class AssemblyIterationCompareDialog(QDialog):
         self.changes_only.setChecked(True)
         self.changes_only.toggled.connect(self._render_rows)
         selector_row.addWidget(self.changes_only)
-        layout.addLayout(selector_row)
+        layout.addWidget(selector_bar)
 
         self.summary_label = QLabel()
-        self.summary_label.setStyleSheet("color:#465568;font-weight:600;")
+        self.summary_label.setObjectName("professionalMuted")
         layout.addWidget(self.summary_label)
 
         self.history_warning = QLabel()
         self.history_warning.setWordWrap(True)
-        self.history_warning.setStyleSheet(
-            "background:#fff7d6;color:#7a4b00;border:1px solid #e7bf45;padding:5px;"
-        )
+        set_banner_style(self.history_warning, "warning")
         self.history_warning.hide()
         layout.addWidget(self.history_warning)
 
@@ -162,6 +130,7 @@ class AssemblyIterationCompareDialog(QDialog):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(24)
         self.table.setWordWrap(True)
         header = self.table.horizontalHeader()
         for column in range(len(headers)):

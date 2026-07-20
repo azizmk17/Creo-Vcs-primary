@@ -1,8 +1,16 @@
 from PyQt5.QtWidgets import (
-    QDialog, QVBoxLayout, QLabel, QTreeWidget, QTreeWidgetItem,
-    QPushButton, QHBoxLayout, QMessageBox, QTextEdit
+    QAbstractItemView, QDialog, QFrame, QHeaderView, QVBoxLayout,
+    QTreeWidget, QTreeWidgetItem, QPushButton, QHBoxLayout, QMessageBox,
+    QTextEdit, QWidget
 )
 from PyQt5.QtCore import Qt
+
+from pages.dialogs.professional_style import (
+    apply_professional_dialog_style,
+    make_dialog_header,
+    make_section_title,
+)
+
 
 class MergeDialog(QDialog):
     def __init__(self, merge_service,merge_repo, parent=None):
@@ -10,33 +18,60 @@ class MergeDialog(QDialog):
         self.merge_service = merge_service
         self.merge_repo = merge_repo
         self.setWindowTitle("Merge to Master")
-        self.resize(650, 500)
+        self.resize(760, 560)
+        self.setMinimumSize(640, 460)
+        apply_professional_dialog_style(self)
 
-        layout = QVBoxLayout(self)
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        root_layout.addWidget(
+            make_dialog_header(
+                "Merge to Master",
+                "Review pending designer commits and promote the selected controlled content.",
+                kicker="MASTER INTEGRATION",
+            )
+        )
 
-        # Info label
-        layout.addWidget(QLabel("Select parts or designers to merge:"))
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(7)
+        root_layout.addWidget(body, 1)
+
+        layout.addWidget(make_section_title("PENDING COMMITS"))
 
         # Tree widget: Designers → Parts
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Designer", "Part", "Status"])
-        self.tree.setColumnWidth(0, 200)
-        layout.addWidget(self.tree)
+        self.tree.setHeaderLabels(["Designer", "Controlled File", "State"])
+        self.tree.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setUniformRowHeights(True)
+        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.tree.header().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.tree.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        layout.addWidget(self.tree, 1)
 
         # Merge message
-        layout.addWidget(QLabel("Merge Message:"))
+        layout.addWidget(make_section_title("INTEGRATION COMMENT"))
         self.message_edit = QTextEdit()
-        self.message_edit.setPlaceholderText("Enter merge message...")
-        self.message_edit.setFixedHeight(80)
+        self.message_edit.setPlaceholderText("Required: describe the integrated change set")
+        self.message_edit.setFixedHeight(72)
         layout.addWidget(self.message_edit)
 
-        # Buttons
-        btn_layout = QHBoxLayout()
+        # Command footer
+        footer = QFrame()
+        footer.setObjectName("professionalFooter")
+        btn_layout = QHBoxLayout(footer)
+        btn_layout.setContentsMargins(8, 6, 8, 6)
+        btn_layout.setSpacing(6)
         self.btn_merge_selected = QPushButton("Merge Selected")
+        self.btn_merge_selected.setObjectName("primary")
         self.btn_cancel = QPushButton("Cancel")
-        btn_layout.addWidget(self.btn_merge_selected)
+        btn_layout.addStretch(1)
         btn_layout.addWidget(self.btn_cancel)
-        layout.addLayout(btn_layout)
+        btn_layout.addWidget(self.btn_merge_selected)
+        layout.addWidget(footer)
 
         self.btn_merge_selected.clicked.connect(self.merge_selected)
         self.btn_cancel.clicked.connect(self.reject)
