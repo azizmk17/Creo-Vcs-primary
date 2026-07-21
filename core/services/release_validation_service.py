@@ -68,6 +68,16 @@ class ReleaseValidationService:
             has_drawing_model_link = (
                 "drawing_owner_cad_document_id" in cad_columns
             )
+            association_columns = (
+                {
+                    str(value[1])
+                    for value in conn.execute(
+                        "PRAGMA table_info(cad_item_associations)"
+                    ).fetchall()
+                }
+                if "cad_item_associations" in tables else set()
+            )
+            has_primary_drawing = "is_primary_drawing" in association_columns
 
             def context(selected_iteration_id: int):
                 selected_iteration_id = int(selected_iteration_id)
@@ -173,6 +183,8 @@ class ReleaseValidationService:
                     })
                 pdm_cad = None
                 pdm_drawing = None
+                pdm_primary_drawing = None
+                selected_drawing_count = 0
                 if has_pdm:
                     pdm_cad = conn.execute(
                         """
@@ -185,22 +197,42 @@ class ReleaseValidationService:
                         (int(row["bom_id"]),),
                     ).fetchone()
                     if has_drawing_model_link:
-                        pdm_drawing = conn.execute(
-                            """
-                            SELECT 1
-                            FROM cad_item_associations model_assoc
-                            JOIN cad_documents model
-                              ON model.id=model_assoc.cad_document_id
+                        primary_select = (
+                            "COALESCE(drawing_assoc.is_primary_drawing,0)"
+                            if has_primary_drawing else "0"
+                        )
+                        selected_drawings = conn.execute(
+                            f"""
+                            SELECT DISTINCT drawing.id AS drawing_id,
+                                   {primary_select} AS is_primary_drawing
+                            FROM cad_item_associations drawing_assoc
                             JOIN cad_documents drawing
-                              ON drawing.drawing_owner_cad_document_id=model.id
+                              ON drawing.id=drawing_assoc.cad_document_id
                              AND upper(drawing.category)='DRAWING'
-                            WHERE model_assoc.item_id=?
-                              AND model_assoc.active=1
-                              AND upper(model.category) IN ('ASSEMBLY','COMPONENT')
-                            LIMIT 1
+                            JOIN cad_documents model
+                              ON model.id=drawing.drawing_owner_cad_document_id
+                             AND upper(model.category) IN ('ASSEMBLY','COMPONENT')
+                            JOIN cad_item_associations model_assoc
+                              ON model_assoc.cad_document_id=model.id
+                             AND model_assoc.item_id=drawing_assoc.item_id
+                             AND model_assoc.active=1
+                            WHERE drawing_assoc.item_id=?
+                              AND drawing_assoc.active=1
+                              AND upper(drawing_assoc.association_type) IN
+                                  ('CONTENT','CONTRIBUTING_CONTENT')
+                            ORDER BY drawing.id
                             """,
                             (int(row["bom_id"]),),
-                        ).fetchone()
+                        ).fetchall()
+                        selected_drawing_count = len(selected_drawings)
+                        pdm_drawing = selected_drawings[0] if selected_drawings else None
+                        pdm_primary_drawing = next(
+                            (
+                                drawing for drawing in selected_drawings
+                                if int(drawing["is_primary_drawing"] or 0) == 1
+                            ),
+                            None,
+                        )
                     else:
                         pdm_drawing = conn.execute(
                             """
@@ -212,6 +244,7 @@ class ReleaseValidationService:
                             """,
                             (int(row["bom_id"]),),
                         ).fetchone()
+                        selected_drawing_count = 1 if pdm_drawing else 0
                 if cad_requirement == "REQUIRED" and not str(
                     snapshot.get("filename") or ""
                 ).strip() and not pdm_cad:
@@ -234,7 +267,30 @@ class ReleaseValidationService:
                         "version": version,
                         "classification": classification,
                         "requirement": "drawing_requirement",
-                        "message": f"{label} {version} requires a drawing.",
+                        "message": (
+                            f"{label} {version} requires an explicitly selected drawing."
+                            if pdm_cad else
+                            f"{label} {version} requires a drawing."
+                        ),
+                    })
+                elif (
+                    drawing_requirement == "REQUIRED"
+                    and pdm_cad
+                    and has_drawing_model_link
+                    and has_primary_drawing
+                    and pdm_drawing
+                    and pdm_primary_drawing is None
+                ):
+                    findings.append({
+                        "bom_id": int(row["bom_id"]),
+                        "iteration_id": selected_iteration_id,
+                        "version": version,
+                        "classification": classification,
+                        "requirement": "primary_drawing",
+                        "message": (
+                            f"{label} {version} has {selected_drawing_count} selected "
+                            "drawing(s) but no primary drawing."
+                        ),
                     })
 
                 if not include_children:

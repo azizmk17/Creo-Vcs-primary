@@ -3,6 +3,7 @@ import re
 import hashlib
 import json
 import sqlite3
+from collections import defaultdict
 from typing import Optional
 
 from config import DB_NAME
@@ -12,6 +13,7 @@ from setup.migrations import (
     _migration_34,
     _migration_35,
     _migration_38,
+    _migration_39,
 )
 from utils import get_base_name, get_version_number, is_creo_file
 
@@ -70,6 +72,17 @@ class PdmRepository:
             if not migration_35_applied:
                 _migration_35(conn)
             _migration_38(conn)
+            migration_39_applied = False
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+            ).fetchone():
+                migration_39_applied = bool(
+                    conn.execute(
+                        "SELECT 1 FROM schema_migrations WHERE version=39"
+                    ).fetchone()
+                )
+            if not migration_39_applied:
+                _migration_39(conn)
             if conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cad_documents'"
             ).fetchone():
@@ -405,8 +418,121 @@ class PdmRepository:
                 record["checked_out_by_username"] = usernames.get(int(owner_id))
         return records
 
-    def _attach_related_drawings(
+    @staticmethod
+    def _association_sort_key(row: dict) -> tuple[int, int]:
+        order = {
+            "OWNER": 0,
+            "CONTRIBUTING_IMAGE": 1,
+            "IMAGE": 2,
+            "CONTRIBUTING_CONTENT": 3,
+            "CONTENT": 4,
+        }
+        return (
+            order.get(str(row.get("association_type") or "").upper(), 9),
+            int(row.get("id") or row.get("association_id") or 0),
+        )
+
+    def _attach_item_associations(
         self, conn, records: list[dict]
+    ) -> list[dict]:
+        """Attach every active Item association while retaining legacy aliases."""
+        document_ids = sorted({int(record["id"]) for record in records})
+        for record in records:
+            record["associations"] = []
+            record["association_count"] = 0
+        if not document_ids:
+            return records
+        placeholders = ",".join("?" for _ in document_ids)
+        has_item_versions = all(
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (name,),
+            ).fetchone()
+            for name in ("bom_revisions", "bom_iterations")
+        )
+        version_select = (
+            ", br.revision_code || '.' || bi.iteration_number AS item_version_label"
+            if has_item_versions else ", NULL AS item_version_label"
+        )
+        version_join = (
+            """
+            LEFT JOIN bom_revisions br ON br.id=b.current_revision_id
+            LEFT JOIN bom_iterations bi ON bi.id=b.current_iteration_id
+            """
+            if has_item_versions else ""
+        )
+        rows = conn.execute(
+            f"""
+            SELECT a.*,a.id AS association_id,
+                   b.part_number AS item_number,
+                   b.aes_number AS item_aes_number,b.name AS item_name
+                   {version_select}
+            FROM cad_item_associations a
+            JOIN bom b ON b.id=a.item_id
+            {version_join}
+            WHERE a.active=1 AND a.cad_document_id IN ({placeholders})
+            ORDER BY a.cad_document_id,
+                     CASE upper(a.association_type)
+                         WHEN 'OWNER' THEN 0
+                         WHEN 'CONTRIBUTING_IMAGE' THEN 1
+                         WHEN 'IMAGE' THEN 2
+                         WHEN 'CONTRIBUTING_CONTENT' THEN 3
+                         WHEN 'CONTENT' THEN 4 ELSE 9 END,
+                     a.id
+            """,
+            document_ids,
+        ).fetchall()
+        by_document = defaultdict(list)
+        for row in rows:
+            association = dict(row)
+            by_document[int(association["cad_document_id"])].append(association)
+        legacy_fields = (
+            "association_id", "item_id", "association_type", "item_number",
+            "item_aes_number", "item_name", "item_version_label",
+            "drives_structure", "drives_attributes", "participates_in_structure",
+            "is_primary_drawing", "drawing_model_cad_document_id",
+        )
+        for record in records:
+            associations = sorted(
+                by_document.get(int(record["id"]), []),
+                key=self._association_sort_key,
+            )
+            record["associations"] = associations
+            record["association_count"] = len(associations)
+            primary = associations[0] if associations else {}
+            for field in legacy_fields:
+                record[field] = primary.get(field)
+        return records
+
+    @staticmethod
+    def _attach_checkout_items(conn, records: list[dict]) -> list[dict]:
+        """Attach every Item reserved by each active CAD working copy."""
+        document_ids = sorted({int(record["id"]) for record in records})
+        for record in records:
+            record["checkout_item_ids"] = []
+        if not document_ids:
+            return records
+        placeholders = ",".join("?" for _ in document_ids)
+        rows = conn.execute(
+            f"""
+            SELECT cad_document_id,item_id
+            FROM cad_document_checkout_items
+            WHERE cad_document_id IN ({placeholders})
+            ORDER BY cad_document_id,item_id
+            """,
+            document_ids,
+        ).fetchall()
+        by_document = defaultdict(list)
+        for row in rows:
+            by_document[int(row["cad_document_id"])].append(int(row["item_id"]))
+        for record in records:
+            record["checkout_item_ids"] = list(
+                by_document.get(int(record["id"]), [])
+            )
+        return records
+
+    def _attach_related_drawings(
+        self, conn, records: list[dict], *, item_id: int | None = None
     ) -> list[dict]:
         """Attach managed DRW metadata to its owning PRT/ASM record."""
         model_ids = [
@@ -420,19 +546,35 @@ class PdmRepository:
         if not model_ids:
             return records
         placeholders = ",".join("?" for _ in model_ids)
-        drawings = [
-            dict(row)
-            for row in conn.execute(
-                f"""
-                SELECT d.*
+        if item_id is None:
+            drawing_sql = f"""
+                SELECT d.*,NULL AS drawing_association_id,
+                       NULL AS drawing_association_type,
+                       0 AS is_primary_drawing
                 FROM cad_documents d
                 WHERE upper(d.category)='DRAWING'
                   AND d.drawing_owner_cad_document_id IN ({placeholders})
                 ORDER BY lower(d.name),lower(d.file_name),d.id
-                """,
-                model_ids,
-            ).fetchall()
-        ]
+            """
+            params = model_ids
+        else:
+            drawing_sql = f"""
+                SELECT d.*,a.id AS drawing_association_id,
+                       a.association_type AS drawing_association_type,
+                       COALESCE(a.is_primary_drawing,0) AS is_primary_drawing
+                FROM cad_documents d
+                LEFT JOIN cad_item_associations a
+                  ON a.cad_document_id=d.id AND a.item_id=? AND a.active=1
+                WHERE upper(d.category)='DRAWING'
+                  AND d.drawing_owner_cad_document_id IN ({placeholders})
+                ORDER BY lower(d.name),lower(d.file_name),d.id
+            """
+            params = [int(item_id), *model_ids]
+        drawings = [dict(row) for row in conn.execute(drawing_sql, params).fetchall()]
+        for drawing in drawings:
+            drawing["selected_for_item"] = bool(
+                drawing.get("drawing_association_id")
+            )
         self._add_checkout_usernames(conn, drawings)
         self._apply_legacy_approved_creo_fallback(conn, drawings)
         by_owner = {}
@@ -581,6 +723,8 @@ class PdmRepository:
             ).fetchone())
             if not record:
                 return None
+            self._attach_item_associations(conn, [record])
+            self._attach_checkout_items(conn, [record])
             self._add_checkout_usernames(conn, [record])
             self._apply_legacy_approved_creo_fallback(conn, [record])
             self._attach_related_drawings(conn, [record])
@@ -654,6 +798,13 @@ class PdmRepository:
             return False
         cad_id = int(document["id"])
         with self.get_conn() as conn:
+            current = conn.execute(
+                "SELECT checked_out_by FROM cad_documents WHERE id=?", (cad_id,)
+            ).fetchone()
+            if current and current["checked_out_by"] is not None:
+                raise ValueError(
+                    "Check in or undo the CAD Document before removing it from the supplier package."
+                )
             used = conn.execute(
                 """
                 SELECT 1 FROM cad_document_members
@@ -667,10 +818,39 @@ class PdmRepository:
                     (cad_id,),
                 )
                 conn.execute(
-                    "UPDATE cad_item_associations SET active=0 WHERE cad_document_id=? AND active=1",
-                    (cad_id,),
+                    """
+                    UPDATE cad_item_associations
+                    SET active=0,is_primary_drawing=0,modified_at=datetime('now')
+                    WHERE cad_document_id=? AND item_id=? AND active=1
+                    """,
+                    (cad_id, int(owner_item_id)),
                 )
                 return False
+            other_association = conn.execute(
+                """
+                SELECT 1 FROM cad_item_associations
+                WHERE cad_document_id=? AND item_id<>? AND active=1 LIMIT 1
+                """,
+                (cad_id, int(owner_item_id)),
+            ).fetchone()
+            if other_association:
+                conn.execute(
+                    "UPDATE cad_documents SET supplier_owner_item_id=NULL WHERE id=?",
+                    (cad_id,),
+                )
+                conn.execute(
+                    """
+                    UPDATE cad_item_associations
+                    SET active=0,is_primary_drawing=0,modified_at=datetime('now')
+                    WHERE cad_document_id=? AND item_id=? AND active=1
+                    """,
+                    (cad_id, int(owner_item_id)),
+                )
+                return False
+            conn.execute(
+                "DELETE FROM cad_document_checkout_items WHERE cad_document_id=?",
+                (cad_id,),
+            )
             conn.execute("DELETE FROM cad_item_associations WHERE cad_document_id=?", (cad_id,))
             conn.execute("DELETE FROM cad_document_contents WHERE cad_document_id=?", (cad_id,))
             conn.execute("DELETE FROM cad_document_iterations WHERE cad_document_id=?", (cad_id,))
@@ -815,6 +995,10 @@ class PdmRepository:
                     (int(document_id),),
                 )
                 conn.execute(
+                    "DELETE FROM cad_document_checkout_items WHERE cad_document_id=?",
+                    (int(document_id),),
+                )
+                conn.execute(
                     "DELETE FROM cad_document_checkout_logs WHERE cad_document_id=?",
                     (int(document_id),),
                 )
@@ -854,6 +1038,80 @@ class PdmRepository:
             digits.insert(0, 0)
         return "".join(chr(value + ord("A")) for value in digits)
 
+    @staticmethod
+    def _checkout_target_item_ids_conn(conn, cad_document_id: int) -> list[int]:
+        document = conn.execute(
+            """
+            SELECT id,drawing_owner_cad_document_id
+            FROM cad_documents WHERE id=?
+            """,
+            (int(cad_document_id),),
+        ).fetchone()
+        if not document:
+            return []
+        rows = conn.execute(
+            """
+            SELECT item_id,association_type,id
+            FROM cad_item_associations
+            WHERE cad_document_id=? AND active=1
+            ORDER BY CASE upper(association_type)
+                WHEN 'OWNER' THEN 0
+                WHEN 'CONTRIBUTING_IMAGE' THEN 1
+                WHEN 'IMAGE' THEN 2
+                WHEN 'CONTRIBUTING_CONTENT' THEN 3
+                WHEN 'CONTENT' THEN 4 ELSE 9 END,id
+            """,
+            (int(cad_document_id),),
+        ).fetchall()
+        # A drawing's explicit Item relationships are authoritative.  Falling
+        # back to the model is retained only for legacy drawings that have not
+        # yet received an explicit per-Item selection.
+        if not rows and document["drawing_owner_cad_document_id"] is not None:
+            rows = conn.execute(
+                """
+                SELECT item_id,association_type,id
+                FROM cad_item_associations
+                WHERE cad_document_id=? AND active=1
+                ORDER BY CASE upper(association_type)
+                    WHEN 'OWNER' THEN 0
+                    WHEN 'CONTRIBUTING_IMAGE' THEN 1
+                    WHEN 'IMAGE' THEN 2
+                    WHEN 'CONTRIBUTING_CONTENT' THEN 3
+                    WHEN 'CONTENT' THEN 4 ELSE 9 END,id
+                LIMIT 1
+                """,
+                (int(document["drawing_owner_cad_document_id"]),),
+            ).fetchall()
+        result = []
+        seen = set()
+        for row in rows:
+            item_id = int(row["item_id"])
+            if item_id not in seen:
+                seen.add(item_id)
+                result.append(item_id)
+        return result
+
+    def list_checkout_target_item_ids(self, cad_document_id: int) -> list[int]:
+        """Return Items that must be reserved when this CAD is checked out."""
+        with self.get_conn() as conn:
+            return self._checkout_target_item_ids_conn(
+                conn, int(cad_document_id)
+            )
+
+    def list_cad_checkout_item_ids(self, cad_document_id: int) -> list[int]:
+        """Return the Item reservations captured for an active CAD checkout."""
+        with self.get_conn() as conn:
+            return [
+                int(row["item_id"])
+                for row in conn.execute(
+                    """
+                    SELECT item_id FROM cad_document_checkout_items
+                    WHERE cad_document_id=? ORDER BY item_id
+                    """,
+                    (int(cad_document_id),),
+                ).fetchall()
+            ]
+
     def checkout_cad_document(
         self,
         cad_document_id: int,
@@ -879,25 +1137,10 @@ class PdmRepository:
             owner = row["checked_out_by"]
             if owner is not None and int(owner) != int(user_id):
                 raise ValueError("The CAD Document is checked out by another user.")
-            association = conn.execute(
-                """
-                SELECT item_id FROM cad_item_associations
-                WHERE cad_document_id=? AND active=1
-                ORDER BY id DESC LIMIT 1
-                """,
-                (int(cad_document_id),),
-            ).fetchone()
-            if association is None and row["drawing_owner_cad_document_id"] is not None:
-                association = conn.execute(
-                    """
-                    SELECT item_id FROM cad_item_associations
-                    WHERE cad_document_id=? AND active=1
-                    ORDER BY CASE association_type WHEN 'OWNER' THEN 0 ELSE 1 END,id DESC
-                    LIMIT 1
-                    """,
-                    (int(row["drawing_owner_cad_document_id"]),),
-                ).fetchone()
-            checkout_item_id = int(association["item_id"]) if association else None
+            checkout_item_ids = self._checkout_target_item_ids_conn(
+                conn, int(cad_document_id)
+            )
+            checkout_item_id = checkout_item_ids[0] if checkout_item_ids else None
             if owner is not None:
                 # Repeated checkout by the owner is intentionally idempotent.
                 updates = []
@@ -925,9 +1168,20 @@ class PdmRepository:
                         f"UPDATE cad_documents SET {', '.join(updates)} WHERE id=?",
                         (*params, int(cad_document_id)),
                     )
-                return self._dict(conn.execute(
+                for item_id in checkout_item_ids:
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO cad_document_checkout_items(
+                            cad_document_id,item_id,user_id
+                        ) VALUES(?,?,?)
+                        """,
+                        (int(cad_document_id), int(item_id), int(user_id)),
+                    )
+                repeated = self._dict(conn.execute(
                     "SELECT * FROM cad_documents WHERE id=?", (int(cad_document_id),)
                 ).fetchone())
+                repeated["checkout_item_ids"] = list(checkout_item_ids)
+                return repeated
             conn.execute(
                 """
                 UPDATE cad_documents SET checked_out_by=?,
@@ -944,6 +1198,19 @@ class PdmRepository:
                     int(cad_document_id),
                 ),
             )
+            conn.execute(
+                "DELETE FROM cad_document_checkout_items WHERE cad_document_id=?",
+                (int(cad_document_id),),
+            )
+            for item_id in checkout_item_ids:
+                conn.execute(
+                    """
+                    INSERT INTO cad_document_checkout_items(
+                        cad_document_id,item_id,user_id
+                    ) VALUES(?,?,?)
+                    """,
+                    (int(cad_document_id), int(item_id), int(user_id)),
+                )
             conn.execute(
                 """
                 INSERT INTO cad_document_checkout_logs(
@@ -1035,6 +1302,18 @@ class PdmRepository:
                 int(row["checkout_item_id"])
                 if row["checkout_item_id"] is not None else None
             )
+            checkout_item_ids = [
+                int(item["item_id"])
+                for item in conn.execute(
+                    """
+                    SELECT item_id FROM cad_document_checkout_items
+                    WHERE cad_document_id=? ORDER BY item_id
+                    """,
+                    (int(cad_document_id),),
+                ).fetchall()
+            ]
+            if not checkout_item_ids and checkout_item_id is not None:
+                checkout_item_ids = [checkout_item_id]
             conn.execute(
                 """
                 UPDATE cad_documents SET iteration=?,lifecycle_state='IN_WORK',
@@ -1061,7 +1340,15 @@ class PdmRepository:
                     row["checkout_workspace_machine_id"],
                 ),
             )
-        return {**self.get_cad_document(int(cad_document_id)), "iteration_id": iteration_id}
+            conn.execute(
+                "DELETE FROM cad_document_checkout_items WHERE cad_document_id=?",
+                (int(cad_document_id),),
+            )
+        return {
+            **self.get_cad_document(int(cad_document_id)),
+            "iteration_id": iteration_id,
+            "checkout_item_ids": checkout_item_ids,
+        }
 
     def undo_checkout_cad_document(
         self, cad_document_id: int, user_id: int, note: str = ""
@@ -1082,6 +1369,18 @@ class PdmRepository:
                 int(row["checkout_item_id"])
                 if row["checkout_item_id"] is not None else None
             )
+            checkout_item_ids = [
+                int(item["item_id"])
+                for item in conn.execute(
+                    """
+                    SELECT item_id FROM cad_document_checkout_items
+                    WHERE cad_document_id=? ORDER BY item_id
+                    """,
+                    (int(cad_document_id),),
+                ).fetchall()
+            ]
+            if not checkout_item_ids and checkout_item_id is not None:
+                checkout_item_ids = [checkout_item_id]
             conn.execute(
                 """
                 UPDATE cad_documents
@@ -1107,7 +1406,14 @@ class PdmRepository:
                     row["checkout_workspace_machine_id"],
                 ),
             )
-        return self.get_cad_document(int(cad_document_id))
+            conn.execute(
+                "DELETE FROM cad_document_checkout_items WHERE cad_document_id=?",
+                (int(cad_document_id),),
+            )
+        return {
+            **self.get_cad_document(int(cad_document_id)),
+            "checkout_item_ids": checkout_item_ids,
+        }
 
     def list_checked_out_cad_by_workspace(self, workspace_id: str) -> list[dict]:
         with self.get_conn() as conn:
@@ -1128,10 +1434,12 @@ class PdmRepository:
             rows = conn.execute(
                 """
                 SELECT d.*,a.association_type
-                FROM cad_documents d
+                FROM cad_document_checkout_items checkout_link
+                JOIN cad_documents d ON d.id=checkout_link.cad_document_id
                 LEFT JOIN cad_item_associations a
-                  ON a.cad_document_id=d.id AND a.active=1
-                WHERE d.checkout_item_id=? AND d.checked_out_by IS NOT NULL
+                  ON a.cad_document_id=d.id
+                 AND a.item_id=checkout_link.item_id AND a.active=1
+                WHERE checkout_link.item_id=? AND d.checked_out_by IS NOT NULL
                 ORDER BY lower(d.file_name),d.id
                 """,
                 (int(item_id),),
@@ -1206,44 +1514,19 @@ class PdmRepository:
 
     def list_cad_documents(self, project_id: int) -> list[dict]:
         with self.get_conn() as conn:
-            has_item_versions = all(
-                conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                    (name,),
-                ).fetchone()
-                for name in ("bom_revisions", "bom_iterations")
-            )
-            item_version_select = (
-                ", br.revision_code || '.' || bi.iteration_number AS item_version_label"
-                if has_item_versions else ", NULL AS item_version_label"
-            )
-            item_version_join = (
-                """
-                LEFT JOIN bom_revisions br ON br.id=b.current_revision_id
-                LEFT JOIN bom_iterations bi ON bi.id=b.current_iteration_id
-                """
-                if has_item_versions else ""
-            )
             rows = conn.execute(
-                f"""
-                SELECT d.*,
-                       a.id AS association_id,a.item_id,a.association_type,
-                       b.part_number AS item_number,
-                       b.aes_number AS item_aes_number,b.name AS item_name
-                       {item_version_select}
+                """
+                SELECT d.*
                 FROM cad_documents d
-                LEFT JOIN cad_item_associations a
-                  ON a.cad_document_id=d.id AND a.active=1
-                LEFT JOIN bom b ON b.id=a.item_id
-                {item_version_join}
                 WHERE d.project_id=?
                 ORDER BY lower(d.file_name), lower(d.name), d.id
                 """,
                 (int(project_id),),
             ).fetchall()
-            records = self._add_checkout_usernames(
-                conn, [dict(row) for row in rows]
-            )
+            records = [dict(row) for row in rows]
+            self._attach_item_associations(conn, records)
+            self._attach_checkout_items(conn, records)
+            self._add_checkout_usernames(conn, records)
             self._apply_legacy_approved_creo_fallback(conn, records)
             return self._attach_related_drawings(conn, records)
 
@@ -1273,7 +1556,8 @@ class PdmRepository:
                 f"""
                 SELECT d.*,a.id AS association_id,a.association_type,
                        a.drives_structure,a.drives_attributes,
-                       a.participates_in_structure,
+                       a.participates_in_structure,a.is_primary_drawing,
+                       a.drawing_model_cad_document_id,
                        b.part_number AS item_number,
                        b.aes_number AS item_aes_number,
                        b.name AS item_name
@@ -1292,8 +1576,11 @@ class PdmRepository:
             records = self._add_checkout_usernames(
                 conn, [dict(row) for row in rows]
             )
+            self._attach_checkout_items(conn, records)
             self._apply_legacy_approved_creo_fallback(conn, records)
-            return self._attach_related_drawings(conn, records)
+            return self._attach_related_drawings(
+                conn, records, item_id=int(item_id)
+            )
 
     def list_related_drawings(self, model_cad_document_id: int) -> list[dict]:
         with self.get_conn() as conn:
@@ -1309,6 +1596,8 @@ class PdmRepository:
             records = self._add_checkout_usernames(
                 conn, [dict(row) for row in rows]
             )
+            self._attach_item_associations(conn, records)
+            self._attach_checkout_items(conn, records)
             return self._apply_legacy_approved_creo_fallback(conn, records)
 
     def bind_drawing_to_model(
@@ -1331,30 +1620,61 @@ class PdmRepository:
                 raise ValueError("Select a managed PRT or ASM CAD Document.")
             if int(drawing["project_id"]) != int(model["project_id"]):
                 raise ValueError("The drawing and model must belong to the same project.")
-            drawing_association = conn.execute(
+            if drawing["checked_out_by"] is not None or model["checked_out_by"] is not None:
+                raise ValueError(
+                    "Check in both the drawing and model before changing their relationship."
+                )
+            drawing_associations = conn.execute(
                 """
-                SELECT item_id FROM cad_item_associations
+                SELECT item_id,is_primary_drawing
+                FROM cad_item_associations
                 WHERE cad_document_id=? AND active=1
-                ORDER BY id DESC LIMIT 1
+                ORDER BY item_id
                 """,
                 (int(drawing_cad_document_id),),
-            ).fetchone()
-            model_association = conn.execute(
-                """
-                SELECT item_id FROM cad_item_associations
-                WHERE cad_document_id=? AND active=1
-                ORDER BY id DESC LIMIT 1
-                """,
-                (int(model_cad_document_id),),
-            ).fetchone()
-            if (
-                drawing_association is not None
-                and model_association is not None
-                and int(drawing_association["item_id"])
-                != int(model_association["item_id"])
-            ):
+            ).fetchall()
+            invalid_items = []
+            primary_conflicts = []
+            for association in drawing_associations:
+                item_id = int(association["item_id"])
+                model_association = conn.execute(
+                    """
+                    SELECT 1 FROM cad_item_associations
+                    WHERE cad_document_id=? AND item_id=? AND active=1
+                    LIMIT 1
+                    """,
+                    (int(model_cad_document_id), item_id),
+                ).fetchone()
+                if not model_association:
+                    invalid_items.append(item_id)
+                    continue
+                if association["is_primary_drawing"]:
+                    conflict = conn.execute(
+                        """
+                        SELECT 1 FROM cad_item_associations
+                        WHERE item_id=? AND drawing_model_cad_document_id=?
+                          AND active=1 AND is_primary_drawing=1
+                          AND cad_document_id<>?
+                        LIMIT 1
+                        """,
+                        (
+                            item_id, int(model_cad_document_id),
+                            int(drawing_cad_document_id),
+                        ),
+                    ).fetchone()
+                    if conflict:
+                        primary_conflicts.append(item_id)
+            if invalid_items:
                 raise ValueError(
-                    "The drawing and model are associated with different Items."
+                    "The target model is not associated with Item(s): "
+                    + ", ".join(str(value) for value in invalid_items)
+                    + ". Associate the model first."
+                )
+            if primary_conflicts:
+                raise ValueError(
+                    "The target model already has a different primary drawing for Item(s): "
+                    + ", ".join(str(value) for value in primary_conflicts)
+                    + ". Clear that primary drawing first."
                 )
             conn.execute(
                 """
@@ -1364,34 +1684,73 @@ class PdmRepository:
                 """,
                 (int(model_cad_document_id), int(drawing_cad_document_id)),
             )
-            if drawing_association is None and model_association is not None:
-                conn.execute(
-                    """
-                    INSERT INTO cad_item_associations(
-                        project_id,item_id,cad_document_id,association_type,
-                        drives_structure,drives_attributes,
-                        participates_in_structure,active
-                    ) VALUES(?,?,?,'CONTENT',0,0,0,1)
-                    """,
-                    (
-                        int(model["project_id"]),
-                        int(model_association["item_id"]),
-                        int(drawing_cad_document_id),
-                    ),
-                )
+            conn.execute(
+                """
+                UPDATE cad_item_associations
+                SET drawing_model_cad_document_id=?,modified_at=datetime('now')
+                WHERE cad_document_id=? AND active=1
+                """,
+                (int(model_cad_document_id), int(drawing_cad_document_id)),
+            )
         return self.get_cad_document(int(drawing_cad_document_id))
 
-    def get_active_association_for_cad(self, cad_document_id: int) -> Optional[dict]:
+    @staticmethod
+    def _active_associations_for_cad_conn(
+        conn, cad_document_id: int
+    ) -> list[dict]:
+        return [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT a.*,a.id AS association_id,
+                       b.part_number AS item_number,
+                       b.aes_number AS item_aes_number,b.name AS item_name
+                FROM cad_item_associations a
+                JOIN bom b ON b.id=a.item_id
+                WHERE a.cad_document_id=? AND a.active=1
+                ORDER BY CASE upper(a.association_type)
+                    WHEN 'OWNER' THEN 0
+                    WHEN 'CONTRIBUTING_IMAGE' THEN 1
+                    WHEN 'IMAGE' THEN 2
+                    WHEN 'CONTRIBUTING_CONTENT' THEN 3
+                    WHEN 'CONTENT' THEN 4 ELSE 9 END,a.id
+                """,
+                (int(cad_document_id),),
+            ).fetchall()
+        ]
+
+    def list_active_associations_for_cad(
+        self, cad_document_id: int
+    ) -> list[dict]:
+        with self.get_conn() as conn:
+            return self._active_associations_for_cad_conn(
+                conn, int(cad_document_id)
+            )
+
+    def get_active_association(
+        self, cad_document_id: int, item_id: int
+    ) -> Optional[dict]:
         with self.get_conn() as conn:
             return self._dict(conn.execute(
                 """
-                SELECT a.*,b.part_number AS item_number,
+                SELECT a.*,a.id AS association_id,
+                       b.part_number AS item_number,
                        b.aes_number AS item_aes_number,b.name AS item_name
-                FROM cad_item_associations a JOIN bom b ON b.id=a.item_id
-                WHERE a.cad_document_id=? AND a.active=1
+                FROM cad_item_associations a
+                JOIN bom b ON b.id=a.item_id
+                WHERE a.cad_document_id=? AND a.item_id=? AND a.active=1
+                LIMIT 1
                 """,
-                (int(cad_document_id),),
+                (int(cad_document_id), int(item_id)),
             ).fetchone())
+
+    def get_active_association_for_cad(self, cad_document_id: int) -> Optional[dict]:
+        """Compatibility lookup; OWNER is deterministic when several exist."""
+        with self.get_conn() as conn:
+            rows = self._active_associations_for_cad_conn(
+                conn, int(cad_document_id)
+            )
+            return rows[0] if rows else None
 
     def associate(
         self,
@@ -1434,18 +1793,18 @@ class PdmRepository:
                     )
                 model_association = conn.execute(
                     """
-                    SELECT item_id FROM cad_item_associations
-                    WHERE cad_document_id=? AND active=1
-                    ORDER BY id DESC LIMIT 1
+                    SELECT id FROM cad_item_associations
+                    WHERE cad_document_id=? AND item_id=? AND active=1
+                    LIMIT 1
                     """,
-                    (int(cad["drawing_owner_cad_document_id"]),),
+                    (
+                        int(cad["drawing_owner_cad_document_id"]),
+                        int(item_id),
+                    ),
                 ).fetchone()
-                if (
-                    model_association is not None
-                    and int(model_association["item_id"]) != int(item_id)
-                ):
+                if model_association is None:
                     raise ValueError(
-                        "The drawing must belong to the same Item as its PRT/ASM model."
+                        "Associate the drawing's PRT/ASM model with this Item first."
                     )
             if kind == "OWNER":
                 owner = conn.execute(
@@ -1458,63 +1817,79 @@ class PdmRepository:
                 ).fetchone()
                 if owner:
                     raise ValueError("This Item already has an OWNER CAD Document.")
+                other_item = conn.execute(
+                    """
+                    SELECT item_id FROM cad_item_associations
+                    WHERE cad_document_id=? AND active=1
+                      AND association_type='OWNER' AND item_id<>?
+                    LIMIT 1
+                    """,
+                    (int(cad_document_id), int(item_id)),
+                ).fetchone()
+                if other_item:
+                    raise ValueError(
+                        "This CAD Document is already the OWNER of another Item."
+                    )
+            existing = conn.execute(
+                """
+                SELECT * FROM cad_item_associations
+                WHERE cad_document_id=? AND item_id=? AND active=1
+                LIMIT 1
+                """,
+                (int(cad_document_id), int(item_id)),
+            ).fetchone()
+            drawing_model_id = (
+                int(cad["drawing_owner_cad_document_id"])
+                if str(cad["category"] or "").upper() == "DRAWING"
+                else None
+            )
+            keep_primary = int(
+                bool(existing and existing["is_primary_drawing"])
+            )
+            if existing and str(existing["association_type"] or "").upper() == kind:
+                conn.execute(
+                    """
+                    UPDATE cad_item_associations
+                    SET drives_structure=?,drives_attributes=?,
+                        participates_in_structure=?,
+                        drawing_model_cad_document_id=?,
+                        modified_at=datetime('now')
+                    WHERE id=?
+                    """,
+                    (
+                        structure, attributes, representation,
+                        drawing_model_id, int(existing["id"]),
+                    ),
+                )
+                return self._dict(conn.execute(
+                    "SELECT * FROM cad_item_associations WHERE id=?",
+                    (int(existing["id"]),),
+                ).fetchone())
             conn.execute(
                 """
                 UPDATE cad_item_associations
-                SET active=0,modified_at=datetime('now')
-                WHERE cad_document_id=? AND active=1
+                SET active=0,is_primary_drawing=0,modified_at=datetime('now')
+                WHERE cad_document_id=? AND item_id=? AND active=1
                 """,
-                (int(cad_document_id),),
+                (int(cad_document_id), int(item_id)),
             )
             cur = conn.execute(
                 """
                 INSERT INTO cad_item_associations(
                     project_id,item_id,cad_document_id,association_type,
                     drives_structure,drives_attributes,participates_in_structure,
-                    active,created_by
-                ) VALUES(?,?,?,?,?,?,?,1,?)
+                    active,created_by,is_primary_drawing,
+                    drawing_model_cad_document_id
+                ) VALUES(?,?,?,?,?,?,?,1,?,?,?)
                 """,
                 (
                     int(project_id), int(item_id), int(cad_document_id), kind,
                     structure, attributes, representation,
                     int(created_by) if created_by else None,
+                    keep_primary, drawing_model_id,
                 ),
             )
             association_id = int(cur.lastrowid)
-            if str(cad["category"] or "").upper() in {"ASSEMBLY", "COMPONENT"}:
-                drawing_ids = [
-                    int(row["id"])
-                    for row in conn.execute(
-                        """
-                        SELECT id FROM cad_documents
-                        WHERE drawing_owner_cad_document_id=?
-                          AND upper(category)='DRAWING'
-                        """,
-                        (int(cad_document_id),),
-                    ).fetchall()
-                ]
-                for drawing_id in drawing_ids:
-                    conn.execute(
-                        """
-                        UPDATE cad_item_associations
-                        SET active=0,modified_at=datetime('now')
-                        WHERE cad_document_id=? AND active=1
-                        """,
-                        (drawing_id,),
-                    )
-                    conn.execute(
-                        """
-                        INSERT INTO cad_item_associations(
-                            project_id,item_id,cad_document_id,association_type,
-                            drives_structure,drives_attributes,
-                            participates_in_structure,active,created_by
-                        ) VALUES(?,?,?,'CONTENT',0,0,0,1,?)
-                        """,
-                        (
-                            int(project_id), int(item_id), drawing_id,
-                            int(created_by) if created_by else None,
-                        ),
-                    )
         return self.get_association(association_id)
 
     def get_association(self, association_id: int) -> Optional[dict]:
@@ -1524,11 +1899,224 @@ class PdmRepository:
                 (int(association_id),),
             ).fetchone())
 
+    def list_item_selected_drawings(
+        self, item_id: int, model_cad_document_id: int | None = None
+    ) -> list[dict]:
+        predicates = [
+            "a.item_id=?", "a.active=1", "upper(d.category)='DRAWING'"
+        ]
+        params = [int(item_id)]
+        if model_cad_document_id is not None:
+            predicates.append(
+                "COALESCE(a.drawing_model_cad_document_id,"
+                "d.drawing_owner_cad_document_id)=?"
+            )
+            params.append(int(model_cad_document_id))
+        with self.get_conn() as conn:
+            records = [
+                dict(row)
+                for row in conn.execute(
+                    f"""
+                    SELECT d.*,a.id AS drawing_association_id,
+                           a.association_type AS drawing_association_type,
+                           a.is_primary_drawing,
+                           a.drawing_model_cad_document_id
+                    FROM cad_item_associations a
+                    JOIN cad_documents d ON d.id=a.cad_document_id
+                    WHERE {' AND '.join(predicates)}
+                    ORDER BY a.is_primary_drawing DESC,lower(d.file_name),d.id
+                    """,
+                    params,
+                ).fetchall()
+            ]
+            for record in records:
+                record["selected_for_item"] = True
+            self._add_checkout_usernames(conn, records)
+            self._apply_legacy_approved_creo_fallback(conn, records)
+            return records
+
+    def set_item_model_drawings(
+        self,
+        item_id: int,
+        model_cad_document_id: int,
+        drawing_ids,
+        primary_drawing_id=None,
+        created_by=None,
+    ) -> list[dict]:
+        item_id = int(item_id)
+        model_id = int(model_cad_document_id)
+        selected_ids = sorted({int(value) for value in (drawing_ids or [])})
+        primary_id = (
+            int(primary_drawing_id)
+            if primary_drawing_id not in (None, "", 0, "0") else None
+        )
+        if primary_id is not None and primary_id not in selected_ids:
+            raise ValueError("The primary drawing must be one of the selected drawings.")
+        with self.get_conn() as conn:
+            model = conn.execute(
+                """
+                SELECT id,project_id,category,checked_out_by
+                FROM cad_documents WHERE id=?
+                """,
+                (model_id,),
+            ).fetchone()
+            if not model or str(model["category"] or "").upper() not in {
+                "ASSEMBLY", "COMPONENT"
+            }:
+                raise ValueError("Select a managed PRT or ASM CAD Document.")
+            if model["checked_out_by"] is not None:
+                raise ValueError(
+                    "Check in the model before changing its Item drawing selections."
+                )
+            model_association = conn.execute(
+                """
+                SELECT 1 FROM cad_item_associations
+                WHERE item_id=? AND cad_document_id=? AND active=1
+                LIMIT 1
+                """,
+                (item_id, model_id),
+            ).fetchone()
+            if not model_association:
+                raise ValueError("Associate the model with this Item first.")
+            related = {
+                int(row["id"]): row
+                for row in conn.execute(
+                    """
+                    SELECT id,checked_out_by FROM cad_documents
+                    WHERE drawing_owner_cad_document_id=?
+                      AND upper(category)='DRAWING'
+                    """,
+                    (model_id,),
+                ).fetchall()
+            }
+            invalid = [value for value in selected_ids if value not in related]
+            if invalid:
+                raise ValueError(
+                    "Drawing(s) are not related to the selected model: "
+                    + ", ".join(str(value) for value in invalid)
+                )
+            current = {
+                int(row["cad_document_id"]): row
+                for row in conn.execute(
+                    """
+                    SELECT a.*,d.checked_out_by
+                    FROM cad_item_associations a
+                    JOIN cad_documents d ON d.id=a.cad_document_id
+                    WHERE a.item_id=? AND a.active=1
+                      AND upper(d.category)='DRAWING'
+                      AND d.drawing_owner_cad_document_id=?
+                    """,
+                    (item_id, model_id),
+                ).fetchall()
+            }
+            changing_ids = set(current).union(selected_ids)
+            checked_out = []
+            for drawing_id in changing_ids:
+                row = current.get(drawing_id) or related.get(drawing_id)
+                if row is not None and row["checked_out_by"] is not None:
+                    checked_out.append(drawing_id)
+            if checked_out:
+                raise ValueError(
+                    "Check in the selected/previous drawing CAD Document(s) before changing associations."
+                )
+            for drawing_id, association in current.items():
+                if drawing_id not in selected_ids:
+                    conn.execute(
+                        """
+                        UPDATE cad_item_associations
+                        SET active=0,is_primary_drawing=0,
+                            modified_at=datetime('now')
+                        WHERE id=?
+                        """,
+                        (int(association["id"]),),
+                    )
+            conn.execute(
+                """
+                UPDATE cad_item_associations
+                SET is_primary_drawing=0,modified_at=datetime('now')
+                WHERE item_id=? AND active=1
+                  AND drawing_model_cad_document_id=?
+                """,
+                (item_id, model_id),
+            )
+            for drawing_id in selected_ids:
+                association = current.get(drawing_id)
+                if association is not None:
+                    conn.execute(
+                        """
+                        UPDATE cad_item_associations
+                        SET drawing_model_cad_document_id=?,
+                            is_primary_drawing=0,modified_at=datetime('now')
+                        WHERE id=?
+                        """,
+                        (model_id, int(association["id"])),
+                    )
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO cad_item_associations(
+                        project_id,item_id,cad_document_id,association_type,
+                        drives_structure,drives_attributes,
+                        participates_in_structure,active,created_by,
+                        is_primary_drawing,drawing_model_cad_document_id
+                    ) VALUES(?,?,?,'CONTENT',0,0,0,1,?,0,?)
+                    """,
+                    (
+                        int(model["project_id"]), item_id, drawing_id,
+                        int(created_by) if created_by else None, model_id,
+                    ),
+                )
+            if primary_id is not None:
+                conn.execute(
+                    """
+                    UPDATE cad_item_associations
+                    SET is_primary_drawing=1,modified_at=datetime('now')
+                    WHERE item_id=? AND cad_document_id=? AND active=1
+                    """,
+                    (item_id, primary_id),
+                )
+        return self.list_item_selected_drawings(item_id, model_id)
+
+    def set_primary_drawing(
+        self, item_id: int, model_cad_document_id: int,
+        drawing_cad_document_id: int, created_by=None,
+    ) -> dict:
+        selected_ids = [
+            int(row["id"])
+            for row in self.list_item_selected_drawings(
+                int(item_id), int(model_cad_document_id)
+            )
+        ]
+        drawing_id = int(drawing_cad_document_id)
+        if drawing_id not in selected_ids:
+            selected_ids.append(drawing_id)
+        rows = self.set_item_model_drawings(
+            int(item_id), int(model_cad_document_id), selected_ids,
+            primary_drawing_id=drawing_id, created_by=created_by,
+        )
+        return next(row for row in rows if int(row["id"]) == drawing_id)
+
+    def clear_primary_drawing(
+        self, item_id: int, model_cad_document_id: int
+    ) -> bool:
+        selected_ids = [
+            int(row["id"])
+            for row in self.list_item_selected_drawings(
+                int(item_id), int(model_cad_document_id)
+            )
+        ]
+        self.set_item_model_drawings(
+            int(item_id), int(model_cad_document_id), selected_ids,
+            primary_drawing_id=None,
+        )
+        return True
+
     def remove_association(self, association_id: int) -> bool:
         with self.get_conn() as conn:
             association = conn.execute(
                 """
-                SELECT a.id,a.cad_document_id,d.checked_out_by,d.category
+                SELECT a.id,a.item_id,a.cad_document_id,
+                       d.checked_out_by,d.category
                 FROM cad_item_associations a
                 JOIN cad_documents d ON d.id=a.cad_document_id
                 WHERE a.id=? AND a.active=1
@@ -1539,10 +2127,33 @@ class PdmRepository:
                 return False
             if association["checked_out_by"] is not None:
                 raise ValueError("Check in the CAD Document before removing its Item association.")
+            if str(association["category"] or "").upper() in {
+                "ASSEMBLY", "COMPONENT"
+            }:
+                checked_out_drawing = conn.execute(
+                    """
+                    SELECT d.file_name
+                    FROM cad_item_associations drawing_assoc
+                    JOIN cad_documents d ON d.id=drawing_assoc.cad_document_id
+                    WHERE drawing_assoc.item_id=? AND drawing_assoc.active=1
+                      AND upper(d.category)='DRAWING'
+                      AND d.drawing_owner_cad_document_id=?
+                      AND d.checked_out_by IS NOT NULL
+                    LIMIT 1
+                    """,
+                    (
+                        int(association["item_id"]),
+                        int(association["cad_document_id"]),
+                    ),
+                ).fetchone()
+                if checked_out_drawing:
+                    raise ValueError(
+                        "Check in the selected drawing before removing the model association."
+                    )
             cur = conn.execute(
                 """
                 UPDATE cad_item_associations
-                SET active=0,modified_at=datetime('now')
+                SET active=0,is_primary_drawing=0,modified_at=datetime('now')
                 WHERE id=? AND active=1
                 """,
                 (int(association_id),),
@@ -1555,14 +2166,18 @@ class PdmRepository:
                 conn.execute(
                     """
                     UPDATE cad_item_associations
-                    SET active=0,modified_at=datetime('now')
-                    WHERE active=1 AND cad_document_id IN (
+                    SET active=0,is_primary_drawing=0,
+                        modified_at=datetime('now')
+                    WHERE item_id=? AND active=1 AND cad_document_id IN (
                         SELECT id FROM cad_documents
                         WHERE drawing_owner_cad_document_id=?
                           AND upper(category)='DRAWING'
                     )
                     """,
-                    (int(association["cad_document_id"]),),
+                    (
+                        int(association["item_id"]),
+                        int(association["cad_document_id"]),
+                    ),
                 )
             return bool(cur.rowcount)
 
@@ -1642,22 +2257,85 @@ class PdmRepository:
         with self.get_conn() as conn:
             rows = conn.execute(
                 """
-                SELECT m.*,d.number,d.name,d.file_name,d.category,
-                       d.build_excluded AS document_build_excluded,
-                       a.item_id,a.association_type,a.participates_in_structure,
-                       a.drives_structure,b.part_number AS item_number,
-                       b.aes_number AS item_aes_number,b.name AS item_name
+                SELECT m.*,d.id AS cad_document_id,d.number,d.name,
+                       d.file_name,d.category,
+                       d.build_excluded AS document_build_excluded
                 FROM cad_document_members m
                 JOIN cad_documents d ON d.id=m.child_cad_document_id
-                LEFT JOIN cad_item_associations a
-                  ON a.cad_document_id=d.id AND a.active=1
-                LEFT JOIN bom b ON b.id=a.item_id
                 WHERE m.parent_cad_document_id=?
                 ORDER BY COALESCE(m.sort_order,m.id),m.id
                 """,
                 (int(parent_cad_document_id),),
             ).fetchall()
-            return [dict(row) for row in rows]
+            records = [dict(row) for row in rows]
+            document_ids = sorted({
+                int(record["child_cad_document_id"]) for record in records
+            })
+            if not document_ids:
+                return records
+            placeholders = ",".join("?" for _ in document_ids)
+            associations = [
+                dict(row)
+                for row in conn.execute(
+                    f"""
+                    SELECT a.*,a.id AS association_id,
+                           b.part_number AS item_number,
+                           b.aes_number AS item_aes_number,b.name AS item_name
+                    FROM cad_item_associations a
+                    JOIN bom b ON b.id=a.item_id
+                    WHERE a.active=1
+                      AND a.cad_document_id IN ({placeholders})
+                    ORDER BY a.cad_document_id,
+                             CASE upper(a.association_type)
+                                WHEN 'OWNER' THEN 0
+                                WHEN 'CONTRIBUTING_IMAGE' THEN 1
+                                WHEN 'IMAGE' THEN 2
+                                WHEN 'CONTRIBUTING_CONTENT' THEN 3
+                                WHEN 'CONTENT' THEN 4 ELSE 9 END,a.id
+                    """,
+                    document_ids,
+                ).fetchall()
+            ]
+            by_document = defaultdict(list)
+            for association in associations:
+                by_document[int(association["cad_document_id"])].append(
+                    association
+                )
+            legacy_fields = (
+                "association_id", "item_id", "association_type",
+                "participates_in_structure", "drives_structure",
+                "drives_attributes", "item_number", "item_aes_number",
+                "item_name",
+            )
+            for record in records:
+                related = list(
+                    by_document.get(int(record["child_cad_document_id"]), [])
+                )
+                owners = [
+                    row for row in related
+                    if str(row.get("association_type") or "").upper() == "OWNER"
+                ]
+                participating = [
+                    row for row in related
+                    if bool(row.get("participates_in_structure"))
+                ]
+                ambiguous = not owners and len(participating) > 1
+                if owners:
+                    selected = owners[0]
+                elif len(participating) == 1:
+                    selected = participating[0]
+                elif not participating and related:
+                    # Preserve NOT_PARTICIPATING diagnostics for CONTENT-only
+                    # CAD rather than incorrectly reporting it unassociated.
+                    selected = related[0]
+                else:
+                    selected = {}
+                record["associations"] = related
+                record["association_count"] = len(related)
+                record["association_ambiguous"] = bool(ambiguous)
+                for field in legacy_fields:
+                    record[field] = selected.get(field)
+            return records
 
     def get_cad_member(self, member_id: int) -> Optional[dict]:
         with self.get_conn() as conn:

@@ -301,6 +301,7 @@ COMPARE_ITEM_ID_ROLE = Qt.UserRole + 90
 COMPARE_CAD_ID_ROLE = Qt.UserRole + 91
 COMPARE_PAYLOAD_ROLE = Qt.UserRole + 92
 COMPARE_PARENT_ITEM_ID_ROLE = Qt.UserRole + 93
+COMPARE_ITEM_IDS_ROLE = Qt.UserRole + 94
 
 PDM_OBJECT_ITEM = "ITEM"
 PDM_OBJECT_CAD = "CAD_DOCUMENT"
@@ -2045,6 +2046,7 @@ class BomPage(QWidget):
         self._lazy_tree_materialized = False
         self._in_search_mode = False     # True while _search_tree (index 2) is visible
         self._advanced_filter_flat_mode = False
+        self._ebom_filter_flat_mode = False
         self._bom_advanced_filters = self._default_bom_advanced_filters()
         self._active_saved_filter_id = None
         self._active_saved_filter_name = ""
@@ -2199,12 +2201,19 @@ class BomPage(QWidget):
             if stack is None:
                 return
             if loading:
-                target = 0
+                stack.setCurrentIndex(0)
             elif getattr(self, "_bom_mode", "cad") == "ebom":
-                target = 3
+                target_tree = (
+                    getattr(self, "_ebom_filter_tree", None)
+                    if getattr(self, "_ebom_filter_flat_mode", False)
+                    else getattr(self, "_ebom_tree", None)
+                )
+                if target_tree is not None:
+                    stack.setCurrentWidget(target_tree)
             else:
-                target = 4
-            stack.setCurrentIndex(target)
+                target_tree = getattr(self, "_cad_tree", None)
+                if target_tree is not None:
+                    stack.setCurrentWidget(target_tree)
         except Exception:
             pass
 
@@ -2302,25 +2311,108 @@ class BomPage(QWidget):
         creo_file = self._pdm_creo_file_text(document)
         return f"{revision} | Creo {creo_file}" if creo_file else revision
 
+    @staticmethod
+    def _pdm_document_associations(document: dict) -> list[dict]:
+        """Return every Item association while accepting the legacy flat payload."""
+        associations = [
+            dict(row) for row in (document.get("associations") or []) if row
+        ]
+        if not associations and document.get("association_id") is not None:
+            associations = [{
+                "id": document.get("association_id"),
+                "association_id": document.get("association_id"),
+                "item_id": document.get("item_id"),
+                "association_type": document.get("association_type"),
+                "item_number": document.get("item_number"),
+                "item_name": document.get("item_name"),
+                "item_aes_number": document.get("item_aes_number"),
+                "item_version_label": document.get("item_version_label"),
+                "is_primary_drawing": document.get("is_primary_drawing"),
+            }]
+        unique = []
+        seen = set()
+        for association in associations:
+            key = (
+                association.get("association_id") or association.get("id"),
+                association.get("item_id"),
+                str(association.get("association_type") or "").upper(),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(association)
+        return unique
+
+    @classmethod
+    def _pdm_association_for_item(
+        cls, document: dict, item_id: int
+    ) -> dict | None:
+        for association in cls._pdm_document_associations(document):
+            try:
+                if int(association.get("item_id")) == int(item_id):
+                    return association
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _pdm_selected_drawings(document: dict) -> list[dict]:
+        """Drawings explicitly selected for the Item represented by this row."""
+        return [
+            dict(drawing)
+            for drawing in (document.get("related_drawings") or [])
+            if drawing and (
+                bool(drawing.get("selected_for_item"))
+                or drawing.get("drawing_association_id") is not None
+                or bool(drawing.get("is_primary_drawing"))
+            )
+        ]
+
+    @staticmethod
+    def _pdm_item_association_label(association: dict) -> str:
+        association_type = str(
+            association.get("association_type") or "CONTENT"
+        ).strip().upper().replace("_", " ")
+        identity = " - ".join(
+            value for value in (
+                str(association.get("item_number") or "").strip(),
+                str(association.get("item_name") or "").strip(),
+            ) if value
+        ) or f"Item {association.get('item_id') or '-'}"
+        version = str(association.get("item_version_label") or "").strip()
+        return f"{association_type}: {identity}" + (
+            f" | Item {version}" if version else ""
+        )
+
+    @classmethod
+    def _pdm_item_association_lines(cls, document: dict) -> list[str]:
+        return [
+            cls._pdm_item_association_label(association)
+            for association in cls._pdm_document_associations(document)
+        ]
+
     def _pdm_related_item_text(self, document: dict) -> str:
-        association_type = str(document.get("association_type") or "").strip().upper()
-        item_number = str(document.get("item_number") or "").strip()
-        item_name = str(document.get("item_name") or "").strip()
-        related_item = " - ".join(value for value in (item_number, item_name) if value)
-        item_aes = str(document.get("item_aes_number") or "").strip()
-        item_version = str(document.get("item_version_label") or "").strip()
-        if related_item and item_aes:
-            related_item += f" | AES {item_aes}"
-        if related_item and item_version:
-            related_item += f" | Item {item_version}"
-        if association_type:
-            return f"{association_type.replace('_', ' ')}: {related_item or 'Item'}"
-        return "Unassociated"
+        associations = self._pdm_document_associations(document)
+        if not associations:
+            return "Unassociated"
+        if len(associations) == 1:
+            return self._pdm_item_association_label(associations[0])
+        owner_count = sum(
+            1 for association in associations
+            if str(association.get("association_type") or "").upper() == "OWNER"
+        )
+        suffix = f" | OWNER: {owner_count}" if owner_count else ""
+        return f"{len(associations)} Item associations{suffix}"
 
     def _add_pdm_cad_node(
         self, document: dict, parent_item: QTreeWidgetItem | None = None
     ) -> QTreeWidgetItem:
-        association_type = str(document.get("association_type") or "").strip().upper()
+        associations = self._pdm_document_associations(document)
+        primary_association = associations[0] if associations else {}
+        association_type = str(
+            primary_association.get("association_type")
+            or document.get("association_type") or ""
+        ).strip().upper()
         related_item = self._pdm_related_item_text(document)
         revision = self._pdm_cad_revision_text(document)
         excluded = bool(
@@ -2357,17 +2449,19 @@ class BomPage(QWidget):
             str(drawing.get("file_name") or drawing.get("name") or "")
             for drawing in document.get("related_drawings") or []
         ) or "None"
+        association_lines = self._pdm_item_association_lines(document)
         item.setToolTip(
             CAD_COL_NUMBER,
             "CAD Document\n"
             f"File: {document.get('file_name') or '-'}\n"
             f"Creo file version: {self._pdm_creo_file_text(document) or '-'}\n"
-            f"Related drawing: {drawing_files}\n"
-            f"Association: {association_type.replace('_', ' ') if association_type else 'None'}\n"
-            f"Related Item: {related_item}\n"
+            f"Related drawings: {drawing_files}\n"
+            f"Item associations ({len(association_lines)}):\n"
+            + ("\n".join(f"  {line}" for line in association_lines) if association_lines else "  None")
+            + "\n"
             f"Checkout: {self._pdm_cad_checkout_text(document)}",
         )
-        if not association_type:
+        if not associations:
             item.setForeground(CAD_COL_ASSOCIATION, QBrush(QColor("#b45309")))
         if excluded:
             item.setForeground(CAD_COL_BUILD, QBrush(QColor("#b45309")))
@@ -2381,7 +2475,12 @@ class BomPage(QWidget):
     def _apply_pdm_cad_tree_item_data(self, item: QTreeWidgetItem, document: dict) -> None:
         payload = dict(item.data(0, PDM_CAD_PAYLOAD_ROLE) or {})
         payload.update(dict(document or {}))
-        association_type = str(payload.get("association_type") or "").strip().upper()
+        associations = self._pdm_document_associations(payload)
+        primary_association = associations[0] if associations else {}
+        association_type = str(
+            primary_association.get("association_type")
+            or payload.get("association_type") or ""
+        ).strip().upper()
         related_item = self._pdm_related_item_text(payload)
         revision = self._pdm_cad_revision_text(payload)
         excluded = bool(payload.get("member_build_excluded") or payload.get("build_excluded"))
@@ -2405,14 +2504,16 @@ class BomPage(QWidget):
             str(drawing.get("file_name") or drawing.get("name") or "")
             for drawing in payload.get("related_drawings") or []
         ) or "None"
+        association_lines = self._pdm_item_association_lines(payload)
         item.setToolTip(
             CAD_COL_NUMBER,
             "CAD Document\n"
             f"File: {payload.get('file_name') or '-'}\n"
             f"Creo file version: {self._pdm_creo_file_text(payload) or '-'}\n"
-            f"Related drawing: {drawing_files}\n"
-            f"Association: {association_type.replace('_', ' ') if association_type else 'None'}\n"
-            f"Related Item: {related_item}\n"
+            f"Related drawings: {drawing_files}\n"
+            f"Item associations ({len(association_lines)}):\n"
+            + ("\n".join(f"  {line}" for line in association_lines) if association_lines else "  None")
+            + "\n"
             f"Checkout: {self._pdm_cad_checkout_text(payload)}",
         )
 
@@ -2559,6 +2660,7 @@ class BomPage(QWidget):
         insert_index: int | None = None,
     ) -> QTreeWidgetItem:
         association_type = str(document.get("association_type") or "CONTENT").upper()
+        assigned_drawings = self._pdm_selected_drawings(document)
         revision = self._pdm_cad_revision_text(document)
         cad_name = str(
             document.get("file_name") or document.get("name") or "CAD Document"
@@ -2579,6 +2681,11 @@ class BomPage(QWidget):
         cad_item.setData(0, PDM_NODE_PAYLOAD_ROLE, dict(document))
         cad_item.setIcon(BOM_COL_NAME, _pdm_cad_icon(document.get("category")))
         cad_item.setForeground(BOM_COL_NAME, QBrush(QColor("#355a73")))
+        drawing_names = ", ".join(
+            str(drawing.get("file_name") or drawing.get("name") or drawing.get("id"))
+            + (" [PRIMARY]" if drawing.get("is_primary_drawing") else "")
+            for drawing in assigned_drawings
+        ) or "None assigned to this Item"
         cad_item.setToolTip(
             BOM_COL_NAME,
             "Associated CAD Document (not an EBOM usage)\n"
@@ -2586,6 +2693,7 @@ class BomPage(QWidget):
             f"Association: {association_type.replace('_', ' ')}\n"
             f"CAD version: {document.get('revision') or 'A'}.{int(document.get('iteration') or 1)}\n"
             f"Creo file version: {self._pdm_creo_file_text(document) or '-'}\n"
+            f"Item drawing assignment: {drawing_names}\n"
             f"Lifecycle: {document.get('lifecycle_state') or '-'}\n"
             f"Checkout: {self._pdm_cad_checkout_text(document)}",
         )
@@ -2597,6 +2705,60 @@ class BomPage(QWidget):
             item_parent.addChild(cad_item)
         else:
             item_parent.insertChild(max(0, int(insert_index)), cad_item)
+        for drawing in assigned_drawings:
+            drawing_payload = dict(drawing)
+            drawing_payload["item_id"] = int(item_id)
+            drawing_payload["association_id"] = (
+                drawing.get("drawing_association_id")
+                or drawing.get("association_id")
+            )
+            drawing_payload["association_type"] = str(
+                drawing.get("drawing_association_type")
+                or drawing.get("association_type") or "CONTENT"
+            ).upper()
+            drawing_item = QTreeWidgetItem([""] * self._ebom_tree.columnCount())
+            drawing_item.setText(
+                BOM_COL_NAME,
+                str(drawing.get("file_name") or drawing.get("name") or "CAD Drawing"),
+            )
+            drawing_item.setText(
+                BOM_COL_AES,
+                "PRIMARY DRAWING" if drawing.get("is_primary_drawing") else "DRAWING",
+            )
+            drawing_item.setText(BOM_COL_TYPE, "CAD Drawing")
+            drawing_item.setText(
+                BOM_COL_REV, self._pdm_cad_revision_text(drawing)
+            )
+            drawing_item.setText(
+                BOM_COL_STATUS, self._pdm_cad_checkout_text(drawing)
+            )
+            drawing_item.setData(0, Qt.UserRole, int(item_id))
+            drawing_item.setData(0, PDM_OBJECT_KIND_ROLE, PDM_OBJECT_CAD)
+            drawing_item.setData(
+                0, PDM_CAD_DOCUMENT_ID_ROLE, int(drawing["id"])
+            )
+            drawing_item.setData(
+                0, PDM_ASSOCIATION_ID_ROLE, drawing_payload.get("association_id")
+            )
+            drawing_item.setData(
+                0, PDM_ASSOCIATION_TYPE_ROLE,
+                drawing_payload.get("association_type"),
+            )
+            drawing_item.setData(0, PDM_ASSOCIATED_ITEM_ID_ROLE, int(item_id))
+            drawing_item.setData(0, PDM_CAD_PAYLOAD_ROLE, drawing_payload)
+            drawing_item.setData(0, PDM_NODE_PAYLOAD_ROLE, drawing_payload)
+            drawing_item.setData(0, BOM_TREE_IS_ASSEMBLY_ROLE, False)
+            drawing_item.setData(0, BOM_TREE_CHILDREN_LOADED_ROLE, True)
+            drawing_item.setIcon(BOM_COL_NAME, _pdm_cad_icon("DRAWING"))
+            drawing_item.setForeground(BOM_COL_NAME, QBrush(QColor("#526f85")))
+            drawing_item.setToolTip(
+                BOM_COL_NAME,
+                "Drawing explicitly assigned to this Item\n"
+                f"Model: {cad_name}\n"
+                f"Role: {'Primary drawing' if drawing.get('is_primary_drawing') else 'Supporting drawing'}\n"
+                f"Creo file version: {self._pdm_creo_file_text(drawing) or '-'}",
+            )
+            cad_item.addChild(drawing_item)
         return cad_item
 
     def _add_released_ebom_node(
@@ -2675,17 +2837,37 @@ class BomPage(QWidget):
             associations_by_item = defaultdict(list)
             if self.session.project_id:
                 for document in self.bom_service.list_pdm_cad_documents() or []:
-                    if (
-                        str(document.get("category") or "").upper() != "DRAWING"
-                        and document.get("item_id") is not None
-                        and document.get("association_id")
-                    ):
-                        associations_by_item[int(document["item_id"])].append(document)
+                    if str(document.get("category") or "").upper() == "DRAWING":
+                        continue
+                    for association in self._pdm_document_associations(document):
+                        if association.get("item_id") is None:
+                            continue
+                        item_document = dict(document)
+                        item_document.update(association)
+                        item_document["association_id"] = (
+                            association.get("association_id")
+                            or association.get("id")
+                        )
+                        item_document["item_id"] = int(association["item_id"])
+                        item_document["association_type"] = str(
+                            association.get("association_type") or "CONTENT"
+                        ).upper()
+                        # Global CAD data contains every model-bound drawing. Item-specific
+                        # drawing assignments are loaded only when the user chooses Show CAD.
+                        item_document["related_drawings"] = []
+                        associations_by_item[int(association["item_id"])].append(
+                            item_document
+                        )
             self._ebom_associations_by_item = associations_by_item
             visible_roots = list(data.get("roots") or [])
             excluded_roots = list(data.get("excluded_roots") or [])
             flattened_roots = list(data.get("flattened_roots") or [])
             self._pdm_ebom_roots = visible_roots
+            # Status/type choices for Advanced Filter are derived lazily from
+            # these cached payloads. Reset the lightweight choice cache when
+            # the EBOM payload changes; do not materialize every Qt tree row
+            # merely to open the filter dialog.
+            self._ebom_filter_choice_cache = {}
             self._pdm_ebom_scope_path, render_roots = self._pdm_roots_for_reload_scope(
                 "ebom", visible_roots, getattr(self, "_pdm_ebom_scope_path", []) or []
             )
@@ -3137,7 +3319,9 @@ class BomPage(QWidget):
         identity = " — ".join(value for value in (number or "No Number", name) if value)
         return f"{identity}  |  AES {aes}" if aes else identity
 
-    def manage_cad_item_associations(self, item_id: int | None = None) -> None:
+    def manage_cad_item_associations(
+        self, item_id: int | None = None, focus_cad_id: int | None = None
+    ) -> None:
         if isinstance(item_id, bool):
             item_id = None
         item_id = int(item_id) if item_id is not None else self._pdm_current_item_id()
@@ -3147,10 +3331,12 @@ class BomPage(QWidget):
             return
         dialog = QDialog(self)
         dialog.setWindowTitle("Edit Associations")
-        dialog.resize(960, 590)
+        dialog.resize(1180, 650)
         dialog.setStyleSheet("""
             QDialog { background:#e9edf1; color:#1d2935; font:9pt 'Segoe UI'; }
             QLabel#associationTitle { color:#172635; font-size:12pt; font-weight:600; }
+            QLabel#associationHint { color:#526577; font-size:9pt; }
+            QLabel#associationStatus { color:#2b5878; font-weight:600; }
             QLineEdit, QComboBox {
                 background:white; border:1px solid #9eaab5; border-radius:0;
                 min-height:23px; padding:1px 5px;
@@ -3178,31 +3364,45 @@ class BomPage(QWidget):
         association_title.setObjectName("associationTitle")
         layout.addWidget(association_title)
         layout.addWidget(QLabel(f"Item: {self._item_identity_text(details)}"))
+        association_hint = QLabel(
+            "Associate an existing PRT/ASM with this Item, select its relationship type, "
+            "and explicitly choose which related DRW documents belong to this Item."
+        )
+        association_hint.setObjectName("associationHint")
+        association_hint.setWordWrap(True)
+        layout.addWidget(association_hint)
         search = QLineEdit()
-        search.setPlaceholderText("Search this Item's CAD Documents and unassociated CAD...")
+        search.setPlaceholderText(
+            "Search CAD file, name, category, association type, drawing, or related Item..."
+        )
         search.setClearButtonEnabled(True)
         layout.addWidget(search)
-        table = QTableWidget(0, 6)
+        table = QTableWidget(0, 9)
         table.setHorizontalHeaderLabels([
-            "", "CAD File", "Name", "Object Type", "Association Type", "Related Item"
+            "", "Status", "CAD File", "Name", "Object Type", "Rev/Iter",
+            "Association Type", "Item Drawing Assignment", "Other Item Associations",
         ])
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        for column in (0, 1, 2, 4, 5, 6):
+            table.horizontalHeader().setSectionResizeMode(
+                column, QHeaderView.ResizeToContents
+            )
+        for column in (3, 7, 8):
+            table.horizontalHeader().setSectionResizeMode(column, QHeaderView.Stretch)
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
 
         controls = QHBoxLayout()
-        association_type = QComboBox()
-        for kind in (
-            "OWNER", "CONTRIBUTING_IMAGE", "IMAGE",
-            "CONTRIBUTING_CONTENT", "CONTENT",
-        ):
-            association_type.addItem(kind.replace("_", " "), kind)
-        controls.addWidget(QLabel("Association type:"))
-        controls.addWidget(association_type)
-        associate_btn = QPushButton("Set Association")
+        association_status = QLabel("")
+        association_status.setObjectName("associationStatus")
+        controls.addWidget(association_status, 1)
+        associate_btn = QPushButton("Apply Selected")
         associate_btn.setObjectName("primary")
         controls.addWidget(associate_btn)
-        remove_btn = QPushButton("Remove Association")
+        remove_btn = QPushButton("Remove Selected")
         remove_btn.setObjectName("secondary")
         controls.addWidget(remove_btn)
         can_manage = self.perm.can("manage_parts")
@@ -3214,6 +3414,12 @@ class BomPage(QWidget):
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
 
+        row_states = {}
+        association_types = (
+            "OWNER", "CONTRIBUTING_IMAGE", "IMAGE",
+            "CONTRIBUTING_CONTENT", "CONTENT",
+        )
+
         def checked_rows():
             return [
                 row for row in range(table.rowCount())
@@ -3221,43 +3427,341 @@ class BomPage(QWidget):
                 and table.item(row, 0).checkState() == Qt.Checked
             ]
 
-        def populate():
-            # This dialog is opened from one EBOM Item.  Keep its scope local:
-            # existing associations for other Items are managed from those
-            # Items, never silently reassigned from here.
-            documents = [
-                document
-                for document in (self.bom_service.list_pdm_cad_documents() or [])
-                if str(document.get("category") or "").upper() != "DRAWING"
-                and (
-                    document.get("item_id") is None
-                    or int(document.get("item_id")) == int(item_id)
+        def update_drawing_button(state: dict) -> None:
+            button = state["drawing_button"]
+            drawings = list(state.get("drawings") or [])
+            selected_ids = set(state.get("selected_drawing_ids") or set())
+            primary_id = state.get("primary_drawing_id")
+            if not drawings:
+                button.setText("No related DRW")
+                button.setToolTip(
+                    "Bind one or more related DRW CAD Documents to this model first."
                 )
-            ]
+                button.setEnabled(False)
+                return
+            names = {
+                int(drawing["id"]): str(
+                    drawing.get("file_name") or drawing.get("name") or drawing["id"]
+                )
+                for drawing in drawings if drawing.get("id") is not None
+            }
+            if not selected_ids:
+                button.setText("Select related drawing(s)...")
+                button.setToolTip(
+                    "No drawing is explicitly assigned to this Item for this CAD model."
+                )
+            else:
+                primary_name = (
+                    names.get(int(primary_id), "") if primary_id is not None else ""
+                )
+                if len(selected_ids) == 1:
+                    button.setText(
+                        primary_name or names.get(next(iter(selected_ids)), "1 drawing")
+                    )
+                else:
+                    button.setText(
+                        f"{len(selected_ids)} drawings | Primary: "
+                        f"{primary_name or 'not set'}"
+                    )
+                button.setToolTip("\n".join(
+                    ("Primary: " if drawing_id == primary_id else "Supporting: ")
+                    + names.get(drawing_id, str(drawing_id))
+                    for drawing_id in sorted(selected_ids)
+                ))
+            button.setEnabled(
+                can_manage and not state.get("cad_checked_out", False)
+            )
+
+        def choose_drawings(cad_id: int) -> None:
+            state = row_states.get(int(cad_id))
+            if not state:
+                return
+            drawings = list(state.get("drawings") or [])
+            if not drawings:
+                return
+            drawing_dialog = QDialog(dialog)
+            drawing_dialog.setWindowTitle("Select Item Drawings")
+            drawing_dialog.resize(760, 430)
+            drawing_layout = QVBoxLayout(drawing_dialog)
+            model_name = str(
+                state["document"].get("file_name")
+                or state["document"].get("name") or cad_id
+            )
+            heading = QLabel(f"Related drawings for {model_name}")
+            heading.setObjectName("associationTitle")
+            drawing_layout.addWidget(heading)
+            hint = QLabel(
+                "Select the drawings that define this EBOM Item. Exactly one selected "
+                "drawing is the primary drawing; the others are supporting content."
+            )
+            hint.setObjectName("associationHint")
+            hint.setWordWrap(True)
+            drawing_layout.addWidget(hint)
+            drawing_table = QTableWidget(len(drawings), 6)
+            drawing_table.setHorizontalHeaderLabels([
+                "Use", "Primary", "Drawing File", "Name", "Rev/Iter", "Lifecycle"
+            ])
+            drawing_table.horizontalHeader().setSectionResizeMode(
+                QHeaderView.ResizeToContents
+            )
+            drawing_table.horizontalHeader().setSectionResizeMode(
+                2, QHeaderView.Stretch
+            )
+            drawing_table.horizontalHeader().setSectionResizeMode(
+                3, QHeaderView.Stretch
+            )
+            drawing_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+            drawing_table.setAlternatingRowColors(True)
+            drawing_table.verticalHeader().setVisible(False)
+            drawing_table.blockSignals(True)
+            selected_ids = set(state.get("selected_drawing_ids") or set())
+            primary_id = state.get("primary_drawing_id")
+            for drawing_row, drawing in enumerate(drawings):
+                drawing_id = int(drawing["id"])
+                use_item = QTableWidgetItem("")
+                use_item.setFlags(use_item.flags() | Qt.ItemIsUserCheckable)
+                use_item.setCheckState(
+                    Qt.Checked if drawing_id in selected_ids else Qt.Unchecked
+                )
+                use_item.setData(Qt.UserRole, drawing_id)
+                primary_item = QTableWidgetItem("")
+                primary_item.setFlags(primary_item.flags() | Qt.ItemIsUserCheckable)
+                primary_item.setCheckState(
+                    Qt.Checked if drawing_id == primary_id else Qt.Unchecked
+                )
+                primary_item.setData(Qt.UserRole, drawing_id)
+                drawing_table.setItem(drawing_row, 0, use_item)
+                drawing_table.setItem(drawing_row, 1, primary_item)
+                values = (
+                    drawing.get("file_name"), drawing.get("name"),
+                    self._pdm_cad_revision_text(drawing),
+                    drawing.get("lifecycle_state"),
+                )
+                for column, value in enumerate(values, start=2):
+                    drawing_table.setItem(
+                        drawing_row, column, QTableWidgetItem(str(value or "-"))
+                    )
+            drawing_table.blockSignals(False)
+
+            def drawing_item_changed(changed_item: QTableWidgetItem) -> None:
+                if changed_item.column() not in {0, 1}:
+                    return
+                drawing_table.blockSignals(True)
+                try:
+                    row = changed_item.row()
+                    use_item = drawing_table.item(row, 0)
+                    primary_item = drawing_table.item(row, 1)
+                    if (
+                        changed_item.column() == 1
+                        and primary_item.checkState() == Qt.Checked
+                    ):
+                        use_item.setCheckState(Qt.Checked)
+                        for other_row in range(drawing_table.rowCount()):
+                            if other_row != row:
+                                drawing_table.item(other_row, 1).setCheckState(
+                                    Qt.Unchecked
+                                )
+                    elif (
+                        changed_item.column() == 0
+                        and use_item.checkState() != Qt.Checked
+                    ):
+                        primary_item.setCheckState(Qt.Unchecked)
+                finally:
+                    drawing_table.blockSignals(False)
+
+            drawing_table.itemChanged.connect(drawing_item_changed)
+            drawing_layout.addWidget(drawing_table, 1)
+            drawing_buttons = QDialogButtonBox(
+                QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+            )
+            drawing_buttons.accepted.connect(drawing_dialog.accept)
+            drawing_buttons.rejected.connect(drawing_dialog.reject)
+            drawing_layout.addWidget(drawing_buttons)
+            if drawing_dialog.exec_() != QDialog.Accepted:
+                return
+            new_selected = {
+                int(drawing_table.item(row, 0).data(Qt.UserRole))
+                for row in range(drawing_table.rowCount())
+                if drawing_table.item(row, 0).checkState() == Qt.Checked
+            }
+            new_primary = next((
+                int(drawing_table.item(row, 1).data(Qt.UserRole))
+                for row in range(drawing_table.rowCount())
+                if drawing_table.item(row, 1).checkState() == Qt.Checked
+            ), None)
+            if new_selected and new_primary not in new_selected:
+                new_primary = sorted(new_selected)[0]
+            state["selected_drawing_ids"] = new_selected
+            state["primary_drawing_id"] = new_primary
+            table.item(state["row"], 0).setCheckState(Qt.Checked)
+            update_drawing_button(state)
+
+        def populate():
+            row_states.clear()
+            all_documents = list(self.bom_service.list_pdm_cad_documents() or [])
+            try:
+                item_documents = list(
+                    self.bom_service.list_item_cad_associations(int(item_id)) or []
+                )
+            except Exception:
+                item_documents = []
+            item_models = {
+                int(document["id"]): document
+                for document in item_documents
+                if document.get("id") is not None
+                and str(document.get("category") or "").upper() != "DRAWING"
+            }
+            target_item_has_owner = any(
+                str(document.get("association_type") or "").upper() == "OWNER"
+                for document in item_models.values()
+            )
+            documents = []
+            seen_document_ids = set()
+            for document in all_documents:
+                if str(document.get("category") or "").upper() == "DRAWING":
+                    continue
+                cad_id = int(document["id"])
+                if cad_id in seen_document_ids:
+                    continue
+                seen_document_ids.add(cad_id)
+                merged = dict(document)
+                item_document = item_models.get(cad_id)
+                if item_document:
+                    merged["related_drawings"] = list(
+                        item_document.get("related_drawings") or []
+                    )
+                documents.append((merged, item_document))
             table.setRowCount(len(documents))
-            for row, document in enumerate(documents):
+            for row, (document, item_document) in enumerate(documents):
+                cad_id = int(document["id"])
+                target_association = self._pdm_association_for_item(document, item_id)
+                if target_association is None and item_document is not None:
+                    target_association = self._pdm_association_for_item(
+                        item_document, item_id
+                    ) or {
+                        "id": item_document.get("association_id"),
+                        "association_id": item_document.get("association_id"),
+                        "item_id": item_id,
+                        "association_type": item_document.get("association_type"),
+                    }
+                associations = self._pdm_document_associations(document)
+                other_associations = []
+                for association in associations:
+                    try:
+                        if int(association.get("item_id")) == int(item_id):
+                            continue
+                    except Exception:
+                        pass
+                    other_associations.append(association)
+                drawings = list(document.get("related_drawings") or [])
+                selected_drawings = self._pdm_selected_drawings(document)
+                selected_drawing_ids = {
+                    int(drawing["id"])
+                    for drawing in selected_drawings if drawing.get("id") is not None
+                }
+                primary_drawing_id = next((
+                    int(drawing["id"])
+                    for drawing in selected_drawings
+                    if drawing.get("id") is not None
+                    and bool(drawing.get("is_primary_drawing"))
+                ), None)
+                if selected_drawing_ids and primary_drawing_id is None:
+                    primary_drawing_id = sorted(selected_drawing_ids)[0]
                 check = QTableWidgetItem("")
                 check.setFlags(check.flags() | Qt.ItemIsUserCheckable)
                 check.setCheckState(Qt.Unchecked)
-                check.setData(Qt.UserRole, int(document["id"]))
-                check.setData(Qt.UserRole + 1, document.get("association_id"))
-                check.setData(Qt.UserRole + 2, document.get("item_id"))
-                if document.get("checked_out_by") is not None:
+                check.setData(Qt.UserRole, cad_id)
+                check.setData(
+                    Qt.UserRole + 1,
+                    (target_association or {}).get("association_id")
+                    or (target_association or {}).get("id"),
+                )
+                check.setData(
+                    Qt.UserRole + 2,
+                    item_id if target_association is not None else None,
+                )
+                cad_checked_out = document.get("checked_out_by") is not None
+                if cad_checked_out:
                     check.setFlags(check.flags() & ~Qt.ItemIsEnabled)
                     check.setToolTip(
                         "Check in or undo this CAD Document before changing its Item association."
                     )
                 table.setItem(row, 0, check)
+                status_item = QTableWidgetItem(
+                    "Associated" if target_association is not None else "Available"
+                )
+                status_item.setForeground(QBrush(QColor(
+                    "#246a46" if target_association is not None else "#526577"
+                )))
+                table.setItem(row, 1, status_item)
                 values = (
                     document.get("file_name"), document.get("name"),
-                    document.get("category"), document.get("association_type") or "UNASSOCIATED",
-                    " — ".join(value for value in (
-                        str(document.get("item_number") or "").strip(),
-                        str(document.get("item_name") or "").strip(),
-                    ) if value) or "—",
+                    document.get("category"), self._pdm_cad_revision_text(document),
                 )
-                for column, value in enumerate(values, start=1):
+                for column, value in enumerate(values, start=2):
                     table.setItem(row, column, QTableWidgetItem(str(value or "")))
+                type_combo = QComboBox()
+                for kind in association_types:
+                    type_combo.addItem(kind.replace("_", " "), kind)
+                current_type = str(
+                    (target_association or {}).get("association_type") or ""
+                ).upper()
+                if not current_type:
+                    has_owner_elsewhere = any(
+                        str(association.get("association_type") or "").upper()
+                        == "OWNER"
+                        for association in other_associations
+                    )
+                    current_type = (
+                        "IMAGE"
+                        if has_owner_elsewhere or target_item_has_owner else "OWNER"
+                    )
+                type_index = type_combo.findData(current_type)
+                type_combo.setCurrentIndex(max(0, type_index))
+                type_combo.setEnabled(can_manage and not cad_checked_out)
+                table.setCellWidget(row, 6, type_combo)
+                drawing_button = QPushButton()
+                drawing_button.setObjectName("secondary")
+                table.setCellWidget(row, 7, drawing_button)
+                other_text = (
+                    f"{len(other_associations)} other Item(s)"
+                    if other_associations else "None"
+                )
+                other_item = QTableWidgetItem(other_text)
+                other_item.setToolTip("\n".join(
+                    self._pdm_item_association_label(association)
+                    for association in other_associations
+                ) or "This CAD Document has no association with another Item.")
+                table.setItem(row, 8, other_item)
+                state = {
+                    "row": row,
+                    "document": document,
+                    "association": target_association,
+                    "drawings": drawings,
+                    "selected_drawing_ids": selected_drawing_ids,
+                    "primary_drawing_id": primary_drawing_id,
+                    "drawing_button": drawing_button,
+                    "type_combo": type_combo,
+                    "cad_checked_out": cad_checked_out,
+                }
+                row_states[cad_id] = state
+                update_drawing_button(state)
+                drawing_button.clicked.connect(
+                    lambda _checked=False, value=cad_id: choose_drawings(value)
+                )
+                type_combo.currentIndexChanged.connect(
+                    lambda _index, row_value=row: table.item(
+                        row_value, 0
+                    ).setCheckState(Qt.Checked)
+                )
+                if focus_cad_id is not None and int(focus_cad_id) == cad_id:
+                    check.setCheckState(Qt.Checked)
+                    table.selectRow(row)
+                    table.scrollToItem(check)
+            association_status.setText(
+                f"{sum(1 for state in row_states.values() if state.get('association'))} "
+                "CAD association(s) currently belong to this Item."
+            )
             apply_filter()
 
         def apply_filter(*_args):
@@ -3268,6 +3772,14 @@ class BomPage(QWidget):
                     for column in range(1, table.columnCount())
                     if table.item(row, column) is not None
                 ).casefold()
+                state = row_states.get(int(table.item(row, 0).data(Qt.UserRole)))
+                if state:
+                    text += " " + str(state["type_combo"].currentText()).casefold()
+                    text += " " + str(state["drawing_button"].text()).casefold()
+                    text += " " + " ".join(
+                        str(drawing.get("file_name") or drawing.get("name") or "")
+                        for drawing in state.get("drawings") or []
+                    ).casefold()
                 table.setRowHidden(row, bool(query and query not in text))
 
         def apply_associations():
@@ -3276,19 +3788,43 @@ class BomPage(QWidget):
                 QMessageBox.information(dialog, "PDM", "Check one or more CAD Documents.")
                 return
             errors = []
+            updated = 0
             for row in rows:
+                cad_id = int(table.item(row, 0).data(Qt.UserRole))
+                state = row_states[cad_id]
                 try:
                     self.bom_service.associate_cad_document(
-                        item_id, int(table.item(row, 0).data(Qt.UserRole)),
-                        str(association_type.currentData()),
+                        item_id, cad_id,
+                        str(state["type_combo"].currentData()),
                     )
+                    set_drawings = getattr(
+                        self.bom_service, "set_item_model_drawings", None
+                    )
+                    if set_drawings is None and (
+                        state.get("selected_drawing_ids")
+                        or self._pdm_selected_drawings(state["document"])
+                    ):
+                        raise RuntimeError(
+                            "The Item drawing-assignment service is not available."
+                        )
+                    if set_drawings is not None:
+                        set_drawings(
+                            int(item_id), cad_id,
+                            sorted(state.get("selected_drawing_ids") or set()),
+                            primary_drawing_id=state.get("primary_drawing_id"),
+                        )
+                    updated += 1
                 except Exception as exc:
-                    errors.append(str(exc))
+                    errors.append(
+                        f"{state['document'].get('file_name') or cad_id}: {exc}"
+                    )
             populate()
             if errors:
                 QMessageBox.warning(dialog, "Association results", "\n".join(dict.fromkeys(errors)))
             else:
-                QMessageBox.information(dialog, "Association results", "CAD–Item associations updated.")
+                association_status.setText(
+                    f"Updated {updated} CAD association(s) and their Item drawing assignments."
+                )
 
         def remove_associations():
             association_ids = [
@@ -3307,7 +3843,7 @@ class BomPage(QWidget):
                 dialog,
                 "Remove CAD Associations",
                 f"Remove {len(association_ids)} selected CAD association(s) from this Item?\n\n"
-                "The CAD Documents remain managed and become unassociated.",
+                "The CAD Documents remain managed. Associations to other Items are unchanged.",
                 QMessageBox.Yes | QMessageBox.Cancel,
                 QMessageBox.Cancel,
             ) != QMessageBox.Yes:
@@ -3322,6 +3858,10 @@ class BomPage(QWidget):
             if errors:
                 QMessageBox.warning(
                     dialog, "Association results", "\n".join(dict.fromkeys(errors))
+                )
+            else:
+                association_status.setText(
+                    f"Removed {len(association_ids)} CAD association(s) from this Item."
                 )
 
         search.textChanged.connect(apply_filter)
@@ -3451,9 +3991,6 @@ class BomPage(QWidget):
             return "A DRW is a related drawing of a PRT/ASM; create the EBOM Item from the owning model."
         if category not in {"ASSEMBLY", "COMPONENT"}:
             return "Create EBOM Items only from PRT/ASM CAD Documents."
-        item_id = cad_document.get("item_id") or cad_document.get("associated_item_id")
-        if item_id not in (None, "", 0, "0"):
-            return "This CAD Document already has an associated EBOM Item."
         return ""
 
     def _create_ebom_item_from_cad_document(
@@ -3471,13 +4008,6 @@ class BomPage(QWidget):
         if cad_id is None:
             QMessageBox.warning(self, "Create Item", "The CAD Document was not found.")
             return None
-        if cad_document.get("item_id"):
-            QMessageBox.information(
-                self,
-                "Create Item",
-                "This CAD Document already has an associated EBOM Item.",
-            )
-            return None
         category = self._normalized_cad_category(cad_document)
         if category not in {"ASSEMBLY", "COMPONENT"}:
             QMessageBox.warning(
@@ -3486,6 +4016,60 @@ class BomPage(QWidget):
                 "Create EBOM Items only from PRT/ASM CAD Documents.",
             )
             return None
+        associations = self._pdm_document_associations(cad_document)
+        try:
+            list_for_cad = getattr(
+                self.bom_service, "list_cad_item_associations", None
+            )
+            if list_for_cad is not None:
+                fresh_associations = list(list_for_cad(int(cad_id)) or [])
+                if fresh_associations:
+                    associations = fresh_associations
+            else:
+                fresh_document = next((
+                    row for row in (self.bom_service.list_pdm_cad_documents() or [])
+                    if int(row.get("id") or 0) == int(cad_id)
+                ), None)
+                if fresh_document:
+                    associations = self._pdm_document_associations(fresh_document)
+        except Exception:
+            pass
+        has_owner = any(
+            str(association.get("association_type") or "").upper() == "OWNER"
+            for association in associations
+        )
+        association_choices = list(self._pdm_association_types())
+        if has_owner:
+            association_choices = [
+                choice for choice in association_choices if choice[1] != "OWNER"
+            ]
+        default_type = "IMAGE" if has_owner else "OWNER"
+        default_index = next((
+            index for index, (_label, value) in enumerate(association_choices)
+            if value == default_type
+        ), 0)
+        selected_type_label, accepted = QInputDialog.getItem(
+            self,
+            "Create EBOM Item from CAD",
+            (
+                "Association to the new Item:\n"
+                + (
+                    "This CAD Document already has an OWNER. Select a shared or "
+                    "supporting association."
+                    if has_owner else
+                    "Select how this CAD Document represents the new Item."
+                )
+            ),
+            [label for label, _value in association_choices],
+            default_index,
+            False,
+        )
+        if not accepted:
+            return None
+        association_type = next(
+            value for label, value in association_choices
+            if label == selected_type_label
+        )
         file_name = str(cad_document.get("file_name") or "").strip()
         stem = os.path.splitext(file_name)[0] if file_name else ""
         part_data = {
@@ -3513,7 +4097,7 @@ class BomPage(QWidget):
                 raise ValueError("The Item could not be created.")
             self.bom_service.checkout_item(int(new_item_id))
             self.bom_service.associate_cad_document(
-                int(new_item_id), int(cad_id), "OWNER"
+                int(new_item_id), int(cad_id), association_type
             )
         except Exception as exc:
             QMessageBox.warning(self, "Create EBOM Item from CAD", str(exc))
@@ -3544,7 +4128,8 @@ class BomPage(QWidget):
         QMessageBox.information(
             self,
             "Create EBOM Item from CAD",
-            f"Created Item from {file_name or cad_id} and associated it as OWNER."
+            f"Created Item from {file_name or cad_id} and associated it as "
+            f"{association_type.replace('_', ' ')}."
             + usage_message,
         )
         return int(new_item_id)
@@ -3611,7 +4196,8 @@ class BomPage(QWidget):
         title.setObjectName("compareTitle")
         subtitle = QLabel(
             "Left: OWNER CAD structure. Right: persisted EBOM Item structure. "
-            "Selecting a row locates the corresponding CAD/Item row when one exists."
+            "Shared PRT/ASM documents are evaluated against every structure-participating "
+            "Item association. Selecting a row locates the corresponding CAD/Item row."
         )
         subtitle.setObjectName("compareSubtitle")
         subtitle.setWordWrap(True)
@@ -3662,6 +4248,7 @@ class BomPage(QWidget):
         item_rows_by_item: dict[int, list[QTreeWidgetItem]] = defaultdict(list)
         item_edges: set[tuple[int, int]] = set()
         expected_edges: set[tuple[int, int]] = set()
+        cad_relation_edge_groups: list[set[tuple[int, int]]] = []
         cad_item_ids: set[int] = set()
 
         def collect_item_edges(node: dict, parent_id=None):
@@ -3677,18 +4264,102 @@ class BomPage(QWidget):
 
         collect_item_edges(item_root)
 
-        def collect_expected_edges(node: dict, parent_item=None):
-            item_value = node.get("item_id")
-            try:
-                item_value = int(item_value) if item_value is not None else None
-            except Exception:
-                item_value = None
-            if item_value is not None:
-                cad_item_ids.add(item_value)
-            if parent_item is not None and item_value is not None:
-                expected_edges.add((int(parent_item), int(item_value)))
+        def structure_item_associations(node: dict) -> list[dict]:
+            """All active Item projections that participate in CAD structure.
+
+            CAD Structure stores one CAD Document node even when the same PRT
+            or ASM represents several EBOM Items.  The legacy flattened
+            ``item_id`` is only a display compatibility field and must not be
+            used as the complete comparison identity.
+            """
+            associations = self._pdm_document_associations(node)
+            participating = []
+            for association in associations:
+                item_value = association.get("item_id")
+                try:
+                    item_value = int(item_value)
+                except Exception:
+                    continue
+                value = association.get("participates_in_structure")
+                if value is None:
+                    association_type = str(
+                        association.get("association_type") or ""
+                    ).upper()
+                    participates = association_type in {
+                        "OWNER", "CONTRIBUTING_IMAGE", "IMAGE"
+                    }
+                else:
+                    try:
+                        participates = bool(int(value))
+                    except Exception:
+                        participates = str(value).strip().lower() not in {
+                            "", "0", "false", "no", "none",
+                        }
+                if participates:
+                    row = dict(association)
+                    row["item_id"] = item_value
+                    participating.append(row)
+
+            # Old projects may expose only the flattened association fields.
+            if not associations and node.get("item_id") is not None:
+                try:
+                    item_value = int(node.get("item_id"))
+                except Exception:
+                    item_value = None
+                if item_value is not None:
+                    participates = node.get("participates_in_structure")
+                    try:
+                        participates = (
+                            True if participates is None else bool(int(participates))
+                        )
+                    except Exception:
+                        participates = str(participates).strip().lower() not in {
+                            "", "0", "false", "no", "none",
+                        }
+                    if participates:
+                        participating.append({
+                            "item_id": item_value,
+                            "item_number": node.get("item_number"),
+                            "item_name": node.get("item_name"),
+                            "item_aes_number": node.get("item_aes_number"),
+                            "association_type": node.get("association_type"),
+                            "participates_in_structure": 1,
+                        })
+
+            unique = []
+            seen = set()
+            for association in participating:
+                item_value = int(association["item_id"])
+                if item_value in seen:
+                    continue
+                seen.add(item_value)
+                unique.append(association)
+            return unique
+
+        def structure_item_ids(node: dict) -> list[int]:
+            return [
+                int(association["item_id"])
+                for association in structure_item_associations(node)
+            ]
+
+        def collect_expected_edges(node: dict, parent_items=None):
+            item_values = structure_item_ids(node)
+            cad_item_ids.update(item_values)
+            relation_edges = {
+                (int(parent_value), int(item_value))
+                for parent_value in (parent_items or [])
+                for item_value in item_values
+            }
+            expected_edges.update(relation_edges)
+            if (
+                relation_edges
+                and not node.get("member_build_excluded")
+                and not node.get("build_excluded")
+                and not node.get("document_build_excluded")
+            ):
+                cad_relation_edge_groups.append(relation_edges)
             for child in node.get("children") or []:
-                collect_expected_edges(child, item_value)
+                collect_expected_edges(child, item_values)
 
         collect_expected_edges(cad_root)
 
@@ -3702,56 +4373,90 @@ class BomPage(QWidget):
                 return QColor("#64748b")
             return QColor("#334155")
 
-        def add_cad_node(node: dict, parent: QTreeWidgetItem | None = None, parent_item_id=None):
-            item_value = node.get("item_id")
-            try:
-                item_value = int(item_value) if item_value is not None else None
-            except Exception:
-                item_value = None
+        def add_cad_node(
+            node: dict,
+            parent: QTreeWidgetItem | None = None,
+            parent_item_ids=None,
+        ):
+            item_associations = structure_item_associations(node)
+            all_item_associations = self._pdm_document_associations(node)
+            item_values = [
+                int(association["item_id"])
+                for association in item_associations
+            ]
             quantity = max(1, int(node.get("quantity") or 1))
-            association = str(node.get("association_type") or "UNASSOCIATED").replace("_", " ")
-            participates = node.get("participates_in_structure")
-            try:
-                participates = True if participates is None else bool(int(participates))
-            except Exception:
-                participates = str(participates).strip().lower() not in {
-                    "", "0", "false", "no", "none",
-                }
+            association_types = []
+            associated_labels = []
+            for item_association in item_associations:
+                association_type = str(
+                    item_association.get("association_type") or "IMAGE"
+                ).upper().replace("_", " ")
+                if association_type not in association_types:
+                    association_types.append(association_type)
+                associated_labels.append(
+                    self._pdm_item_association_label(item_association)
+                )
+            association = ", ".join(association_types) or "UNASSOCIATED"
+            if len(associated_labels) == 1:
+                associated_item_text = associated_labels[0]
+            elif associated_labels:
+                associated_item_text = f"{len(associated_labels)} associated EBOM Items"
+            else:
+                associated_item_text = "No EBOM Item"
             if parent is None:
                 status = "OWNER"
             elif node.get("member_build_excluded") or node.get("build_excluded") or node.get("document_build_excluded"):
                 status = "EXCLUDED"
-            elif item_value is None:
-                status = "NO EBOM ITEM"
-            elif not participates:
-                status = "NOT PARTICIPATING"
-            elif parent_item_id is None:
+            elif not item_values:
+                status = (
+                    "NOT PARTICIPATING"
+                    if all_item_associations or node.get("item_id") is not None
+                    else "NO EBOM ITEM"
+                )
+            elif not parent_item_ids:
                 status = "PARENT NOT ASSOCIATED"
-            elif (int(parent_item_id), int(item_value)) in item_edges:
+            elif any(
+                (int(parent_value), int(item_value)) in item_edges
+                for parent_value in parent_item_ids
+                for item_value in item_values
+            ):
                 status = "MATCHED"
             else:
                 status = "MISSING IN EBOM"
             row = QTreeWidgetItem([
                 self._cad_label(node),
-                self._cad_item_label(node),
+                associated_item_text,
                 association,
                 str(quantity),
                 status,
             ])
-            row.setData(0, COMPARE_ITEM_ID_ROLE, item_value)
+            row.setData(
+                0, COMPARE_ITEM_ID_ROLE,
+                item_values[0] if item_values else None,
+            )
+            row.setData(0, COMPARE_ITEM_IDS_ROLE, list(item_values))
             row.setData(0, COMPARE_CAD_ID_ROLE, node.get("id"))
-            row.setData(0, COMPARE_PARENT_ITEM_ID_ROLE, parent_item_id)
+            row.setData(
+                0, COMPARE_PARENT_ITEM_ID_ROLE,
+                parent_item_ids[0] if parent_item_ids else None,
+            )
             row.setData(0, COMPARE_PAYLOAD_ROLE, dict(node))
             row.setIcon(0, _pdm_cad_icon(node.get("category")))
             row.setForeground(4, QBrush(status_color(status)))
-            if item_value is not None:
+            if associated_labels:
+                row.setToolTip(
+                    1,
+                    "All structure-participating associations for this shared CAD Document:\n"
+                    + "\n".join(associated_labels),
+                )
+            for item_value in item_values:
                 cad_rows_by_item[item_value].append(row)
             if parent is None:
                 cad_tree.addTopLevelItem(row)
             else:
                 parent.addChild(row)
             for child in node.get("children") or []:
-                add_cad_node(child, row, item_value)
+                add_cad_node(child, row, item_values)
             row.setExpanded(True)
             return row
 
@@ -3802,15 +4507,41 @@ class BomPage(QWidget):
             source_item = source_tree.currentItem()
             if source_item is None:
                 return
-            item_value = source_item.data(0, COMPARE_ITEM_ID_ROLE)
-            if item_value is None:
+            item_values = list(
+                source_item.data(0, COMPARE_ITEM_IDS_ROLE) or []
+            )
+            if not item_values:
+                item_value = source_item.data(0, COMPARE_ITEM_ID_ROLE)
+                if item_value is not None:
+                    item_values = [item_value]
+            if not item_values:
                 return
-            targets = target_map.get(int(item_value)) or []
-            if not targets:
+            current_target = target_tree.currentItem()
+            current_target_id = (
+                current_target.data(0, COMPARE_ITEM_ID_ROLE)
+                if current_target is not None else None
+            )
+            preferred_values = []
+            if current_target_id is not None:
+                try:
+                    current_target_id = int(current_target_id)
+                    if current_target_id in {int(value) for value in item_values}:
+                        preferred_values.append(current_target_id)
+                except Exception:
+                    pass
+            preferred_values.extend(
+                int(value) for value in item_values
+                if int(value) not in preferred_values
+            )
+            target = next((
+                candidate
+                for item_value in preferred_values
+                for candidate in (target_map.get(int(item_value)) or [])
+            ), None)
+            if target is None:
                 return
             syncing["active"] = True
             try:
-                target = targets[0]
                 target_tree.setCurrentItem(target)
                 target_tree.scrollToItem(target)
             finally:
@@ -3863,10 +4594,13 @@ class BomPage(QWidget):
 
         cad_tree.customContextMenuRequested.connect(cad_context_menu)
 
-        missing_edges = len([1 for edge in expected_edges if edge not in item_edges])
+        missing_edges = sum(
+            1 for supported_edges in cad_relation_edge_groups
+            if not supported_edges.intersection(item_edges)
+        )
         summary = QLabel(
-            f"CAD-associated Item rows: {sum(len(rows) for rows in cad_rows_by_item.values())}  |  "
-            f"Missing EBOM usages: {missing_edges}  |  "
+            f"CAD-Item projections: {sum(len(rows) for rows in cad_rows_by_item.values())}  |  "
+            f"CAD relations without an EBOM usage: {missing_edges}  |  "
             f"Legacy compare rows: {len(comparison.get('rows') or [])}"
         )
         summary.setObjectName("compareSubtitle")
@@ -3924,16 +4658,17 @@ class BomPage(QWidget):
         if query or advanced_active:
             self._materialize_pdm_tree_for_search(tree)
         show_parents = bool(filters.get("show_parent_matches", True))
+        flat_results = bool(advanced_active) and (
+            not show_parents or bool(filters.get("remove_duplicates", False))
+        )
         visible_count = 0
 
-        def recurse(item):
-            nonlocal visible_count
+        def item_matches(item):
             if self._is_lazy_placeholder(item):
-                item.setHidden(False)
-                return False
+                return False, False
             haystack = " ".join(
                 str(item.text(column) or "")
-                for column in range(self._ebom_tree.columnCount())
+                for column in range(tree.columnCount())
             ) + " " + " ".join(
                 (
                     str(item.toolTip(BOM_COL_NAME) or ""),
@@ -3945,17 +4680,58 @@ class BomPage(QWidget):
             basic_match = matches_bom_filter_text(haystack, query)
             is_related_cad = item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD
             if is_related_cad:
-                # A related CAD row is a neutral relation under its Item.  It
-                # must not make an Item pass Item-only health/document filters;
-                # it only contributes a match for an explicit search query.
-                advanced_match = True
-                self_match = bool(query) and basic_match
-            else:
-                advanced_match = (
-                    self._bom_tree_item_matches_advanced_filter(item, filters)
-                    if advanced_active else True
-                )
-                self_match = basic_match and advanced_match
+                return bool(query) and basic_match, True
+            advanced_match = (
+                self._bom_tree_item_matches_advanced_filter(item, filters)
+                if advanced_active else True
+            )
+            return basic_match and advanced_match, False
+
+        if flat_results:
+            result_tree = getattr(self, "_ebom_filter_tree", None)
+            if result_tree is None:
+                return 0
+            matches = []
+            seen_item_ids = set()
+            for item in self._iter_tree_items_visual_order(tree):
+                self_match, is_related_cad = item_matches(item)
+                if not self_match or is_related_cad:
+                    continue
+                if filters.get("remove_duplicates", False):
+                    item_id = item.data(0, Qt.UserRole)
+                    if item_id in seen_item_ids:
+                        continue
+                    seen_item_ids.add(item_id)
+                matches.append(item)
+
+            result_tree.setUpdatesEnabled(False)
+            try:
+                result_tree.clear()
+                for source_item in matches:
+                    clone = source_item.clone()
+                    while clone.childCount():
+                        clone.takeChild(0)
+                    clone.setHidden(False)
+                    clone.setExpanded(False)
+                    result_tree.addTopLevelItem(clone)
+            finally:
+                result_tree.setUpdatesEnabled(True)
+            self._ebom_filter_flat_mode = True
+            self._tree_stack.setCurrentWidget(result_tree)
+            return len(matches)
+
+        self._ebom_filter_flat_mode = False
+        try:
+            getattr(self, "_ebom_filter_tree", None).clear()
+        except Exception:
+            pass
+
+        def recurse(item):
+            nonlocal visible_count
+            if self._is_lazy_placeholder(item):
+                item.setHidden(False)
+                return False
+            self_match, is_related_cad = item_matches(item)
             child_match = False
             for index in range(item.childCount()):
                 child_match = recurse(item.child(index)) or child_match
@@ -3977,6 +4753,8 @@ class BomPage(QWidget):
         for index in range(tree.topLevelItemCount()):
             recurse(tree.topLevelItem(index))
         self._renumber_tree_rows(tree)
+        if getattr(self, "_bom_mode", "cad") == "ebom":
+            self._tree_stack.setCurrentWidget(tree)
         return visible_count
 
     def _show_tree_placeholder(self, _message: str) -> None:
@@ -4393,7 +5171,10 @@ class BomPage(QWidget):
 
         # The persisted Item Structure has its own tree so CAD Document and Item
         # selection/editing state remain independent.
-        self._ebom_tree = QTreeWidget()
+        self._ebom_tree = BomTreeWidget()
+        self._ebom_tree.setDragEnabled(False)
+        self._ebom_tree.setAcceptDrops(False)
+        self._ebom_tree.setDragDropMode(QAbstractItemView.NoDragDrop)
         self._ebom_tree.setHeaderLabels([
             "#", "Item / Related CAD", "Files", "Number / Association", "Object", "Rev/Iter",
             "Status", "Integrity", "Source Qty", "Effective Qty", "Level",
@@ -4426,9 +5207,46 @@ class BomPage(QWidget):
         )
         self._tree_stack.addWidget(self._ebom_tree)             # index 3
 
+        # Flat advanced-filter results live in a separate view.  A child row
+        # cannot remain visible inside QTreeWidget when its parent is hidden,
+        # so this preserves the source hierarchy while showing exact matches.
+        self._ebom_filter_tree = BomTreeWidget()
+        self._ebom_filter_tree.setDragEnabled(False)
+        self._ebom_filter_tree.setAcceptDrops(False)
+        self._ebom_filter_tree.setDragDropMode(QAbstractItemView.NoDragDrop)
+        self._ebom_filter_tree.setHeaderLabels([
+            "#", "Item / Related CAD", "Files", "Number / Association", "Object", "Rev/Iter",
+            "Status", "Integrity", "Source Qty", "Effective Qty", "Level",
+        ])
+        self._ebom_filter_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self._ebom_filter_tree.setAlternatingRowColors(True)
+        self._ebom_filter_tree.setUniformRowHeights(True)
+        self._ebom_filter_tree.setIndentation(14)
+        self._ebom_filter_tree.setMouseTracking(True)
+        for column in range(self._ebom_tree.columnCount()):
+            self._ebom_filter_tree.setColumnWidth(
+                column, self._ebom_tree.columnWidth(column)
+            )
+        self._ebom_filter_tree.setTreePosition(BOM_COL_NAME)
+        self._ebom_filter_tree.itemClicked.connect(self.on_tree_item_clicked)
+        self._ebom_filter_tree.itemSelectionChanged.connect(
+            self._sync_visual_action_states
+        )
+        self._ebom_filter_tree.itemDoubleClicked.connect(
+            self._on_tree_item_double_clicked
+        )
+        self._ebom_filter_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._ebom_filter_tree.customContextMenuRequested.connect(
+            self._show_pdm_tree_context_menu
+        )
+        self._tree_stack.addWidget(self._ebom_filter_tree)      # index 4
+
         # Managed CAD Documents have their own native structure browser.  This
         # schema intentionally has no Item PDF/STEP or integrity columns.
-        self._cad_tree = QTreeWidget()
+        self._cad_tree = BomTreeWidget()
+        self._cad_tree.setDragEnabled(False)
+        self._cad_tree.setAcceptDrops(False)
+        self._cad_tree.setDragDropMode(QAbstractItemView.NoDragDrop)
         self._cad_tree.setHeaderLabels([
             "CAD Name", "Description", "Category", "CAD / Creo Ver",
             "Lifecycle", "Related Item", "Checkout", "Build", "Qty",
@@ -4451,7 +5269,7 @@ class BomPage(QWidget):
         self._cad_tree.customContextMenuRequested.connect(
             self._show_pdm_tree_context_menu
         )
-        self._tree_stack.addWidget(self._cad_tree)              # index 4
+        self._tree_stack.addWidget(self._cad_tree)              # index 5
 
         _bom_tree_qss = f"""
             QTreeWidget {{
@@ -4507,6 +5325,7 @@ class BomPage(QWidget):
         self.tree.setStyleSheet(_bom_tree_qss)
         self._search_tree.setStyleSheet(_bom_tree_qss)
         self._ebom_tree.setStyleSheet(_bom_tree_qss)
+        self._ebom_filter_tree.setStyleSheet(_bom_tree_qss)
         self._cad_tree.setStyleSheet(_bom_tree_qss)
 
         def _bom_tree_sel_palette(w):
@@ -4521,7 +5340,10 @@ class BomPage(QWidget):
             except Exception:
                 pass
 
-        for _tw in (self.tree, self._search_tree, self._ebom_tree, self._cad_tree):
+        for _tw in (
+            self.tree, self._search_tree, self._ebom_tree,
+            self._ebom_filter_tree, self._cad_tree,
+        ):
             try:
                 _tw.setShowDecorationSelected(True)
             except Exception:
@@ -4540,8 +5362,12 @@ class BomPage(QWidget):
         self._ebom_tree.setItemDelegateForColumn(BOM_COL_FILES, _BomTreeFilesDelegate(self._ebom_tree, self._ebom_tree))
         self._ebom_tree.setItemDelegateForColumn(BOM_COL_STATUS, _BomTreeStatusDelegate(self._ebom_tree, self._ebom_tree))
         self._ebom_tree.setItemDelegateForColumn(BOM_COL_INTEGRITY, _BomTreeIntegrityDelegate(self._ebom_tree, self._ebom_tree))
+        self._ebom_filter_tree.setItemDelegateForColumn(BOM_COL_NAME, _BomTreeNameDelegate(self._ebom_filter_tree, self._ebom_filter_tree))
+        self._ebom_filter_tree.setItemDelegateForColumn(BOM_COL_FILES, _BomTreeFilesDelegate(self._ebom_filter_tree, self._ebom_filter_tree))
+        self._ebom_filter_tree.setItemDelegateForColumn(BOM_COL_STATUS, _BomTreeStatusDelegate(self._ebom_filter_tree, self._ebom_filter_tree))
+        self._ebom_filter_tree.setItemDelegateForColumn(BOM_COL_INTEGRITY, _BomTreeIntegrityDelegate(self._ebom_filter_tree, self._ebom_filter_tree))
 
-        self._tree_stack.setCurrentIndex(4)
+        self._tree_stack.setCurrentWidget(self._cad_tree)
 
         tree_layout.addWidget(self._tree_stack)
         left_layout.addWidget(tree_group)
@@ -4714,10 +5540,10 @@ class BomPage(QWidget):
         files_card_layout.setSpacing(6)
         files_heading = QHBoxLayout()
         files_heading.addWidget(
-            self._details_card_label("Associated CAD Documents", "associatedFilesTitle")
+            self._details_card_label("Associated CAD and Item Drawings", "associatedFilesTitle")
         )
         files_heading.addStretch()
-        association_hint = QLabel("Manage from the Item/CAD row context menu")
+        association_hint = QLabel("Use Edit Associations to assign model-specific drawings")
         association_hint.setStyleSheet("color:#64748b;font-size:9px;background:transparent;")
         files_heading.addWidget(association_hint)
         files_card_layout.addLayout(files_heading)
@@ -4725,8 +5551,8 @@ class BomPage(QWidget):
         associated_files_grid = QGridLayout()
         associated_files_grid.setHorizontalSpacing(28)
         associated_files_grid.setVerticalSpacing(4)
-        associated_files_grid.addWidget(self._details_card_label("CAD FILE", "associatedFilesLabel"), 0, 0)
-        associated_files_grid.addWidget(self._details_card_label("DRAWING FILE", "associatedFilesLabel"), 0, 1)
+        associated_files_grid.addWidget(self._details_card_label("CAD DOCUMENTS", "associatedFilesLabel"), 0, 0)
+        associated_files_grid.addWidget(self._details_card_label("ASSIGNED ITEM DRAWINGS", "associatedFilesLabel"), 0, 1)
         self.associated_cad_file_label = self._details_card_label("Not linked", "associatedFilesValue")
         self.associated_drawing_file_label = self._details_card_label("Not linked", "associatedFilesValue")
         self.associated_cad_file_label.setWordWrap(True)
@@ -5322,14 +6148,25 @@ class BomPage(QWidget):
             menu_button.setEnabled(has_enabled_action)
 
     def _pdm_mode_for_tree(self, tree: QTreeWidget | None) -> str | None:
+        if tree is None:
+            return None
         if tree is getattr(self, "_cad_tree", None):
             return "cad"
-        if tree is getattr(self, "_ebom_tree", None):
+        if tree in (
+            getattr(self, "_ebom_tree", None),
+            getattr(self, "_ebom_filter_tree", None),
+        ):
             return "ebom"
         return None
 
     def _current_pdm_tree(self) -> QTreeWidget | None:
         if str(getattr(self, "_bom_mode", "cad")) == "ebom":
+            filtered = getattr(self, "_ebom_filter_tree", None)
+            if (
+                getattr(self, "_ebom_filter_flat_mode", False)
+                and filtered is not None
+            ):
+                return filtered
             return getattr(self, "_ebom_tree", None)
         return getattr(self, "_cad_tree", None)
 
@@ -5363,11 +6200,14 @@ class BomPage(QWidget):
             return
         tree.setUpdatesEnabled(False)
         try:
+            tree.resetLoadingIndicators()
             tree.clear()
             for root in list(roots or []):
                 self._add_pdm_cad_node(root)
-            self._refresh_pdm_cad_filter()
             tree.collapseAll()
+            # Filtering may expand ancestors of matching descendants, so it
+            # must run after the default collapsed state is established.
+            self._refresh_pdm_cad_filter()
         finally:
             tree.setUpdatesEnabled(True)
         self._update_pdm_scope_bar()
@@ -5379,6 +6219,7 @@ class BomPage(QWidget):
             return
         tree.setUpdatesEnabled(False)
         try:
+            tree.resetLoadingIndicators()
             tree.clear()
             for root in list(roots or []):
                 self._add_released_ebom_node(
@@ -5386,8 +6227,9 @@ class BomPage(QWidget):
                     associations_by_item=getattr(self, "_ebom_associations_by_item", {}),
                 )
             self._renumber_tree_rows(tree)
-            self._refresh_ebom_filters()
             tree.collapseAll()
+            # Preserve the expansions created by search/advanced filtering.
+            self._refresh_ebom_filters()
         finally:
             tree.setUpdatesEnabled(True)
         self._update_pdm_scope_bar()
@@ -5398,9 +6240,47 @@ class BomPage(QWidget):
             item is None
             or self._is_lazy_placeholder(item)
             or item.data(0, BOM_TREE_CHILDREN_LOADED_ROLE)
+            or item.data(0, BOM_TREE_LOADING_ROLE)
         ):
             return
-        self._load_pdm_lazy_children_for_item(item, refresh_filters=True)
+        tree = item.treeWidget()
+        if not isinstance(tree, BomTreeWidget):
+            self._load_pdm_lazy_children_for_item(item, refresh_filters=True)
+            return
+
+        # Paint the branch spinner where the expand triangle normally appears,
+        # then populate the cached direct children on the next event-loop turn.
+        # Keeping the branch closed avoids flashing the temporary Loading row.
+        previous_signal_state = tree.blockSignals(True)
+        try:
+            item.setExpanded(False)
+        finally:
+            tree.blockSignals(previous_signal_state)
+        tree.setItemLoading(item, True)
+        QTimer.singleShot(
+            0,
+            lambda tree=tree, item=item: self._finish_pdm_tree_item_expansion(
+                tree, item
+            ),
+        )
+
+    def _finish_pdm_tree_item_expansion(
+        self, tree: BomTreeWidget, item: QTreeWidgetItem
+    ) -> None:
+        try:
+            if item.treeWidget() is not tree:
+                return
+            self._load_pdm_lazy_children_for_item(item, refresh_filters=True)
+        finally:
+            try:
+                tree.setItemLoading(item, False)
+            except Exception:
+                pass
+        try:
+            if item.treeWidget() is tree and item.childCount():
+                item.setExpanded(True)
+        except Exception:
+            pass
 
     def _load_pdm_lazy_children_for_item(
         self, item: QTreeWidgetItem, refresh_filters: bool = False
@@ -5468,11 +6348,27 @@ class BomPage(QWidget):
         if item is None or item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
             return
         associations = list(item.data(0, PDM_EBOM_ASSOCIATIONS_ROLE) or [])
-        if not associations:
-            return
         try:
             item_id = int(item.data(0, Qt.UserRole))
         except (TypeError, ValueError):
+            return
+        try:
+            item_documents = [
+                document
+                for document in (
+                    self.bom_service.list_item_cad_associations(item_id) or []
+                )
+                if str(document.get("category") or "").upper() != "DRAWING"
+            ]
+            if item_documents:
+                associations = item_documents
+                item.setData(
+                    0, PDM_EBOM_ASSOCIATIONS_ROLE, list(item_documents)
+                )
+        except Exception:
+            # The global association summary still permits Show CAD on older data.
+            pass
+        if not associations:
             return
         tree = item.treeWidget()
         if tree is not None:
@@ -6247,8 +7143,9 @@ class BomPage(QWidget):
         )
         if not accepted:
             return
-        self._associate_specific_cad_to_item(
-            int(cad_id), int(items[labels.index(selected)]["id"])
+        self.manage_cad_item_associations(
+            int(items[labels.index(selected)]["id"]),
+            focus_cad_id=int(cad_id),
         )
 
     def _change_cad_item_association(
@@ -6279,7 +7176,7 @@ class BomPage(QWidget):
         if QMessageBox.question(
             self, "Remove CAD Association",
             f"Remove the association between this Item and {cad_label}?\n\n"
-            "The CAD Document remains managed and may become unassociated.",
+            "The CAD Document remains managed; its associations to other Items are unchanged.",
             QMessageBox.Yes | QMessageBox.Cancel,
             QMessageBox.Cancel,
         ) != QMessageBox.Yes:
@@ -6494,37 +7391,71 @@ class BomPage(QWidget):
         needs_revision = (
             str(payload.get("lifecycle_state") or "").upper() == "RELEASED"
         )
-        item_id = payload.get("item_id") or payload.get("associated_item_id")
-        if item_id is None:
-            association = self.bom_service.pdm_service.repo.get_active_association_for_cad(
-                int(cad_id)
+        try:
+            associated_item_ids = list(
+                self.bom_service.pdm_service.checkout_target_item_ids(int(cad_id))
+                or []
             )
-            if association:
-                item_id = association.get("item_id")
-        revision_code = None
-        if item_id:
+        except Exception:
+            associated_item_ids = []
+        if not associated_item_ids:
+            legacy_item_id = (
+                payload.get("item_id") or payload.get("associated_item_id")
+            )
+            if legacy_item_id is not None:
+                associated_item_ids = [int(legacy_item_id)]
+        associated_item_ids = sorted({
+            int(value) for value in associated_item_ids if value is not None
+        })
+        released_revision_codes = {}
+        associated_item_labels = []
+        for item_id in associated_item_ids:
             details = self.bom_service.get_part_details(int(item_id)) or {}
+            associated_item_labels.append(
+                self._item_identity_text(details or {"id": item_id})
+            )
             if (
-                str(details.get("revision_state") or details.get("lifecycle_state") or "").lower()
-                == "released" and not details.get("locked")
+                str(
+                    details.get("revision_state")
+                    or details.get("lifecycle_state") or ""
+                ).lower() == "released"
+                and not details.get("locked")
             ):
                 try:
-                    suggested = self.bom_service.suggest_next_revision(int(item_id))
+                    suggested = self.bom_service.suggest_next_revision(
+                        int(item_id)
+                    )
                 except Exception:
                     suggested = ""
                 revision_code, accepted = QInputDialog.getText(
-                    self, "Check Out Related Released Item",
-                    "CAD checkout also checks out its related Item. Enter the Item revision to create:",
-                    QLineEdit.Normal, suggested,
+                    self,
+                    "Check Out Related Released Item",
+                    (
+                        f"{self._item_identity_text(details or {'id': item_id})} is Released.\n"
+                        "Enter the next Item revision to create for this shared CAD checkout:"
+                    ),
+                    QLineEdit.Normal,
+                    suggested,
                 )
                 if not accepted or not str(revision_code or "").strip():
                     return
+                released_revision_codes[int(item_id)] = str(
+                    revision_code
+                ).strip()
         message = (
             "Released CAD iterations are immutable. Create the next CAD revision and check it out?"
             if needs_revision else "Check out this CAD Document?"
         )
-        if item_id:
-            message += "\n\nIts associated Item will be checked out automatically; other CAD Documents remain checked in."
+        if associated_item_ids:
+            message += (
+                f"\n\n{len(associated_item_ids)} associated Item"
+                f"{'s' if len(associated_item_ids) != 1 else ''} will be checked "
+                "out automatically; other CAD Documents remain checked in."
+            )
+            if associated_item_labels:
+                message += "\n\n" + "\n".join(
+                    f"- {label}" for label in associated_item_labels
+                )
         if QMessageBox.question(
             self, "Check Out CAD Document", message,
             QMessageBox.Yes | QMessageBox.Cancel,
@@ -6536,7 +7467,8 @@ class BomPage(QWidget):
             if needs_revision:
                 revised = self.bom_service.revise_pdm_cad_document(int(cad_id)) or {}
             result = self.bom_service.checkout_pdm_cad_document(
-                int(cad_id), released_item_revision_code=revision_code,
+                int(cad_id),
+                released_item_revision_codes=released_revision_codes,
                 **workspace_descriptor,
             )
             materialized = workspace_service.materialize_cad_document(
@@ -6707,6 +7639,7 @@ class BomPage(QWidget):
             payload = dict(item.data(0, PDM_CAD_PAYLOAD_ROLE) or {})
             payload.setdefault("id", cad_id)
             payload.setdefault("item_id", item_id)
+            associations = self._pdm_document_associations(payload)
             parent_item_id = None
             if item.parent() is not None:
                 parent_item_id = (
@@ -6736,11 +7669,27 @@ class BomPage(QWidget):
                 locate_action.triggered.connect(
                     lambda _checked=False, value=cad_id: self._select_cad_in_structure(value)
                 )
-            if item_id is not None:
+            if len(associations) == 1 and associations[0].get("item_id") is not None:
                 item_action = menu.addAction("Open Associated Item")
                 item_action.triggered.connect(
-                    lambda _checked=False, value=int(item_id): self._select_item_in_ebom(value)
+                    lambda _checked=False, value=int(associations[0]["item_id"]):
+                    self._select_item_in_ebom(value)
                 )
+            elif len(associations) > 1:
+                item_menu = menu.addMenu(
+                    f"Open Associated Item ({len(associations)})"
+                )
+                for association in associations:
+                    target_item_id = association.get("item_id")
+                    if target_item_id is None:
+                        continue
+                    item_action = item_menu.addAction(
+                        self._pdm_item_association_label(association)
+                    )
+                    item_action.triggered.connect(
+                        lambda _checked=False, value=int(target_item_id):
+                        self._select_item_in_ebom(value)
+                    )
             menu.addSeparator()
             checked_out = payload.get("checked_out_by") is not None
             try:
@@ -6851,27 +7800,64 @@ class BomPage(QWidget):
                     self._bind_existing_drawing_to_model(value)
                 )
                 menu.addSeparator()
-            association_menu = menu.addMenu("CAD-Item Association")
-            if association_id is not None and item_id is not None:
-                change_action = association_menu.addAction("Change Association Type...")
-                change_action.setEnabled(can_manage and not checked_out)
-                change_action.triggered.connect(
-                    lambda _checked=False, cid=cad_id, iid=int(item_id), aid=association_id,
-                           kind_value=association_type:
-                    self._change_cad_item_association(cid, iid, aid, kind_value)
+            association_menu = menu.addMenu(
+                f"CAD-Item Associations ({len(associations)})"
+            )
+            for association in associations:
+                target_item_id = association.get("item_id")
+                target_association_id = (
+                    association.get("association_id") or association.get("id")
                 )
-                remove_action = association_menu.addAction("Remove Association")
+                if target_item_id is None or target_association_id is None:
+                    continue
+                association_row_menu = association_menu.addMenu(
+                    self._pdm_item_association_label(association)
+                )
+                open_item_action = association_row_menu.addAction("Open Item")
+                open_item_action.triggered.connect(
+                    lambda _checked=False, value=int(target_item_id):
+                    self._select_item_in_ebom(value)
+                )
+                edit_item_association = association_row_menu.addAction(
+                    "Edit Type and Item Drawings..."
+                )
+                edit_item_association.setEnabled(can_manage and not checked_out)
+                edit_item_association.triggered.connect(
+                    lambda _checked=False, value=int(target_item_id), focus=cad_id:
+                    self.manage_cad_item_associations(value, focus_cad_id=focus)
+                )
+                remove_action = association_row_menu.addAction("Remove Association")
                 remove_action.setEnabled(can_manage and not checked_out)
                 remove_action.triggered.connect(
-                    lambda _checked=False, aid=int(association_id), iid=int(item_id),
+                    lambda _checked=False, aid=int(target_association_id),
+                           iid=int(target_item_id),
                            label=str(payload.get("file_name") or payload.get("name") or "CAD Document"):
                     self._remove_cad_item_association(aid, iid, label)
                 )
+            if associations:
+                association_menu.addSeparator()
+            if category == "DRAWING":
+                drawing_item_id = item_id or parent_item_id
+                drawing_model_id = payload.get("drawing_owner_cad_document_id")
+                edit_drawing_assignment = association_menu.addAction(
+                    "Edit Item Drawing Assignment..."
+                )
+                edit_drawing_assignment.setEnabled(
+                    can_manage and not checked_out
+                    and drawing_item_id is not None and drawing_model_id is not None
+                )
+                if drawing_item_id is not None and drawing_model_id is not None:
+                    edit_drawing_assignment.triggered.connect(
+                        lambda _checked=False, value=int(drawing_item_id),
+                               focus=int(drawing_model_id):
+                        self.manage_cad_item_associations(value, focus_cad_id=focus)
+                    )
             else:
-                associate_action = association_menu.addAction("Associate with Item...")
+                associate_action = association_menu.addAction("Add Association...")
                 associate_action.setEnabled(can_manage and not checked_out)
                 associate_action.triggered.connect(
-                    lambda _checked=False, value=cad_id: self._associate_cad_to_an_item(value)
+                    lambda _checked=False, value=cad_id:
+                    self._associate_cad_to_an_item(value)
                 )
             create_item_action = association_menu.addAction("Create EBOM Item from CAD...")
             create_reason = self._cad_create_ebom_item_disabled_reason(payload)
@@ -7667,11 +8653,51 @@ class BomPage(QWidget):
 
     def _collect_tree_column_values(self, column: int) -> list[str]:
         values = set()
-        for tree in (
-            getattr(self, "tree", None),
-            getattr(self, "_search_tree", None),
-            getattr(self, "_ebom_tree", None),
-        ):
+        # Advanced filtering belongs to the persisted EBOM view.  Mixing in
+        # legacy-tree values (for example Design versus WIP, or Part versus
+        # prt) presents choices that cannot match any row in the new EBOM.
+        tree = self._current_tree_for_filtering()
+        if tree is not None and tree is getattr(self, "_ebom_tree", None):
+            cache = getattr(self, "_ebom_filter_choice_cache", {}) or {}
+            if column in cache:
+                return list(cache[column])
+
+            # The EBOM payload already contains the complete lazy structure.
+            # Reading these two fields from dictionaries is substantially
+            # cheaper than creating every QTreeWidgetItem merely to open the
+            # Advanced Filter dialog.
+            payload_fields = {
+                BOM_COL_STATUS: ("status", "state", "lifecycle_state"),
+                BOM_COL_TYPE: ("type",),
+            }.get(column, ())
+            stack = list(reversed(getattr(self, "_pdm_ebom_roots", []) or []))
+            while stack:
+                node = stack.pop()
+                if not isinstance(node, dict):
+                    continue
+                for field in payload_fields:
+                    value = str(node.get(field) or "").strip()
+                    if value:
+                        values.add(value)
+                        break
+                stack.extend(reversed(node.get("children") or []))
+
+            # Include any currently rendered values without forcing unloaded
+            # branches to materialize.
+            try:
+                for item in self._iter_tree_items(tree):
+                    if item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+                        continue
+                    value = str(item.text(column) or "").strip()
+                    if value:
+                        values.add(value)
+            except Exception:
+                pass
+            result = sorted(values, key=lambda s: s.lower())
+            cache[column] = tuple(result)
+            self._ebom_filter_choice_cache = cache
+            return result
+        for tree in (tree,):
             if tree is None:
                 continue
             try:
@@ -7706,13 +8732,21 @@ class BomPage(QWidget):
             return False
         text = str(filters.get("text") or "").strip()
         if text:
+            payload = item.data(0, PDM_NODE_PAYLOAD_ROLE) or {}
+            if not isinstance(payload, dict):
+                payload = {}
             haystack = " ".join([
                 str(item.text(col) or "") for col in range(BOM_COL_NAME, BOM_COL_STATUS + 1)
             ] + [
+                str(item.data(0, BOM_TREE_ITEM_NUMBER_ROLE) or ""),
+                str(item.data(0, BOM_TREE_AES_NUMBER_ROLE) or ""),
                 str(item.data(0, BOM_TREE_INWORK_ROLE) or ""),
                 ", ".join(item.data(0, BOM_TREE_CATEGORY_ROLE) or []),
                 str(item.toolTip(BOM_COL_NAME) or ""),
+                str(item.toolTip(BOM_COL_AES) or ""),
                 str(item.toolTip(BOM_COL_FILES) or ""),
+                str(payload.get("part_number") or ""),
+                str(payload.get("aes_number") or ""),
             ])
             whole_word = str(filters.get("text_match_mode") or "normal") == "whole_word"
             if not matches_bom_filter_text(haystack, text, whole_word=whole_word):
@@ -8041,6 +9075,7 @@ class BomPage(QWidget):
             getattr(self, "tree", None),
             getattr(self, "_search_tree", None),
             getattr(self, "_ebom_tree", None),
+            getattr(self, "_ebom_filter_tree", None),
         ):
             if tree is None:
                 continue
@@ -8051,7 +9086,7 @@ class BomPage(QWidget):
                 pass
         if getattr(self, "_bom_mode", "cad") == "cad":
             self._refresh_pdm_cad_filter()
-            self._tree_stack.setCurrentIndex(4)
+            self._tree_stack.setCurrentWidget(self._cad_tree)
         elif getattr(self, "_bom_mode", "cad") == "ebom":
             self._refresh_ebom_filters()
         elif was_flat_filter:
@@ -8135,6 +9170,8 @@ class BomPage(QWidget):
                 pass
         for column, role in (
             (0, Qt.UserRole),
+            (0, BOM_TREE_ITEM_NUMBER_ROLE),
+            (0, BOM_TREE_AES_NUMBER_ROLE),
             (0, BOM_TREE_INWORK_ROLE),
             (0, BOM_TREE_IS_ASSEMBLY_ROLE),
             (0, BOM_TREE_ISSUE_ROLE),
@@ -8143,6 +9180,7 @@ class BomPage(QWidget):
             (0, BOM_TREE_POLICY_ROLE),
             (0, BOM_TREE_OCCURRENCE_ROLE),
             (0, BOM_TREE_PROMOTION_ROLE),
+            (0, PDM_NODE_PAYLOAD_ROLE),
             (BOM_COL_FILES, BOM_TREE_FILES_ROLE),
             (BOM_COL_INTEGRITY, BOM_TREE_INTEGRITY_ROLE),
         ):
@@ -8225,6 +9263,18 @@ class BomPage(QWidget):
             self.clear_bom_tree_filter()
             return
         if getattr(self, "_bom_mode", "cad") == "ebom":
+            # The advanced dialog has its own Contains field.  Do not silently
+            # AND it with a basic CAD/EBOM search left in the shared search box.
+            try:
+                self._search_timer.stop()
+                previous_signal_state = self.search_input.blockSignals(True)
+                try:
+                    self.search_input.clear()
+                finally:
+                    self.search_input.blockSignals(previous_signal_state)
+                self.search_btn.setText("Search")
+            except Exception:
+                pass
             total_visible = self._refresh_ebom_filters()
             self._update_advanced_filter_button_state(total_visible)
             return
@@ -9923,7 +10973,7 @@ class BomPage(QWidget):
         query = self.search_input.text().strip()
         if getattr(self, "_bom_mode", "cad") == "cad":
             visible = self._refresh_pdm_cad_filter()
-            self._tree_stack.setCurrentIndex(4)
+            self._tree_stack.setCurrentWidget(self._cad_tree)
             try:
                 self.clear_filter_btn.setEnabled(bool(query))
                 self.search_btn.setText(f"Search ({visible})" if query else "Search")
@@ -9934,7 +10984,6 @@ class BomPage(QWidget):
             visible = self._refresh_ebom_filters()
             if not self._is_default_bom_advanced_filter():
                 self._update_advanced_filter_button_state(visible)
-            self._tree_stack.setCurrentIndex(3)
             return
         if not query:
             self._exit_search_mode()
@@ -12789,13 +13838,15 @@ class BomPage(QWidget):
             "type": "CAD Category",
             "revision": "CAD Revision / Iteration",
             "state": "Lifecycle",
-            "material": "Association",
-            "categories": "Related Item / Version",
+            "material": "Associations",
+            "categories": "Related Items / Versions",
         })
-        related_item = self._pdm_related_item_text(payload)
-        if related_item == "Unassociated":
-            related_item = "Not associated"
-        association_type = str(payload.get("association_type") or "None").replace("_", " ")
+        association_lines = self._pdm_item_association_lines(payload)
+        related_item = "\n".join(association_lines) or "Not associated"
+        association_summary = (
+            f"{len(association_lines)} active Item association(s)"
+            if association_lines else "None"
+        )
         revision = f"{payload.get('revision') or 'A'}.{int(payload.get('iteration') or 1)}"
         creo_file = self._pdm_creo_file_text(payload) or "No approved file yet"
         related_drawings = list(payload.get("related_drawings") or [])
@@ -12817,7 +13868,7 @@ class BomPage(QWidget):
             "type": str(payload.get("category") or "OTHER"),
             "revision": f"CAD {revision}\nIndependent from linked Item version",
             "state": str(payload.get("lifecycle_state") or "-"),
-            "material": association_type,
+            "material": association_summary,
             "categories": related_item,
         }
         for key, (_label, value_label, _keys) in self._details_summary_fields.items():
@@ -12864,7 +13915,7 @@ class BomPage(QWidget):
         self.checkin_part_btn.setEnabled(can_manage and checked_out_by_me)
         self.undo_checkout_btn.setEnabled(can_manage and checked_out_by_me)
         self.checkout_part_btn.setToolTip(
-            "Check out this CAD Document and automatically reserve its associated Item"
+            "Check out this CAD Document and reserve its associated Item data as required"
         )
         self.checkin_part_btn.setToolTip("Create the next CAD Document iteration")
         self.undo_checkout_btn.setToolTip("Discard this CAD Document checkout")
@@ -13474,28 +14525,49 @@ class BomPage(QWidget):
             for row in pdm_documents
             if str(row.get("category") or "").upper() != "DRAWING"
         ]
-        drawing_links = [
-            (
+        drawing_links = []
+        listed_drawing_ids = set()
+        for row in pdm_documents:
+            if str(row.get("category") or "").upper() != "DRAWING":
+                continue
+            drawing_id = row.get("id")
+            if drawing_id is not None:
+                listed_drawing_ids.add(int(drawing_id))
+            role = "PRIMARY" if row.get("is_primary_drawing") else str(
+                row.get("association_type") or "CONTENT"
+            ).upper().replace("_", " ")
+            drawing_links.append(
                 f"{row.get('file_name') or row.get('name') or 'CAD Drawing'} "
-                f"[{row.get('association_type')}; {self._pdm_cad_revision_text(row)}]"
+                f"[{role}; {self._pdm_cad_revision_text(row)}]"
             )
-            for row in pdm_documents
-            if str(row.get("category") or "").upper() == "DRAWING"
-        ]
         for model in pdm_documents:
-            for drawing in model.get("related_drawings") or []:
+            if str(model.get("category") or "").upper() == "DRAWING":
+                continue
+            for drawing in self._pdm_selected_drawings(model):
+                drawing_id = drawing.get("id")
+                if drawing_id is not None and int(drawing_id) in listed_drawing_ids:
+                    continue
                 label = (
                     f"{drawing.get('file_name') or drawing.get('name') or 'CAD Drawing'} "
-                    f"[RELATED TO {model.get('file_name') or model.get('name') or 'CAD Model'}; "
+                    f"[{'PRIMARY' if drawing.get('is_primary_drawing') else 'SUPPORTING'}; "
+                    f"MODEL {model.get('file_name') or model.get('name') or 'CAD Model'}; "
                     f"{self._pdm_cad_revision_text(drawing)}]"
                 )
-                if label not in drawing_links:
-                    drawing_links.append(label)
+                drawing_links.append(label)
+                if drawing_id is not None:
+                    listed_drawing_ids.add(int(drawing_id))
         self.associated_cad_file_label.setText(
             "\n".join(model_links) if model_links else (cad_file or "Not linked")
         )
+        drawing_display = (
+            "\n".join(drawing_links)
+            if drawing_links else (
+                "No drawing assigned to this Item"
+                if model_links else (drawing_file or "Not linked")
+            )
+        )
         self.associated_drawing_file_label.setText(
-            "\n".join(drawing_links) if drawing_links else (drawing_file or "Not linked")
+            drawing_display
         )
 
         for _field_key, (field_label, value_label, detail_keys) in self._details_summary_fields.items():

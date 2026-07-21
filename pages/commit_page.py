@@ -1693,18 +1693,50 @@ class CommitPage(QWidget):
                 by_base[base_name.casefold()] = document
         return by_file, by_base, by_id
 
-    def _item_id_for_pdm_document_in_commit_page(self, document: dict, documents_by_id: dict) -> int | None:
+    def _item_ids_for_pdm_document_in_commit_page(
+        self,
+        document: dict,
+        documents_by_id: dict,
+    ) -> list[int]:
+        """Resolve every EBOM Item affected by a staged CAD Document.
+
+        Models may legitimately describe several Items.  Drawings are more
+        specific: their direct Item associations are the user's explicit
+        drawing selections and must not be inherited by every Item that uses
+        the owning model.
+        """
+        associations = list(document.get("associations") or [])
+        item_ids = {
+            item_id
+            for association in associations
+            if (item_id := self._optional_int(association.get("item_id"))) is not None
+        }
+        if item_ids:
+            return sorted(item_ids)
+
+        # Compatibility for databases/documents loaded before association
+        # aggregation was introduced.
         item_id = self._optional_int(document.get("item_id"))
         if item_id is not None:
-            return item_id
+            return [item_id]
+
         owner_id = self._optional_int(document.get("drawing_owner_cad_document_id"))
-        if owner_id is not None:
-            owner_document = documents_by_id.get(owner_id)
-            if owner_document:
-                owner_item_id = self._optional_int(owner_document.get("item_id"))
-                if owner_item_id is not None:
-                    return owner_item_id
-        return None
+        if owner_id is None:
+            return []
+        owner_document = documents_by_id.get(owner_id) or {}
+        owner_associations = list(owner_document.get("associations") or [])
+        # An unassigned legacy drawing falls back only to the model OWNER.  It
+        # never becomes content of every secondary IMAGE/CONTENT Item.
+        owner_item_ids = {
+            item_id
+            for association in owner_associations
+            if str(association.get("association_type") or "").upper() == "OWNER"
+            if (item_id := self._optional_int(association.get("item_id"))) is not None
+        }
+        if owner_item_ids:
+            return sorted(owner_item_ids)
+        owner_item_id = self._optional_int(owner_document.get("item_id"))
+        return [owner_item_id] if owner_item_id is not None else []
 
     def _legacy_affected_bom_items_for_staged_file(self, staged_file: dict, project_id: int, designer_id):
         filename = staged_file.get("filename") or ""
@@ -1740,18 +1772,21 @@ class CommitPage(QWidget):
             cad_document = cad_by_file.get(clean_filename.casefold())
             if cad_document is None:
                 cad_document = cad_by_base.get((staged.get("base_stem") or "").casefold())
-            item_id = (
-                self._item_id_for_pdm_document_in_commit_page(cad_document, cad_by_id)
-                if cad_document else None
+            item_ids = (
+                self._item_ids_for_pdm_document_in_commit_page(cad_document, cad_by_id)
+                if cad_document else []
             )
-            if item_id is not None:
+            resolved_from_pdm = False
+            for item_id in item_ids:
                 try:
                     info = self.bom_service.get_part_details(int(item_id)) or {}
                 except Exception:
                     info = {}
                 if info:
                     result[int(item_id)] = info
-                    continue
+                    resolved_from_pdm = True
+            if resolved_from_pdm:
+                continue
 
             boms = self._legacy_affected_bom_items_for_staged_file(
                 staged,
@@ -3040,7 +3075,10 @@ class CommitPage(QWidget):
         document = self.bom_service.pdm_service.repo.get_cad_document(
             int(cad_document_id)
         ) or {}
-        if str(document.get("lifecycle_state") or "").upper() == "RELEASED":
+        needs_cad_revision = (
+            str(document.get("lifecycle_state") or "").upper() == "RELEASED"
+        )
+        if needs_cad_revision:
             answer = QMessageBox.question(
                 self,
                 "Revise CAD Document",
@@ -3050,14 +3088,17 @@ class CommitPage(QWidget):
             )
             if answer != QMessageBox.Yes:
                 return
-            self.bom_service.revise_pdm_cad_document(int(cad_document_id))
 
-        revision_code = None
-        association = self.bom_service.pdm_service.repo.get_active_association_for_cad(
-            int(cad_document_id)
-        )
-        if association and association.get("item_id") is not None:
-            item_id = int(association["item_id"])
+        try:
+            associated_item_ids = list(
+                self.bom_service.pdm_service.checkout_target_item_ids(
+                    int(cad_document_id)
+                ) or []
+            )
+        except Exception:
+            associated_item_ids = []
+        released_revision_codes = {}
+        for item_id in sorted({int(value) for value in associated_item_ids}):
             details = self.bom_service.get_part_details(item_id) or {}
             if (
                 str(details.get("revision_state") or details.get("lifecycle_state") or "").lower()
@@ -3070,17 +3111,23 @@ class CommitPage(QWidget):
                 revision_code, accepted = QInputDialog.getText(
                     self,
                     "Check Out Related Released Item",
-                    "Enter the Item revision to create:",
+                    (
+                        f"{details.get('part_number') or details.get('name') or ('Item ' + str(item_id))} "
+                        "is Released. Enter the next Item revision to create:"
+                    ),
                     QLineEdit.Normal,
                     suggested,
                 )
                 if not accepted or not str(revision_code or "").strip():
                     return
+                released_revision_codes[item_id] = str(revision_code).strip()
 
         descriptor = self.cad_workspace_service.checkout_descriptor(workspace["id"])
+        if needs_cad_revision:
+            self.bom_service.revise_pdm_cad_document(int(cad_document_id))
         self.bom_service.checkout_pdm_cad_document(
             int(cad_document_id),
-            released_item_revision_code=revision_code,
+            released_item_revision_codes=released_revision_codes,
             **descriptor,
         )
         try:

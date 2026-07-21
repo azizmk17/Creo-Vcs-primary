@@ -2712,6 +2712,463 @@ def _migration_38(conn):
         )
 
 
+def _migration_39(conn):
+    """Allow shared CAD representations and explicit Item drawing selection.
+
+    A CAD model may describe several Items with different association types.
+    Drawings remain related to their PRT/ASM through ``cad_documents`` while
+    their Item relationship is an explicit CAD-Item association.
+    """
+    conn.row_factory = sqlite3.Row
+    tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "cad_item_associations" not in tables:
+        return
+
+    _ensure_column(
+        conn,
+        "cad_item_associations",
+        "is_primary_drawing",
+        "is_primary_drawing INTEGER NOT NULL DEFAULT 0",
+    )
+    _ensure_column(
+        conn,
+        "cad_item_associations",
+        "drawing_model_cad_document_id",
+        "drawing_model_cad_document_id INTEGER",
+    )
+    # Databases produced by the supported migration chain cannot contain
+    # duplicate active pairs because migration 32 allowed only one active
+    # association per CAD Document.  Clean defensive/manual-schema duplicates
+    # before replacing that older constraint so the new unique indexes cannot
+    # make an otherwise recoverable legacy database fail at startup.
+    conn.execute("DROP INDEX IF EXISTS uq_active_cad_item_association")
+    # Drop predicate indexes before normalizing legacy values.  SQLite's
+    # partial-index predicate is case-sensitive, so an old ``owner`` row could
+    # otherwise bypass the OWNER constraints (or collide while being changed
+    # to its canonical value).
+    conn.execute("DROP INDEX IF EXISTS uq_active_owner_per_item")
+    conn.execute("DROP INDEX IF EXISTS uq_active_owner_per_cad")
+    conn.execute("DROP INDEX IF EXISTS uq_primary_drawing_per_item")
+    conn.execute("DROP INDEX IF EXISTS uq_primary_drawing_per_item_model")
+    conn.execute(
+        """
+        UPDATE cad_item_associations
+        SET association_type=upper(trim(association_type)),
+            modified_at=datetime('now')
+        WHERE association_type<>upper(trim(association_type))
+        """
+    )
+    conn.execute(
+        """
+        UPDATE cad_item_associations AS older
+        SET active=0,is_primary_drawing=0,modified_at=datetime('now')
+        WHERE older.active=1 AND EXISTS (
+            SELECT 1 FROM cad_item_associations newer
+            WHERE newer.active=1
+              AND newer.item_id=older.item_id
+              AND newer.cad_document_id=older.cad_document_id
+              AND newer.id>older.id
+        )
+        """
+    )
+    conn.execute(
+        """
+        UPDATE cad_item_associations
+        SET is_primary_drawing=0,
+            drawing_model_cad_document_id=NULL
+        WHERE is_primary_drawing IS NULL
+           OR cad_document_id NOT IN (
+               SELECT id FROM cad_documents WHERE upper(category)='DRAWING'
+           )
+        """
+    )
+    conn.execute(
+        """
+        UPDATE cad_item_associations
+        SET drawing_model_cad_document_id=(
+            SELECT drawing_owner_cad_document_id
+            FROM cad_documents d
+            WHERE d.id=cad_item_associations.cad_document_id
+        )
+        WHERE active=1 AND cad_document_id IN (
+            SELECT id FROM cad_documents WHERE upper(category)='DRAWING'
+        )
+        """
+    )
+    conn.execute(
+        """
+        UPDATE cad_item_associations
+        SET is_primary_drawing=0,modified_at=datetime('now')
+        WHERE active=1 AND is_primary_drawing=1
+          AND drawing_model_cad_document_id IS NULL
+        """
+    )
+    # If an unsupported/manual database contains several OWNER relationships,
+    # preserve all relationships but demote the later conflicting OWNER rows
+    # to IMAGE.  OWNER remains one-to-one in both directions.
+    conn.execute(
+        """
+        UPDATE cad_item_associations AS duplicate_owner
+        SET association_type='IMAGE',drives_structure=0,
+            drives_attributes=0,participates_in_structure=1,
+            modified_at=datetime('now')
+        WHERE duplicate_owner.active=1
+          AND upper(duplicate_owner.association_type)='OWNER'
+          AND EXISTS (
+              SELECT 1 FROM cad_item_associations keeper
+              WHERE keeper.active=1
+                AND upper(keeper.association_type)='OWNER'
+                AND keeper.cad_document_id=duplicate_owner.cad_document_id
+                AND keeper.id<duplicate_owner.id
+          )
+        """
+    )
+    conn.execute(
+        """
+        UPDATE cad_item_associations AS duplicate_owner
+        SET association_type='IMAGE',drives_structure=0,
+            drives_attributes=0,participates_in_structure=1,
+            modified_at=datetime('now')
+        WHERE duplicate_owner.active=1
+          AND upper(duplicate_owner.association_type)='OWNER'
+          AND EXISTS (
+              SELECT 1 FROM cad_item_associations keeper
+              WHERE keeper.active=1
+                AND upper(keeper.association_type)='OWNER'
+                AND keeper.item_id=duplicate_owner.item_id
+                AND keeper.id<duplicate_owner.id
+          )
+        """
+    )
+    conn.execute(
+        """
+        UPDATE cad_item_associations AS duplicate_primary
+        SET is_primary_drawing=0,modified_at=datetime('now')
+        WHERE duplicate_primary.active=1
+          AND duplicate_primary.is_primary_drawing=1
+          AND EXISTS (
+              SELECT 1 FROM cad_item_associations keeper
+              WHERE keeper.active=1 AND keeper.is_primary_drawing=1
+                AND keeper.item_id=duplicate_primary.item_id
+                AND keeper.drawing_model_cad_document_id=
+                    duplicate_primary.drawing_model_cad_document_id
+                AND keeper.id<duplicate_primary.id
+          )
+        """
+    )
+    conn.executescript(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_active_cad_item_pair
+            ON cad_item_associations(item_id, cad_document_id)
+            WHERE active=1;
+
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_active_owner_per_item
+            ON cad_item_associations(item_id)
+            WHERE active=1 AND association_type='OWNER';
+
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_active_owner_per_cad
+            ON cad_item_associations(cad_document_id)
+            WHERE active=1 AND association_type='OWNER';
+
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_primary_drawing_per_item_model
+            ON cad_item_associations(item_id, drawing_model_cad_document_id)
+            WHERE active=1 AND is_primary_drawing=1;
+
+        CREATE TABLE IF NOT EXISTS cad_document_checkout_items (
+            cad_document_id INTEGER NOT NULL,
+            item_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (cad_document_id, item_id),
+            FOREIGN KEY (cad_document_id) REFERENCES cad_documents(id)
+                ON DELETE CASCADE,
+            FOREIGN KEY (item_id) REFERENCES bom(id)
+                ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_cad_checkout_items_item
+            ON cad_document_checkout_items(item_id, cad_document_id);
+        """
+    )
+
+    # Migration 32 could only retain the first association when several
+    # legacy Items referenced the same PRT/ASM.  Recover only deterministic,
+    # project-scoped exact legacy file relationships.  Existing relationships
+    # and explicit primary selections always win.
+    migration_recorded = bool(
+        "schema_migrations" in tables
+        and conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=39"
+        ).fetchone()
+    )
+    if not migration_recorded and {"bom", "cad_documents"}.issubset(tables):
+        bom_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(bom)").fetchall()
+        }
+
+        def clean_creo_file(value):
+            name = os.path.basename(str(value or "").replace("\\", "/")).strip()
+            match = re.match(
+                r"^(.*\.(?:asm|prt|drw))\.\d+$", name, flags=re.IGNORECASE
+            )
+            return (match.group(1) if match else name).casefold()
+
+        def clean_base(value):
+            name = clean_creo_file(value)
+            if name.endswith((".asm", ".prt", ".drw")):
+                return name.rsplit(".", 1)[0]
+            return os.path.splitext(name)[0]
+
+        documents = [
+            dict(row) for row in conn.execute(
+                "SELECT * FROM cad_documents ORDER BY id"
+            ).fetchall()
+        ]
+        documents_by_id = {
+            int(document["id"]): document for document in documents
+        }
+        models_by_file = {}
+        models_by_base = {}
+        drawings_by_file = {}
+        drawings_by_base = {}
+        for document in documents:
+            project_id = int(document.get("project_id") or 0)
+            category = str(document.get("category") or "").upper()
+            file_key = clean_creo_file(document.get("file_name"))
+            base_key = clean_base(
+                document.get("base_file_name") or document.get("file_name")
+            )
+            if category == "DRAWING":
+                target_by_file = drawings_by_file
+                target_by_base = drawings_by_base
+            elif category in {"ASSEMBLY", "COMPONENT"}:
+                target_by_file = models_by_file
+                target_by_base = models_by_base
+            else:
+                continue
+            if file_key:
+                target_by_file[(project_id, file_key)] = document
+            if base_key:
+                target_by_base.setdefault((project_id, base_key), []).append(document)
+
+        select_columns = ["id"]
+        for column in (
+            "project_id", "represented_part_id", "filename", "base_file_name",
+            "drawing", "base_drw_name",
+        ):
+            if column in bom_columns:
+                select_columns.append(column)
+        order_sql = (
+            "CASE WHEN represented_part_id IS NULL THEN 0 ELSE 1 END,id"
+            if "represented_part_id" in bom_columns else "id"
+        )
+        legacy_items = [
+            dict(row) for row in conn.execute(
+                f"SELECT {','.join(select_columns)} FROM bom ORDER BY {order_sql}"
+            ).fetchall()
+        ]
+        item_projects = {
+            int(item["id"]): int(item.get("project_id") or 0)
+            for item in legacy_items
+        }
+
+        def unique_by_base(index, project_id, base_key):
+            candidates = index.get((project_id, base_key), [])
+            return candidates[0] if len(candidates) == 1 else None
+
+        def ensure_model_association(project_id, item_id, model):
+            existing = conn.execute(
+                """
+                SELECT id FROM cad_item_associations
+                WHERE item_id=? AND cad_document_id=? AND active=1
+                """,
+                (int(item_id), int(model["id"])),
+            ).fetchone()
+            if existing:
+                return int(existing["id"])
+            cad_owner = conn.execute(
+                """
+                SELECT item_id FROM cad_item_associations
+                WHERE cad_document_id=? AND active=1 AND association_type='OWNER'
+                LIMIT 1
+                """,
+                (int(model["id"]),),
+            ).fetchone()
+            item_owner = conn.execute(
+                """
+                SELECT cad_document_id FROM cad_item_associations
+                WHERE item_id=? AND active=1 AND association_type='OWNER'
+                LIMIT 1
+                """,
+                (int(item_id),),
+            ).fetchone()
+            use_owner = bool(
+                cad_owner is None
+                and item_owner is None
+                and int(model.get("legacy_bom_id") or 0) == int(item_id)
+            )
+            kind = "OWNER" if use_owner else "IMAGE"
+            flags = (1, 1, 1) if use_owner else (0, 0, 1)
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO cad_item_associations(
+                    project_id,item_id,cad_document_id,association_type,
+                    drives_structure,drives_attributes,participates_in_structure,
+                    active
+                ) VALUES(?,?,?,?,?,?,?,1)
+                """,
+                (
+                    int(project_id), int(item_id), int(model["id"]), kind,
+                    *flags,
+                ),
+            )
+            if cur.rowcount:
+                return int(cur.lastrowid)
+            row = conn.execute(
+                """
+                SELECT id FROM cad_item_associations
+                WHERE item_id=? AND cad_document_id=? AND active=1
+                """,
+                (int(item_id), int(model["id"])),
+            ).fetchone()
+            return int(row["id"]) if row else None
+
+        for legacy in legacy_items:
+            project_id = int(legacy.get("project_id") or 0)
+            own_item_id = int(legacy["id"])
+            represented_item_id = legacy.get("represented_part_id")
+            item_id = (
+                int(represented_item_id)
+                if represented_item_id not in (None, "", 0, "0")
+                else own_item_id
+            )
+            # Old/manual databases can contain stale or cross-project
+            # represented_part_id values.  Never let such legacy metadata
+            # make startup fail with a foreign-key error or create a
+            # cross-product association.
+            if item_projects.get(item_id) != project_id:
+                item_id = own_item_id
+            model_file = clean_creo_file(legacy.get("filename"))
+            model_base = clean_base(
+                legacy.get("base_file_name") or legacy.get("filename")
+            )
+            model = models_by_file.get((project_id, model_file)) if model_file else None
+            if model is None and model_base:
+                model = unique_by_base(models_by_base, project_id, model_base)
+            if model is not None:
+                ensure_model_association(project_id, item_id, model)
+
+            drawing_file = clean_creo_file(legacy.get("drawing"))
+            drawing_base = clean_base(
+                legacy.get("base_drw_name") or legacy.get("drawing")
+            )
+            drawing = (
+                drawings_by_file.get((project_id, drawing_file))
+                if drawing_file else None
+            )
+            if drawing is None and drawing_base:
+                drawing = unique_by_base(drawings_by_base, project_id, drawing_base)
+            if drawing is None or drawing.get("drawing_owner_cad_document_id") is None:
+                continue
+            drawing_model = documents_by_id.get(
+                int(drawing["drawing_owner_cad_document_id"])
+            )
+            if drawing_model is None:
+                continue
+            ensure_model_association(project_id, item_id, drawing_model)
+            existing_drawing = conn.execute(
+                """
+                SELECT id FROM cad_item_associations
+                WHERE item_id=? AND cad_document_id=? AND active=1
+                """,
+                (item_id, int(drawing["id"])),
+            ).fetchone()
+            if existing_drawing is None:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO cad_item_associations(
+                        project_id,item_id,cad_document_id,association_type,
+                        drives_structure,drives_attributes,participates_in_structure,
+                        active,is_primary_drawing,drawing_model_cad_document_id
+                    ) VALUES(?,?,?,'CONTENT',0,0,0,1,0,?)
+                    """,
+                    (
+                        project_id, item_id, int(drawing["id"]),
+                        int(drawing_model["id"]),
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE cad_item_associations
+                    SET drawing_model_cad_document_id=?,modified_at=datetime('now')
+                    WHERE id=?
+                    """,
+                    (int(drawing_model["id"]), int(existing_drawing["id"])),
+                )
+            has_primary = conn.execute(
+                """
+                SELECT 1 FROM cad_item_associations
+                WHERE item_id=? AND drawing_model_cad_document_id=?
+                  AND active=1 AND is_primary_drawing=1
+                LIMIT 1
+                """,
+                (item_id, int(drawing_model["id"])),
+            ).fetchone()
+            if not has_primary:
+                conn.execute(
+                    """
+                    UPDATE cad_item_associations
+                    SET is_primary_drawing=1,modified_at=datetime('now')
+                    WHERE item_id=? AND cad_document_id=? AND active=1
+                    """,
+                    (item_id, int(drawing["id"])),
+                )
+
+        # A single legacy drawing selection is unambiguous even when its BOM
+        # filename fields were blank.  Never guess when several remain.
+        conn.execute(
+            """
+            UPDATE cad_item_associations AS candidate
+            SET is_primary_drawing=1,modified_at=datetime('now')
+            WHERE candidate.active=1
+              AND candidate.drawing_model_cad_document_id IS NOT NULL
+              AND candidate.is_primary_drawing=0
+              AND NOT EXISTS (
+                  SELECT 1 FROM cad_item_associations selected
+                  WHERE selected.item_id=candidate.item_id
+                    AND selected.drawing_model_cad_document_id=
+                        candidate.drawing_model_cad_document_id
+                    AND selected.active=1 AND selected.is_primary_drawing=1
+              )
+              AND 1=(
+                  SELECT COUNT(*) FROM cad_item_associations sibling
+                  WHERE sibling.item_id=candidate.item_id
+                    AND sibling.drawing_model_cad_document_id=
+                        candidate.drawing_model_cad_document_id
+                    AND sibling.active=1
+              )
+            """
+        )
+    # Preserve active legacy working copies in the new many-Item checkout map.
+    if "cad_documents" in tables:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO cad_document_checkout_items(
+                cad_document_id,item_id,user_id
+            )
+            SELECT id,checkout_item_id,checked_out_by
+            FROM cad_documents
+            WHERE checked_out_by IS NOT NULL AND checkout_item_id IS NOT NULL
+            """
+        )
+
+
 MIGRATIONS = {
     1: """
     CREATE TABLE IF NOT EXISTS users (
@@ -3098,6 +3555,8 @@ WHERE r.name = 'designer' AND p.name = 'manage_issues';
     37: _migration_37,
 
     38: _migration_38,
+
+    39: _migration_39,
 
 }
 

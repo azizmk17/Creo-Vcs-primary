@@ -559,6 +559,32 @@ class BomService(BaseService):
             }
         return {"item_id": item_id, "item_checkout": "AUTO_RELEASED"}
 
+    def _release_auto_item_checkouts_after_cad(
+        self, item_ids, actor_id: int
+    ) -> dict:
+        """Release every expendable CAD-origin Item lock after a CAD closes."""
+        normalized_ids = sorted({int(value) for value in (item_ids or [])})
+        results = [
+            self._release_auto_item_checkout_after_cad(item_id, int(actor_id))
+            for item_id in normalized_ids
+        ]
+        summary = {
+            "associated_item_ids": normalized_ids,
+            "item_checkouts": results,
+            # Compatibility for callers written before shared CAD associations.
+            "associated_item_id": normalized_ids[0] if normalized_ids else None,
+        }
+        if len(results) == 1:
+            summary.update({
+                key: value for key, value in results[0].items()
+                if key != "item_id"
+            })
+        elif results:
+            summary["item_checkout"] = "MULTIPLE"
+        else:
+            summary["item_checkout"] = "NOT_APPLICABLE"
+        return summary
+
     def part_ids_sharing_base_file(self, part_id: int) -> List[int]:
         part = self.bom_repo.get_by_id(int(part_id))
         if not part:
@@ -2438,6 +2464,10 @@ class BomService(BaseService):
             lock_owners = self.lock_repo.get_lock_owners_for_project(project_id)
         except Exception:
             lock_owners = {}
+        try:
+            category_map = self.bom_repo.get_categories_for_boms(item_ids)
+        except Exception:
+            category_map = {}
         for row in nodes:
             item_id = int(row.get("bom_id") or row.get("id"))
             context = contexts.get(item_id) or {}
@@ -2452,8 +2482,10 @@ class BomService(BaseService):
                 context.get("state") or row.get("lifecycle_state")
                 or row.get("status") or ""
             )
-            if row.get("locked"):
-                row["locked_by_username"] = lock_owners.get(item_id)
+            lock_owner = lock_owners.get(item_id)
+            row["locked"] = bool(lock_owner)
+            row["locked_by_username"] = lock_owner
+            row["category_names"] = list(category_map.get(item_id, []))
         return structure
 
     # -------------------------------
@@ -2533,13 +2565,16 @@ class BomService(BaseService):
         cad_document_id: int,
         *,
         released_item_revision_code: str | None = None,
+        released_item_revision_codes: dict | None = None,
         as_user_id: int | None = None,
         workspace_id: str | None = None,
         workspace_name: str | None = None,
         workspace_machine_id: str | None = None,
     ) -> Dict:
-        """Check out one CAD Document and ensure its associated Item is owned."""
+        """Check out CAD and coordinate every affected Item working copy."""
         cad_document_id = int(cad_document_id)
+        if self.user_id is None:
+            raise PermissionError("You must be logged in.")
         current_user_id = int(self.user_id)
         actor_id = int(as_user_id) if as_user_id is not None else current_user_id
         if actor_id != current_user_id and not self.permission_repo.user_has_permission(
@@ -2560,34 +2595,74 @@ class BomService(BaseService):
         if state == "OBSOLETE":
             raise ValueError("An Obsolete CAD Document cannot be checked out.")
 
-        association = self.pdm_service.repo.get_active_association_for_cad(
+        associated_item_ids = self.pdm_service.checkout_target_item_ids(
             cad_document_id
         )
-        if association is None and document.get("drawing_owner_cad_document_id") is not None:
-            association = self.pdm_service.repo.get_active_association_for_cad(
-                int(document["drawing_owner_cad_document_id"])
-            )
-        associated_item_id = (
-            int(association["item_id"]) if association else None
-        )
-        auto_item_checkout = False
-        if associated_item_id is not None:
-            item_lock = self.lock_repo.get_by_part(associated_item_id)
+        revision_codes = {
+            int(item_id): str(value or "").strip()
+            for item_id, value in (released_item_revision_codes or {}).items()
+        }
+        effective_revision_codes = {}
+
+        # Preflight every target before creating any working copy. A shared CAD
+        # checkout is one operation and must not leave a partial set of locks.
+        for associated_item_id in associated_item_ids:
+            item_lock = self.lock_repo.get_by_part(int(associated_item_id))
             if item_lock and int(item_lock.user_id) != actor_id:
                 raise ValueError(
-                    "The associated Item is checked out by another user. "
+                    f"Associated Item {associated_item_id} is checked out by another user. "
                     "The CAD Document was not checked out."
                 )
-            if not item_lock:
+            if item_lock:
+                continue
+            context = self.revision_repo.get_current_context(
+                int(associated_item_id)
+            )
+            state = str(context.get("state") or "").strip().lower()
+            revision_code = revision_codes.get(
+                int(associated_item_id),
+                str(released_item_revision_code or "").strip(),
+            )
+            effective_revision_codes[int(associated_item_id)] = revision_code
+            if state == "released":
+                pending_revision = str(
+                    context.get("pending_revision_code") or ""
+                ).strip()
+                target_revision = revision_code or pending_revision
+                if not target_revision:
+                    raise ValueError(
+                        f"Associated Item {context.get('version_label') or associated_item_id} "
+                        "is Released. Provide its next Item revision before checking out the shared CAD Document."
+                    )
+                if pending_revision and pending_revision.casefold() != target_revision.casefold():
+                    raise ValueError(
+                        f"Associated Item {associated_item_id} is already preparing "
+                        f"revision {pending_revision}."
+                    )
+                if not pending_revision:
+                    self.revision_repo.validate_released_checkout(
+                        int(associated_item_id), target_revision
+                    )
+                effective_revision_codes[int(associated_item_id)] = target_revision
+            else:
+                self.revision_repo.assert_mutable(int(associated_item_id))
+
+        auto_item_checkout_ids = []
+        try:
+            for associated_item_id in associated_item_ids:
+                if self.lock_repo.get_by_part(int(associated_item_id)):
+                    continue
+                revision_code = effective_revision_codes.get(
+                    int(associated_item_id), ""
+                )
                 self.checkout_part(
-                    associated_item_id,
-                    released_revision_code=released_item_revision_code,
+                    int(associated_item_id),
+                    as_user_id=actor_id,
+                    released_revision_code=revision_code or None,
                     exact_item=True,
                     checkout_origin="CAD",
                 )
-                auto_item_checkout = True
-
-        try:
+                auto_item_checkout_ids.append(int(associated_item_id))
             result = self.pdm_service.checkout_cad_document(
                 cad_document_id,
                 actor_id,
@@ -2596,16 +2671,30 @@ class BomService(BaseService):
                 workspace_machine_id=workspace_machine_id,
             )
         except Exception:
-            if auto_item_checkout and associated_item_id is not None:
+            for associated_item_id in reversed(auto_item_checkout_ids):
                 try:
-                    self.undo_checkout(associated_item_id, exact_item=True)
+                    self.undo_checkout(
+                        int(associated_item_id),
+                        as_user_id=actor_id,
+                        exact_item=True,
+                    )
                 except Exception:
                     pass
             raise
+
+        recorded_item_ids = self.pdm_service.cad_checkout_item_ids(
+            cad_document_id
+        )
+        if not recorded_item_ids:
+            recorded_item_ids = list(associated_item_ids)
         return {
             **result,
-            "associated_item_id": associated_item_id,
-            "item_checkout_auto_created": bool(auto_item_checkout),
+            "associated_item_ids": recorded_item_ids,
+            "associated_item_id": (
+                recorded_item_ids[0] if recorded_item_ids else None
+            ),
+            "item_checkout_auto_created": bool(auto_item_checkout_ids),
+            "item_checkout_auto_created_ids": auto_item_checkout_ids,
         }
 
     def checkin_pdm_cad_document(
@@ -2629,10 +2718,11 @@ class BomService(BaseService):
         document = self.pdm_service.repo.get_cad_document(cad_document_id)
         if not document:
             raise ValueError("The CAD Document was not found.")
-        associated_item_id = (
-            int(document["checkout_item_id"])
-            if document.get("checkout_item_id") is not None else None
+        associated_item_ids = self.pdm_service.cad_checkout_item_ids(
+            cad_document_id
         )
+        if not associated_item_ids and document.get("checkout_item_id") is not None:
+            associated_item_ids = [int(document["checkout_item_id"])]
         result = self.pdm_service.checkin_cad_document(
             cad_document_id,
             actor_id,
@@ -2642,8 +2732,13 @@ class BomService(BaseService):
             source_file_name=source_file_name,
             creo_file_version=creo_file_version,
         )
-        item_result = self._release_auto_item_checkout_after_cad(
-            associated_item_id, actor_id
+        returned_item_ids = [
+            int(value) for value in (result.get("checkout_item_ids") or [])
+        ]
+        if returned_item_ids:
+            associated_item_ids = returned_item_ids
+        item_result = self._release_auto_item_checkouts_after_cad(
+            associated_item_ids, actor_id
         )
         try:
             from core.services.cad_workspace_service import CadWorkspaceService
@@ -2662,15 +2757,21 @@ class BomService(BaseService):
         document = self.pdm_service.repo.get_cad_document(cad_document_id)
         if not document:
             raise ValueError("The CAD Document was not found.")
-        associated_item_id = (
-            int(document["checkout_item_id"])
-            if document.get("checkout_item_id") is not None else None
+        associated_item_ids = self.pdm_service.cad_checkout_item_ids(
+            cad_document_id
         )
+        if not associated_item_ids and document.get("checkout_item_id") is not None:
+            associated_item_ids = [int(document["checkout_item_id"])]
         result = self.pdm_service.undo_checkout_cad_document(
             cad_document_id, actor_id, note
         )
-        item_result = self._release_auto_item_checkout_after_cad(
-            associated_item_id, actor_id
+        returned_item_ids = [
+            int(value) for value in (result.get("checkout_item_ids") or [])
+        ]
+        if returned_item_ids:
+            associated_item_ids = returned_item_ids
+        item_result = self._release_auto_item_checkouts_after_cad(
+            associated_item_ids, actor_id
         )
         try:
             from core.services.cad_workspace_service import CadWorkspaceService
@@ -2692,34 +2793,182 @@ class BomService(BaseService):
     def list_item_cad_associations(self, item_id: int) -> List[Dict]:
         return self.pdm_service.list_item_cad_documents(int(item_id))
 
+    def list_cad_item_associations(self, cad_document_id: int) -> List[Dict]:
+        return self.pdm_service.list_cad_item_associations(
+            int(cad_document_id)
+        )
+
+    def get_item_cad_association(
+        self, item_id: int, cad_document_id: int
+    ) -> Dict | None:
+        return self.pdm_service.get_item_cad_association(
+            int(item_id), int(cad_document_id)
+        )
+
+    def list_item_selected_drawings(
+        self, item_id: int, model_cad_document_id: int | None = None
+    ) -> List[Dict]:
+        return self.pdm_service.list_item_selected_drawings(
+            int(item_id),
+            (
+                int(model_cad_document_id)
+                if model_cad_document_id is not None else None
+            ),
+        )
+
+    def _assert_cad_documents_checked_in(self, cad_document_ids, action: str) -> None:
+        for cad_document_id in sorted({int(value) for value in cad_document_ids}):
+            document = self.pdm_service.repo.get_cad_document(cad_document_id)
+            if not document:
+                raise ValueError(f"CAD Document {cad_document_id} was not found.")
+            if document.get("checked_out_by") is not None:
+                raise ValueError(
+                    f"Check in or undo {document.get('file_name') or document.get('name') or cad_document_id} "
+                    f"before you {action}."
+                )
+
+    def set_item_model_drawings(
+        self,
+        item_id: int,
+        model_cad_document_id: int,
+        drawing_ids,
+        primary_drawing_id: int | None = None,
+    ) -> List[Dict]:
+        """Replace the explicit drawings selected for one Item/model pair."""
+        item_id = int(item_id)
+        model_cad_document_id = int(model_cad_document_id)
+        selected_ids = sorted({int(value) for value in (drawing_ids or [])})
+        if primary_drawing_id is None and len(selected_ids) == 1:
+            primary_drawing_id = selected_ids[0]
+        primary_id = (
+            int(primary_drawing_id)
+            if primary_drawing_id is not None else None
+        )
+        if primary_id is not None and primary_id not in selected_ids:
+            raise ValueError("The primary drawing must be included in the selected drawings.")
+
+        self._assert_checked_out_for_change(
+            item_id, "change its selected CAD drawings"
+        )
+        if not self.pdm_service.get_item_cad_association(
+            item_id, model_cad_document_id
+        ):
+            raise ValueError(
+                "Associate the PRT/ASM CAD Document with this Item before selecting its drawing."
+            )
+        current_drawing_ids = [
+            int(row["id"])
+            for row in self.pdm_service.list_item_selected_drawings(
+                item_id, model_cad_document_id
+            )
+            if row.get("id") is not None
+        ]
+        self._assert_cad_documents_checked_in(
+            [model_cad_document_id, *current_drawing_ids, *selected_ids],
+            "change the Item drawing selection",
+        )
+        result = self.pdm_service.set_item_model_drawings(
+            item_id,
+            model_cad_document_id,
+            selected_ids,
+            primary_drawing_id=primary_id,
+            actor_id=self.user_id,
+        )
+        self.lock_repo.set_checkout_origin(item_id, "ITEM")
+        return result
+
+    def set_item_primary_drawing(
+        self,
+        item_id: int,
+        model_cad_document_id: int,
+        drawing_cad_document_id: int,
+    ) -> Dict:
+        item_id = int(item_id)
+        model_cad_document_id = int(model_cad_document_id)
+        drawing_cad_document_id = int(drawing_cad_document_id)
+        self._assert_checked_out_for_change(
+            item_id, "change its primary drawing"
+        )
+        current_drawing_ids = [
+            int(row["id"])
+            for row in self.pdm_service.list_item_selected_drawings(
+                item_id, model_cad_document_id
+            )
+            if row.get("id") is not None
+        ]
+        self._assert_cad_documents_checked_in(
+            [
+                model_cad_document_id,
+                drawing_cad_document_id,
+                *current_drawing_ids,
+            ],
+            "change the Item primary drawing",
+        )
+        result = self.pdm_service.set_primary_drawing(
+            item_id,
+            model_cad_document_id,
+            drawing_cad_document_id,
+            actor_id=self.user_id,
+        )
+        self.lock_repo.set_checkout_origin(item_id, "ITEM")
+        return result
+
+    def clear_item_primary_drawing(
+        self, item_id: int, model_cad_document_id: int
+    ) -> bool:
+        item_id = int(item_id)
+        model_cad_document_id = int(model_cad_document_id)
+        self._assert_checked_out_for_change(
+            item_id, "clear its primary drawing"
+        )
+        current_drawing_ids = [
+            int(row["id"])
+            for row in self.pdm_service.list_item_selected_drawings(
+                item_id, model_cad_document_id
+            )
+            if row.get("id") is not None
+        ]
+        self._assert_cad_documents_checked_in(
+            [model_cad_document_id, *current_drawing_ids],
+            "clear the Item primary drawing",
+        )
+        changed = self.pdm_service.clear_primary_drawing(
+            item_id, model_cad_document_id
+        )
+        if changed:
+            self.lock_repo.set_checkout_origin(item_id, "ITEM")
+        return changed
+
     def associate_cad_document(
         self, item_id: int, cad_document_id: int, association_type: str
     ) -> Dict:
         item_id = int(item_id)
         cad_document_id = int(cad_document_id)
-        current = self.pdm_service.repo.get_active_association_for_cad(
-            cad_document_id
+        current = self.pdm_service.get_item_cad_association(
+            item_id, cad_document_id
         )
         document = self.pdm_service.repo.get_cad_document(cad_document_id)
         if not document:
             raise ValueError("The CAD Document was not found.")
+        requested_type = str(association_type or "").strip().upper()
+        if (
+            current
+            and str(current.get("association_type") or "").strip().upper()
+            == requested_type
+        ):
+            return current
         if document.get("checked_out_by") is not None:
             raise ValueError(
                 "Check in or undo the CAD Document before changing its Item association."
             )
-        changed_item_ids = {item_id}
-        if current and int(current["item_id"]) != item_id:
-            changed_item_ids.add(int(current["item_id"]))
-        for changed_item_id in sorted(changed_item_ids):
-            self._assert_checked_out_for_change(
-                changed_item_id, "change its CAD associations"
-            )
+        self._assert_checked_out_for_change(
+            item_id, "change its CAD associations"
+        )
         result = self.pdm_service.associate(
             int(self.session.project_id), item_id, cad_document_id,
-            association_type, self.user_id,
+            requested_type, self.user_id,
         )
-        for changed_item_id in changed_item_ids:
-            self.lock_repo.set_checkout_origin(changed_item_id, "ITEM")
+        self.lock_repo.set_checkout_origin(item_id, "ITEM")
         return result
 
     def remove_cad_item_association(self, association_id: int) -> bool:

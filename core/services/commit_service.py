@@ -86,21 +86,60 @@ class CommitService(BaseService):
             return "DRAWING"
         return "OTHER"
 
-    def _item_id_for_cad_commit(self, cad_document: dict) -> int | None:
-        cad_document_id = int(cad_document["id"])
-        association = self.pdm_service.repo.get_active_association_for_cad(
-            cad_document_id
-        )
-        if association and association.get("item_id") is not None:
-            return int(association["item_id"])
+    def _active_associations_for_cad(self, cad_document_id: int) -> list[dict]:
+        repo = self.pdm_service.repo
+        list_method = getattr(repo, "list_active_associations_for_cad", None)
+        if callable(list_method):
+            return list(list_method(int(cad_document_id)) or [])
+        # Compatibility with repositories created before shared CAD
+        # associations were introduced.
+        association = repo.get_active_association_for_cad(int(cad_document_id))
+        return [association] if association else []
+
+    def _item_ids_for_cad_commit(self, cad_document: dict) -> list[int]:
+        """Return all Items affected by this CAD commit.
+
+        A model commit affects every Item explicitly associated to that model.
+        A drawing commit affects only Items explicitly associated to the DRW;
+        an old unassigned DRW falls back to the OWNER of its model.
+        """
+        associations = self._active_associations_for_cad(int(cad_document["id"]))
+        direct_ids = {
+            int(association["item_id"])
+            for association in associations
+            if association.get("item_id") is not None
+        }
+        if direct_ids:
+            return sorted(direct_ids)
+
         owner_id = cad_document.get("drawing_owner_cad_document_id")
-        if owner_id is not None:
-            owner_association = self.pdm_service.repo.get_active_association_for_cad(
-                int(owner_id)
-            )
-            if owner_association and owner_association.get("item_id") is not None:
-                return int(owner_association["item_id"])
-        return None
+        if owner_id is None:
+            return []
+        owner_associations = self._active_associations_for_cad(int(owner_id))
+        owner_ids = {
+            int(association["item_id"])
+            for association in owner_associations
+            if association.get("item_id") is not None
+            and str(association.get("association_type") or "").upper() == "OWNER"
+        }
+        return sorted(owner_ids)
+
+    def _item_id_for_cad_commit(self, cad_document: dict) -> int | None:
+        item_ids = self._item_ids_for_cad_commit(cad_document)
+        if not item_ids:
+            return None
+
+        # Keep one canonical legacy part_id on the commit row.  OWNER-first
+        # ordering is provided by the repository; the complete affected set is
+        # retained separately in the commit plan and refresh result.
+        associations = self._active_associations_for_cad(int(cad_document["id"]))
+        for association in associations:
+            if (
+                str(association.get("association_type") or "").upper() == "OWNER"
+                and association.get("item_id") is not None
+            ):
+                return int(association["item_id"])
+        return int(item_ids[0])
 
     def _cad_document_label(self, cad_document: dict | None, fallback: str = "CAD Document") -> str:
         if not cad_document:
@@ -514,6 +553,7 @@ class CommitService(BaseService):
                     f"Commit blocked: CAD Document {label} is checked out by another user."
                 )
 
+            part_ids = self._item_ids_for_cad_commit(cad_document)
             part_id = self._item_id_for_cad_commit(cad_document)
             commit_plan.append({
                 "filepath": filepath,
@@ -522,6 +562,7 @@ class CommitService(BaseService):
                 "base_f_name": base_f_name,
                 "part_type": part_type,
                 "part_id": part_id,
+                "part_ids": part_ids,
                 "cad_document_id": int(cad_document["id"]),
                 "creo_file_version": creo_file_version,
             })
@@ -646,9 +687,9 @@ class CommitService(BaseService):
                 commit_user_dir,
                 delayed_attachments,
                 {
-                    int(item["part_id"])
+                    int(part_id)
                     for item in commit_plan
-                    if item.get("part_id") is not None
+                    for part_id in (item.get("part_ids") or [])
                 },
                 commit_id,
             )
@@ -716,9 +757,9 @@ class CommitService(BaseService):
         return {
             "commit_id": commit_id,
             "affected_part_ids": sorted({
-                int(item["part_id"])
+                int(part_id)
                 for item in commit_plan
-                if item.get("part_id") is not None
+                for part_id in (item.get("part_ids") or [])
             }),
         }
 

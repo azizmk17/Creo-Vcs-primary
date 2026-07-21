@@ -117,6 +117,9 @@ class PdmCheckoutCoordinationTests(unittest.TestCase):
         self.assertEqual(document["checkout_workspace_id"], "b" * 32)
 
     def test_ebom_item_rows_include_vault_iteration_and_checkout_owner(self):
+        self.service.bom_repo.set_categories_for_bom(
+            1, 7, ["Mechanical"], assigned_by=1
+        )
         self.service.checkout_item(1)
 
         structure = self.service.get_released_ebom_project(7)
@@ -128,6 +131,7 @@ class PdmCheckoutCoordinationTests(unittest.TestCase):
         self.assertEqual(machine["iteration_number"], 1)
         self.assertTrue(machine["locked"])
         self.assertEqual(machine["locked_by_username"], "designer")
+        self.assertEqual(machine["category_names"], ["Mechanical"])
 
     def test_cad_checkout_auto_locks_item_and_item_actions_are_blocked(self):
         result = self.service.checkout_pdm_cad_document(int(self.owner_cad["id"]))

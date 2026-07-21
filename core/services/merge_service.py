@@ -414,19 +414,29 @@ class MergeService(BaseService):
 
         return None
 
-    @staticmethod
-    def _part_ids_for_issue_gate(commits):
-        part_ids = []
+    def _part_ids_for_issue_gate(self, commits):
+        part_ids = set()
         for commit in commits:
+            cad_document_id = getattr(commit, "cad_document_id", None)
+            if cad_document_id is not None:
+                try:
+                    part_ids.update(
+                        int(value)
+                        for value in self.bom_service.pdm_service.repo.list_checkout_target_item_ids(
+                            int(cad_document_id)
+                        )
+                    )
+                except Exception:
+                    pass
             if commit.part_id is None:
-                if getattr(commit, "cad_document_id", None) is not None:
+                if cad_document_id is not None:
                     continue
                 label = commit.commit_id or commit.id
                 raise ValueError(
                     f"Cannot merge commit {label}. It is not linked to an EBOM Item or CAD Document."
                 )
-            part_ids.append(int(commit.part_id))
-        return part_ids
+            part_ids.add(int(commit.part_id))
+        return sorted(part_ids)
 
     @require_permission("merge")
     def excute_merge(self, selected_ids, message):
@@ -509,7 +519,14 @@ class MergeService(BaseService):
                 pass
             try:
                 if item.get("cad_document_id") is not None:
-                    cad_document_ids.add(int(item["cad_document_id"]))
+                    cad_document_id = int(item["cad_document_id"])
+                    cad_document_ids.add(cad_document_id)
+                    part_ids.update(
+                        int(value)
+                        for value in self.bom_service.pdm_service.repo.list_checkout_target_item_ids(
+                            cad_document_id
+                        )
+                    )
             except Exception:
                 pass
         for pid in extra_part_ids or []:

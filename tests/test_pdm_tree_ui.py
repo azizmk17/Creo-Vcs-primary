@@ -6,8 +6,15 @@ from types import SimpleNamespace
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PyQt5.QtCore import Qt
-    from PyQt5.QtWidgets import QApplication, QTreeWidget, QTreeWidgetItem
+    from PyQt5.QtCore import Qt, QTimer
+    from PyQt5.QtWidgets import (
+        QApplication,
+        QLineEdit,
+        QPushButton,
+        QStackedWidget,
+        QTreeWidget,
+        QTreeWidgetItem,
+    )
 except (ImportError, ModuleNotFoundError):
     PYQT_AVAILABLE = False
 else:
@@ -44,6 +51,9 @@ else:
         PDM_OBJECT_CAD,
         PDM_OBJECT_ITEM,
         PDM_OBJECT_KIND_ROLE,
+        BOM_TREE_CATEGORY_ROLE,
+        BOM_TREE_INWORK_ROLE,
+        BOM_TREE_IS_ASSEMBLY_ROLE,
         BomPage,
         _pdm_cad_icon,
     )
@@ -86,7 +96,7 @@ class PdmTreeUiTests(unittest.TestCase):
         self.assertEqual(row.text(CAD_COL_FILE), "pump.asm")
         self.assertEqual(row.text(CAD_COL_DESCRIPTION), "Pump CAD")
         self.assertEqual(row.text(CAD_COL_CATEGORY), "ASSEMBLY")
-        self.assertEqual(row.text(CAD_COL_REV), "B.3")
+        self.assertEqual(row.text(CAD_COL_REV), "CAD B.3")
         self.assertEqual(row.text(CAD_COL_STATE), "IN_WORK")
         self.assertIn("OWNER", row.text(CAD_COL_ASSOCIATION))
         self.assertEqual(row.text(CAD_COL_CHECKOUT), "Checked in")
@@ -145,13 +155,22 @@ class PdmTreeUiTests(unittest.TestCase):
 
     def test_ebom_renumbering_skips_associated_cad_rows(self):
         child = _item_payload(202, "Child Item", level=1)
-        root = _item_payload(201, "Root Item", children=[child])
+        root = _item_payload(201, "Root Item")
         associations = {
             201: [_cad_document(id=801, association_id=901, association_type="OWNER")],
             202: [_cad_document(id=802, association_id=902, association_type="CONTENT")],
         }
         root_row = self.page._add_released_ebom_node(
             root, associations_by_item=associations
+        )
+        self.page._add_ebom_associated_cad_node(
+            associations[201][0], root_row, item_id=201
+        )
+        child_item = self.page._add_released_ebom_node(
+            child, root_row, associations_by_item=associations
+        )
+        self.page._add_ebom_associated_cad_node(
+            associations[202][0], child_item, item_id=202
         )
 
         self.page._renumber_tree_rows(self.page._ebom_tree)
@@ -171,6 +190,11 @@ class PdmTreeUiTests(unittest.TestCase):
                 301: [_cad_document(id=803, association_id=903)]
             },
         )
+        self.page._add_ebom_associated_cad_node(
+            _cad_document(id=803, association_id=903),
+            root_row,
+            item_id=301,
+        )
         cad_row = root_row.child(0)
 
         self.page._matching_item_ids = set()
@@ -183,11 +207,124 @@ class PdmTreeUiTests(unittest.TestCase):
         self.assertFalse(root_row.isHidden())
         self.assertFalse(cad_row.isHidden())
 
+    def test_advanced_filter_default_fields_do_not_reject_ebom_item(self):
+        row = QTreeWidgetItem([""] * self.page._ebom_tree.columnCount())
+        self.page._ebom_tree.addTopLevelItem(row)
+        row.setText(BOM_COL_NAME, "Pump Item")
+        row.setText(BOM_COL_AES, "50026023")
+        row.setText(BOM_COL_TYPE, "prt")
+        row.setText(BOM_COL_REV, "A.1")
+        row.setText(BOM_COL_STATUS, "Released")
+        row.setData(0, PDM_OBJECT_KIND_ROLE, PDM_OBJECT_ITEM)
+        row.setData(0, BOM_TREE_CATEGORY_ROLE, ["Mechanical"])
+        row.setData(0, BOM_TREE_INWORK_ROLE, "")
+        row.setData(0, BOM_TREE_IS_ASSEMBLY_ROLE, False)
+
+        filters = BomPage._default_bom_advanced_filters(self.page)
+        filters["text"] = "50026023"
+        self.assertTrue(
+            BomPage._bom_tree_item_matches_advanced_filter(
+                self.page, row, filters
+            )
+        )
+
+        self.page._bom_advanced_filters = filters
+        self.page._bom_tree_item_matches_advanced_filter = (
+            lambda item, definition: BomPage._bom_tree_item_matches_advanced_filter(
+                self.page, item, definition
+            )
+        )
+        self.page.search_input = SimpleNamespace(text=lambda: "")
+        self.assertEqual(self.page._refresh_ebom_filters(), 1)
+        self.assertFalse(row.isHidden())
+
+    def test_advanced_filter_choices_come_only_from_active_ebom(self):
+        legacy_row = QTreeWidgetItem([""] * self.page.tree.columnCount())
+        legacy_row.setText(BOM_COL_STATUS, "Legacy Design")
+        self.page.tree.addTopLevelItem(legacy_row)
+        ebom_row = QTreeWidgetItem([""] * self.page._ebom_tree.columnCount())
+        ebom_row.setText(BOM_COL_STATUS, "Released")
+        ebom_row.setData(0, PDM_OBJECT_KIND_ROLE, PDM_OBJECT_ITEM)
+        self.page._ebom_tree.addTopLevelItem(ebom_row)
+        self.page._bom_mode = "ebom"
+
+        values = self.page._collect_tree_column_values(BOM_COL_STATUS)
+
+        self.assertEqual(values, ["Released"])
+
+    def test_applying_advanced_filter_clears_stale_basic_search(self):
+        self.page._bom_mode = "ebom"
+        self.page.search_input = QLineEdit("stale CAD search")
+        self.page.search_btn = QPushButton("Search (0)")
+        self.page._search_timer = QTimer()
+        self.page._default_bom_advanced_filters = (
+            lambda: BomPage._default_bom_advanced_filters(self.page)
+        )
+        self.page._normalize_bom_filter_definition = (
+            lambda definition: BomPage._normalize_bom_filter_definition(
+                self.page, definition
+            )
+        )
+        self.page._is_default_bom_advanced_filter = (
+            lambda filters=None: BomPage._is_default_bom_advanced_filter(
+                self.page, filters
+            )
+        )
+        self.page._refresh_ebom_filters = lambda: 1
+        self.page._update_advanced_filter_button_state = lambda _count: None
+
+        filters = BomPage._default_bom_advanced_filters(self.page)
+        filters["text"] = "Pump"
+        BomPage.apply_bom_tree_filter(self.page, filters)
+
+        self.assertEqual(self.page.search_input.text(), "")
+        self.assertEqual(self.page.search_btn.text(), "Search")
+
+    def test_disabling_parent_branches_shows_matching_children_as_flat_rows(self):
+        root = QTreeWidgetItem(["", "Parent Assembly"])
+        root.setData(0, Qt.UserRole, 401)
+        root.setData(0, PDM_OBJECT_KIND_ROLE, PDM_OBJECT_ITEM)
+        child = QTreeWidgetItem(["", "Matching Child"])
+        child.setData(0, Qt.UserRole, 402)
+        child.setData(0, PDM_OBJECT_KIND_ROLE, PDM_OBJECT_ITEM)
+        root.addChild(child)
+        self.page._ebom_tree.addTopLevelItem(root)
+        self.page._ebom_filter_tree = QTreeWidget()
+        self.page._ebom_filter_tree.setColumnCount(EBOM_COL_LEVEL + 1)
+        self.page._tree_stack = QStackedWidget()
+        self.page._tree_stack.addWidget(self.page._ebom_tree)
+        self.page._tree_stack.addWidget(self.page._ebom_filter_tree)
+        self.page._bom_mode = "ebom"
+        self.page._matching_item_ids = {402}
+        self.page._bom_advanced_filters = {
+            "show_parent_matches": False,
+            "remove_duplicates": False,
+        }
+
+        visible = self.page._refresh_ebom_filters()
+
+        self.assertEqual(visible, 1)
+        self.assertEqual(self.page._ebom_filter_tree.topLevelItemCount(), 1)
+        self.assertEqual(
+            self.page._ebom_filter_tree.topLevelItem(0).text(BOM_COL_NAME),
+            "Matching Child",
+        )
+        self.assertIs(
+            self.page._tree_stack.currentWidget(), self.page._ebom_filter_tree
+        )
+
 
 class _PdmTreeHarness:
     """Bind only the deterministic BomPage tree helpers under test."""
 
     _pdm_cad_checkout_text = BomPage._pdm_cad_checkout_text if PYQT_AVAILABLE else None
+    _pdm_related_item_text = BomPage._pdm_related_item_text if PYQT_AVAILABLE else None
+    _pdm_cad_revision_text = BomPage._pdm_cad_revision_text if PYQT_AVAILABLE else None
+    _pdm_creo_file_text = BomPage._pdm_creo_file_text if PYQT_AVAILABLE else None
+    _pdm_document_associations = staticmethod(BomPage._pdm_document_associations) if PYQT_AVAILABLE else None
+    _pdm_selected_drawings = staticmethod(BomPage._pdm_selected_drawings) if PYQT_AVAILABLE else None
+    _pdm_item_association_label = staticmethod(BomPage._pdm_item_association_label) if PYQT_AVAILABLE else None
+    _pdm_item_association_lines = BomPage._pdm_item_association_lines if PYQT_AVAILABLE else None
     _add_pdm_cad_node = BomPage._add_pdm_cad_node if PYQT_AVAILABLE else None
     _add_ebom_associated_cad_node = (
         BomPage._add_ebom_associated_cad_node if PYQT_AVAILABLE else None
@@ -195,11 +332,22 @@ class _PdmTreeHarness:
     _add_released_ebom_node = BomPage._add_released_ebom_node if PYQT_AVAILABLE else None
     _renumber_tree_rows = BomPage._renumber_tree_rows if PYQT_AVAILABLE else None
     _refresh_ebom_filters = BomPage._refresh_ebom_filters if PYQT_AVAILABLE else None
+    _ensure_pdm_lazy_placeholder = BomPage._ensure_pdm_lazy_placeholder if PYQT_AVAILABLE else None
+    _pdm_name_column_for_tree = BomPage._pdm_name_column_for_tree if PYQT_AVAILABLE else None
+    _is_lazy_placeholder = staticmethod(BomPage._is_lazy_placeholder) if PYQT_AVAILABLE else None
+    _is_folder_tree_item = staticmethod(BomPage._is_folder_tree_item) if PYQT_AVAILABLE else None
+    _file_badge_kind = BomPage._file_badge_kind if PYQT_AVAILABLE else None
+    _collect_tree_column_values = BomPage._collect_tree_column_values if PYQT_AVAILABLE else None
+    _current_tree_for_filtering = BomPage._current_tree_for_filtering if PYQT_AVAILABLE else None
+    _iter_tree_items = BomPage._iter_tree_items if PYQT_AVAILABLE else None
+    _iter_tree_items_visual_order = BomPage._iter_tree_items_visual_order if PYQT_AVAILABLE else None
 
     def __init__(self):
         self.session = SimpleNamespace(user_id=7)
         self._cad_tree = QTreeWidget()
         self._cad_tree.setColumnCount(CAD_COL_QTY + 1)
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(EBOM_COL_LEVEL + 1)
         self._ebom_tree = QTreeWidget()
         self._ebom_tree.setColumnCount(EBOM_COL_LEVEL + 1)
         self._bom_row_numbers = {}
@@ -209,6 +357,10 @@ class _PdmTreeHarness:
             "show_parent_matches": True,
         }
         self._matching_item_ids = set()
+
+    @staticmethod
+    def _materialize_pdm_tree_for_search(_tree):
+        return None
 
     @staticmethod
     def _default_bom_advanced_filters():

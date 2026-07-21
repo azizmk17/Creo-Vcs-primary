@@ -26,6 +26,18 @@ class PdmService:
     def list_item_cad_documents(self, item_id: int) -> list[dict]:
         return self.repo.list_item_cad_documents(int(item_id))
 
+    def list_cad_item_associations(self, cad_document_id: int) -> list[dict]:
+        """Return every active Item relationship for one CAD Document."""
+        return self.repo.list_active_associations_for_cad(int(cad_document_id))
+
+    def get_item_cad_association(
+        self, item_id: int, cad_document_id: int
+    ) -> dict | None:
+        """Return the exact Item/CAD relationship, never an arbitrary match."""
+        return self.repo.get_active_association(
+            int(cad_document_id), int(item_id)
+        )
+
     def create_cad_document(self, project_id: int, **values) -> int:
         return self.repo.create_cad_document(int(project_id), **values)
 
@@ -42,6 +54,62 @@ class PdmService:
     ) -> dict:
         return self.repo.bind_drawing_to_model(
             int(drawing_cad_document_id), int(model_cad_document_id)
+        )
+
+    def list_item_selected_drawings(
+        self, item_id: int, model_cad_document_id: int | None = None
+    ) -> list[dict]:
+        return self.repo.list_item_selected_drawings(
+            int(item_id),
+            (
+                int(model_cad_document_id)
+                if model_cad_document_id is not None else None
+            ),
+        )
+
+    def set_primary_drawing(
+        self,
+        item_id: int,
+        model_cad_document_id: int,
+        drawing_cad_document_id: int,
+        actor_id=None,
+    ) -> dict:
+        return self.repo.set_primary_drawing(
+            int(item_id),
+            int(model_cad_document_id),
+            int(drawing_cad_document_id),
+            created_by=(int(actor_id) if actor_id is not None else None),
+        )
+
+    def clear_primary_drawing(
+        self, item_id: int, model_cad_document_id: int
+    ) -> bool:
+        return self.repo.clear_primary_drawing(
+            int(item_id), int(model_cad_document_id)
+        )
+
+    def set_item_model_drawings(
+        self,
+        item_id: int,
+        model_cad_document_id: int,
+        drawing_ids,
+        primary_drawing_id: int | None = None,
+        actor_id=None,
+    ) -> list[dict]:
+        """Atomically replace one Item's selected drawings for a model."""
+        normalized_ids = sorted({int(value) for value in (drawing_ids or [])})
+        primary_id = (
+            int(primary_drawing_id)
+            if primary_drawing_id is not None else None
+        )
+        if primary_id is not None and primary_id not in normalized_ids:
+            raise ValueError("The primary drawing must be included in the selected drawings.")
+        return self.repo.set_item_model_drawings(
+            int(item_id),
+            int(model_cad_document_id),
+            normalized_ids,
+            primary_drawing_id=primary_id,
+            created_by=(int(actor_id) if actor_id is not None else None),
         )
 
     def associate(
@@ -208,20 +276,12 @@ class PdmService:
                     return
                 parent_item_id = int(parent_assoc["item_id"])
                 built_item_ids.add(parent_item_id)
-                members = [dict(row) for row in conn.execute(
-                    """
-                    SELECT m.*,d.build_excluded AS document_build_excluded,
-                           a.item_id,a.association_type,
-                           a.participates_in_structure,a.drives_structure
-                    FROM cad_document_members m
-                    JOIN cad_documents d ON d.id=m.child_cad_document_id
-                    LEFT JOIN cad_item_associations a
-                      ON a.cad_document_id=d.id AND a.active=1
-                    WHERE m.parent_cad_document_id=?
-                    ORDER BY COALESCE(m.sort_order,m.id),m.id
-                    """,
-                    (cad_document_id,),
-                ).fetchall()]
+                # The repository collapses the many Item associations of a CAD
+                # Document into one deterministic structure-driving projection
+                # while retaining the complete association list on each member.
+                # A raw join here would duplicate one CAD occurrence for every
+                # associated Item and could silently build the wrong EBOM usage.
+                members = self.repo.list_cad_members(cad_document_id)
                 member_ids = {int(row["id"]) for row in members}
                 stale = conn.execute(
                     """
@@ -246,6 +306,19 @@ class PdmService:
                         )
                         summary["excluded"] += 1
                         result(member_id, parent_item_id, None, "EXCLUDED", "CAD member is excluded from EBOM build.")
+                    elif member.get("association_ambiguous"):
+                        conn.execute(
+                            "DELETE FROM item_usages WHERE source='CAD_BUILD' AND cad_member_id=?",
+                            (member_id,),
+                        )
+                        summary["conflicts"] += 1
+                        result(
+                            member_id,
+                            parent_item_id,
+                            None,
+                            "AMBIGUOUS_ITEM_ASSOCIATION",
+                            "CAD Document has several structure-participating Item associations; assign an OWNER association to select the EBOM Item.",
+                        )
                     elif not member.get("item_id"):
                         conn.execute(
                             "DELETE FROM item_usages WHERE source='CAD_BUILD' AND cad_member_id=?",
@@ -367,6 +440,8 @@ class PdmService:
                 ).fetchone()
                 if member.get("build_excluded") or member.get("document_build_excluded"):
                     status = "EXCLUDED"
+                elif member.get("association_ambiguous"):
+                    status = "AMBIGUOUS_ITEM_ASSOCIATION"
                 elif not member.get("item_id"):
                     status = "NO_RELATED_ITEM"
                 elif not member.get("participates_in_structure"):
@@ -575,14 +650,10 @@ class PdmService:
         file_name = str(item.get("filename") or "").strip()
         if not file_name:
             return self.repo.list_item_cad_documents(int(item_id))
+        target_item_id = int(item.get("represented_part_id") or item_id)
         existing = self.repo.get_cad_document_by_file(int(item.get("project_id") or 0), file_name)
         if existing:
             cad_id = int(existing["id"])
-            if not self.repo.get_active_association_for_cad(int(existing["id"])):
-                self.associate(
-                    int(item.get("project_id") or 0), int(item_id), int(existing["id"]),
-                    "IMAGE" if item.get("represented_part_id") else "OWNER",
-                )
         else:
             cad_id = self.repo.create_cad_document(
                 int(item.get("project_id") or 0),
@@ -593,11 +664,23 @@ class PdmService:
                 build_excluded=str(item.get("default_ebom_behavior") or "NORMAL").upper() == "EXCLUDE",
                 legacy_bom_id=int(item_id),
             )
-        target_item_id = int(item.get("represented_part_id") or item_id)
-        if not self.repo.get_active_association_for_cad(int(cad_id)):
+        if not self.repo.get_active_association(int(cad_id), target_item_id):
+            cad_has_owner = any(
+                str(row.get("association_type") or "").upper() == "OWNER"
+                for row in self.repo.list_active_associations_for_cad(int(cad_id))
+            )
+            target_has_owner = any(
+                str(row.get("association_type") or "").upper() == "OWNER"
+                for row in self.repo.list_item_cad_documents(target_item_id)
+            )
+            association_type = (
+                "IMAGE"
+                if item.get("represented_part_id") or cad_has_owner or target_has_owner
+                else "OWNER"
+            )
             self.associate(
                 int(item.get("project_id") or 0), target_item_id, cad_id,
-                "IMAGE" if item.get("represented_part_id") else "OWNER",
+                association_type,
             )
 
         drawing_file = str(item.get("drawing") or "").strip()
@@ -619,11 +702,19 @@ class PdmService:
                 drawing_id = int(drawing["id"])
                 if drawing.get("drawing_owner_cad_document_id") is None:
                     self.repo.bind_drawing_to_model(drawing_id, int(cad_id))
-            if not self.repo.get_active_association_for_cad(int(drawing_id)):
+            if not self.repo.get_active_association(
+                int(drawing_id), target_item_id
+            ):
                 self.associate(
                     int(item.get("project_id") or 0), target_item_id,
                     int(drawing_id), "CONTENT",
                 )
+            # The legacy Item has one explicit drawing field, so its exact DRW
+            # is the primary selection for this Item/model. Other Items that
+            # share the model keep their own drawing assignments unchanged.
+            self.repo.set_primary_drawing(
+                target_item_id, int(cad_id), int(drawing_id)
+            )
         return self.repo.list_item_cad_documents(target_item_id)
 
     def sync_legacy_cad_relation(
@@ -739,7 +830,9 @@ class PdmService:
                 supplier_owner_item_id=int(owner_item_id),
             )
             document = self.repo.get_cad_document(cad_id)
-        association = self.repo.get_active_association_for_cad(int(document["id"]))
+        association = self.repo.get_active_association(
+            int(document["id"]), int(owner_item_id)
+        )
         if association is None:
             self.associate(
                 int(project_id), int(owner_item_id), int(document["id"]), "CONTENT"
@@ -769,6 +862,24 @@ class PdmService:
             workspace_name=workspace_name,
             workspace_machine_id=workspace_machine_id,
         )
+
+    def checkout_target_item_ids(self, cad_document_id: int) -> list[int]:
+        """Items whose working-copy locks must accompany this CAD checkout."""
+        return [
+            int(value)
+            for value in self.repo.list_checkout_target_item_ids(
+                int(cad_document_id)
+            )
+        ]
+
+    def cad_checkout_item_ids(self, cad_document_id: int) -> list[int]:
+        """Items recorded against the active CAD working copy."""
+        return [
+            int(value)
+            for value in self.repo.list_cad_checkout_item_ids(
+                int(cad_document_id)
+            )
+        ]
 
     def checkin_cad_document(
         self, cad_document_id: int, actor_id: int, source_path: str,
