@@ -206,7 +206,7 @@ class PartDialog(QDialog):
         subtitle = QLabel(
             "Create the business Item independently from CAD Documents and delivery content."
             if not self.part_data
-            else "Modify controlled Item attributes. Number is the immutable PLM identity."
+            else "Modify controlled Item attributes and optional business identifiers."
         )
         subtitle.setObjectName("itemDialogSubtitle")
         header_layout.addWidget(kicker)
@@ -237,9 +237,9 @@ class PartDialog(QDialog):
         for value in ITEM_TYPES:
             self.item_type_input.addItem(self.ITEM_TYPE_LABELS[value], value)
         self.part_number_input = QLineEdit()
-        self.part_number_input.setReadOnly(True)
+        self.part_number_input.setPlaceholderText("Optional article number")
         self.part_number_input.setToolTip(
-            "PLM Item Number (bom.part_number). Generated at Finish and immutable afterward."
+            "Optional article number. Enter it manually or leave it empty."
         )
         context_layout.addWidget(self.product_input, 1, 0)
         context_layout.addWidget(self.item_type_input, 1, 1)
@@ -428,7 +428,7 @@ class PartDialog(QDialog):
 
     def _load_data(self) -> None:
         number = str(self.part_data.get("part_number") or "").strip()
-        self.part_number_input.setText(number or "(Generated on Finish)")
+        self.part_number_input.setText(number)
         self._set_combo_data(
             self.item_type_input,
             self.part_data.get("item_type") or "MECHANICAL_PART",
@@ -512,10 +512,7 @@ class PartDialog(QDialog):
             "represented_part_id": self._represented_part_id,
             "name": self.part_name_input.text().strip(),
             "type": "asm" if assembly_mode != "COMPONENT" else "prt",
-            "part_number": str(self.part_data.get("part_number") or "").strip(),
-            "generate_part_number": not bool(
-                str(self.part_data.get("part_number") or "").strip()
-            ),
+            "part_number": self.part_number_input.text().strip(),
             "item_type": item_type,
             "assembly_mode": assembly_mode,
             "procurement_source": str(

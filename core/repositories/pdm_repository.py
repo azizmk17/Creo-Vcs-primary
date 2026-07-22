@@ -1429,20 +1429,50 @@ class PdmRepository:
             ]
 
     def list_checked_out_cad_for_item(self, item_id: int) -> list[dict]:
-        """Return active CAD working copies tied to one Item checkout."""
+        """Return every active CAD working copy associated with one Item.
+
+        The checkout link is authoritative for current working copies, while
+        the active association also covers CAD data created by older Nexus
+        versions before checkout links were persisted.
+        """
         with self.get_conn() as conn:
             rows = conn.execute(
                 """
-                SELECT d.*,a.association_type
-                FROM cad_document_checkout_items checkout_link
-                JOIN cad_documents d ON d.id=checkout_link.cad_document_id
-                LEFT JOIN cad_item_associations a
-                  ON a.cad_document_id=d.id
-                 AND a.item_id=checkout_link.item_id AND a.active=1
-                WHERE checkout_link.item_id=? AND d.checked_out_by IS NOT NULL
+                SELECT d.*,
+                       (
+                           SELECT a.association_type
+                           FROM cad_item_associations a
+                           WHERE a.cad_document_id=d.id
+                             AND a.item_id=? AND a.active=1
+                           ORDER BY CASE upper(a.association_type)
+                               WHEN 'OWNER' THEN 0
+                               WHEN 'CONTRIBUTING_IMAGE' THEN 1
+                               WHEN 'IMAGE' THEN 2
+                               WHEN 'CONTRIBUTING_CONTENT' THEN 3
+                               WHEN 'CONTENT' THEN 4 ELSE 9 END,
+                               a.id
+                           LIMIT 1
+                       ) AS association_type
+                FROM cad_documents d
+                WHERE d.checked_out_by IS NOT NULL
+                  AND (
+                      EXISTS (
+                          SELECT 1
+                          FROM cad_document_checkout_items checkout_link
+                          WHERE checkout_link.cad_document_id=d.id
+                            AND checkout_link.item_id=?
+                      )
+                      OR EXISTS (
+                          SELECT 1
+                          FROM cad_item_associations association_link
+                          WHERE association_link.cad_document_id=d.id
+                            AND association_link.item_id=?
+                            AND association_link.active=1
+                      )
+                  )
                 ORDER BY lower(d.file_name),d.id
                 """,
-                (int(item_id),),
+                (int(item_id), int(item_id), int(item_id)),
             ).fetchall()
             return [dict(row) for row in rows]
 

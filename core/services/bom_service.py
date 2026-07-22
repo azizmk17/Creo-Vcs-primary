@@ -212,15 +212,14 @@ class BomService(BaseService):
     def add_part(self, part_data: dict) -> int:
         part_data = self._representation_values(part_data)
         part_number = str(part_data.get("part_number") or "").strip()
-        if not part_number:
-            part_number = self.bom_repo.allocate_part_number()
-        existing_number = self.bom_repo.get_by_part_number(
-            part_number, self.session.project_id
-        )
-        if existing_number:
-            raise ValueError(
-                f"Item Number {part_number} already identifies another Item in this product."
+        if part_number:
+            existing_number = self.bom_repo.get_by_part_number(
+                part_number, self.session.project_id
             )
+            if existing_number:
+                raise ValueError(
+                    f"Item Number {part_number} already identifies another Item in this product."
+                )
         part_data["part_number"] = part_number
         aes_number = str(part_data.get("aes_number") or "").strip()
         if requires_aes_number(
@@ -335,24 +334,15 @@ class BomService(BaseService):
         requested_number = str(
             part_data.get("part_number", part.part_number) or ""
         ).strip()
-        current_number = str(part.part_number or "").strip()
-        if not requested_number:
-            if current_number:
-                requested_number = current_number
-            else:
-                requested_number = self.bom_repo.allocate_part_number()
-        if current_number and requested_number.casefold() != current_number.casefold():
-            raise ValueError(
-                "Item Number is immutable. Use a controlled Rename operation to change identity."
+        if requested_number:
+            number_owner = self.bom_repo.get_by_part_number(
+                requested_number, self.session.project_id
             )
-        number_owner = self.bom_repo.get_by_part_number(
-            requested_number, self.session.project_id
-        )
-        if number_owner and int(number_owner.id) != int(part.id):
-            raise ValueError(
-                f"Item Number {requested_number} already identifies another Item in this product."
-            )
-        part_data["part_number"] = current_number or requested_number
+            if number_owner and int(number_owner.id) != int(part.id):
+                raise ValueError(
+                    f"Item Number {requested_number} already identifies another Item in this product."
+                )
+        part_data["part_number"] = requested_number
         effective_behavior = part_data.get(
             "default_ebom_behavior", part.default_ebom_behavior
         )
@@ -410,6 +400,18 @@ class BomService(BaseService):
     # -------------------------------
     # DELETE PART
     # -------------------------------
+    def assert_item_fully_checked_in_for_delete(self, part_id: int) -> None:
+        """Require the Item and all associated CAD Documents to be checked in."""
+        lock = self.lock_repo.get_by_part(int(part_id))
+        if lock:
+            raise ValueError(
+                "This Item is checked out. "
+                "Check it in or undo its checkout before deleting it."
+            )
+        self._assert_no_active_cad_checkouts(
+            [int(part_id)], "delete this Item"
+        )
+
     def delete_part(self, part_id: str) -> bool:
         """
         Delete a part by AES number
@@ -417,6 +419,9 @@ class BomService(BaseService):
         part = self.bom_repo.get_by_id(part_id)
         if not part:
             return False
+        # Deletion is never a working-copy operation.  The Item and every CAD
+        # Document connected to it must be back in a checked-in state first.
+        self.assert_item_fully_checked_in_for_delete(int(part.id))
         representations = self.bom_repo.get_representations(int(part.id))
         if representations:
             labels = ", ".join(str(item.name or item.filename or item.id) for item in representations[:3])

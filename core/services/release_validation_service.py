@@ -132,16 +132,9 @@ class ReleaseValidationService:
                 label = self._label(row, snapshot)
                 version = f"{row['revision_code']}.{int(row['iteration_number'])}"
                 item_number = str(snapshot.get("part_number") or "").strip()
-                if not item_number:
-                    findings.append({
-                        "bom_id": int(row["bom_id"]),
-                        "iteration_id": selected_iteration_id,
-                        "version": version,
-                        "classification": classification,
-                        "requirement": "part_number",
-                        "message": f"{label} {version} has no Item Number.",
-                    })
-                else:
+                # Article/Item Number is user-managed and optional.  When it
+                # is supplied it must still remain unique within the product.
+                if item_number:
                     duplicate = conn.execute(
                         """
                         SELECT other.id

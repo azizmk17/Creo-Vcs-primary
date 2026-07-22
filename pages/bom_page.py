@@ -12704,6 +12704,18 @@ class BomPage(QWidget):
                 return
             id = self.current_part_id
 
+        # Run the checkout-only preflight before asking for irreversible
+        # confirmation.  The service repeats it during deletion for safety.
+        try:
+            self.bom_service.assert_item_fully_checked_in_for_delete(int(id))
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Delete Blocked",
+                str(exc),
+            )
+            return
+
         reply = QMessageBox.question(
             self,
             "Delete Item",
