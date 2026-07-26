@@ -150,6 +150,39 @@ class BomService(BaseService):
         self._tree_dirty.add(int(self.session.project_id))
         return result
 
+    def list_cad_folders(self) -> List[Dict]:
+        if not self.session.project_id:
+            return []
+        return self.folder_repo.list_cad_for_project(int(self.session.project_id))
+
+    def create_cad_folder(
+        self, name: str, parent_cad_document_id=None, parent_folder_id=None
+    ) -> Dict:
+        if not self.session.project_id:
+            raise ValueError("Select a project before creating a CAD folder.")
+        return self.folder_repo.create_cad(
+            int(self.session.project_id),
+            name,
+            created_by=self.user_id,
+            parent_cad_document_id=parent_cad_document_id,
+            parent_folder_id=parent_folder_id,
+        )
+
+    def eligible_cad_folder_documents(self, folder_id: int) -> List[Dict]:
+        return self.folder_repo.eligible_cad_documents(
+            int(self.session.project_id), int(folder_id)
+        )
+
+    def set_cad_folder_documents(
+        self, folder_id: int, cad_document_ids
+    ) -> List[int]:
+        return self.folder_repo.set_cad_documents(
+            int(self.session.project_id),
+            int(folder_id),
+            cad_document_ids,
+            self.user_id,
+        )
+
     # -------------------------------
     # INSERT PART / ASM
     # -------------------------------
@@ -2539,7 +2572,15 @@ class BomService(BaseService):
             raise ValueError("The CAD Document was not found.")
         owner = document.get("checked_out_by")
         if owner is None:
-            raise ValueError(f"Check out the CAD assembly before you {action}.")
+            for item_id in self.pdm_service.checkout_target_item_ids(
+                int(cad_document_id)
+            ):
+                item_lock = self.lock_repo.get_by_part(int(item_id))
+                if item_lock and int(item_lock.user_id) == int(self.user_id):
+                    return document
+            raise ValueError(
+                f"Check out the CAD assembly or its related Item before you {action}."
+            )
         if int(owner) != int(self.user_id):
             raise ValueError("The CAD assembly is checked out by another user.")
         return document
