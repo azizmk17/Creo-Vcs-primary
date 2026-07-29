@@ -958,9 +958,6 @@ class BomService(BaseService):
             raise ValueError("A check-in comment is required.")
 
         related_parts = self._checkout_scope(part, exact_item=bool(exact_item))
-        self._assert_no_active_cad_checkouts(
-            [related.id for related in related_parts], "check in the Item"
-        )
         locks = {
             int(related.id): self.lock_repo.get_by_part(int(related.id))
             for related in related_parts
@@ -996,9 +993,6 @@ class BomService(BaseService):
                 "The assembly structure changed without an updated native assembly file. "
                 "Update the assembly in Creo before check-in."
             )
-        if not selected.get("has_non_cad_changes"):
-            raise ValueError("No metadata, document, or structure changes were detected.")
-
         for analysis in analyses.values():
             if analysis.get("requires_commit"):
                 raise ValueError(
@@ -1044,11 +1038,11 @@ class BomService(BaseService):
             else:
                 context = self.revision_repo.restore_checked_in_state(related_id)
                 signature = self.signature_repo.add_signature(
-                    "undo_checkout",
+                    "checkin",
                     int(lock.user_id),
-                    note="Shared CAD-family checkout released without BOM-object changes",
+                    note=note or "Check-in completed without detected Item changes",
                 )
-                self.lock_repo.undo_checkout(
+                self.lock_repo.checkin(
                     related_id,
                     int(lock.user_id),
                     signature,
@@ -1075,9 +1069,9 @@ class BomService(BaseService):
         if not part:
             raise ValueError("Part not found")
         related_parts = self._checkout_scope(part, exact_item=bool(exact_item))
-        self._assert_no_active_cad_checkouts(
-            [related.id for related in related_parts], "undo the Item checkout"
-        )
+        active_cad = []
+        for related in related_parts:
+            active_cad.extend(self.checked_out_cad_for_item(int(related.id)))
         locks = {
             int(related.id): self.lock_repo.get_by_part(int(related.id))
             for related in related_parts
@@ -1094,6 +1088,22 @@ class BomService(BaseService):
             ):
                 raise ValueError("Part is checked out by another user.")
         effective_user_id = int(as_user_id) if as_user_id is not None else actor
+        if effective_user_id != actor and not self.permission_repo.user_has_permission(
+            actor, "merge", self.session.project_id
+        ):
+            raise PermissionError("Only Master/Admin can undo checkout for another user.")
+        seen_cad_ids = set()
+        for cad in active_cad:
+            cad_id = int(cad["id"])
+            if cad_id in seen_cad_ids:
+                continue
+            seen_cad_ids.add(cad_id)
+            cad_owner = cad.get("checked_out_by")
+            if cad_owner is not None and int(cad_owner) != int(effective_user_id):
+                raise ValueError(
+                    f"Associated CAD Document {cad.get('file_name') or cad_id} "
+                    "is checked out by another user."
+                )
 
         # Restore first. If restoration fails, keep the lock so no partial working
         # configuration is exposed as checked in.
@@ -1101,6 +1111,16 @@ class BomService(BaseService):
         for related in related_parts:
             related_id = int(related.id)
             restored_contexts[related_id] = self.revision_repo.restore_checked_in_state(related_id)
+        for cad in active_cad:
+            cad_id = int(cad["id"])
+            if cad_id not in seen_cad_ids:
+                continue
+            self.undo_checkout_pdm_cad_document(
+                cad_id,
+                "Associated Item checkout was undone",
+                as_user_id=effective_user_id,
+            )
+            seen_cad_ids.discard(cad_id)
         for related in related_parts:
             related_id = int(related.id)
             lock = locks.get(related_id)
@@ -2581,7 +2601,9 @@ class BomService(BaseService):
             raise ValueError(
                 f"Check out the CAD assembly or its related Item before you {action}."
             )
-        if int(owner) != int(self.user_id):
+        if int(owner) != int(self.user_id) and not self.permission_repo.user_has_permission(
+            int(self.user_id), "merge", self.session.project_id
+        ):
             raise ValueError("The CAD assembly is checked out by another user.")
         return document
 
@@ -2796,28 +2818,20 @@ class BomService(BaseService):
         return {**result, **item_result}
 
     def undo_checkout_pdm_cad_document(
-        self, cad_document_id: int, note: str = ""
+        self, cad_document_id: int, note: str = "", *, as_user_id: int | None = None
     ) -> Dict:
         cad_document_id = int(cad_document_id)
-        actor_id = int(self.user_id)
+        current_user_id = int(self.user_id)
+        actor_id = int(as_user_id) if as_user_id is not None else current_user_id
+        if actor_id != current_user_id and not self.permission_repo.user_has_permission(
+            current_user_id, "merge", self.session.project_id
+        ):
+            raise PermissionError("Only Master/Admin can undo CAD checkout for another user.")
         document = self.pdm_service.repo.get_cad_document(cad_document_id)
         if not document:
             raise ValueError("The CAD Document was not found.")
-        associated_item_ids = self.pdm_service.cad_checkout_item_ids(
-            cad_document_id
-        )
-        if not associated_item_ids and document.get("checkout_item_id") is not None:
-            associated_item_ids = [int(document["checkout_item_id"])]
         result = self.pdm_service.undo_checkout_cad_document(
             cad_document_id, actor_id, note
-        )
-        returned_item_ids = [
-            int(value) for value in (result.get("checkout_item_ids") or [])
-        ]
-        if returned_item_ids:
-            associated_item_ids = returned_item_ids
-        item_result = self._release_auto_item_checkouts_after_cad(
-            associated_item_ids, actor_id
         )
         try:
             from core.services.cad_workspace_service import CadWorkspaceService
@@ -2826,7 +2840,7 @@ class BomService(BaseService):
             )
         except Exception:
             pass
-        return {**result, **item_result}
+        return {**result, "item_checkout": "RETAINED_BY_RULE"}
 
     def revise_pdm_cad_document(self, cad_document_id: int) -> Dict:
         return self.pdm_service.revise_cad_document(

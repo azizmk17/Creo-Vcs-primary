@@ -56,6 +56,7 @@ from pages.dialogs.assembly_configuration_dialogs import (
 )
 from pages.dialogs.windchill_compare_dialog import WindchillCompareSetupDialog
 from pages.pdf_viewer_widget import PdfViewerWidget
+from pages.rich_text_image_editor import html_to_plain_text, looks_like_html
 from utils import safe_exists, safe_startfile
 from PyQt5.QtGui import QKeyEvent
 from PyQt5.QtGui import QKeyEvent, QPalette, QColor
@@ -1358,7 +1359,7 @@ class _TimelineTable(QTableWidget):
             self.setItem(i, 5, proj_item)
 
             # Col 6: details
-            details = str(ev.get("details", "") or "")
+            details = html_to_plain_text(str(ev.get("details", "") or ""))
             det_item = QTableWidgetItem(details)
             det_item.setToolTip(details)
             det_item.setForeground(QBrush(QColor("#4b5563")))
@@ -8665,7 +8666,7 @@ class BomPage(QWidget):
             )
         except Exception:
             checked_out_by_me = False
-        if not checked_out_by_me:
+        if not (checked_out_by_me or self.perm.can("merge")):
             QMessageBox.information(
                 self,
                 "CAD Structure",
@@ -9048,12 +9049,13 @@ class BomPage(QWidget):
                 )
             except Exception:
                 checked_out_by_me = False
+            cad_checkout_editable = checked_out_by_me or self.perm.can("merge")
             is_assembly = str(payload.get("category") or "").upper() == "ASSEMBLY"
             cad_context = cad_item is not None
             if hasattr(self, "register_cad_btn"):
                 self.register_cad_btn.setEnabled(bool(cad_mode and can_manage and self.session.project_id))
             if hasattr(self, "add_cad_component_btn"):
-                self.add_cad_component_btn.setEnabled(bool(cad_mode and cad_context and can_manage and is_assembly and checked_out_by_me))
+                self.add_cad_component_btn.setEnabled(bool(cad_mode and cad_context and can_manage and is_assembly and cad_checkout_editable))
             if hasattr(self, "delete_cad_btn"):
                 checked_out = payload.get("checked_out_by") is not None
                 self.delete_cad_btn.setEnabled(
@@ -10169,6 +10171,79 @@ class BomPage(QWidget):
             revision_codes[item_id] = str(revision_code).strip()
         return revision_codes
 
+    def _prompt_actor_user_id(
+        self,
+        title: str,
+        prompt: str,
+        *,
+        default_user_id: int | None = None,
+        only_for_admin: bool = True,
+    ) -> int | None:
+        """Return the effective user for a lifecycle operation, or None when cancelled."""
+        current_user_id = getattr(self.session, "user_id", None)
+        if only_for_admin and not self.perm.can("merge"):
+            return int(current_user_id) if current_user_id is not None else None
+        if not self.perm.can("merge"):
+            return int(current_user_id) if current_user_id is not None else None
+        users = self.project_service.get_users_for_project(self.session.project_id) or []
+        choices = []
+        choice_to_id = {}
+        for user in users:
+            try:
+                user_id = int(user.get("id"))
+            except Exception:
+                continue
+            name = str(user.get("username") or "").strip()
+            email = str(user.get("email") or "").strip()
+            if not name:
+                continue
+            label = f"{name} ({email})" if email else name
+            choices.append(label)
+            choice_to_id[label] = user_id
+        if not choices:
+            return int(default_user_id or current_user_id) if (default_user_id or current_user_id) is not None else None
+        preferred = int(default_user_id or current_user_id or 0)
+        default_label = choices[0]
+        for label, user_id in choice_to_id.items():
+            if preferred and int(user_id) == preferred:
+                default_label = label
+                break
+        selected, ok = QInputDialog.getItem(
+            self,
+            title,
+            prompt,
+            choices,
+            choices.index(default_label) if default_label in choices else 0,
+            False,
+        )
+        if not ok:
+            return None
+        return choice_to_id.get(selected)
+
+    def _prompt_cad_workspace_copy(self, title: str) -> tuple[bool, dict | None]:
+        """Ask whether CAD files should be copied to a local workspace."""
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Question)
+        dialog.setWindowTitle(title)
+        dialog.setText("Copy the checked-out CAD file(s) to a workspace?")
+        dialog.setInformativeText(
+            "Choose Yes when the physical Creo files will be edited. "
+            "Choose No when you only need the CAD reservation and Item binding."
+        )
+        yes_button = dialog.addButton("Yes, copy to workspace", QMessageBox.AcceptRole)
+        no_button = dialog.addButton("No, reserve only", QMessageBox.ActionRole)
+        dialog.addButton(QMessageBox.Cancel)
+        dialog.setDefaultButton(yes_button)
+        dialog.exec_()
+        if dialog.clickedButton() == yes_button:
+            workspace = self._choose_local_cad_workspace(title)
+            if not workspace:
+                return False, None
+            return True, workspace
+        if dialog.clickedButton() == no_button:
+            return False, {}
+        return False, None
+
     def _metadata_checkout_for_cad_document(self, cad_id: int, payload=None) -> None:
         item_rows = self._associated_item_rows_for_cad_checkout(cad_id, payload)
         if not item_rows:
@@ -10221,29 +10296,20 @@ class BomPage(QWidget):
         document = self.bom_service.pdm_service.repo.get_cad_document(int(cad_id)) or {}
         for key, value in document.items():
             payload.setdefault(key, value)
-        scope = QMessageBox(self)
-        scope.setIcon(QMessageBox.Question)
-        scope.setWindowTitle("CAD Checkout Scope")
-        scope.setText("What do you want to check out?")
-        scope.setInformativeText(
-            "Choose Physical CAD when you will edit the Creo file content and need a workspace copy.\n"
-            "Choose Metadata / Structure when you only need to edit CAD document data, add CAD children, or change quantities."
+        as_user_id = self._prompt_actor_user_id(
+            "Check Out CAD As",
+            "Check out this CAD Document as:",
         )
-        physical_btn = scope.addButton("Physical CAD File", QMessageBox.AcceptRole)
-        metadata_btn = scope.addButton("Metadata / Structure Only", QMessageBox.ActionRole)
-        scope.addButton(QMessageBox.Cancel)
-        scope.setDefaultButton(physical_btn)
-        scope.exec_()
-        if scope.clickedButton() == metadata_btn:
-            self._metadata_checkout_for_cad_document(int(cad_id), payload)
+        if as_user_id is None:
             return
-        if scope.clickedButton() != physical_btn:
+        copy_to_workspace, workspace = self._prompt_cad_workspace_copy("CAD Checkout Workspace")
+        if workspace is None:
             return
-        workspace = self._choose_local_cad_workspace("CAD Checkout Workspace")
-        if not workspace:
-            return
-        workspace_service = self._local_cad_workspaces()
-        workspace_descriptor = workspace_service.checkout_descriptor(workspace["id"])
+        workspace_service = self._local_cad_workspaces() if copy_to_workspace else None
+        workspace_descriptor = (
+            workspace_service.checkout_descriptor(workspace["id"])
+            if copy_to_workspace and workspace_service and workspace else {}
+        )
         needs_revision = (
             str(payload.get("lifecycle_state") or "").upper() == "RELEASED"
         )
@@ -10325,20 +10391,23 @@ class BomPage(QWidget):
             result = self.bom_service.checkout_pdm_cad_document(
                 int(cad_id),
                 released_item_revision_codes=released_revision_codes,
+                as_user_id=as_user_id,
                 **workspace_descriptor,
             )
-            materialized = workspace_service.materialize_cad_document(
-                workspace["id"], int(cad_id)
+            materialized = (
+                workspace_service.materialize_cad_document(workspace["id"], int(cad_id))
+                if copy_to_workspace and workspace_service and workspace else None
             )
         except Exception as exc:
             try:
                 current = self.bom_service.pdm_service.repo.get_cad_document(int(cad_id)) or {}
                 if (
                     current.get("checked_out_by") is not None
+                    and copy_to_workspace and workspace
                     and str(current.get("checkout_workspace_id") or "") == workspace["id"]
                 ):
                     self.bom_service.undo_checkout_pdm_cad_document(
-                        int(cad_id), "Workspace materialization failed"
+                        int(cad_id), "Workspace materialization failed", as_user_id=as_user_id
                     )
             except Exception:
                 pass
@@ -10361,13 +10430,24 @@ class BomPage(QWidget):
             self,
             "Check Out CAD Document",
             "CAD Document checked out." + suffix
-            + f"\n\nWorkspace: {workspace['name']}\nFile: {materialized['path']}",
+            + (
+                f"\n\nWorkspace: {workspace['name']}\nFile: {materialized['path']}"
+                if materialized else
+                "\n\nNo workspace copy was created."
+            ),
         )
         self._reload_pdm_structure_views()
         self._reselect_cad_in_current_view(int(cad_id))
 
     def _checkin_pdm_cad_document(self, cad_id: int, payload: dict | None = None) -> None:
         payload = dict(payload or {})
+        actor_user_id = self._prompt_actor_user_id(
+            "Check In CAD As",
+            "Check in this CAD Document as:",
+            default_user_id=payload.get("checked_out_by"),
+        )
+        if actor_user_id is None:
+            return
         initial = str(getattr(self, "working_dir", "") or "")
         file_name = str(payload.get("file_name") or "")
         if initial and file_name:
@@ -10388,7 +10468,7 @@ class BomPage(QWidget):
             return
         try:
             result = self.bom_service.checkin_pdm_cad_document(
-                int(cad_id), path, str(note).strip()
+                int(cad_id), path, str(note).strip(), as_user_id=actor_user_id
             )
         except Exception as exc:
             QMessageBox.warning(self, "Check In CAD Document", str(exc))
@@ -10404,16 +10484,25 @@ class BomPage(QWidget):
         self._reselect_cad_in_current_view(int(cad_id))
 
     def _undo_pdm_cad_checkout(self, cad_id: int) -> None:
+        payload = self.bom_service.pdm_service.repo.get_cad_document(int(cad_id)) or {}
+        actor_user_id = self._prompt_actor_user_id(
+            "Undo CAD Checkout As",
+            "Undo this CAD checkout as:",
+            default_user_id=payload.get("checked_out_by"),
+        )
+        if actor_user_id is None:
+            return
         if QMessageBox.question(
             self, "Undo CAD Checkout",
-            "Discard the CAD working state and undo this checkout?",
+            "Discard the CAD working state and undo this checkout?\n\n"
+            "The associated Item checkout will stay active.",
             QMessageBox.Yes | QMessageBox.Cancel,
             QMessageBox.Cancel,
         ) != QMessageBox.Yes:
             return
         try:
             self.bom_service.undo_checkout_pdm_cad_document(
-                int(cad_id), "Discarded from CAD Structure"
+                int(cad_id), "Discarded from CAD Structure", as_user_id=actor_user_id
             )
         except Exception as exc:
             QMessageBox.warning(self, "Undo CAD Checkout", str(exc))
@@ -10598,6 +10687,7 @@ class BomPage(QWidget):
                 )
             except Exception:
                 checked_out_by_me = False
+            cad_checkout_editable = checked_out_by_me or self.perm.can("merge")
             checkout_action = menu.addAction(
                 "Revise and Check Out CAD..."
                 if str(payload.get("lifecycle_state") or "").upper() == "RELEASED"
@@ -10608,14 +10698,15 @@ class BomPage(QWidget):
                 lambda _checked=False, value=cad_id, data=payload:
                 self._checkout_pdm_cad_document(value, data)
             )
+            can_finish_cad_checkout = checked_out_by_me or self.perm.can("merge")
             checkin_action = menu.addAction("Check In CAD...")
-            checkin_action.setEnabled(can_manage and checked_out_by_me)
+            checkin_action.setEnabled(can_manage and checked_out and can_finish_cad_checkout)
             checkin_action.triggered.connect(
                 lambda _checked=False, value=cad_id, data=payload:
                 self._checkin_pdm_cad_document(value, data)
             )
             undo_action = menu.addAction("Undo CAD Checkout")
-            undo_action.setEnabled(can_manage and checked_out_by_me)
+            undo_action.setEnabled(can_manage and checked_out and can_finish_cad_checkout)
             undo_action.triggered.connect(
                 lambda _checked=False, value=cad_id: self._undo_pdm_cad_checkout(value)
             )
@@ -10771,7 +10862,7 @@ class BomPage(QWidget):
                 if category == "ASSEMBLY":
                     menu.addSeparator()
                     add_member_action = menu.addAction("Add CAD Component...")
-                    add_member_action.setEnabled(can_manage and checked_out_by_me)
+                    add_member_action.setEnabled(can_manage and cad_checkout_editable)
                     add_member_action.setToolTip(
                         "The parent CAD assembly must be checked out by you."
                     )
@@ -10797,16 +10888,17 @@ class BomPage(QWidget):
                         )
                     except Exception:
                         parent_checked_out_by_me = False
+                    parent_cad_checkout_editable = parent_checked_out_by_me or self.perm.can("merge")
                     edit_member_action = menu.addAction("Edit CAD Occurrence...")
                     edit_member_action.setEnabled(
-                        can_manage and parent_item is not None and parent_checked_out_by_me
+                        can_manage and parent_item is not None and parent_cad_checkout_editable
                     )
                     edit_member_action.triggered.connect(
                         lambda _checked=False, row=item: self._edit_cad_member_from_tree(row)
                     )
                     remove_member_action = menu.addAction("Remove from CAD Assembly")
                     remove_member_action.setEnabled(
-                        can_manage and parent_cad_id is not None and parent_checked_out_by_me
+                        can_manage and parent_cad_id is not None and parent_cad_checkout_editable
                     )
                     if parent_cad_id is None:
                         remove_member_action.setToolTip(
@@ -10873,18 +10965,18 @@ class BomPage(QWidget):
         if locked and checkout_origin == "CAD":
             checkout_action.setText("Make Item Checkout Explicit")
         checkout_action.setEnabled(
-            not locked or (checkout_origin == "CAD" and lock_is_mine)
+            not locked or (checkout_origin == "CAD" and can_finish_checkout)
         )
         checkout_action.triggered.connect(lambda: self.checkout_part(item_id))
         checkin_action = menu.addAction("Check In Item...")
-        checkin_action.setEnabled(locked and can_finish_checkout and not active_cad)
+        checkin_action.setEnabled(locked and can_finish_checkout)
         if active_cad:
-            checkin_action.setToolTip("Associated CAD Documents must be checked in or undone first.")
+            checkin_action.setToolTip("Check in Item data only; associated CAD Documents stay checked out.")
         checkin_action.triggered.connect(lambda: self.checkin_part(item_id))
         undo_action = menu.addAction("Undo Item Checkout")
-        undo_action.setEnabled(locked and can_finish_checkout and not active_cad)
+        undo_action.setEnabled(locked and can_finish_checkout)
         if active_cad:
-            undo_action.setToolTip("Associated CAD Documents must be checked in or undone first.")
+            undo_action.setToolTip("Undo Item checkout and automatically undo associated CAD checkouts.")
         undo_action.triggered.connect(lambda: self.undo_checkout(item_id))
         menu.addSeparator()
         cad_menu = menu.addMenu("Associated CAD Documents")
@@ -15752,11 +15844,20 @@ class BomPage(QWidget):
                 int(part_id), dialog.comment()
             )
             context = (result or {}).get("context") or {}
+            created_iteration = bool(
+                ((result or {}).get("analysis") or analysis or {}).get("has_non_cad_changes")
+            )
             QMessageBox.information(
                 self,
                 "Check In",
-                f"Checkout completed as {context.get('version_label') or analysis.get('next_version')}.\n"
-                "The Item iteration was created independently; associated CAD Documents were not checked in.",
+                (
+                    f"Checkout completed as {context.get('version_label') or analysis.get('next_version')}.\n"
+                    "The Item iteration was created independently; associated CAD Documents were not checked in."
+                    if created_iteration else
+                    f"Checkout closed at {context.get('version_label') or analysis.get('current_version') or '-'}.\n"
+                    "No Item data changes were detected, so no new Item iteration was created. "
+                    "Associated CAD Documents were not checked in."
+                ),
             )
             for affected_id in (result or {}).get("affected_part_ids") or [int(part_id)]:
                 self._refresh_loaded_part_branch(int(affected_id))
@@ -15781,10 +15882,20 @@ class BomPage(QWidget):
                 QMessageBox.warning(self, "No Selection", "Please select a checked-out item.")
                 return
             part_id = self.current_part_id
+        details = self.bom_service.get_part_details(int(part_id)) or {}
+        actor_user_id = self._prompt_actor_user_id(
+            "Undo Item Checkout As",
+            "Undo this Item checkout as:",
+            default_user_id=details.get("locked_by_user_id"),
+        )
+        if actor_user_id is None:
+            return
         answer = QMessageBox.question(
             self,
             "Undo Checkout",
-            "Discard the working BOM attributes and structure and release this checkout?\n\n"
+            "Discard the working Item attributes/structure and release this checkout?\n\n"
+            "Any associated CAD checkout owned by the same acting user will also be undone. "
+            "CAD/Item associations will not be removed.\n\n"
             "This does not create an iteration and is not a check-in.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -15792,7 +15903,7 @@ class BomPage(QWidget):
         if answer != QMessageBox.Yes:
             return
         try:
-            self.bom_service.undo_item_checkout(int(part_id))
+            self.bom_service.undo_item_checkout(int(part_id), as_user_id=actor_user_id)
             QMessageBox.information(self, "Undo Checkout", "Checkout undone. No iteration was created.")
             self._refresh_current_tree_item_lock_state(int(part_id))
             self._load_released_ebom_tree()
@@ -15829,6 +15940,7 @@ class BomPage(QWidget):
             and (
                 lock_owner_id is None or self.session.user_id is None
                 or int(lock_owner_id) == int(self.session.user_id)
+                or self.perm.can("merge")
             )
         )
         if auto_checkout_is_mine:
@@ -15872,54 +15984,36 @@ class BomPage(QWidget):
         workspace = None
         workspace_descriptor = {}
         if associated_cad_rows:
-            choice = QMessageBox(self)
-            choice.setIcon(QMessageBox.Question)
-            choice.setWindowTitle("Item Checkout Scope")
-            choice.setText("What do you want to check out?")
-            choice.setInformativeText(
-                "Item metadata/structure can be edited without checking out CAD Documents. "
-                "If physical CAD files must be edited, select which associated CAD Documents to check out."
+            selected_cad_ids = self._select_checked_rows_dialog(
+                "Select CAD Documents",
+                "Select associated CAD Documents to check out with this Item. "
+                "Leave all unchecked for Item-only checkout.",
+                associated_cad_rows,
+                lambda row: (
+                    f"{row.get('file_name') or row.get('name') or row.get('id')}  "
+                    f"[{row.get('association_type') or 'ASSOCIATED'}]"
+                ),
+                checked_ids=[
+                    int(owner_cad["id"])
+                ] if owner_cad and owner_cad.get("id") is not None else [-1],
             )
-            item_and_cad = choice.addButton("Item + CAD Documents...", QMessageBox.AcceptRole)
-            item_only = choice.addButton("Item Only", QMessageBox.ActionRole)
-            choice.addButton(QMessageBox.Cancel)
-            choice.setDefaultButton(item_and_cad)
-            choice.exec_()
-            if choice.clickedButton() == item_and_cad:
-                selected_cad_ids = self._select_checked_rows_dialog(
-                    "Select CAD Documents",
-                    "Select the associated CAD Documents to check out physically. Multiple CAD Documents can be selected.",
-                    associated_cad_rows,
-                    lambda row: (
-                        f"{row.get('file_name') or row.get('name') or row.get('id')}  "
-                        f"[{row.get('association_type') or 'ASSOCIATED'}]"
-                    ),
-                    checked_ids=[
-                        int(owner_cad["id"])
-                    ] if owner_cad and owner_cad.get("id") is not None else None,
-                )
-                if selected_cad_ids is None:
-                    return
-                if not selected_cad_ids:
-                    QMessageBox.information(
-                        self,
-                        "Item Checkout Scope",
-                        "Select at least one associated CAD Document, or choose Item Only.",
-                    )
-                    return
-                selected_set = {int(value) for value in selected_cad_ids}
-                selected_cad_rows = [
-                    row for row in associated_cad_rows
-                    if int(row.get("id")) in selected_set
-                ]
-                workspace = self._choose_local_cad_workspace("Item and CAD Checkout Workspace")
-                if not workspace:
-                    return
-                workspace_descriptor = self._local_cad_workspaces().checkout_descriptor(
-                    workspace["id"]
-                )
-            elif choice.clickedButton() != item_only:
+            if selected_cad_ids is None:
                 return
+            selected_set = {int(value) for value in selected_cad_ids}
+            selected_cad_rows = [
+                row for row in associated_cad_rows
+                if int(row.get("id")) in selected_set
+            ]
+            if selected_cad_rows:
+                copy_to_workspace, workspace = self._prompt_cad_workspace_copy(
+                    "Item and CAD Checkout Workspace"
+                )
+                if workspace is None:
+                    return
+                if copy_to_workspace:
+                    workspace_descriptor = self._local_cad_workspaces().checkout_descriptor(
+                        workspace["id"]
+                    )
         state = str(
             details.get("revision_state") or details.get("lifecycle_state") or ""
         ).strip().lower()
@@ -15945,46 +16039,13 @@ class BomPage(QWidget):
                 QMessageBox.warning(self, "Check Out", "Enter the revision to create on commit.")
                 return
 
-        as_user_id = None
-        # Master/Admin can check out as a project-assigned user.
-        if self.perm.can("merge") and self.session.project_id and not details.get("locked"):
-            users = self.project_service.get_users_for_project(self.session.project_id) or []
-            choices = []
-            choice_to_id = {}
-            for u in users:
-                try:
-                    label = str(u.get("username") or "").strip()
-                    email = str(u.get("email") or "").strip()
-                    uid = int(u.get("id"))
-                except Exception:
-                    continue
-                if not label:
-                    continue
-                if email:
-                    display = f"{label} ({email})"
-                else:
-                    display = label
-                choices.append(display)
-                choice_to_id[display] = uid
-            if choices:
-                default_choice = None
-                for disp, uid in choice_to_id.items():
-                    if self.session.user_id is not None and int(uid) == int(self.session.user_id):
-                        default_choice = disp
-                        break
-                if default_choice is None:
-                    default_choice = choices[0]
-                selected, ok = QInputDialog.getItem(
-                    self,
-                    "Check Out As",
-                    "Check out this part as:",
-                    choices,
-                    choices.index(default_choice) if default_choice in choices else 0,
-                    False,
-                )
-                if not ok:
-                    return
-                as_user_id = choice_to_id.get(selected)
+        as_user_id = self._prompt_actor_user_id(
+            "Check Out As",
+            "Check out this Item as:",
+            default_user_id=lock_owner_id,
+        )
+        if as_user_id is None:
+            return
 
         confirmation = (
             f"Check out Released {details.get('current_version') or details.get('revision')} for work?\n\n"
@@ -15995,8 +16056,12 @@ class BomPage(QWidget):
             + (
                 f"The Item and {len(selected_cad_rows)} associated CAD Document"
                 f"{'s' if len(selected_cad_rows) != 1 else ''} will be reserved "
-                f"in workspace {workspace.get('name')}."
-                if selected_cad_rows and workspace else
+                + (
+                    f"in workspace {workspace.get('name')}."
+                    if workspace else
+                    "without copying CAD files to a workspace."
+                )
+                if selected_cad_rows else
                 "Only Item metadata and structure will be reserved; CAD remains checked in."
             )
         )
@@ -16038,7 +16103,7 @@ class BomPage(QWidget):
                     include_owner_cad=False,
                 )
                 materialized = None
-                if selected_cad_rows and workspace:
+                if selected_cad_rows:
                     try:
                         for cad_row in selected_cad_rows:
                             self.bom_service.checkout_pdm_cad_document(
@@ -16047,15 +16112,16 @@ class BomPage(QWidget):
                                 as_user_id=as_user_id,
                                 **workspace_descriptor,
                             )
-                            materialized = self._local_cad_workspaces().materialize_cad_document(
-                                workspace["id"], int(cad_row["id"])
-                            )
-                            materialized_paths.append(materialized["path"])
+                            if workspace:
+                                materialized = self._local_cad_workspaces().materialize_cad_document(
+                                    workspace["id"], int(cad_row["id"])
+                                )
+                                materialized_paths.append(materialized["path"])
                     except Exception:
                         for cad_row in selected_cad_rows:
                             try:
                                 self.bom_service.undo_checkout_pdm_cad_document(
-                                    int(cad_row["id"]), "Workspace materialization failed"
+                                    int(cad_row["id"]), "CAD checkout failed", as_user_id=as_user_id
                                 )
                             except Exception:
                                 pass
@@ -16066,7 +16132,12 @@ class BomPage(QWidget):
                     + (
                         "\nCAD workspace files were copied:\n"
                         + "\n".join(f"- {path}" for path in materialized_paths)
-                        if materialized_paths else "\nCAD Documents remain checked in."
+                        if materialized_paths else
+                        (
+                            "\nSelected CAD Documents were checked out without workspace copies."
+                            if selected_cad_rows else
+                            "\nCAD Documents remain checked in."
+                        )
                     ),
                 )
                 self._refresh_current_tree_item_lock_state(int(part_id))
@@ -16936,10 +17007,11 @@ class BomPage(QWidget):
             )
         except Exception:
             checked_out_by_me = False
+        can_finish_cad_checkout = checked_out_by_me or self.perm.can("merge")
         can_manage = self.perm.can("manage_parts")
         self.checkout_part_btn.setEnabled(can_manage and not checked_out)
-        self.checkin_part_btn.setEnabled(can_manage and checked_out_by_me)
-        self.undo_checkout_btn.setEnabled(can_manage and checked_out_by_me)
+        self.checkin_part_btn.setEnabled(can_manage and checked_out and can_finish_cad_checkout)
+        self.undo_checkout_btn.setEnabled(can_manage and checked_out and can_finish_cad_checkout)
         self.checkout_part_btn.setToolTip(
             "Check out this CAD Document and reserve its associated Item data as required"
         )
@@ -17642,12 +17714,10 @@ class BomPage(QWidget):
             and not obsolete and not read_only_ebom
         )
         self.checkin_part_btn.setEnabled(
-            has_item and locked and can_finish_checkout
-            and not active_cad and not read_only_ebom
+            has_item and locked and can_finish_checkout and not read_only_ebom
         )
         self.undo_checkout_btn.setEnabled(
-            has_item and locked and can_finish_checkout
-            and not active_cad and not read_only_ebom
+            has_item and locked and can_finish_checkout and not read_only_ebom
         )
         if active_cad:
             labels = ", ".join(
@@ -17655,10 +17725,10 @@ class BomPage(QWidget):
                 for row in active_cad[:3]
             )
             self.checkin_part_btn.setToolTip(
-                f"Check in or undo associated CAD first: {labels}"
+                f"Check in Item data only; associated CAD stays checked out: {labels}"
             )
             self.undo_checkout_btn.setToolTip(
-                f"Check in or undo associated CAD first: {labels}"
+                f"Undo Item checkout and automatically undo associated CAD: {labels}"
             )
         elif can_promote_auto_checkout:
             self.checkout_part_btn.setToolTip(
@@ -18064,7 +18134,7 @@ class BomPage(QWidget):
             
         if db_commit_info:
             from dataclasses import asdict
-            shown_keys = {"id", "commit_id", "part_id", "project_id"}
+            shown_keys = {"id", "commit_id", "part_id", "project_id", "message"}
             extra_commit_info = []
             for k, v in asdict(db_commit_info).items():
                 if k in shown_keys:
@@ -18082,16 +18152,6 @@ class BomPage(QWidget):
 
         # ── Details text ──────────────────────────────────────────────
         layout.addWidget(QLabel("Details:"))
-        txt = QPlainTextEdit()
-        txt.setReadOnly(True)
-        txt.setStyleSheet("""
-            QPlainTextEdit {
-                background: #f9fafb; border: 1px solid #e5e7eb;
-                border-radius: 6px; font-family: 'Consolas', 'Cascadia Mono', monospace;
-                font-size: 11px; padding: 8px;
-            }
-        """)
-
         step_status = str(ev_data.get("step_diff_status") or "").strip()
         step_summary = str(ev_data.get("step_diff_summary") or "").strip()
         step_error = str(ev_data.get("step_error") or "").strip()
@@ -18103,7 +18163,27 @@ class BomPage(QWidget):
         if step_error:
             extra.append(f"STEP error: {step_error}")
         full_text = details_text if not extra else f"{details_text}\n\n{'─' * 40}\n" + "\n".join(extra)
-        txt.setPlainText(full_text)
+        if looks_like_html(full_text):
+            txt = QTextEdit()
+            txt.setReadOnly(True)
+            txt.setStyleSheet("""
+                QTextEdit {
+                    background: #f9fafb; border: 1px solid #e5e7eb;
+                    border-radius: 6px; font-size: 11px; padding: 8px;
+                }
+            """)
+            txt.setHtml(full_text)
+        else:
+            txt = QPlainTextEdit()
+            txt.setReadOnly(True)
+            txt.setStyleSheet("""
+                QPlainTextEdit {
+                    background: #f9fafb; border: 1px solid #e5e7eb;
+                    border-radius: 6px; font-family: 'Consolas', 'Cascadia Mono', monospace;
+                    font-size: 11px; padding: 8px;
+                }
+            """)
+            txt.setPlainText(full_text)
         layout.addWidget(txt)
 
         # ── Action buttons ────────────────────────────────────────────
@@ -18218,7 +18298,10 @@ class BomPage(QWidget):
             msg.setReadOnly(True)
             msg.setMinimumHeight(140)
             msg.setMaximumHeight(280)
-            msg.setPlainText(str(message))
+            if looks_like_html(str(message)):
+                msg.setHtml(str(message))
+            else:
+                msg.setPlainText(str(message))
             layout.addWidget(msg)
 
         display_details = dict(details)
@@ -18493,7 +18576,7 @@ class BomPage(QWidget):
                             ev.get("object_version", ""),
                             ev.get("event", ""),
                             ev.get("user", ""),
-                            ev.get("details", ""),
+                            html_to_plain_text(str(ev.get("details", "") or "")),
                             ev.get("commit_id", ""),
                             ev.get("step_diff_status", ""),
                             ev.get("step_diff_summary", ""),
@@ -18561,6 +18644,13 @@ class BomPage(QWidget):
             return labels.get(state, state.title() if state else "Unknown")
         return "Unknown"
 
+    def _doc_export_detail_text(self, item: QTreeWidgetItem, doc_key: str) -> str:
+        payload = item.data(BOM_COL_FILES, BOM_TREE_FILES_ROLE) or {}
+        value = payload.get(doc_key)
+        if isinstance(value, (tuple, list)) and len(value) > 1:
+            return str(value[1] or "").strip()
+        return ""
+
     def _integrity_export_text(self, item: QTreeWidgetItem) -> str:
         payload = item.data(BOM_COL_INTEGRITY, BOM_TREE_INTEGRITY_ROLE) or {}
         state = str(payload.get("state") or "ok").lower()
@@ -18621,7 +18711,10 @@ class BomPage(QWidget):
         return rows or [("Filter", "None - all visible BOM rows")]
 
     def _collect_visible_bom_export_rows(self) -> list[dict]:
-        tree = self._current_tree_for_filtering()
+        if getattr(self, "_bom_mode", "cad") == "ebom":
+            tree = self._current_pdm_tree() or getattr(self, "_ebom_tree", self.tree)
+        else:
+            tree = self._current_tree_for_filtering()
         rows: list[dict] = []
 
         def recurse(item: QTreeWidgetItem, level: int, ancestor_visible: bool = True):
@@ -18646,13 +18739,17 @@ class BomPage(QWidget):
                 "categories": ", ".join(item.data(0, BOM_TREE_CATEGORY_ROLE) or []),
                 "status": item.text(BOM_COL_STATUS),
                 "work_state": item.data(0, BOM_TREE_INWORK_ROLE) or "Checked In",
-                "pdf": self._doc_export_text(item, "pdf"),
-                "step": self._doc_export_text(item, "step"),
+                "pdf_status": self._doc_export_text(item, "pdf"),
+                "pdf_details": self._doc_export_detail_text(item, "pdf"),
+                "step_status": self._doc_export_text(item, "step"),
+                "step_details": self._doc_export_detail_text(item, "step"),
                 "integrity": self._integrity_export_text(item),
                 "issues": issue_text,
                 "part_id": "" if part_id is None else str(part_id),
                 "details": "\n".join(details),
             })
+            if not item.isExpanded():
+                return
             for child_index in range(item.childCount()):
                 recurse(item.child(child_index), level + 1, visible)
 
@@ -18663,7 +18760,8 @@ class BomPage(QWidget):
     def _export_visible_bom_csv(self, file_path: str, rows: list[dict]) -> None:
         fieldnames = [
             "level", "part_number", "name", "aes_number", "type", "revision", "categories", "status",
-            "work_state", "pdf", "step", "integrity", "issues", "part_id", "details",
+            "work_state", "pdf_status", "pdf_details", "step_status", "step_details",
+            "integrity", "issues", "part_id", "details",
         ]
         with open(file_path, "w", newline="", encoding="utf-8-sig") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -18690,8 +18788,10 @@ class BomPage(QWidget):
             ("categories", "Categories"),
             ("status", "Status"),
             ("work_state", "Work State"),
-            ("pdf", "PDF"),
-            ("step", "STEP"),
+            ("pdf_status", "PDF Status"),
+            ("pdf_details", "PDF Details"),
+            ("step_status", "STEP Status"),
+            ("step_details", "STEP Details"),
             ("integrity", "Integrity"),
             ("issues", "Issues"),
             ("part_id", "Internal Item ID"),
@@ -18737,7 +18837,8 @@ class BomPage(QWidget):
         ws.auto_filter.ref = f"A{header_row}:{get_column_letter(len(headers))}{max(header_row, header_row + len(rows))}"
         widths = {
             "A": 8, "B": 32, "C": 16, "D": 12, "E": 12, "F": 28, "G": 14,
-            "H": 18, "I": 14, "J": 14, "K": 16, "L": 20, "M": 10, "N": 54,
+            "H": 18, "I": 14, "J": 14, "K": 32, "L": 16, "M": 32, "N": 20,
+            "O": 18, "P": 10, "Q": 54,
         }
         for column, width in widths.items():
             ws.column_dimensions[column].width = width
@@ -18758,38 +18859,45 @@ class BomPage(QWidget):
 
     def export_bom(self):
         if getattr(self, "_bom_mode", "cad") == "ebom":
-            selected = self._ebom_tree.currentItem()
-            if selected is None and self._ebom_tree.topLevelItemCount():
-                selected = self._ebom_tree.topLevelItem(0)
-            if selected is None:
-                QMessageBox.warning(
-                    self, "Export Item Structure", "There is no Item Structure to export."
-                )
-                return
-            while selected.parent() is not None:
-                selected = selected.parent()
-            root_bom_id = selected.data(0, Qt.UserRole)
-            file_path, _selected_filter = QFileDialog.getSaveFileName(
+            default_name = (
+                "item_structure_visible.csv"
+                if self._is_default_bom_advanced_filter()
+                else "item_structure_filtered.csv"
+            )
+            file_path, selected_filter = QFileDialog.getSaveFileName(
                 self,
-                "Export Item Structure",
-                "item_structure.csv",
-                "CSV Files (*.csv)",
+                "Export Visible Item Structure",
+                default_name,
+                "CSV Files (*.csv);;Excel Workbook (*.xlsx);;All Files (*)",
             )
             if not file_path:
                 return
-            if not file_path.lower().endswith(".csv"):
-                file_path += ".csv"
             try:
-                result = self.bom_service.export_item_structure(
-                    int(root_bom_id), file_path
-                )
+                rows = self._collect_visible_bom_export_rows()
+                if not rows:
+                    QMessageBox.warning(
+                        self,
+                        "Export Visible Item Structure",
+                        "There are no visible Item rows to export.",
+                    )
+                    return
+                lower = file_path.lower()
+                wants_xlsx = "excel" in selected_filter.lower() or lower.endswith(".xlsx")
+                if wants_xlsx:
+                    if not lower.endswith(".xlsx"):
+                        file_path += ".xlsx"
+                    self._export_visible_bom_xlsx(file_path, rows)
+                else:
+                    if not lower.endswith(".csv"):
+                        file_path += ".csv"
+                    self._export_visible_bom_csv(file_path, rows)
                 QMessageBox.information(
                     self,
-                    "Export Item Structure",
-                    f"Exported {result['row_count']} persisted Item row(s) to {file_path}.",
+                    "Export Visible Item Structure",
+                    f"Exported {len(rows)} visible Item row(s) to {file_path}.",
                 )
             except Exception as exc:
-                QMessageBox.critical(self, "Export Item Structure", str(exc))
+                QMessageBox.critical(self, "Export Visible Item Structure", str(exc))
             return
         if getattr(self, "_bom_mode", "cad") == "cad":
             file_path, _selected_filter = QFileDialog.getSaveFileName(

@@ -83,6 +83,10 @@ class CheckoutReviewDialog(QDialog):
         root_layout.addWidget(body)
         layout.addWidget(self._section("Detected changes", self._change_rows()))
 
+        self.comment_edit = QTextEdit()
+        self.comment_edit.setPlaceholderText("Describe the completed BOM-object changes...")
+        self.comment_edit.setFixedHeight(64)
+
         if self.mode == "blocked_structure":
             warning = QLabel(
                 "<b>Native assembly file has not changed.</b><br><br>"
@@ -111,14 +115,13 @@ class CheckoutReviewDialog(QDialog):
             layout.addWidget(result)
         else:
             info = QLabel(
-                "No controlled changes were detected. Use Undo Checkout if the work should be discarded."
+                "No controlled changes were detected. You can still check in to close the Item reservation, "
+                "or close this dialog and use Undo Checkout if the work should be discarded."
             )
             set_banner_style(info, "neutral")
             layout.addWidget(info)
-
-        self.comment_edit = QTextEdit()
-        self.comment_edit.setPlaceholderText("Describe the completed BOM-object changes...")
-        self.comment_edit.setFixedHeight(64)
+            layout.addWidget(QLabel("Comment:"))
+            layout.addWidget(self.comment_edit)
         if self.mode == "checkin":
             layout.addWidget(QLabel("Comment:"))
             layout.addWidget(self.comment_edit)
@@ -145,7 +148,7 @@ class CheckoutReviewDialog(QDialog):
             commit_button.setObjectName("primary")
             commit_button.clicked.connect(self._choose_commit)
             actions.addWidget(commit_button)
-        elif self.mode == "checkin":
+        elif self.mode in {"checkin", "no_changes"}:
             checkin_button = QPushButton("Check In")
             checkin_button.setObjectName("primary")
             checkin_button.clicked.connect(self._choose_checkin)
