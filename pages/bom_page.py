@@ -12406,7 +12406,14 @@ class BomPage(QWidget):
         )
 
         # Let user pick parts (defaults to current part checked)
-        dlg = PackagePartsDialog(self, project_id=self.session.project_id, preselected_ids=[int(self.current_part_id)])
+        dlg = PackagePartsDialog(
+            self,
+            project_id=self.session.project_id,
+            preselected_ids=[int(self.current_part_id)],
+            title="Create Baseline - Select Items",
+            subtitle="Filter the EBOM scope, select all filtered Items when needed, then freeze their active PDF/STEP versions.",
+            kicker="BASELINE",
+        )
         part_ids = [int(self.current_part_id)]
         if dlg.exec_() == QDialog.Accepted:
             picked = dlg.selected_part_ids()
@@ -13217,7 +13224,14 @@ class BomPage(QWidget):
             part_ids = [self.current_part_id]
             include_children = mode.endswith("children")
         else:
-            dlg = PackagePartsDialog(self, project_id=self.session.project_id, preselected_ids=[])
+            dlg = PackagePartsDialog(
+                self,
+                project_id=self.session.project_id,
+                preselected_ids=[],
+                title="Export Package - Select Items",
+                subtitle="Filter the EBOM scope and select all filtered Items for the delivery package.",
+                kicker="DELIVERY PACKAGE",
+            )
             if dlg.exec_() != QDialog.Accepted:
                 return
             part_ids = dlg.selected_part_ids()

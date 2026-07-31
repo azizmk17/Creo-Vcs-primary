@@ -12,6 +12,7 @@ from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFrame,
+    QGridLayout,
     QWidget,
     QSizePolicy,
 )
@@ -34,9 +35,20 @@ _DOC_BADGE_STYLE = {
 
 
 class PackagePartsDialog(QDialog):
-    def __init__(self, parent=None, project_id=None, preselected_ids=None):
+    def __init__(
+        self,
+        parent=None,
+        project_id=None,
+        preselected_ids=None,
+        title: str = "Select Items",
+        subtitle: str = "Build the package scope. Selections remain active while searching and filtering.",
+        kicker: str = "DELIVERY PACKAGE",
+    ):
         super().__init__(parent)
-        self.setWindowTitle("Select Items")
+        self._dialog_title = title or "Select Items"
+        self._dialog_subtitle = subtitle or ""
+        self._dialog_kicker = kicker or ""
+        self.setWindowTitle(self._dialog_title)
         self.setModal(True)
         self.resize(860, 620)
         self.setMinimumSize(720, 520)
@@ -61,9 +73,9 @@ class PackagePartsDialog(QDialog):
         root_layout.setSpacing(0)
         root_layout.addWidget(
             make_dialog_header(
-                "Select Items",
-                "Build the package scope. Selections remain active while searching and filtering.",
-                kicker="DELIVERY PACKAGE",
+                self._dialog_title,
+                self._dialog_subtitle,
+                kicker=self._dialog_kicker,
             )
         )
 
@@ -76,20 +88,66 @@ class PackagePartsDialog(QDialog):
         search_row = QHBoxLayout()
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText(
-            "Filter by Item Number, name, AES, or type..."
+            "Find in structure: Item Number, name, AES, asm/prt type, Item type, lifecycle, source, view..."
         )
         self.search_input.textChanged.connect(self._apply_filter)
         search_row.addWidget(self.search_input)
 
+        self.clear_filter_btn = QPushButton("Clear")
+        self.clear_filter_btn.clicked.connect(self._clear_filters)
+        search_row.addWidget(self.clear_filter_btn)
+        layout.addLayout(search_row)
+
+        filter_grid = QGridLayout()
+        filter_grid.setHorizontalSpacing(8)
+        filter_grid.setVerticalSpacing(5)
+
         self.type_filter = QComboBox()
-        self.type_filter.addItem("All types", "")
+        self.type_filter.addItem("All CAD types", "")
         self.type_filter.currentIndexChanged.connect(self._apply_filter)
-        search_row.addWidget(self.type_filter)
+
+        self.item_type_filter = QComboBox()
+        self.item_type_filter.addItem("All item types", "")
+        self.item_type_filter.currentIndexChanged.connect(self._apply_filter)
+
+        self.lifecycle_filter = QComboBox()
+        self.lifecycle_filter.addItem("All lifecycle", "")
+        self.lifecycle_filter.currentIndexChanged.connect(self._apply_filter)
+
+        self.source_filter = QComboBox()
+        self.source_filter.addItem("All sources", "")
+        self.source_filter.currentIndexChanged.connect(self._apply_filter)
+
+        self.view_filter = QComboBox()
+        self.view_filter.addItem("All views", "")
+        self.view_filter.currentIndexChanged.connect(self._apply_filter)
+
+        self.pdf_filter = QComboBox()
+        self._populate_doc_filter(self.pdf_filter, "PDF")
+        self.pdf_filter.currentIndexChanged.connect(self._apply_filter)
+
+        self.step_filter = QComboBox()
+        self._populate_doc_filter(self.step_filter, "STEP")
+        self.step_filter.currentIndexChanged.connect(self._apply_filter)
 
         self.selected_only = QCheckBox("Selected only")
         self.selected_only.toggled.connect(self._apply_filter)
-        search_row.addWidget(self.selected_only)
-        layout.addLayout(search_row)
+        filter_grid.addWidget(QLabel("Type"), 0, 0)
+        filter_grid.addWidget(self.type_filter, 0, 1)
+        filter_grid.addWidget(QLabel("Item Type"), 0, 2)
+        filter_grid.addWidget(self.item_type_filter, 0, 3)
+        filter_grid.addWidget(QLabel("Lifecycle"), 0, 4)
+        filter_grid.addWidget(self.lifecycle_filter, 0, 5)
+        filter_grid.addWidget(QLabel("View"), 1, 0)
+        filter_grid.addWidget(self.view_filter, 1, 1)
+        filter_grid.addWidget(QLabel("Source"), 1, 2)
+        filter_grid.addWidget(self.source_filter, 1, 3)
+        filter_grid.addWidget(QLabel("PDF"), 2, 0)
+        filter_grid.addWidget(self.pdf_filter, 2, 1)
+        filter_grid.addWidget(QLabel("STEP"), 2, 2)
+        filter_grid.addWidget(self.step_filter, 2, 3)
+        filter_grid.addWidget(self.selected_only, 2, 4)
+        layout.addLayout(filter_grid)
 
         summary = QFrame()
         summary.setObjectName("professionalCommandBar")
@@ -112,11 +170,11 @@ class PackagePartsDialog(QDialog):
         layout.addWidget(summary)
 
         action_row = QHBoxLayout()
-        self.select_all_btn = QPushButton("Select Visible")
+        self.select_all_btn = QPushButton("Select All Filtered")
         self.select_all_btn.clicked.connect(self._select_all_visible)
-        self.select_none_btn = QPushButton("Clear Visible")
+        self.select_none_btn = QPushButton("Clear Filtered")
         self.select_none_btn.clicked.connect(self._select_none_visible)
-        self.invert_btn = QPushButton("Invert Visible")
+        self.invert_btn = QPushButton("Invert Filtered")
         self.invert_btn.clicked.connect(self._invert_visible)
         self.clear_all_btn = QPushButton("Clear All")
         self.clear_all_btn.setObjectName("danger")
@@ -143,13 +201,16 @@ class PackagePartsDialog(QDialog):
         name_header = QLabel("ITEM NAME")
         name_header.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         type_header = QLabel("TYPE")
-        type_header.setFixedWidth(115)
+        type_header.setFixedWidth(70)
+        item_type_header = QLabel("ITEM TYPE")
+        item_type_header.setFixedWidth(115)
         docs_header = QLabel("DOCUMENT STATUS")
         docs_header.setFixedWidth(126)
         columns_layout.addWidget(number_header)
         columns_layout.addWidget(aes_header)
         columns_layout.addWidget(name_header, 1)
         columns_layout.addWidget(type_header)
+        columns_layout.addWidget(item_type_header)
         columns_layout.addWidget(docs_header)
         layout.addWidget(columns)
 
@@ -189,7 +250,11 @@ class PackagePartsDialog(QDialog):
                     "part_number": (p.part_number or ""),
                     "aes_number": (p.aes_number or ""),
                     "name": (p.name or ""),
-                    "type": (p.item_type or p.type or ""),
+                    "type": (p.type or ""),
+                    "item_type": (p.item_type or ""),
+                    "lifecycle": (p.lifecycle_state or p.status or ""),
+                    "source": (p.procurement_source or ""),
+                    "view": (p.item_view or ""),
                     "pdf": self._document_status(int(p.id), "pdf"),
                     "step": self._document_status(int(p.id), "step"),
                 }
@@ -197,14 +262,23 @@ class PackagePartsDialog(QDialog):
 
         rows.sort(key=lambda r: (r["part_number"].lower(), r["name"].lower()))
         self._all_parts = rows
-        for part_type in sorted({row["type"] for row in rows if row["type"]}, key=str.lower):
-            self.type_filter.addItem(part_type, part_type)
+        self._populate_dynamic_filter(self.type_filter, rows, "type", "All CAD types")
+        self._populate_dynamic_filter(self.item_type_filter, rows, "item_type", "All item types")
+        self._populate_dynamic_filter(self.lifecycle_filter, rows, "lifecycle", "All lifecycle")
+        self._populate_dynamic_filter(self.source_filter, rows, "source", "All sources")
+        self._populate_dynamic_filter(self.view_filter, rows, "view", "All views")
         valid_ids = {row["id"] for row in rows}
         self._selected_ids.intersection_update(valid_ids)
 
     def _apply_filter(self):
         q = (self.search_input.text() or "").strip().lower()
         part_type = str(self.type_filter.currentData() or "").lower()
+        item_type = str(self.item_type_filter.currentData() or "").lower()
+        lifecycle = str(self.lifecycle_filter.currentData() or "").lower()
+        source = str(self.source_filter.currentData() or "").lower()
+        view = str(self.view_filter.currentData() or "").lower()
+        pdf_status = str(self.pdf_filter.currentData() or "").lower()
+        step_status = str(self.step_filter.currentData() or "").lower()
         selected_only = self.selected_only.isChecked()
 
         self._rebuilding = True
@@ -213,11 +287,24 @@ class PackagePartsDialog(QDialog):
         for p in self._all_parts:
             label = (
                 f"{p['part_number']} | {p['name']} | "
-                f"{p['aes_number']} | {p['type']}"
+                f"{p['aes_number']} | {p['type']} | {p['item_type']} | {p['lifecycle']} | "
+                f"{p['source']} | {p['view']}"
             )
             if q and q not in label.lower():
                 continue
             if part_type and p["type"].lower() != part_type:
+                continue
+            if item_type and p["item_type"].lower() != item_type:
+                continue
+            if lifecycle and p["lifecycle"].lower() != lifecycle:
+                continue
+            if source and p["source"].lower() != source:
+                continue
+            if view and p["view"].lower() != view:
+                continue
+            if pdf_status and str(p["pdf"].get("kind") or "").lower() != pdf_status:
+                continue
+            if step_status and str(p["step"].get("kind") or "").lower() != step_status:
                 continue
             if selected_only and p["id"] not in self._selected_ids:
                 continue
@@ -298,19 +385,23 @@ class PackagePartsDialog(QDialog):
         name.setStyleSheet("background:transparent;color:#172033;font-size:11px;font-weight:600;")
         name.setToolTip(part["name"] or "")
         part_type = QLabel(part["type"] or "-")
-        part_type.setFixedWidth(115)
+        part_type.setFixedWidth(70)
         part_type.setStyleSheet("background:transparent;color:#64748b;font-size:10px;")
+        item_type = QLabel(part["item_type"] or "-")
+        item_type.setFixedWidth(115)
+        item_type.setStyleSheet("background:transparent;color:#64748b;font-size:10px;")
 
         layout.addWidget(number)
         layout.addWidget(aes)
         layout.addWidget(name, 1)
         layout.addWidget(part_type)
+        layout.addWidget(item_type)
         layout.addWidget(self._document_badge("PDF", part["pdf"]))
         layout.addWidget(self._document_badge("STEP", part["step"]))
         row.setToolTip(
             f"{part['part_number']} — {part['name']}"
             + (f" | AES {part['aes_number']}" if part['aes_number'] else "")
-            + f" | {part['type']}\n"
+            + f" | {part['type']} | {part['item_type']} | {part['lifecycle']} | {part['source']} | {part['view']}\n"
             f"{part['pdf']['tooltip']}\n{part['step']['tooltip']}"
         )
         return row
@@ -333,8 +424,51 @@ class PackagePartsDialog(QDialog):
         visible = self.list_widget.count()
         total = len(self._all_parts)
         self.selected_count_label.setText(f"{selected} selected")
-        self.visible_count_label.setText(f"{visible} shown / {total} total")
+        self.visible_count_label.setText(f"{visible} filtered / {total} total")
         self.clear_all_btn.setEnabled(selected > 0)
+        self.select_all_btn.setEnabled(visible > 0)
+        self.select_none_btn.setEnabled(visible > 0)
+        self.invert_btn.setEnabled(visible > 0)
+
+    @staticmethod
+    def _populate_doc_filter(combo: QComboBox, label: str) -> None:
+        combo.addItem(f"All {label}", "")
+        combo.addItem("Current / OK", "ok")
+        combo.addItem("Needs review", "outdated")
+        combo.addItem("Missing", "missing")
+        combo.addItem("None", "na")
+
+    @staticmethod
+    def _populate_dynamic_filter(combo: QComboBox, rows: list, key: str, all_label: str) -> None:
+        current = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(all_label, "")
+        values = {
+            str(row.get(key) or "").strip()
+            for row in rows
+            if str(row.get(key) or "").strip()
+        }
+        for value in sorted(values, key=str.lower):
+            combo.addItem(value, value)
+        index = combo.findData(current)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _clear_filters(self):
+        self.search_input.clear()
+        for combo in (
+            self.type_filter,
+            self.item_type_filter,
+            self.lifecycle_filter,
+            self.source_filter,
+            self.view_filter,
+            self.pdf_filter,
+            self.step_filter,
+        ):
+            combo.setCurrentIndex(0)
+        self.selected_only.setChecked(False)
+        self._apply_filter()
 
     def _select_all_visible(self):
         for i in range(self.list_widget.count()):
