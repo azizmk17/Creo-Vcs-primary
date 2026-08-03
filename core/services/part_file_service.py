@@ -74,16 +74,41 @@ class PartFileService:
             pass
         return self._working_dir()
 
-    def _store_managed_blob(self, source_path: str, root_project_id: Optional[int]) -> dict:
-        family_dir = self._family_working_dir(root_project_id)
-        if not family_dir:
+    def _current_project_working_dir(self, root_project_id: Optional[int], version_label: Optional[str]) -> str:
+        """Prefer the active project-version directory for newly stored blobs.
+
+        Older managed blobs were intentionally stored under the family root
+        project.  That made version B/C files physically appear in version A's
+        `.nexus` folder.  New writes should follow the active project version,
+        while the resolver still keeps the old root fallback for compatibility.
+        """
+        try:
+            if root_project_id and version_label:
+                project = self.project_service.get_project_by_root_and_label(
+                    int(root_project_id), str(version_label).strip()
+                ) or {}
+                wd = str(project.get("working_directory") or "").strip()
+                if wd:
+                    return wd
+        except Exception:
+            pass
+        return self._working_dir() or self._family_working_dir(root_project_id)
+
+    def _store_managed_blob(
+        self,
+        source_path: str,
+        root_project_id: Optional[int],
+        project_version_label: Optional[str] = None,
+    ) -> dict:
+        storage_dir = self._current_project_working_dir(root_project_id, project_version_label)
+        if not storage_dir:
             raise ValueError("Project working directory is not set")
         sha256 = self._hash_file_sha256(source_path)
         filename = self._safe_filename(os.path.basename(source_path))
         rel_path = os.path.join(
             ".nexus", "vault", "blobs", sha256[:2], sha256, filename
         )
-        abs_path = os.path.join(family_dir, rel_path)
+        abs_path = os.path.join(storage_dir, rel_path)
         if not safe_exists(abs_path):
             ensure_dir_exists(os.path.dirname(abs_path))
             safe_copy2(source_path, abs_path)
@@ -170,7 +195,7 @@ class PartFileService:
         created_by = self.session.user_id
         root_project_id, project_version_label = self._project_version_context()
         revision = self._part_revision(part_id) if revision_override is None else str(revision_override or "")
-        stored = self._store_managed_blob(source_path, root_project_id)
+        stored = self._store_managed_blob(source_path, root_project_id, project_version_label)
         file_id = self.repo.create_file(
             part_id, file_type, display_name, description,
             created_by=created_by, file_role=file_role,
@@ -225,7 +250,7 @@ class PartFileService:
         root_project_id, project_version_label = self._project_version_context()
         version_no = self.repo.get_next_version_no(file_id)
 
-        stored = self._store_managed_blob(source_path, root_project_id)
+        stored = self._store_managed_blob(source_path, root_project_id, project_version_label)
 
         version_id = self.repo.add_version(
             file_id=file_id,
@@ -265,15 +290,24 @@ class PartFileService:
         normalized_type = str(file_type or "").strip().upper()
         if not normalized_type:
             raise ValueError("file_type is required")
+        requested_role = str(file_role or "").strip().lower()
+        canonical_delivery = normalized_type in {"PDF", "STEP", "STP"}
+        canonical_role = "document" if canonical_delivery else (requested_role or "document")
 
         existing = None
         for attachment in self.list_attachments(part_id):
             same_type = str(attachment.file_type or "").strip().upper() == normalized_type
-            same_role = (
-                not file_role
-                or str(getattr(attachment, "file_role", "") or "").strip().lower()
-                == str(file_role).strip().lower()
-            )
+            if canonical_delivery:
+                # PDF and STEP are one logical export document each. Manual and
+                # generated outputs become versions of that document, not
+                # separate rows such as document + generated_pdf.
+                same_role = same_type
+            else:
+                same_role = (
+                    not requested_role
+                    or str(getattr(attachment, "file_role", "") or "").strip().lower()
+                    == requested_role
+                )
             if same_type and same_role:
                 existing = attachment
                 break
@@ -297,7 +331,7 @@ class PartFileService:
             source_path=source_path,
             note=note,
             revision_override=revision,
-            file_role=file_role or "document",
+            file_role=canonical_role,
             source_kind=source_kind,
             source_commit_id=source_commit_id,
         )
@@ -324,8 +358,26 @@ class PartFileService:
 
     def resolve_version_path(self, version: PartFileVersion) -> str:
         if str(getattr(version, "storage_scheme", "legacy") or "legacy").lower() == "managed_blob":
-            root = self._family_working_dir(getattr(version, "root_project_id", None))
-            return os.path.join(root, version.vault_rel_path) if root else ""
+            root_project_id = getattr(version, "root_project_id", None)
+            version_label = getattr(version, "project_version_label", None)
+            rel_path = str(getattr(version, "vault_rel_path", "") or "")
+            candidates = []
+            exact = self._working_dir_for_root_label(root_project_id, version_label)
+            if exact:
+                candidates.append(os.path.join(exact, rel_path))
+            current = self._working_dir()
+            if current:
+                candidates.append(os.path.join(current, rel_path))
+            family = self._family_working_dir(root_project_id)
+            if family:
+                candidates.append(os.path.join(family, rel_path))
+            for candidate in candidates:
+                try:
+                    if candidate and safe_exists(candidate):
+                        return candidate
+                except Exception:
+                    pass
+            return candidates[0] if candidates else ""
         # Prefer the project WD that originally stored this version.
         wd = self._working_dir_for_version(getattr(version, "root_project_id", None), getattr(version, "project_version_label", None))
         if not wd:

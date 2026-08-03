@@ -108,10 +108,26 @@ class ManagedFileService:
     def _working_dir(self, bom_id: int) -> str:
         return str(self._project_for_bom(int(bom_id)).get("working_directory") or "").strip()
 
+    def _project_version_dir(self, bom_id: int) -> str:
+        project = self._project_for_bom(int(bom_id))
+        root_id = project.get("root_project_id") or project.get("id")
+        version_label = str(project.get("version_label") or "").strip()
+        if root_id and version_label:
+            try:
+                version_project = self.project_service.get_project_by_root_and_label(
+                    int(root_id), version_label
+                ) or {}
+                wd = str(version_project.get("working_directory") or "").strip()
+                if wd:
+                    return wd
+            except Exception:
+                pass
+        return self._working_dir(int(bom_id)) or self._family_root(int(bom_id))
+
     def store_blob(self, bom_id: int, source_path: str) -> dict:
         if not source_path or not safe_exists(source_path):
             raise ValueError("Source file does not exist.")
-        root = self._family_root(int(bom_id))
+        root = self._project_version_dir(int(bom_id))
         if not root:
             raise ValueError("Project working directory is not configured.")
         sha256 = self._sha256(source_path)
@@ -142,7 +158,17 @@ class ManagedFileService:
         if not rel_path:
             return ""
         if str(entry.get("storage_scheme") or "").lower() == "managed_blob":
-            return os.path.join(self._family_root(int(entry["bom_id"])), rel_path)
+            candidates = [
+                os.path.join(self._project_version_dir(int(entry["bom_id"])), rel_path),
+                os.path.join(self._family_root(int(entry["bom_id"])), rel_path),
+            ]
+            for candidate in candidates:
+                try:
+                    if candidate and safe_exists(candidate):
+                        return candidate
+                except Exception:
+                    pass
+            return candidates[0] if candidates else ""
         return os.path.join(self._working_dir(int(entry["bom_id"])), rel_path)
 
     def _native_entry(self, bom_id: int, context: dict, role: str, filename: str) -> dict:
@@ -355,11 +381,65 @@ class ManagedFileService:
             item["version_id"] = item.get("part_file_version_id")
             item["path"] = item.get("path") or self.resolve_manifest_path(item)
             rows.append(item)
+        rows = self._collapse_export_documents(rows)
         order = {"native_cad": 0, "drawing": 1, "generated_pdf": 2, "generated_step": 3, "document": 4}
         rows.sort(key=lambda row: (order.get(row["role"], 9), str(row.get("filename") or "").lower()))
         return rows
 
+    def _collapse_export_documents(self, rows: list[dict]) -> list[dict]:
+        """Show one PDF and one STEP deliverable document per Item.
+
+        Legacy/manual and generated rows can exist as separate part_files.  In
+        the UI they are versions of the same deliverable document, not separate
+        documents.
+        """
+        groups: dict[str, list[dict]] = {}
+        passthrough = []
+        for row in rows or []:
+            file_type = str(row.get("file_type") or "").strip().upper()
+            if file_type in {"PDF", "STEP", "STP"} and row.get("part_file_id"):
+                key = "STEP" if file_type == "STP" else file_type
+                groups.setdefault(key, []).append(row)
+            else:
+                passthrough.append(row)
+        collapsed = list(passthrough)
+        for file_type, group in groups.items():
+            group.sort(
+                key=lambda row: (
+                    str(row.get("updated") or row.get("created_at") or ""),
+                    int(row.get("version_id") or 0),
+                ),
+                reverse=True,
+            )
+            chosen = dict(group[0])
+            ids = []
+            for row in group:
+                try:
+                    ids.append(int(row.get("part_file_id")))
+                except Exception:
+                    pass
+            chosen["related_file_ids"] = sorted(set(ids))
+            chosen["role"] = "document"
+            chosen["role_label"] = "Export PDF" if file_type == "PDF" else "Export STEP"
+            chosen["source"] = "Mixed" if len({str(r.get("source") or "") for r in group}) > 1 else chosen.get("source")
+            if len(group) > 1:
+                chosen["health"] = f"{chosen.get('health') or 'Unknown'} | {len(group)} document streams"
+            collapsed.append(chosen)
+        return collapsed
+
     def list_file_history(self, bom_id: int, role: str, file_id=None) -> list[dict]:
+        if isinstance(file_id, (list, tuple, set)):
+            rows = []
+            seen = set()
+            for one_id in file_id:
+                for row in self.list_file_history(bom_id, role, file_id=one_id):
+                    key = row.get("version_id") or (row.get("filename"), row.get("created_at"))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    rows.append(row)
+            rows.sort(key=lambda row: (str(row.get("created_at") or ""), int(row.get("version_id") or 0)), reverse=True)
+            return rows
         if file_id:
             rows = []
             for version in self.part_file_service.list_versions(int(file_id)):

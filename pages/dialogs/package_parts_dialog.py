@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
     QWidget,
     QSizePolicy,
 )
-from PyQt5.QtCore import QSize
+from PyQt5.QtCore import QSize, QTimer
 
 from core.repositories.bom_repository import BomRepository
 from core.session_manager import SessionManager
@@ -40,6 +40,8 @@ class PackagePartsDialog(QDialog):
         parent=None,
         project_id=None,
         preselected_ids=None,
+        current_filter_ids=None,
+        use_current_filter: bool = False,
         title: str = "Select Items",
         subtitle: str = "Build the package scope. Selections remain active while searching and filtering.",
         kicker: str = "DELIVERY PACKAGE",
@@ -57,15 +59,28 @@ class PackagePartsDialog(QDialog):
         self.session = SessionManager()
         self.project_id = project_id or self.session.project_id
         self._selected_ids = {int(part_id) for part_id in (preselected_ids or [])}
+        self._current_filter_ids = {
+            int(part_id) for part_id in (current_filter_ids or [])
+            if part_id is not None
+        }
+        self._use_current_filter_initial = bool(
+            use_current_filter and self._current_filter_ids
+        )
         self._rebuilding = False
 
         self.bom_repo = BomRepository()
         self._all_parts = []
+        self._visible_parts = []
         self._doc_status_cache = {}
+        self._page_limit = 200
+        self._loaded_count = 0
+        self._query_offset = 0
+        self._total_count = 0
+        self._choices_loaded = False
 
         self._build_ui()
-        self._load_parts()
-        self._apply_filter()
+        self.visible_count_label.setText("Ready")
+        QTimer.singleShot(25, lambda: self._reload_query(reset=True))
 
     def _build_ui(self):
         root_layout = QVBoxLayout(self)
@@ -132,6 +147,14 @@ class PackagePartsDialog(QDialog):
 
         self.selected_only = QCheckBox("Selected only")
         self.selected_only.toggled.connect(self._apply_filter)
+        self.current_bom_filter_only = QCheckBox("Use current BOM view filter")
+        self.current_bom_filter_only.setToolTip(
+            "Limit this selector to the Items currently visible in the EBOM tree "
+            "after search, advanced filter, saved filter, or isolation."
+        )
+        self.current_bom_filter_only.setVisible(bool(self._current_filter_ids))
+        self.current_bom_filter_only.setChecked(self._use_current_filter_initial)
+        self.current_bom_filter_only.toggled.connect(self._apply_filter)
         filter_grid.addWidget(QLabel("Type"), 0, 0)
         filter_grid.addWidget(self.type_filter, 0, 1)
         filter_grid.addWidget(QLabel("Item Type"), 0, 2)
@@ -147,6 +170,7 @@ class PackagePartsDialog(QDialog):
         filter_grid.addWidget(QLabel("STEP"), 2, 2)
         filter_grid.addWidget(self.step_filter, 2, 3)
         filter_grid.addWidget(self.selected_only, 2, 4)
+        filter_grid.addWidget(self.current_bom_filter_only, 2, 5)
         layout.addLayout(filter_grid)
 
         summary = QFrame()
@@ -176,12 +200,15 @@ class PackagePartsDialog(QDialog):
         self.select_none_btn.clicked.connect(self._select_none_visible)
         self.invert_btn = QPushButton("Invert Filtered")
         self.invert_btn.clicked.connect(self._invert_visible)
+        self.load_more_btn = QPushButton("Load More")
+        self.load_more_btn.clicked.connect(self._load_more)
         self.clear_all_btn = QPushButton("Clear All")
         self.clear_all_btn.setObjectName("danger")
         self.clear_all_btn.clicked.connect(self._clear_all)
         action_row.addWidget(self.select_all_btn)
         action_row.addWidget(self.select_none_btn)
         action_row.addWidget(self.invert_btn)
+        action_row.addWidget(self.load_more_btn)
         action_row.addStretch()
         action_row.addWidget(self.clear_all_btn)
         layout.addLayout(action_row)
@@ -234,81 +261,224 @@ class PackagePartsDialog(QDialog):
         footer_layout.addWidget(button_box)
         layout.addWidget(footer)
 
-    def _load_parts(self):
-        if not self.project_id:
-            self._all_parts = []
-            return
+    def _sql_filter_values(self):
+        return {
+            "search": (self.search_input.text() or "").strip(),
+            "type": str(self.type_filter.currentData() or ""),
+            "item_type": str(self.item_type_filter.currentData() or ""),
+            "lifecycle": str(self.lifecycle_filter.currentData() or ""),
+            "source": str(self.source_filter.currentData() or ""),
+            "view": str(self.view_filter.currentData() or ""),
+        }
 
-        parts = self.bom_repo.get_all(self.project_id)
-        rows = []
-        for p in parts:
-            if getattr(p, "represented_part_id", None) is not None:
-                continue
-            rows.append(
-                {
-                    "id": int(p.id),
-                    "part_number": (p.part_number or ""),
-                    "aes_number": (p.aes_number or ""),
-                    "name": (p.name or ""),
-                    "type": (p.type or ""),
-                    "item_type": (p.item_type or ""),
-                    "lifecycle": (p.lifecycle_state or p.status or ""),
-                    "source": (p.procurement_source or ""),
-                    "view": (p.item_view or ""),
-                    "pdf": self._document_status(int(p.id), "pdf"),
-                    "step": self._document_status(int(p.id), "step"),
-                }
+    def _doc_filter_values(self):
+        return {
+            "pdf": str(self.pdf_filter.currentData() or "").lower(),
+            "step": str(self.step_filter.currentData() or "").lower(),
+        }
+
+    def _base_sql_where(self, *, include_selected_only=True, include_current_view=True):
+        filters = self._sql_filter_values()
+        clauses = ["project_id=?", "represented_part_id IS NULL"]
+        params = [int(self.project_id)]
+        q = filters["search"]
+        if q:
+            like = f"%{q.lower()}%"
+            clauses.append(
+                "("
+                "lower(COALESCE(part_number,'')) LIKE ? OR "
+                "lower(COALESCE(aes_number,'')) LIKE ? OR "
+                "lower(COALESCE(name,'')) LIKE ? OR "
+                "lower(COALESCE(type,'')) LIKE ? OR "
+                "lower(COALESCE(item_type,'')) LIKE ? OR "
+                "lower(COALESCE(lifecycle_state,'')) LIKE ? OR "
+                "lower(COALESCE(status,'')) LIKE ? OR "
+                "lower(COALESCE(procurement_source,'')) LIKE ? OR "
+                "lower(COALESCE(item_view,'')) LIKE ?"
+                ")"
             )
+            params.extend([like] * 9)
+        if filters["type"]:
+            clauses.append("lower(COALESCE(type,''))=?")
+            params.append(filters["type"].lower())
+        if filters["item_type"]:
+            clauses.append("lower(COALESCE(item_type,''))=?")
+            params.append(filters["item_type"].lower())
+        if filters["lifecycle"]:
+            clauses.append("lower(COALESCE(lifecycle_state,status,''))=?")
+            params.append(filters["lifecycle"].lower())
+        if filters["source"]:
+            clauses.append("lower(COALESCE(procurement_source,''))=?")
+            params.append(filters["source"].lower())
+        if filters["view"]:
+            clauses.append("lower(COALESCE(item_view,''))=?")
+            params.append(filters["view"].lower())
+        if include_selected_only and self.selected_only.isChecked():
+            if not self._selected_ids:
+                clauses.append("0")
+            else:
+                placeholders = ",".join("?" for _ in self._selected_ids)
+                clauses.append(f"id IN ({placeholders})")
+                params.extend(sorted(self._selected_ids))
+        current_view_only = (
+            include_current_view
+            and bool(self._current_filter_ids)
+            and self.current_bom_filter_only.isChecked()
+        )
+        if current_view_only:
+            placeholders = ",".join("?" for _ in self._current_filter_ids)
+            clauses.append(f"id IN ({placeholders})")
+            params.extend(sorted(self._current_filter_ids))
+        return " AND ".join(clauses), params
 
-        rows.sort(key=lambda r: (r["part_number"].lower(), r["name"].lower()))
-        self._all_parts = rows
-        self._populate_dynamic_filter(self.type_filter, rows, "type", "All CAD types")
-        self._populate_dynamic_filter(self.item_type_filter, rows, "item_type", "All item types")
-        self._populate_dynamic_filter(self.lifecycle_filter, rows, "lifecycle", "All lifecycle")
-        self._populate_dynamic_filter(self.source_filter, rows, "source", "All sources")
-        self._populate_dynamic_filter(self.view_filter, rows, "view", "All views")
-        valid_ids = {row["id"] for row in rows}
-        self._selected_ids.intersection_update(valid_ids)
+    def _query_part_rows(self, *, limit: int, offset: int):
+        if not self.project_id:
+            return [], 0, 0
+        where_sql, params = self._base_sql_where()
+        sql = f"""
+            SELECT id, part_number, aes_number, name, type, item_type,
+                   COALESCE(lifecycle_state, status, '') AS lifecycle,
+                   COALESCE(procurement_source, '') AS source,
+                   COALESCE(item_view, '') AS view
+            FROM bom
+            WHERE {where_sql}
+            ORDER BY lower(COALESCE(part_number, '')), lower(name), id
+            LIMIT ? OFFSET ?
+        """
+        count_sql = f"SELECT COUNT(*) FROM bom WHERE {where_sql}"
+        with self.bom_repo.get_conn() as conn:
+            total = int(conn.execute(count_sql, params).fetchone()[0] or 0)
+            db_rows = conn.execute(
+                sql, [*params, max(1, int(limit)), max(0, int(offset))]
+            ).fetchall()
+        doc_filters = self._doc_filter_values()
+        needs_doc_status = bool(doc_filters["pdf"] or doc_filters["step"])
+        rows = []
+        for row in db_rows:
+            part_id = int(row["id"])
+            rows.append({
+                "id": part_id,
+                "part_number": row["part_number"] or "",
+                "aes_number": row["aes_number"] or "",
+                "name": row["name"] or "",
+                "type": row["type"] or "",
+                "item_type": row["item_type"] or "",
+                "lifecycle": row["lifecycle"] or "",
+                "source": row["source"] or "",
+                "view": row["view"] or "",
+                "pdf": (
+                    self._document_status(part_id, "pdf")
+                    if needs_doc_status else self._deferred_document_status("pdf")
+                ),
+                "step": (
+                    self._document_status(part_id, "step")
+                    if needs_doc_status else self._deferred_document_status("step")
+                ),
+            })
+        return self._apply_doc_filters_to_rows(rows), total, len(db_rows)
+
+    def _query_matching_ids(self):
+        where_sql, params = self._base_sql_where()
+        with self.bom_repo.get_conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id FROM bom
+                WHERE {where_sql}
+                ORDER BY lower(COALESCE(part_number, '')), lower(name), id
+                """,
+                params,
+            ).fetchall()
+        ids = [int(row["id"]) for row in rows]
+        doc_filters = self._doc_filter_values()
+        if not doc_filters["pdf"] and not doc_filters["step"]:
+            return ids
+        filtered = []
+        for part_id in ids:
+            if doc_filters["pdf"] and self._document_status(part_id, "pdf").get("kind") != doc_filters["pdf"]:
+                continue
+            if doc_filters["step"] and self._document_status(part_id, "step").get("kind") != doc_filters["step"]:
+                continue
+            filtered.append(part_id)
+        return filtered
+
+    def _load_filter_choices(self):
+        if not self.project_id:
+            return
+        if self._choices_loaded:
+            return
+        with self.bom_repo.get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT type, item_type,
+                       COALESCE(lifecycle_state, status, '') AS lifecycle,
+                       COALESCE(procurement_source, '') AS source,
+                       COALESCE(item_view, '') AS view
+                FROM bom
+                WHERE project_id=? AND represented_part_id IS NULL
+                """,
+                (int(self.project_id),),
+            ).fetchall()
+        values = [dict(row) for row in rows]
+        self._populate_dynamic_filter(self.type_filter, values, "type", "All CAD types")
+        self._populate_dynamic_filter(self.item_type_filter, values, "item_type", "All item types")
+        self._populate_dynamic_filter(self.lifecycle_filter, values, "lifecycle", "All lifecycle")
+        self._populate_dynamic_filter(self.source_filter, values, "source", "All sources")
+        self._populate_dynamic_filter(self.view_filter, values, "view", "All views")
+        self._choices_loaded = True
+
+    def _reload_query(self, reset: bool = False):
+        if reset:
+            self._loaded_count = 0
+            self._query_offset = 0
+            self._visible_parts = []
+            if not self._choices_loaded:
+                self._load_filter_choices()
+        self.visible_count_label.setText("Loading...")
+        rows, total, scanned = self._query_part_rows(
+            limit=self._page_limit, offset=self._query_offset
+        )
+        self._total_count = total
+        self._visible_parts.extend(rows)
+        self._loaded_count += len(rows)
+        self._query_offset += scanned
+        self._render_rows()
+
+    @staticmethod
+    def _deferred_document_status(doc_key):
+        return {
+            "kind": "na",
+            "tooltip": (
+                f"{str(doc_key).upper()}: not calculated yet. "
+                "Use the PDF/STEP filter when package selection must be based on document status."
+            ),
+        }
 
     def _apply_filter(self):
-        q = (self.search_input.text() or "").strip().lower()
-        part_type = str(self.type_filter.currentData() or "").lower()
-        item_type = str(self.item_type_filter.currentData() or "").lower()
-        lifecycle = str(self.lifecycle_filter.currentData() or "").lower()
-        source = str(self.source_filter.currentData() or "").lower()
-        view = str(self.view_filter.currentData() or "").lower()
-        pdf_status = str(self.pdf_filter.currentData() or "").lower()
-        step_status = str(self.step_filter.currentData() or "").lower()
-        selected_only = self.selected_only.isChecked()
+        self._reload_query(reset=True)
 
+    def _apply_doc_filters_to_rows(self, rows):
+        doc_filters = self._doc_filter_values()
+        if not doc_filters["pdf"] and not doc_filters["step"]:
+            return rows
+        filtered = []
+        for p in rows:
+            if doc_filters["pdf"] and str(p["pdf"].get("kind") or "").lower() != doc_filters["pdf"]:
+                continue
+            if doc_filters["step"] and str(p["step"].get("kind") or "").lower() != doc_filters["step"]:
+                continue
+            filtered.append(p)
+        return filtered
+
+    def _render_rows(self):
         self._rebuilding = True
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
-        for p in self._all_parts:
+        for p in self._visible_parts:
             label = (
                 f"{p['part_number']} | {p['name']} | "
                 f"{p['aes_number']} | {p['type']} | {p['item_type']} | {p['lifecycle']} | "
                 f"{p['source']} | {p['view']}"
             )
-            if q and q not in label.lower():
-                continue
-            if part_type and p["type"].lower() != part_type:
-                continue
-            if item_type and p["item_type"].lower() != item_type:
-                continue
-            if lifecycle and p["lifecycle"].lower() != lifecycle:
-                continue
-            if source and p["source"].lower() != source:
-                continue
-            if view and p["view"].lower() != view:
-                continue
-            if pdf_status and str(p["pdf"].get("kind") or "").lower() != pdf_status:
-                continue
-            if step_status and str(p["step"].get("kind") or "").lower() != step_status:
-                continue
-            if selected_only and p["id"] not in self._selected_ids:
-                continue
-
             item = QListWidgetItem(label)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Checked if p["id"] in self._selected_ids else Qt.Unchecked)
@@ -320,6 +490,9 @@ class PackagePartsDialog(QDialog):
         self.list_widget.blockSignals(False)
         self._rebuilding = False
         self._update_summary()
+
+    def _load_more(self):
+        self._reload_query(reset=False)
 
     def _on_item_changed(self, item):
         if self._rebuilding:
@@ -422,13 +595,24 @@ class PackagePartsDialog(QDialog):
     def _update_summary(self):
         selected = len(self._selected_ids)
         visible = self.list_widget.count()
-        total = len(self._all_parts)
+        total = self._total_count
         self.selected_count_label.setText(f"{selected} selected")
-        self.visible_count_label.setText(f"{visible} filtered / {total} total")
+        current_scope = (
+            f" / {len(self._current_filter_ids)} current view"
+            if self._current_filter_ids and self.current_bom_filter_only.isChecked()
+            else ""
+        )
+        loaded_text = f"{visible} loaded"
+        if visible < total:
+            loaded_text += f" / {total} matching"
+        else:
+            loaded_text += f" / {total} matching"
+        self.visible_count_label.setText(f"{loaded_text}{current_scope}")
         self.clear_all_btn.setEnabled(selected > 0)
-        self.select_all_btn.setEnabled(visible > 0)
+        self.select_all_btn.setEnabled(total > 0)
         self.select_none_btn.setEnabled(visible > 0)
         self.invert_btn.setEnabled(visible > 0)
+        self.load_more_btn.setEnabled(self._query_offset < self._total_count)
 
     @staticmethod
     def _populate_doc_filter(combo: QComboBox, label: str) -> None:
@@ -468,28 +652,19 @@ class PackagePartsDialog(QDialog):
         ):
             combo.setCurrentIndex(0)
         self.selected_only.setChecked(False)
+        self.current_bom_filter_only.setChecked(False)
         self._apply_filter()
 
     def _select_all_visible(self):
-        for i in range(self.list_widget.count()):
-            part_id = int(self.list_widget.item(i).data(Qt.UserRole))
-            self._selected_ids.add(part_id)
+        self._selected_ids.update(self._query_matching_ids())
         self._apply_filter()
 
     def _select_none_visible(self):
-        visible_ids = {
-            int(self.list_widget.item(i).data(Qt.UserRole))
-            for i in range(self.list_widget.count())
-        }
-        self._selected_ids.difference_update(visible_ids)
+        self._selected_ids.difference_update(self._query_matching_ids())
         self._apply_filter()
 
     def _invert_visible(self):
-        visible_ids = [
-            int(self.list_widget.item(i).data(Qt.UserRole))
-            for i in range(self.list_widget.count())
-        ]
-        for part_id in visible_ids:
+        for part_id in self._query_matching_ids():
             if part_id in self._selected_ids:
                 self._selected_ids.remove(part_id)
             else:

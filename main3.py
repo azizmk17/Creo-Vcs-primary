@@ -54,6 +54,11 @@ APP_TOOLBAR_LOGO_PATH = "assets/pictures/nexus_logo_glow.png"
 
 
 PAGE_PRESENTATION = {
+    6: (
+        "MANAGEMENT",
+        "Manager Dashboard",
+        "Executive readiness, manufacturing health, risks and workload",
+    ),
     0: (
         "PRODUCT DATA",
         "Product Structure",
@@ -471,6 +476,9 @@ class BomGUI(QMainWindow):
         startup_stage("Loading engineering issues...")
         from pages.issue_page import EngineeringIssuePage
         self.issue_page = EngineeringIssuePage()
+        startup_stage("Preparing manager dashboard...")
+        from pages.dashboard_page import ManagerDashboardPage
+        self.dashboard_page = ManagerDashboardPage()
         startup_stage("Preparing secondary tools...")
         self.diag_page = self._lazy_page_placeholder("Diagnostic")
         self.admin_page = self._lazy_page_placeholder("Admin")
@@ -482,10 +490,12 @@ class BomGUI(QMainWindow):
         self.pages.addWidget(self.diag_page)
         self.pages.addWidget(self.admin_page)
         self.pages.addWidget(self.snap_page)
+        self.pages.addWidget(self.dashboard_page)
         self.bom_page.issue_requested.connect(self.open_issues_for_part)
         self.bom_page.create_issue_requested.connect(self.create_issue_for_part)
         self.issue_page.issue_changed.connect(self.bom_page.refresh_issue_indicators)
         self.issue_page.issue_changed.connect(lambda _part_ids: self.commit_page._refresh_resolved_issues())
+        self.issue_page.issue_changed.connect(lambda _part_ids: self.dashboard_page.refresh())
 
         
 
@@ -632,6 +642,15 @@ class BomGUI(QMainWindow):
             role="navigation",
             page_index=0,
             tooltip="Open CAD Structure and EBOM / Item Structure",
+        )
+        add_action(
+            toolbar,
+            "Dashboard",
+            lambda _checked=False: self.switch_page(6),
+            "SP_FileDialogDetailedView",
+            role="navigation",
+            page_index=6,
+            tooltip="Open manager dashboard for readiness, risks and workload",
         )
         add_action(
             toolbar,
@@ -1205,17 +1224,28 @@ class BomGUI(QMainWindow):
 
     def refresh_current_page(self):
         current_index = self.pages.currentIndex()
-        self.pages.setCurrentIndex(0)
         if current_index == 0:
-            self.bom_page.load_tree()
+            try:
+                self.bom_page._bom_mode = "ebom"
+                self.bom_page.bom_mode_selector.setCurrentIndex(
+                    self.bom_page.bom_mode_selector.findData("ebom")
+                )
+                self.bom_page._load_released_ebom_tree()
+            except Exception:
+                self.bom_page.load_tree()
             self.statusBar().showMessage("BOM refreshed")
+            return
         elif current_index == 1:
             self.statusBar().showMessage("Commit page refreshed")
+            return
         elif current_index == 2:
             self.issue_page.refresh()
             self.statusBar().showMessage("Issue Center refreshed")
-
-        self.reload_main_window()
+            return
+        elif current_index == 6:
+            self.dashboard_page.refresh()
+            self.statusBar().showMessage("Manager Dashboard refreshing")
+            return
 
     def export_current(self):
         current_index = self.pages.currentIndex()
@@ -1223,6 +1253,8 @@ class BomGUI(QMainWindow):
             self.bom_page.export_bom()
         elif current_index == 1:
             QMessageBox.information(self, "Info", "Commit export coming soon!")
+        elif current_index == 6:
+            self.dashboard_page.export_dashboard()
 
 
     

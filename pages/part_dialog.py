@@ -19,7 +19,12 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from core.ebom_policy import CAD_CONTROL_MODES, REQUIREMENTS, requires_aes_number
+from core.ebom_policy import (
+    CAD_CONTROL_MODES,
+    CLASSIFICATIONS,
+    REQUIREMENTS,
+    requires_aes_number,
+)
 from core.item_policy import (
     ASSEMBLY_MODES,
     DEFAULT_UNITS,
@@ -61,6 +66,12 @@ class PartDialog(QDialog):
         "MM": "mm",
         "L": "L",
         "SET": "set",
+    }
+    CLASSIFICATION_LABELS = {
+        "PHYSICAL": "Physical Item",
+        "CAD_ONLY": "CAD-only representation",
+        "REFERENCE": "Reference / non-controlled",
+        "SKELETON": "Skeleton / layout reference",
     }
 
     def __init__(
@@ -287,6 +298,22 @@ class PartDialog(QDialog):
         attributes_form.addRow("Weight", self.weight_input)
         body_layout.addWidget(attributes)
 
+        controlled = QGroupBox("Controlled Item Parameters")
+        controlled_form = self._form_layout(controlled)
+        self.drawing_number_input = QLineEdit()
+        self.drawing_number_input.setPlaceholderText("Optional drawing / reference designator")
+        self.status_input = QLineEdit()
+        self.status_input.setPlaceholderText("Design status, e.g. Design, Prototype, Production")
+        self.classification_input = QComboBox()
+        for value in CLASSIFICATIONS:
+            self.classification_input.addItem(
+                self.CLASSIFICATION_LABELS.get(value, value.title()), value
+            )
+        controlled_form.addRow("Drawing Number", self.drawing_number_input)
+        controlled_form.addRow("Status", self.status_input)
+        controlled_form.addRow("Classification", self.classification_input)
+        body_layout.addWidget(controlled)
+
         delivery = QGroupBox("Delivery and Engineering Requirements")
         delivery_form = self._form_layout(delivery)
         self.delivery_input = QComboBox()
@@ -461,6 +488,14 @@ class PartDialog(QDialog):
             self.weight_input.setValue(float(self.part_data.get("weight") or 0))
         except (TypeError, ValueError):
             self.weight_input.setValue(0)
+        self.drawing_number_input.setText(
+            str(self.part_data.get("drawing_number") or "")
+        )
+        self.status_input.setText(str(self.part_data.get("status") or "Design"))
+        self._set_combo_data(
+            self.classification_input,
+            self.part_data.get("classification") or "PHYSICAL",
+        )
 
         behavior = str(
             self.part_data.get("default_ebom_behavior") or "NORMAL"
@@ -502,11 +537,9 @@ class PartDialog(QDialog):
         now = QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm")
         assembly_mode = str(self.assembly_mode_input.currentData() or "COMPONENT")
         item_type = str(self.item_type_input.currentData() or "MECHANICAL_PART")
-        classification = str(self.part_data.get("classification") or "PHYSICAL")
+        classification = str(self.classification_input.currentData() or "PHYSICAL")
         if item_type == "REFERENCE_PART":
             classification = "REFERENCE"
-        elif classification == "REFERENCE":
-            classification = "PHYSICAL"
         return {
             "aes_number": self.part_aes_input.text().strip(),
             "represented_part_id": self._represented_part_id,
@@ -520,7 +553,7 @@ class PartDialog(QDialog):
             ),
             "item_view": str(self.item_view_input.currentData() or "DESIGN"),
             "default_unit": str(self.default_unit_input.currentData() or "EA"),
-            "drawing_number": str(self.part_data.get("drawing_number") or ""),
+            "drawing_number": self.drawing_number_input.text().strip(),
             "classification": classification,
             "cad_control_mode": str(
                 self.cad_control_mode_input.currentData() or "CONTROLLED"
@@ -545,7 +578,7 @@ class PartDialog(QDialog):
             "material": self.material_input.text().strip(),
             "weight": self.weight_input.value(),
             "notes": self.notes_input.toPlainText().strip(),
-            "status": str(self.part_data.get("status") or "Design"),
+            "status": self.status_input.text().strip() or "Design",
             "created": str(self.part_data.get("created") or now),
             "modified": now,
         }

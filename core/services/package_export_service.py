@@ -3,7 +3,7 @@ import os
 import shutil
 from dataclasses import asdict
 from datetime import datetime
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from core.repositories.bom_children_repository import BomChildrenRepository
 from core.repositories.bom_repository import BomRepository
@@ -54,6 +54,7 @@ class PackageExportService:
         include_children: bool = True,
         package_name: Optional[str] = None,
         create_zip: bool = False,
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
     ) -> Dict:
         if not root_part_id:
             raise ValueError("root_part_id is required")
@@ -63,6 +64,7 @@ class PackageExportService:
             include_children=include_children,
             package_name=package_name,
             create_zip=create_zip,
+            progress_callback=progress_callback,
         )
 
     def export_package_for_parts(
@@ -72,6 +74,7 @@ class PackageExportService:
         include_children: bool = True,
         package_name: Optional[str] = None,
         create_zip: bool = False,
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
     ) -> Dict:
         if not part_ids:
             raise ValueError("part_ids is required")
@@ -103,11 +106,27 @@ class PackageExportService:
         exported: List[Dict] = []
         missing: List[Dict] = []
         skipped: List[Dict] = []
+        total_steps = max(1, len(selected) * 2 + (1 if create_zip else 0) + 1)
+        completed_steps = 0
+
+        def report(message: str) -> None:
+            if progress_callback:
+                progress_callback(str(message), completed_steps, total_steps)
+
+        def step(message: str) -> None:
+            nonlocal completed_steps
+            completed_steps = min(total_steps, completed_steps + 1)
+            if progress_callback:
+                progress_callback(str(message), completed_steps, total_steps)
+
+        report("Preparing package export...")
 
         for pid in selected:
             part = self.bom_repo.get_by_id(pid)
             if not part:
                 missing.append({"part_id": pid, "reason": "part_not_found"})
+                step(f"Missing Item {pid}")
+                step(f"Skipping Item {pid}")
                 continue
 
             if getattr(part, "represented_part_id", None):
@@ -118,6 +137,8 @@ class PackageExportService:
                     "reason": "cad_representation",
                     "represented_part_id": int(part.represented_part_id),
                 })
+                step(f"Skipping CAD-only representation {getattr(part, 'name', pid)}")
+                step(f"Skipping CAD-only representation {getattr(part, 'name', pid)}")
                 continue
 
             part_info = {
@@ -172,11 +193,12 @@ class PackageExportService:
                 dst_path = os.path.join(pdf_dir, dst_name)
                 shutil.copy2(pdf_path, dst_path)
                 row["pdf"] = {"src": pdf_path, "dst": dst_path, **(pdf_meta or {})}
+                step(f"Copied PDF for {getattr(part, 'name', pid)}")
             else:
                 reason = (pdf_meta or {}).get("reason")
                 missing.append({**part_info, "missing": "PDF", "expected": pdf_path, **({"reason": reason} if reason else {})})
+                step(f"PDF missing for {getattr(part, 'name', pid)}")
 
-            
             if step_path and os.path.exists(step_path):
                 dst_name = exported_document_filename(
                     part=part,
@@ -189,9 +211,11 @@ class PackageExportService:
                 dst_path = os.path.join(step_dir, dst_name)
                 shutil.copy2(step_path, dst_path)
                 row["step"] = {"src": step_path, "dst": dst_path, **(step_meta or {})}
+                step(f"Copied STEP for {getattr(part, 'name', pid)}")
             else:
                 reason = (step_meta or {}).get("reason")
                 missing.append({**part_info, "missing": "STEP", "expected": step_path, **({"reason": reason} if reason else {})})
+                step(f"STEP missing for {getattr(part, 'name', pid)}")
 
 
             exported.append(row)
@@ -211,11 +235,15 @@ class PackageExportService:
 
         if create_zip:
             # Creates: <destination_dir>/<package_name>.zip
+            report("Creating ZIP archive...")
             zip_base = os.path.join(destination_dir, self._safe_filename(package_name))
             zip_path = shutil.make_archive(zip_base, "zip", root_dir=out_dir)
             manifest["package"]["zip_path"] = zip_path
+            step("ZIP archive created")
 
         with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
+        completed_steps = total_steps
+        report("Package export complete")
 
         return manifest

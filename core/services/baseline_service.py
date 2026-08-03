@@ -2,7 +2,7 @@ import json
 import os
 import shutil
 from datetime import datetime
-from typing import Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set
 
 from core.repositories.baseline_repository import BaselineRepository
 from core.repositories.baseline_file_repository import BaselineFileRepository
@@ -165,7 +165,13 @@ class BaselineService(BaseService):
             "missing": missing,
         }
 
-    def export_baseline(self, baseline_id: int, destination_dir: str, package_name: Optional[str] = None) -> Dict:
+    def export_baseline(
+        self,
+        baseline_id: int,
+        destination_dir: str,
+        package_name: Optional[str] = None,
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
+    ) -> Dict:
         if not baseline_id:
             raise ValueError("baseline_id is required")
         if not destination_dir:
@@ -186,6 +192,20 @@ class BaselineService(BaseService):
 
         exported: List[Dict] = []
         missing: List[Dict] = []
+        total_steps = max(1, len(files) + 1)
+        completed_steps = 0
+
+        def report(message: str) -> None:
+            if progress_callback:
+                progress_callback(str(message), completed_steps, total_steps)
+
+        def step(message: str) -> None:
+            nonlocal completed_steps
+            completed_steps = min(total_steps, completed_steps + 1)
+            if progress_callback:
+                progress_callback(str(message), completed_steps, total_steps)
+
+        report("Preparing baseline export...")
 
         for bf in files:
             part = self.bom_repo.get_by_id(int(bf.part_id))
@@ -193,11 +213,13 @@ class BaselineService(BaseService):
 
             if not bf.version_id:
                 missing.append({"part_id": bf.part_id, "aes_number": aes, "file_type": bf.file_type, "reason": "no_version"})
+                step(f"Missing {bf.file_type} version for Item {bf.part_id}")
                 continue
 
             ver = self.part_file_service.repo.get_version_by_id(int(bf.version_id))
             if not ver:
                 missing.append({"part_id": bf.part_id, "aes_number": aes, "file_type": bf.file_type, "version_id": bf.version_id, "reason": "version_not_found"})
+                step(f"Version not found for Item {bf.part_id}")
                 continue
 
             src = self.part_file_service.resolve_version_path(ver)
@@ -209,6 +231,7 @@ class BaselineService(BaseService):
 
             if not src or not os.path.exists(src):
                 missing.append({"part_id": bf.part_id, "aes_number": aes, "file_type": bf.file_type, "version_id": bf.version_id, "reason": "file_missing", "expected": src})
+                step(f"{bf.file_type} missing for Item {bf.part_id}")
                 continue
 
             file_type = str(bf.file_type or "").upper()
@@ -223,6 +246,7 @@ class BaselineService(BaseService):
             )
             dst_path = os.path.join(dst_dir, dst_name)
             shutil.copy2(src, dst_path)
+            step(f"Copied {file_type} for {getattr(part, 'name', bf.part_id) if part else bf.part_id}")
 
             exported.append(
                 {
@@ -263,5 +287,7 @@ class BaselineService(BaseService):
 
         with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
+        completed_steps = total_steps
+        report("Baseline export complete")
 
         return manifest
