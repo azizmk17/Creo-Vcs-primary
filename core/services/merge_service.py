@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import json
 import os
-import shutil
 from datetime import datetime
 import uuid
 from core.services.permission_decorators import require_permission
@@ -19,7 +18,7 @@ from core.services.issue_service import IssueService
 from core.services.traceability_service import TraceabilityService
 from core.services.part_file_service import PartFileService
 from core.services.managed_file_service import ManagedFileService
-from core.services.export_naming import is_project_revision
+from core.services.export_naming import exported_document_filename
 from utils import (
     is_creo_file,
     ensure_dir_exists,
@@ -30,6 +29,7 @@ from utils import (
     safe_exists,
     safe_isdir,
     safe_listdir,
+    safe_move,
     safe_open,
     safe_remove,
     safe_rmtree,
@@ -69,19 +69,6 @@ class MergeService(BaseService):
         cleaned = "".join(ch if ch.isalnum() or ch in "._- ()" else "_" for ch in os.path.basename(name or ""))
         return cleaned or f"validation_{uuid.uuid4().hex[:8]}"
 
-    def _drawing_index_for_part(self, part) -> str:
-        for field_name in (
-            "drawing_index",
-            "draw_index",
-            "drawing_indice",
-            "indice",
-            "index",
-        ):
-            value = str(getattr(part, field_name, "") or "").strip()
-            if value:
-                return value
-        return ""
-
     def _project_version_label(self, project_id: int | None) -> str:
         if not project_id:
             return ""
@@ -107,27 +94,17 @@ class MergeService(BaseService):
         if not ext:
             ext = ".pdf" if file_role == "exported_pdf" else ".step" if file_role == "exported_step" else ""
 
-        drawing_number = str(getattr(part, "drawing_number", "") or "").strip()
-        if not drawing_number:
-            drawing_number = str(getattr(part, "base_drw_name", "") or getattr(part, "base_file_name", "") or f"part_{part_id}").strip()
-        index = self._drawing_index_for_part(part)
-        aes = str(getattr(part, "aes_number", "") or "").strip()
-        part_name = str(getattr(part, "name", "") or "").strip()
+        if part:
+            return exported_document_filename(
+                part=part,
+                file_type=file_type,
+                source_path=source_path,
+                revision=drawing_revision if file_role == "exported_pdf" else "",
+                project_version_label=project_version_label,
+                include_date=False,
+            )
 
-        parts = [drawing_number, index, aes, part_name]
-        if file_role == "exported_pdf":
-            rev = str(drawing_revision or "").strip()
-            if rev and not is_project_revision(rev, project_version_label):
-                parts.append(rev)
-
-        stem = "_".join(
-            self._safe_filename(piece).strip("._- ")
-            for piece in parts
-            if str(piece or "").strip()
-        )
-        if not stem:
-            stem = self._safe_filename(os.path.splitext(os.path.basename(source_path or ""))[0] or f"part_{part_id}")
-        return f"{stem}{ext}"
+        return f"part_{part_id}{ext}"
 
     def _copy_with_legacy_engineering_name(
         self,
@@ -854,7 +831,7 @@ class MergeService(BaseService):
         try:
             for item in plan:
                 archived_path = os.path.join(archive_dir, item["approved_filename"])
-                shutil.move(item["approved_path"], archived_path)
+                safe_move(item["approved_path"], archived_path)
                 moved_files.append((archived_path, item["approved_path"]))
 
             part_updates = {}
@@ -898,7 +875,7 @@ class MergeService(BaseService):
             for archived_path, original_path in reversed(moved_files):
                 try:
                     if safe_exists(archived_path) and not safe_exists(original_path):
-                        shutil.move(archived_path, original_path)
+                        safe_move(archived_path, original_path)
                 except Exception:
                     pass
             raise

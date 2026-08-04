@@ -1,6 +1,5 @@
 import json
 import os
-import shutil
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Set
 
@@ -14,6 +13,7 @@ from core.services.export_naming import exported_document_filename, safe_filenam
 from core.services.part_file_service import PartFileService
 from core.services.ebom_service import EbomService
 from config import DB_NAME
+from utils import ensure_dir_exists, safe_copy2, safe_exists, safe_open
 
 
 class BaselineService(BaseService):
@@ -187,8 +187,8 @@ class BaselineService(BaseService):
         out_dir = os.path.join(destination_dir, self._safe_filename(f"baseline_{baseline_id}_{package_name}"))
         pdf_dir = os.path.join(out_dir, "PDF")
         step_dir = os.path.join(out_dir, "STEP")
-        os.makedirs(pdf_dir, exist_ok=True)
-        os.makedirs(step_dir, exist_ok=True)
+        ensure_dir_exists(pdf_dir)
+        ensure_dir_exists(step_dir)
 
         exported: List[Dict] = []
         missing: List[Dict] = []
@@ -229,7 +229,7 @@ class BaselineService(BaseService):
             #     missing.append({"part_id": bf.part_id, "aes_number": aes, "file_type": bf.file_type, "version_id": bf.version_id, "reason": "not_released", "state": state})
             #     continue
 
-            if not src or not os.path.exists(src):
+            if not src or not safe_exists(src):
                 missing.append({"part_id": bf.part_id, "aes_number": aes, "file_type": bf.file_type, "version_id": bf.version_id, "reason": "file_missing", "expected": src})
                 step(f"{bf.file_type} missing for Item {bf.part_id}")
                 continue
@@ -245,7 +245,7 @@ class BaselineService(BaseService):
                 include_date=True,
             )
             dst_path = os.path.join(dst_dir, dst_name)
-            shutil.copy2(src, dst_path)
+            safe_copy2(src, dst_path)
             step(f"Copied {file_type} for {getattr(part, 'name', bf.part_id) if part else bf.part_id}")
 
             exported.append(
@@ -285,7 +285,7 @@ class BaselineService(BaseService):
             "missing": missing,
         }
 
-        with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as f:
+        with safe_open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
         completed_steps = total_steps
         report("Baseline export complete")

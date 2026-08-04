@@ -1,6 +1,7 @@
 from typing import List, Dict
 from collections import defaultdict
 import os
+import re
 import sqlite3
 from datetime import datetime
 from core.models.bom_model import Bom
@@ -57,6 +58,24 @@ class BomService(BaseService):
         self._tree_dirty: set = set()  # project_ids that need re-fetch
         self._lazy_index_cache: dict = {}
         print(self.user_id)
+
+    @staticmethod
+    def _clean_drawing_number(value) -> str:
+        """Return a real drawing number or blank.
+
+        Creo/native document file names such as ``assy_x.drw.1`` are file
+        references, not drawing-number metadata.  If no valid drawing number
+        exists, the Item must keep this parameter blank.
+        """
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        lowered = text.lower()
+        if re.search(r"\.(?:drw|prt|asm)(?:\.\d+)?$", lowered):
+            return ""
+        if re.search(r"\.(?:pdf|step|stp|iges|igs|dxf|dwg)$", lowered):
+            return ""
+        return text
 
     def _assert_checked_out_for_change(self, part_id: int, action: str = "modify this item"):
         """Require a mutable revision and an owned (or administratively controlled) lock."""
@@ -254,6 +273,9 @@ class BomService(BaseService):
                     f"Item Number {part_number} already identifies another Item in this product."
                 )
         part_data["part_number"] = part_number
+        part_data["drawing_number"] = self._clean_drawing_number(
+            part_data.get("drawing_number")
+        )
         aes_number = str(part_data.get("aes_number") or "").strip()
         if requires_aes_number(
             part_data.get("default_ebom_behavior"),
@@ -397,6 +419,10 @@ class BomService(BaseService):
                 )
         if "aes_number" in part_data:
             part_data["aes_number"] = effective_aes
+        if "drawing_number" in part_data:
+            part_data["drawing_number"] = self._clean_drawing_number(
+                part_data.get("drawing_number")
+            )
         if "cad_control_mode" in part_data:
             new_control_mode = normalize_cad_control_mode(part_data.get("cad_control_mode"))
             if (

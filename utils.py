@@ -48,6 +48,11 @@ def safe_copy2(src: str, dst: str):
     return shutil.copy2(long_path(src), long_path(dst))
 
 
+def safe_move(src: str, dst: str):
+    ensure_dir_exists(os.path.dirname(dst))
+    return shutil.move(long_path(src), long_path(dst))
+
+
 def safe_remove(path: str) -> None:
     os.remove(long_path(path))
 

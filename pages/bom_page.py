@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (
     QGraphicsDropShadowEffect, QToolTip, QStyledItemDelegate, QStyle, QStyleOptionViewItem,
     QApplication, QProgressDialog,
 )
-from PyQt5.QtCore import Qt, QDateTime, pyqtSignal, QTimer, QObject, QThread, QSize, QRect, QRectF, QPointF, QEvent
+from PyQt5.QtCore import Qt, QDateTime, pyqtSignal, QTimer, QObject, QThread, QSize, QRect, QRectF, QPointF, QEvent, QSettings
 from PyQt5.QtGui import QColor, QPen, QFont, QBrush, QCursor, QPalette, QFontMetrics, QPolygonF
 from datetime import datetime, timedelta
 from pages.part_dialog import PartDialog
@@ -447,10 +447,45 @@ BOM_COL_TYPE = 4
 BOM_COL_REV = 5
 BOM_COL_STATUS = 6
 BOM_COL_INTEGRITY = 7
-BOM_TREE_COLUMN_COUNT = 8
+BOM_BASE_TREE_COLUMN_COUNT = 8
 EBOM_COL_SOURCE_QTY = 8
 EBOM_COL_EFFECTIVE_QTY = 9
 EBOM_COL_LEVEL = 10
+BOM_COL_EXTRA_START = 11
+
+BOM_EXTRA_COLUMN_SPECS = [
+    ("part_number", "Item Number", 115, False, ("part_number", "number")),
+    ("aes_number", "AES Number", 95, True, ("aes_number",)),
+    ("drawing_number", "Drawing Number", 120, False, ("drawing_number", "drawing")),
+    ("filename", "Native File", 135, False, ("filename", "base_file_name")),
+    ("base_drw_name", "Drawing File", 135, False, ("base_drw_name",)),
+    ("item_type", "Item Type", 115, False, ("item_type",)),
+    ("assembly_mode", "Assembly Mode", 105, False, ("assembly_mode",)),
+    ("classification", "Classification", 105, False, ("classification",)),
+    ("procurement_source", "Source", 82, False, ("procurement_source", "source")),
+    ("item_view", "View", 75, False, ("item_view", "view")),
+    ("default_unit", "Unit", 58, False, ("default_unit", "unit")),
+    ("material", "Material", 105, False, ("material",)),
+    ("weight", "Weight", 75, False, ("weight",)),
+    ("cad_requirement", "CAD Req.", 85, False, ("cad_requirement",)),
+    ("drawing_requirement", "Drawing Req.", 95, False, ("drawing_requirement",)),
+    ("cad_control_mode", "CAD Control", 120, False, ("cad_control_mode",)),
+    ("default_ebom_behavior", "EBOM Behavior", 115, False, ("default_ebom_behavior",)),
+    ("source_quantity", "Source Qty", 74, False, ("source_quantity", "quantity")),
+    ("effective_quantity", "Effective Qty", 84, False, ("effective_quantity",)),
+    ("level", "Level", 52, False, ("level",)),
+    ("usage_id", "Usage ID", 70, False, ("usage_id",)),
+    ("represented_part_id", "Represents", 80, False, ("represented_part_id",)),
+    ("current_revision_id", "Revision ID", 82, False, ("current_revision_id",)),
+    ("current_iteration_id", "Iteration ID", 82, False, ("current_iteration_id",)),
+    ("pending_revision_code", "Pending Rev.", 90, False, ("pending_revision_code",)),
+    ("released_by", "Released By", 90, False, ("released_by",)),
+    ("released_at", "Released At", 125, False, ("released_at",)),
+    ("created", "Created", 125, False, ("created", "created_at")),
+    ("modified", "Modified", 125, False, ("modified", "modified_at")),
+    ("notes", "Notes", 180, False, ("notes",)),
+]
+BOM_TREE_COLUMN_COUNT = BOM_COL_EXTRA_START + len(BOM_EXTRA_COLUMN_SPECS)
 
 # Inline "In Work" beside name (spec)
 _BOM_INWORK_COLOR = QColor("#BA7517")
@@ -2684,6 +2719,7 @@ class BomPage(QWidget):
         try:
             self.advanced_filter_btn.setEnabled(mode == "ebom")
             self.saved_filters_btn.setEnabled(mode == "ebom")
+            self.bom_columns_btn.setEnabled(mode == "ebom")
             self.search_input.setPlaceholderText(
                 "Search Item Number, name, or AES..."
                 if mode == "ebom"
@@ -6882,7 +6918,16 @@ class BomPage(QWidget):
         query = str(self.search_input.text() or "").strip()
         filters = self._bom_advanced_filters or self._default_bom_advanced_filters()
         advanced_active = not self._is_default_bom_advanced_filter(filters)
-        if query or str(filters.get("text") or "").strip():
+        db_safe_advanced = advanced_active
+        if db_safe_advanced:
+            defaults = self._default_bom_advanced_filters()
+            for key in ("pdf", "step", "integrity", "issues", "work_state", "work_owner"):
+                if filters.get(key, defaults.get(key)) != defaults.get(key):
+                    db_safe_advanced = False
+                    break
+            if (filters.get("categories") or []) or str(filters.get("category") or "").strip() not in ("", "All"):
+                db_safe_advanced = False
+        if query or str(filters.get("text") or "").strip() or db_safe_advanced:
             return self._apply_ebom_db_flat_filter(query=query, filters=filters)
         show_parents = bool(filters.get("show_parent_matches", True))
         flat_results = bool(advanced_active) and (
@@ -6985,7 +7030,14 @@ class BomPage(QWidget):
         return visible_count
 
     def _apply_ebom_db_flat_filter(self, query: str = "", filters: dict | None = None) -> int:
-        """Show EBOM search results from SQL without expanding the lazy tree."""
+        """Show EBOM filter results from SQL without expanding the lazy tree.
+
+        When parent branches are enabled, the result is a lightweight filtered
+        EBOM tree: every matching descendant is shown under its real ancestor
+        path.  This fixes lazy BOM filtering where matches below collapsed
+        subassemblies were previously invisible because only loaded siblings
+        were inspected.
+        """
         result_tree = getattr(self, "_ebom_filter_tree", None)
         if result_tree is None or not self.session.project_id:
             return 0
@@ -7030,41 +7082,206 @@ class BomPage(QWidget):
         if revision:
             where.append("lower(COALESCE(b.revision,'')) LIKE ?")
             params.append(f"%{revision.lower()}%")
+        relation_table = "bom_children"
+        relation_parent = "parent_id"
+        relation_child = "child_id"
+        relation_project_clause = (
+            "EXISTS (SELECT 1 FROM bom bp WHERE bp.id=u.parent_id AND bp.project_id=b.project_id)"
+        )
+        relation_order_expr = "u.id"
+        try:
+            with self.bom_service.bom_repo.get_conn() as conn:
+                tables = {
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type IN ('table','view')"
+                    ).fetchall()
+                }
+                if "item_usages" in tables:
+                    relation_table = "item_usages"
+                    relation_parent = "parent_item_id"
+                    relation_child = "child_item_id"
+                    relation_project_clause = "u.project_id=b.project_id"
+                relation_columns = {
+                    str(row[1])
+                    for row in conn.execute(f"PRAGMA table_info({relation_table})").fetchall()
+                }
+                if "sort_order" in relation_columns:
+                    relation_order_expr = "COALESCE(u.sort_order, u.id)"
+        except Exception:
+            pass
+
         structure = str(filters.get("structure") or "Any")
         if structure == "Assemblies only":
             where.append(
-                "EXISTS (SELECT 1 FROM item_usages u WHERE u.project_id=b.project_id AND u.parent_item_id=b.id)"
+                f"EXISTS (SELECT 1 FROM {relation_table} u WHERE {relation_project_clause} AND u.{relation_parent}=b.id)"
             )
         elif structure == "Leaf parts only":
             where.append(
-                "NOT EXISTS (SELECT 1 FROM item_usages u WHERE u.project_id=b.project_id AND u.parent_item_id=b.id)"
+                f"NOT EXISTS (SELECT 1 FROM {relation_table} u WHERE {relation_project_clause} AND u.{relation_parent}=b.id)"
             )
         sql = f"""
             SELECT b.id, b.part_number, b.aes_number, b.name, b.type,
+                   COALESCE(b.drawing_number, '') AS drawing_number,
+                   COALESCE(b.filename, '') AS filename,
+                   COALESCE(b.base_file_name, '') AS base_file_name,
+                   COALESCE(b.base_drw_name, '') AS base_drw_name,
+                   COALESCE(b.material, '') AS material,
+                   COALESCE(b.weight, '') AS weight,
+                   COALESCE(b.notes, '') AS notes,
                    COALESCE(b.revision, 'A') AS revision,
                    COALESCE(b.lifecycle_state, b.status, '') AS lifecycle_state,
                    COALESCE(b.item_type, '') AS item_type,
+                   COALESCE(b.assembly_mode, '') AS assembly_mode,
+                   COALESCE(b.classification, '') AS classification,
+                   COALESCE(b.default_ebom_behavior, '') AS default_ebom_behavior,
+                   COALESCE(b.cad_requirement, '') AS cad_requirement,
+                   COALESCE(b.drawing_requirement, '') AS drawing_requirement,
+                   COALESCE(b.cad_control_mode, '') AS cad_control_mode,
                    COALESCE(b.procurement_source, '') AS procurement_source,
                    COALESCE(b.item_view, '') AS item_view,
+                   COALESCE(b.default_unit, '') AS default_unit,
+                   b.represented_part_id,
+                   b.current_revision_id,
+                   b.current_iteration_id,
+                   COALESCE(b.pending_revision_code, '') AS pending_revision_code,
+                   b.released_by,
+                   COALESCE(b.released_at, '') AS released_at,
+                   COALESCE(b.created, '') AS created,
+                   COALESCE(b.modified, '') AS modified,
                    EXISTS (
-                       SELECT 1 FROM item_usages u
-                       WHERE u.project_id=b.project_id AND u.parent_item_id=b.id
+                       SELECT 1 FROM {relation_table} u
+                       WHERE {relation_project_clause} AND u.{relation_parent}=b.id
                    ) AS has_children
             FROM bom b
             WHERE {' AND '.join(where)}
             ORDER BY lower(COALESCE(b.part_number,'')), lower(b.name), b.id
             LIMIT 500
         """
+        show_parent_branches = bool(filters.get("show_parent_matches", True))
+        remove_duplicates = bool(filters.get("remove_duplicates", False))
         try:
             with self.bom_service.bom_repo.get_conn() as conn:
                 rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
+                match_ids = [int(row["id"]) for row in rows if row.get("id") is not None]
+
+                parent_by_child: dict[int, list[int]] = {}
+                if show_parent_branches and not remove_duplicates and match_ids:
+                    if relation_table == "item_usages":
+                        rel_sql = f"""
+                            SELECT u.{relation_parent} AS parent_id,
+                                   u.{relation_child} AS child_id
+                            FROM {relation_table} u
+                            JOIN bom p ON p.id=u.{relation_parent}
+                            JOIN bom c ON c.id=u.{relation_child}
+                            WHERE u.project_id=? AND p.project_id=? AND c.project_id=?
+                            ORDER BY {relation_order_expr}, u.id
+                        """
+                        rel_params = (int(self.session.project_id),) * 3
+                    else:
+                        rel_sql = f"""
+                            SELECT u.{relation_parent} AS parent_id,
+                                   u.{relation_child} AS child_id
+                            FROM {relation_table} u
+                            JOIN bom p ON p.id=u.{relation_parent}
+                            JOIN bom c ON c.id=u.{relation_child}
+                            WHERE p.project_id=? AND c.project_id=?
+                            ORDER BY {relation_order_expr}, u.id
+                        """
+                        rel_params = (int(self.session.project_id), int(self.session.project_id))
+                    for rel in conn.execute(rel_sql, rel_params).fetchall():
+                        parent_id = int(rel["parent_id"])
+                        child_id = int(rel["child_id"])
+                        parent_by_child.setdefault(child_id, []).append(parent_id)
+
+                    include_ids = set(match_ids)
+                    paths: set[tuple[int, ...]] = set()
+
+                    def ancestor_paths(item_id: int, trail: tuple[int, ...] = ()) -> list[tuple[int, ...]]:
+                        if item_id in trail:
+                            return [(item_id,)]
+                        parents = parent_by_child.get(int(item_id), [])
+                        if not parents:
+                            return [(int(item_id),)]
+                        built = []
+                        next_trail = trail + (int(item_id),)
+                        for parent_id in parents:
+                            include_ids.add(int(parent_id))
+                            for parent_path in ancestor_paths(int(parent_id), next_trail):
+                                built.append(parent_path + (int(item_id),))
+                        return built or [(int(item_id),)]
+
+                    for match_id in match_ids:
+                        for path in ancestor_paths(int(match_id)):
+                            for depth in range(1, len(path) + 1):
+                                paths.add(path[:depth])
+
+                    if include_ids:
+                        id_list = sorted(include_ids)
+                        row_by_id = {}
+                        for offset in range(0, len(id_list), 800):
+                            chunk = id_list[offset:offset + 800]
+                            placeholders = ",".join("?" for _ in chunk)
+                            fetch_sql = f"""
+                                SELECT b.id, b.part_number, b.aes_number, b.name, b.type,
+                                       COALESCE(b.drawing_number, '') AS drawing_number,
+                                       COALESCE(b.filename, '') AS filename,
+                                       COALESCE(b.base_file_name, '') AS base_file_name,
+                                       COALESCE(b.base_drw_name, '') AS base_drw_name,
+                                       COALESCE(b.material, '') AS material,
+                                       COALESCE(b.weight, '') AS weight,
+                                       COALESCE(b.notes, '') AS notes,
+                                       COALESCE(b.revision, 'A') AS revision,
+                                       COALESCE(b.lifecycle_state, b.status, '') AS lifecycle_state,
+                                       COALESCE(b.item_type, '') AS item_type,
+                                       COALESCE(b.assembly_mode, '') AS assembly_mode,
+                                       COALESCE(b.classification, '') AS classification,
+                                       COALESCE(b.default_ebom_behavior, '') AS default_ebom_behavior,
+                                       COALESCE(b.cad_requirement, '') AS cad_requirement,
+                                       COALESCE(b.drawing_requirement, '') AS drawing_requirement,
+                                       COALESCE(b.cad_control_mode, '') AS cad_control_mode,
+                                       COALESCE(b.procurement_source, '') AS procurement_source,
+                                       COALESCE(b.item_view, '') AS item_view,
+                                       COALESCE(b.default_unit, '') AS default_unit,
+                                       b.represented_part_id,
+                                       b.current_revision_id,
+                                       b.current_iteration_id,
+                                       COALESCE(b.pending_revision_code, '') AS pending_revision_code,
+                                       b.released_by,
+                                       COALESCE(b.released_at, '') AS released_at,
+                                       COALESCE(b.created, '') AS created,
+                                       COALESCE(b.modified, '') AS modified,
+                                       EXISTS (
+                                           SELECT 1 FROM {relation_table} u
+                                           WHERE {relation_project_clause} AND u.{relation_parent}=b.id
+                                       ) AS has_children
+                                FROM bom b
+                                WHERE b.project_id=? AND b.represented_part_id IS NULL
+                                  AND b.id IN ({placeholders})
+                            """
+                            for row in conn.execute(fetch_sql, [int(self.session.project_id), *chunk]).fetchall():
+                                row_by_id[int(row["id"])] = dict(row)
+
+                        rows = []
+                        for path in sorted(paths, key=lambda p: (len(p), p)):
+                            leaf_id = int(path[-1])
+                            row = dict(row_by_id.get(leaf_id) or {})
+                            if not row:
+                                continue
+                            row["_filter_path"] = path
+                            row["_filter_is_match"] = leaf_id in set(match_ids)
+                            rows.append(row)
         except Exception:
             rows = []
         result_tree.setUpdatesEnabled(False)
         try:
             result_tree.clear()
+            path_items: dict[tuple[int, ...], QTreeWidgetItem] = {}
+            match_count = 0
             for row in rows:
                 part_id = int(row["id"])
+                if row.get("_filter_is_match", True):
+                    match_count += 1
                 info = {
                     "id": part_id,
                     "bom_id": part_id,
@@ -7077,8 +7294,30 @@ class BomPage(QWidget):
                     "status": row.get("lifecycle_state") or "",
                     "lifecycle_state": row.get("lifecycle_state") or "",
                     "item_type": row.get("item_type") or "",
+                    "drawing_number": row.get("drawing_number") or "",
+                    "filename": row.get("filename") or row.get("base_file_name") or "",
+                    "base_file_name": row.get("base_file_name") or "",
+                    "base_drw_name": row.get("base_drw_name") or "",
+                    "material": row.get("material") or "",
+                    "weight": row.get("weight") or "",
+                    "notes": row.get("notes") or "",
+                    "assembly_mode": row.get("assembly_mode") or "",
+                    "classification": row.get("classification") or "",
+                    "default_ebom_behavior": row.get("default_ebom_behavior") or "",
+                    "cad_requirement": row.get("cad_requirement") or "",
+                    "drawing_requirement": row.get("drawing_requirement") or "",
+                    "cad_control_mode": row.get("cad_control_mode") or "",
                     "procurement_source": row.get("procurement_source") or "",
                     "item_view": row.get("item_view") or "",
+                    "default_unit": row.get("default_unit") or "",
+                    "represented_part_id": row.get("represented_part_id"),
+                    "current_revision_id": row.get("current_revision_id"),
+                    "current_iteration_id": row.get("current_iteration_id"),
+                    "pending_revision_code": row.get("pending_revision_code") or "",
+                    "released_by": row.get("released_by"),
+                    "released_at": row.get("released_at") or "",
+                    "created": row.get("created") or "",
+                    "modified": row.get("modified") or "",
                     "_has_children": bool(row.get("has_children")),
                     "_defer_indicators": True,
                     "children": [],
@@ -7099,13 +7338,22 @@ class BomPage(QWidget):
                 item.setData(0, PDM_ASSOCIATIONS_SHOWN_ROLE, False)
                 item.setIcon(BOM_COL_NAME, _pdm_item_icon())
                 self._ensure_pdm_lazy_placeholder(item)
-                result_tree.addTopLevelItem(item)
+                path = tuple(row.get("_filter_path") or (part_id,))
+                item.setData(0, BOM_TREE_PATH_ROLE, " > ".join(str(value) for value in path))
+                path_items[path] = item
+                parent_path = path[:-1]
+                parent_item = path_items.get(parent_path) if parent_path else None
+                if parent_item is not None:
+                    parent_item.addChild(item)
+                    parent_item.setExpanded(True)
+                else:
+                    result_tree.addTopLevelItem(item)
         finally:
             result_tree.setUpdatesEnabled(True)
         self._ebom_filter_flat_mode = True
         self._tree_stack.setCurrentWidget(result_tree)
         self._sync_search_tree_row_numbers()
-        return len(rows)
+        return match_count if show_parent_branches and not remove_duplicates else len(rows)
 
     def _show_tree_placeholder(self, _message: str) -> None:
         # Backward compatible; loader is now a spinner overlay.
@@ -7225,7 +7473,208 @@ class BomPage(QWidget):
         if project_working_dir:
             return project_working_dir
 
-        
+    def _bom_tree_headers(self, ebom: bool = False) -> list[str]:
+        base_name = "Item / Related CAD" if ebom else "Name"
+        number_label = "Number / Association" if ebom else "AES Number"
+        return [
+            "#", base_name, "Files", number_label, "Object", "Rev/Iter",
+            "Status", "Integrity", "Source Qty", "Effective Qty", "Level",
+        ] + [label for _key, label, _width, _default, _aliases in BOM_EXTRA_COLUMN_SPECS]
+
+    def _default_visible_bom_column_keys(self) -> set[str]:
+        return {
+            key for key, _label, _width, default_visible, _aliases in BOM_EXTRA_COLUMN_SPECS
+            if default_visible
+        }
+
+    def _visible_bom_column_keys(self) -> set[str]:
+        settings = QSettings("Nexus", "NexusPDM")
+        raw = str(settings.value("bom/visible_extra_columns", "") or "").strip()
+        if not raw:
+            return self._default_visible_bom_column_keys()
+        try:
+            loaded = json.loads(raw)
+            return {
+                str(value)
+                for value in (loaded or [])
+                if str(value) in {spec[0] for spec in BOM_EXTRA_COLUMN_SPECS}
+            }
+        except Exception:
+            return self._default_visible_bom_column_keys()
+
+    def _save_visible_bom_column_keys(self, keys: set[str]) -> None:
+        QSettings("Nexus", "NexusPDM").setValue(
+            "bom/visible_extra_columns",
+            json.dumps(sorted(str(key) for key in keys)),
+        )
+
+    def _configure_bom_tree_columns(self, tree: QTreeWidget | None, ebom: bool = False) -> None:
+        if tree is None:
+            return
+        tree.setHeaderLabels(self._bom_tree_headers(ebom=ebom))
+        widths = {
+            BOM_COL_ROW: 38,
+            BOM_COL_NAME: 260 if ebom else 280,
+            BOM_COL_FILES: 100,
+            BOM_COL_AES: 125 if ebom else 90,
+            BOM_COL_TYPE: 70,
+            BOM_COL_REV: 70,
+            BOM_COL_STATUS: 85,
+            BOM_COL_INTEGRITY: 55,
+            EBOM_COL_SOURCE_QTY: 74,
+            EBOM_COL_EFFECTIVE_QTY: 84,
+            EBOM_COL_LEVEL: 45,
+        }
+        for column, width in widths.items():
+            try:
+                tree.setColumnWidth(column, width)
+            except Exception:
+                pass
+        for offset, (_key, _label, width, _default, _aliases) in enumerate(BOM_EXTRA_COLUMN_SPECS):
+            try:
+                tree.setColumnWidth(BOM_COL_EXTRA_START + offset, int(width))
+            except Exception:
+                pass
+        self._apply_bom_column_visibility(tree, ebom=ebom)
+        try:
+            tree.setTreePosition(BOM_COL_NAME)
+        except Exception:
+            pass
+        try:
+            header = tree.header()
+            if not bool(header.property("nexusColumnMenuInstalled")):
+                header.setContextMenuPolicy(Qt.CustomContextMenu)
+                header.customContextMenuRequested.connect(
+                    lambda _pos, self=self: self.show_bom_column_dialog()
+                )
+                header.setProperty("nexusColumnMenuInstalled", True)
+                header.setToolTip("Right-click to manage visible tree columns.")
+        except Exception:
+            pass
+
+    def _apply_bom_column_visibility(self, tree: QTreeWidget | None = None, ebom: bool | None = None) -> None:
+        trees = []
+        if tree is not None:
+            trees = [(tree, bool(ebom))]
+        else:
+            trees = [
+                (getattr(self, "tree", None), False),
+                (getattr(self, "_search_tree", None), False),
+                (getattr(self, "_ebom_tree", None), True),
+                (getattr(self, "_ebom_filter_tree", None), True),
+            ]
+        visible_keys = self._visible_bom_column_keys()
+        for target_tree, is_ebom in trees:
+            if target_tree is None:
+                continue
+            # EBOM-specific quantity/level columns stay visible in EBOM only.
+            for column in (EBOM_COL_SOURCE_QTY, EBOM_COL_EFFECTIVE_QTY, EBOM_COL_LEVEL):
+                try:
+                    target_tree.setColumnHidden(column, not is_ebom)
+                except Exception:
+                    pass
+            for offset, (key, _label, _width, _default, _aliases) in enumerate(BOM_EXTRA_COLUMN_SPECS):
+                try:
+                    target_tree.setColumnHidden(BOM_COL_EXTRA_START + offset, key not in visible_keys)
+                except Exception:
+                    pass
+
+    def _extra_bom_column_value(self, info: dict, spec: tuple) -> str:
+        key, _label, _width, _default, aliases = spec
+        for alias in aliases:
+            value = info.get(alias)
+            if value not in (None, ""):
+                if isinstance(value, (list, tuple, set)):
+                    return ", ".join(str(v) for v in value if str(v).strip())
+                return str(value)
+        if key == "effective_quantity":
+            value = info.get("effective_quantity")
+            if value in (None, ""):
+                value = info.get("quantity")
+            return "" if value in (None, "") else str(value)
+        return ""
+
+    def _apply_extra_bom_columns(self, item: QTreeWidgetItem, info: dict) -> None:
+        for offset, spec in enumerate(BOM_EXTRA_COLUMN_SPECS):
+            column = BOM_COL_EXTRA_START + offset
+            try:
+                value = self._extra_bom_column_value(info or {}, spec)
+                item.setText(column, value)
+                if value:
+                    item.setToolTip(column, value)
+            except Exception:
+                pass
+
+    def show_bom_column_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Tree Columns")
+        dialog.resize(520, 620)
+        layout = QVBoxLayout(dialog)
+        title = QLabel("Select BOM Tree Columns")
+        title.setStyleSheet("font-weight:700;font-size:13px;color:#1f3347;")
+        layout.addWidget(title)
+        help_label = QLabel(
+            "Choose the metadata columns shown in the Product Structure tree. "
+            "The main tree column remains fixed, like Creo/Windchill."
+        )
+        help_label.setWordWrap(True)
+        layout.addWidget(help_label)
+
+        list_widget = QListWidget()
+        list_widget.setAlternatingRowColors(True)
+        visible = self._visible_bom_column_keys()
+        for key, label, _width, _default, _aliases in BOM_EXTRA_COLUMN_SPECS:
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, key)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if key in visible else Qt.Unchecked)
+            if key == "aes_number":
+                item.setToolTip("AES delivery reference. Kept available even when Item Number is the primary PLM number.")
+            list_widget.addItem(item)
+        layout.addWidget(list_widget, 1)
+
+        quick_row = QHBoxLayout()
+        select_all = QPushButton("Select All")
+        clear_all = QPushButton("Clear Optional")
+        default_btn = QPushButton("Default")
+        quick_row.addWidget(select_all)
+        quick_row.addWidget(clear_all)
+        quick_row.addWidget(default_btn)
+        quick_row.addStretch()
+        layout.addLayout(quick_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+
+        def set_all(state):
+            for row in range(list_widget.count()):
+                list_widget.item(row).setCheckState(state)
+
+        select_all.clicked.connect(lambda: set_all(Qt.Checked))
+        clear_all.clicked.connect(lambda: set_all(Qt.Unchecked))
+
+        def reset_default():
+            defaults = self._default_visible_bom_column_keys()
+            for row in range(list_widget.count()):
+                item = list_widget.item(row)
+                item.setCheckState(Qt.Checked if item.data(Qt.UserRole) in defaults else Qt.Unchecked)
+
+        default_btn.clicked.connect(reset_default)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        selected = set()
+        for row in range(list_widget.count()):
+            item = list_widget.item(row)
+            if item.checkState() == Qt.Checked:
+                selected.add(str(item.data(Qt.UserRole)))
+        self._save_visible_bom_column_keys(selected)
+        self._apply_bom_column_visibility()
+        try:
+            self.window().statusBar().showMessage("BOM tree columns updated.")
+        except Exception:
+            pass
 
     def init_ui(self):
         self.setObjectName("pdmWorkspace")
@@ -7303,9 +7752,14 @@ class BomPage(QWidget):
         self.clear_filter_btn.setProperty("structureTool", True)
         self.clear_filter_btn.clicked.connect(self.clear_bom_tree_filter)
         self.clear_filter_btn.setEnabled(False)
+        self.bom_columns_btn = QPushButton("Columns")
+        self.bom_columns_btn.setProperty("structureTool", True)
+        self.bom_columns_btn.setToolTip("Manage visible Product Structure tree columns.")
+        self.bom_columns_btn.clicked.connect(self.show_bom_column_dialog)
         filter_row.addWidget(self.advanced_filter_btn)
         filter_row.addWidget(self.saved_filters_btn)
         filter_row.addWidget(self.clear_filter_btn)
+        filter_row.addWidget(self.bom_columns_btn)
         left_layout.addLayout(filter_row)
 
         # Tree (BOM structure)
@@ -7461,19 +7915,7 @@ class BomPage(QWidget):
             self.tree.itemEntered.connect(self._on_tree_item_entered)
         except Exception:
             pass
-        self.tree.setHeaderLabels(["#", "Name", "Files", "AES Number", "Type", "Rev/Iter", "Status", "Integrity"])
-        self.tree.setColumnWidth(BOM_COL_ROW, 38)
-        self.tree.setColumnWidth(BOM_COL_NAME, 280)
-        self.tree.setColumnWidth(BOM_COL_FILES, 100)
-        self.tree.setColumnWidth(BOM_COL_AES, 90)
-        self.tree.setColumnWidth(BOM_COL_TYPE, 60)
-        self.tree.setColumnWidth(BOM_COL_REV, 65)
-        self.tree.setColumnWidth(BOM_COL_STATUS, 90)
-        self.tree.setColumnWidth(BOM_COL_INTEGRITY, 55)
-        try:
-            self.tree.setTreePosition(BOM_COL_NAME)
-        except Exception:
-            pass
+        self._configure_bom_tree_columns(self.tree, ebom=False)
         self.tree.itemClicked.connect(self.on_tree_item_clicked)
         self.tree.itemExpanded.connect(self._on_bom_item_expanded)
         try:
@@ -7511,19 +7953,7 @@ class BomPage(QWidget):
             self._search_tree.itemEntered.connect(self._on_tree_item_entered)
         except Exception:
             pass
-        self._search_tree.setHeaderLabels(["#", "Name", "Files", "AES Number", "Type", "Rev/Iter", "Status", "Integrity"])
-        self._search_tree.setColumnWidth(BOM_COL_ROW, 38)
-        self._search_tree.setColumnWidth(BOM_COL_NAME, 280)
-        self._search_tree.setColumnWidth(BOM_COL_FILES, 100)
-        self._search_tree.setColumnWidth(BOM_COL_AES, 90)
-        self._search_tree.setColumnWidth(BOM_COL_TYPE, 60)
-        self._search_tree.setColumnWidth(BOM_COL_REV, 65)
-        self._search_tree.setColumnWidth(BOM_COL_STATUS, 90)
-        self._search_tree.setColumnWidth(BOM_COL_INTEGRITY, 55)
-        try:
-            self._search_tree.setTreePosition(BOM_COL_NAME)
-        except Exception:
-            pass
+        self._configure_bom_tree_columns(self._search_tree, ebom=False)
         self._search_tree.itemClicked.connect(self.on_tree_item_clicked)
         try:
             self._search_tree.itemDoubleClicked.connect(self._on_tree_item_double_clicked)
@@ -7539,28 +7969,13 @@ class BomPage(QWidget):
         self._ebom_tree.setDragEnabled(False)
         self._ebom_tree.setAcceptDrops(False)
         self._ebom_tree.setDragDropMode(QAbstractItemView.NoDragDrop)
-        self._ebom_tree.setHeaderLabels([
-            "#", "Item / Related CAD", "Files", "Number / Association", "Object", "Rev/Iter",
-            "Status", "Integrity", "Source Qty", "Effective Qty", "Level",
-        ])
+        self._configure_bom_tree_columns(self._ebom_tree, ebom=True)
         self._ebom_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._ebom_tree.setAlternatingRowColors(True)
         self._ebom_tree.setUniformRowHeights(True)
         self._ebom_tree.setIndentation(14)
         self._ebom_tree.setAnimated(True)
         self._ebom_tree.setMouseTracking(True)
-        self._ebom_tree.setColumnWidth(BOM_COL_ROW, 38)
-        self._ebom_tree.setColumnWidth(BOM_COL_NAME, 260)
-        self._ebom_tree.setColumnWidth(BOM_COL_FILES, 100)
-        self._ebom_tree.setColumnWidth(BOM_COL_AES, 125)
-        self._ebom_tree.setColumnWidth(BOM_COL_TYPE, 60)
-        self._ebom_tree.setColumnWidth(BOM_COL_REV, 65)
-        self._ebom_tree.setColumnWidth(BOM_COL_STATUS, 75)
-        self._ebom_tree.setColumnWidth(BOM_COL_INTEGRITY, 55)
-        self._ebom_tree.setColumnWidth(EBOM_COL_SOURCE_QTY, 74)
-        self._ebom_tree.setColumnWidth(EBOM_COL_EFFECTIVE_QTY, 84)
-        self._ebom_tree.setColumnWidth(EBOM_COL_LEVEL, 45)
-        self._ebom_tree.setTreePosition(BOM_COL_NAME)
         self._ebom_tree.itemClicked.connect(self.on_tree_item_clicked)
         self._ebom_tree.itemExpanded.connect(self._on_pdm_tree_item_expanded)
         self._ebom_tree.itemSelectionChanged.connect(self._sync_visual_action_states)
@@ -7578,20 +7993,12 @@ class BomPage(QWidget):
         self._ebom_filter_tree.setDragEnabled(False)
         self._ebom_filter_tree.setAcceptDrops(False)
         self._ebom_filter_tree.setDragDropMode(QAbstractItemView.NoDragDrop)
-        self._ebom_filter_tree.setHeaderLabels([
-            "#", "Item / Related CAD", "Files", "Number / Association", "Object", "Rev/Iter",
-            "Status", "Integrity", "Source Qty", "Effective Qty", "Level",
-        ])
+        self._configure_bom_tree_columns(self._ebom_filter_tree, ebom=True)
         self._ebom_filter_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._ebom_filter_tree.setAlternatingRowColors(True)
         self._ebom_filter_tree.setUniformRowHeights(True)
         self._ebom_filter_tree.setIndentation(14)
         self._ebom_filter_tree.setMouseTracking(True)
-        for column in range(self._ebom_tree.columnCount()):
-            self._ebom_filter_tree.setColumnWidth(
-                column, self._ebom_tree.columnWidth(column)
-            )
-        self._ebom_filter_tree.setTreePosition(BOM_COL_NAME)
         self._ebom_filter_tree.itemClicked.connect(self.on_tree_item_clicked)
         self._ebom_filter_tree.itemSelectionChanged.connect(
             self._sync_visual_action_states
@@ -15272,6 +15679,7 @@ class BomPage(QWidget):
         item.setText(BOM_COL_STATUS, str(info.get("status", "") or ""))
         item.setText(BOM_COL_INTEGRITY, "")
         item.setData(0, Qt.UserRole, part_id)
+        self._apply_extra_bom_columns(item, info)
 
         try:
             if info.get("_defer_indicators"):

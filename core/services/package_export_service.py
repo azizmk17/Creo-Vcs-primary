@@ -9,6 +9,7 @@ from core.repositories.bom_children_repository import BomChildrenRepository
 from core.repositories.bom_repository import BomRepository
 from core.services.export_naming import exported_document_filename, safe_filename
 from core.services.part_file_service import PartFileService
+from utils import ensure_dir_exists, safe_copy2, safe_exists, safe_open
 
 
 class PackageExportService:
@@ -100,8 +101,8 @@ class PackageExportService:
         out_dir = os.path.join(destination_dir, self._safe_filename(package_name))
         pdf_dir = os.path.join(out_dir, "PDF")
         step_dir = os.path.join(out_dir, "STEP")
-        os.makedirs(pdf_dir, exist_ok=True)
-        os.makedirs(step_dir, exist_ok=True)
+        ensure_dir_exists(pdf_dir)
+        ensure_dir_exists(step_dir)
 
         exported: List[Dict] = []
         missing: List[Dict] = []
@@ -179,7 +180,7 @@ class PackageExportService:
 
             row = {**part_info, "pdf": None, "step": None}
 
-            if pdf_path and os.path.exists(pdf_path):
+            if pdf_path and safe_exists(pdf_path):
                 active_revision = (pdf_meta or {}).get("active_version_revision") or getattr(part, "revision", None) or ""
                 project_version_label = (pdf_meta or {}).get("project_version_label") or ""
                 dst_name = exported_document_filename(
@@ -191,7 +192,7 @@ class PackageExportService:
                     include_date=True,
                 )
                 dst_path = os.path.join(pdf_dir, dst_name)
-                shutil.copy2(pdf_path, dst_path)
+                safe_copy2(pdf_path, dst_path)
                 row["pdf"] = {"src": pdf_path, "dst": dst_path, **(pdf_meta or {})}
                 step(f"Copied PDF for {getattr(part, 'name', pid)}")
             else:
@@ -199,7 +200,7 @@ class PackageExportService:
                 missing.append({**part_info, "missing": "PDF", "expected": pdf_path, **({"reason": reason} if reason else {})})
                 step(f"PDF missing for {getattr(part, 'name', pid)}")
 
-            if step_path and os.path.exists(step_path):
+            if step_path and safe_exists(step_path):
                 dst_name = exported_document_filename(
                     part=part,
                     file_type="STEP",
@@ -209,7 +210,7 @@ class PackageExportService:
                     include_date=True,
                 )
                 dst_path = os.path.join(step_dir, dst_name)
-                shutil.copy2(step_path, dst_path)
+                safe_copy2(step_path, dst_path)
                 row["step"] = {"src": step_path, "dst": dst_path, **(step_meta or {})}
                 step(f"Copied STEP for {getattr(part, 'name', pid)}")
             else:
@@ -241,7 +242,7 @@ class PackageExportService:
             manifest["package"]["zip_path"] = zip_path
             step("ZIP archive created")
 
-        with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as f:
+        with safe_open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
         completed_steps = total_steps
         report("Package export complete")
