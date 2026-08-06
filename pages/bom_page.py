@@ -6918,16 +6918,7 @@ class BomPage(QWidget):
         query = str(self.search_input.text() or "").strip()
         filters = self._bom_advanced_filters or self._default_bom_advanced_filters()
         advanced_active = not self._is_default_bom_advanced_filter(filters)
-        db_safe_advanced = advanced_active
-        if db_safe_advanced:
-            defaults = self._default_bom_advanced_filters()
-            for key in ("pdf", "step", "integrity", "issues", "work_state", "work_owner"):
-                if filters.get(key, defaults.get(key)) != defaults.get(key):
-                    db_safe_advanced = False
-                    break
-            if (filters.get("categories") or []) or str(filters.get("category") or "").strip() not in ("", "All"):
-                db_safe_advanced = False
-        if query or str(filters.get("text") or "").strip() or db_safe_advanced:
+        if query or advanced_active or str(filters.get("text") or "").strip():
             return self._apply_ebom_db_flat_filter(query=query, filters=filters)
         show_parents = bool(filters.get("show_parent_matches", True))
         flat_results = bool(advanced_active) and (
@@ -7043,45 +7034,10 @@ class BomPage(QWidget):
             return 0
         filters = filters or self._default_bom_advanced_filters()
         q = str(query or "").strip()
-        where = ["b.project_id=?", "b.represented_part_id IS NULL"]
+        where = ["b.project_id=?"]
         params = [int(self.session.project_id)]
-        if q:
-            like = f"%{q.lower()}%"
-            where.append(
-                "("
-                "lower(COALESCE(b.part_number,'')) LIKE ? OR "
-                "lower(COALESCE(b.aes_number,'')) LIKE ? OR "
-                "lower(COALESCE(b.name,'')) LIKE ? OR "
-                "lower(COALESCE(b.type,'')) LIKE ? OR "
-                "lower(COALESCE(b.item_type,'')) LIKE ? OR "
-                "lower(COALESCE(b.lifecycle_state,'')) LIKE ? OR "
-                "lower(COALESCE(b.status,'')) LIKE ?"
-                ")"
-            )
-            params.extend([like] * 7)
-        text = str(filters.get("text") or "").strip()
-        if text:
-            like = f"%{text.lower()}%"
-            where.append(
-                "("
-                "lower(COALESCE(b.part_number,'')) LIKE ? OR "
-                "lower(COALESCE(b.aes_number,'')) LIKE ? OR "
-                "lower(COALESCE(b.name,'')) LIKE ?"
-                ")"
-            )
-            params.extend([like] * 3)
-        status = str(filters.get("status") or "All").strip()
-        if status and status != "All":
-            where.append("lower(COALESCE(b.lifecycle_state,b.status,''))=?")
-            params.append(status.lower())
-        part_type = str(filters.get("type") or "All").strip()
-        if part_type and part_type != "All":
-            where.append("lower(COALESCE(b.type,''))=?")
-            params.append(part_type.lower())
-        revision = str(filters.get("revision") or "").strip()
-        if revision:
-            where.append("lower(COALESCE(b.revision,'')) LIKE ?")
-            params.append(f"%{revision.lower()}%")
+        table_names = set()
+        bom_columns = set()
         relation_table = "bom_children"
         relation_parent = "parent_id"
         relation_child = "child_id"
@@ -7091,13 +7047,17 @@ class BomPage(QWidget):
         relation_order_expr = "u.id"
         try:
             with self.bom_service.bom_repo.get_conn() as conn:
-                tables = {
+                table_names = {
                     str(row[0])
                     for row in conn.execute(
                         "SELECT name FROM sqlite_master WHERE type IN ('table','view')"
                     ).fetchall()
                 }
-                if "item_usages" in tables:
+                bom_columns = {
+                    str(row[1])
+                    for row in conn.execute("PRAGMA table_info(bom)").fetchall()
+                }
+                if "item_usages" in table_names:
                     relation_table = "item_usages"
                     relation_parent = "parent_item_id"
                     relation_child = "child_item_id"
@@ -7111,6 +7071,63 @@ class BomPage(QWidget):
         except Exception:
             pass
 
+        def bom_expr(column: str, default: str = "") -> str:
+            if column in bom_columns:
+                return f"COALESCE(b.{column}, {default!r})"
+            return f"{default!r}"
+
+        def table_exists(name: str) -> bool:
+            return name in table_names
+
+        if "represented_part_id" in bom_columns:
+            where.append("b.represented_part_id IS NULL")
+
+        if q:
+            like = f"%{q.lower()}%"
+            searchable_columns = [
+                column for column in (
+                    "part_number", "aes_number", "name", "type",
+                    "item_type", "lifecycle_state", "status",
+                    "drawing_number", "material", "procurement_source",
+                )
+                if column in bom_columns
+            ]
+            if searchable_columns:
+                where.append(
+                    "(" + " OR ".join(
+                        f"lower(COALESCE(b.{column},'')) LIKE ?"
+                        for column in searchable_columns
+                    ) + ")"
+                )
+                params.extend([like] * len(searchable_columns))
+        text = str(filters.get("text") or "").strip()
+        if text:
+            like = f"%{text.lower()}%"
+            text_columns = [
+                column for column in ("part_number", "aes_number", "name", "drawing_number")
+                if column in bom_columns
+            ]
+            if text_columns:
+                where.append(
+                    "(" + " OR ".join(
+                        f"lower(COALESCE(b.{column},'')) LIKE ?"
+                        for column in text_columns
+                    ) + ")"
+                )
+                params.extend([like] * len(text_columns))
+        status = str(filters.get("status") or "All").strip()
+        if status and status != "All":
+            where.append(f"lower(COALESCE({bom_expr('lifecycle_state')}, {bom_expr('status')}, ''))=?")
+            params.append(status.lower())
+        part_type = str(filters.get("type") or "All").strip()
+        if part_type and part_type != "All" and "type" in bom_columns:
+            where.append("lower(COALESCE(b.type,''))=?")
+            params.append(part_type.lower())
+        revision = str(filters.get("revision") or "").strip()
+        if revision and "revision" in bom_columns:
+            where.append("lower(COALESCE(b.revision,'')) LIKE ?")
+            params.append(f"%{revision.lower()}%")
+
         structure = str(filters.get("structure") or "Any")
         if structure == "Assemblies only":
             where.append(
@@ -7120,35 +7137,120 @@ class BomPage(QWidget):
             where.append(
                 f"NOT EXISTS (SELECT 1 FROM {relation_table} u WHERE {relation_project_clause} AND u.{relation_parent}=b.id)"
             )
+        selected_categories = [
+            str(value).strip()
+            for value in (filters.get("categories") or [])
+            if str(value).strip()
+        ]
+        legacy_category = str(filters.get("category") or "").strip()
+        if not selected_categories and legacy_category not in ("", "All"):
+            selected_categories = [legacy_category]
+        if selected_categories and table_exists("bom_categories") and table_exists("bom_item_categories"):
+            category_keys = {value.casefold() for value in selected_categories}
+            category_values = [value for value in selected_categories if value.casefold() != "uncategorized"]
+            clauses = []
+            if category_values:
+                placeholders = ",".join("?" for _ in category_values)
+                clauses.append(
+                    "EXISTS ("
+                    "SELECT 1 FROM bom_item_categories bic "
+                    "JOIN bom_categories bc ON bc.id=bic.category_id "
+                    "WHERE bic.bom_id=b.id AND bc.project_id=b.project_id "
+                    f"AND lower(bc.name) IN ({placeholders})"
+                    ")"
+                )
+                params.extend([value.lower() for value in category_values])
+            if "uncategorized" in category_keys:
+                clauses.append(
+                    "NOT EXISTS (SELECT 1 FROM bom_item_categories bic WHERE bic.bom_id=b.id)"
+                )
+            if clauses:
+                where.append("(" + " OR ".join(clauses) + ")")
+
+        for doc_key in ("pdf", "step"):
+            desired = str(filters.get(doc_key) or "Any")
+            if desired == "Any" or not table_exists("part_files"):
+                continue
+            file_type = doc_key.upper()
+            exists_sql = (
+                "EXISTS ("
+                "SELECT 1 FROM part_files pf "
+                "WHERE pf.part_id=b.id AND upper(COALESCE(pf.file_type,''))=? "
+                "AND COALESCE(pf.deleted_at,'')=''"
+                ")"
+            )
+            if desired in ("OK", "Outdated"):
+                where.append(exists_sql)
+                params.append(file_type)
+            elif desired in ("Missing", "Not attached"):
+                where.append("NOT " + exists_sql)
+                params.append(file_type)
+
+        work_state = str(filters.get("work_state") or "Any")
+        owner = str(filters.get("work_owner") or "All").strip()
+        if (work_state != "Any" or (owner and owner != "All")) and table_exists("locks"):
+            if work_state == "In Work":
+                where.append("EXISTS (SELECT 1 FROM locks l WHERE l.part_id=b.id)")
+            elif work_state == "Checked In":
+                where.append("NOT EXISTS (SELECT 1 FROM locks l WHERE l.part_id=b.id)")
+            if owner and owner != "All" and table_exists("users"):
+                where.append(
+                    "EXISTS ("
+                    "SELECT 1 FROM locks l LEFT JOIN users lu ON lu.id=l.user_id "
+                    "WHERE l.part_id=b.id AND lower(COALESCE(lu.username,'')) LIKE ?"
+                    ")"
+                )
+                params.append(f"%{owner.lower()}%")
+
+        issues_filter = str(filters.get("issues") or "Any")
+        if issues_filter != "Any" and table_exists("issues") and table_exists("issue_parts"):
+            active_issue_sql = (
+                "EXISTS ("
+                "SELECT 1 FROM issue_parts ip JOIN issues i ON i.id=ip.issue_id "
+                "WHERE ip.part_id=b.id AND COALESCE(i.archived,0)=0 "
+                "AND lower(COALESCE(i.status,'')) NOT IN ('closed','rejected')"
+                ")"
+            )
+            any_issue_sql = (
+                "EXISTS (SELECT 1 FROM issue_parts ip JOIN issues i ON i.id=ip.issue_id "
+                "WHERE ip.part_id=b.id AND COALESCE(i.archived,0)=0)"
+            )
+            if issues_filter == "Active issues":
+                where.append(active_issue_sql)
+            elif issues_filter == "Any linked issue":
+                where.append(any_issue_sql)
+            elif issues_filter == "No linked issues":
+                where.append("NOT " + any_issue_sql)
+
         sql = f"""
             SELECT b.id, b.part_number, b.aes_number, b.name, b.type,
-                   COALESCE(b.drawing_number, '') AS drawing_number,
-                   COALESCE(b.filename, '') AS filename,
-                   COALESCE(b.base_file_name, '') AS base_file_name,
-                   COALESCE(b.base_drw_name, '') AS base_drw_name,
-                   COALESCE(b.material, '') AS material,
-                   COALESCE(b.weight, '') AS weight,
-                   COALESCE(b.notes, '') AS notes,
-                   COALESCE(b.revision, 'A') AS revision,
-                   COALESCE(b.lifecycle_state, b.status, '') AS lifecycle_state,
-                   COALESCE(b.item_type, '') AS item_type,
-                   COALESCE(b.assembly_mode, '') AS assembly_mode,
-                   COALESCE(b.classification, '') AS classification,
-                   COALESCE(b.default_ebom_behavior, '') AS default_ebom_behavior,
-                   COALESCE(b.cad_requirement, '') AS cad_requirement,
-                   COALESCE(b.drawing_requirement, '') AS drawing_requirement,
-                   COALESCE(b.cad_control_mode, '') AS cad_control_mode,
-                   COALESCE(b.procurement_source, '') AS procurement_source,
-                   COALESCE(b.item_view, '') AS item_view,
-                   COALESCE(b.default_unit, '') AS default_unit,
-                   b.represented_part_id,
-                   b.current_revision_id,
-                   b.current_iteration_id,
-                   COALESCE(b.pending_revision_code, '') AS pending_revision_code,
-                   b.released_by,
-                   COALESCE(b.released_at, '') AS released_at,
-                   COALESCE(b.created, '') AS created,
-                   COALESCE(b.modified, '') AS modified,
+                   {bom_expr('drawing_number')} AS drawing_number,
+                   {bom_expr('filename')} AS filename,
+                   {bom_expr('base_file_name')} AS base_file_name,
+                   {bom_expr('base_drw_name')} AS base_drw_name,
+                   {bom_expr('material')} AS material,
+                   {bom_expr('weight')} AS weight,
+                   {bom_expr('notes')} AS notes,
+                   {bom_expr('revision', 'A')} AS revision,
+                   COALESCE({bom_expr('lifecycle_state')}, {bom_expr('status')}, '') AS lifecycle_state,
+                   {bom_expr('item_type')} AS item_type,
+                   {bom_expr('assembly_mode')} AS assembly_mode,
+                   {bom_expr('classification')} AS classification,
+                   {bom_expr('default_ebom_behavior')} AS default_ebom_behavior,
+                   {bom_expr('cad_requirement')} AS cad_requirement,
+                   {bom_expr('drawing_requirement')} AS drawing_requirement,
+                   {bom_expr('cad_control_mode')} AS cad_control_mode,
+                   {bom_expr('procurement_source')} AS procurement_source,
+                   {bom_expr('item_view')} AS item_view,
+                   {bom_expr('default_unit')} AS default_unit,
+                   {('b.represented_part_id' if 'represented_part_id' in bom_columns else 'NULL')} AS represented_part_id,
+                   {('b.current_revision_id' if 'current_revision_id' in bom_columns else 'NULL')} AS current_revision_id,
+                   {('b.current_iteration_id' if 'current_iteration_id' in bom_columns else 'NULL')} AS current_iteration_id,
+                   {bom_expr('pending_revision_code')} AS pending_revision_code,
+                   {('b.released_by' if 'released_by' in bom_columns else 'NULL')} AS released_by,
+                   {bom_expr('released_at')} AS released_at,
+                   {bom_expr('created')} AS created,
+                   {bom_expr('modified')} AS modified,
                    EXISTS (
                        SELECT 1 FROM {relation_table} u
                        WHERE {relation_project_clause} AND u.{relation_parent}=b.id
@@ -7224,39 +7326,40 @@ class BomPage(QWidget):
                             placeholders = ",".join("?" for _ in chunk)
                             fetch_sql = f"""
                                 SELECT b.id, b.part_number, b.aes_number, b.name, b.type,
-                                       COALESCE(b.drawing_number, '') AS drawing_number,
-                                       COALESCE(b.filename, '') AS filename,
-                                       COALESCE(b.base_file_name, '') AS base_file_name,
-                                       COALESCE(b.base_drw_name, '') AS base_drw_name,
-                                       COALESCE(b.material, '') AS material,
-                                       COALESCE(b.weight, '') AS weight,
-                                       COALESCE(b.notes, '') AS notes,
-                                       COALESCE(b.revision, 'A') AS revision,
-                                       COALESCE(b.lifecycle_state, b.status, '') AS lifecycle_state,
-                                       COALESCE(b.item_type, '') AS item_type,
-                                       COALESCE(b.assembly_mode, '') AS assembly_mode,
-                                       COALESCE(b.classification, '') AS classification,
-                                       COALESCE(b.default_ebom_behavior, '') AS default_ebom_behavior,
-                                       COALESCE(b.cad_requirement, '') AS cad_requirement,
-                                       COALESCE(b.drawing_requirement, '') AS drawing_requirement,
-                                       COALESCE(b.cad_control_mode, '') AS cad_control_mode,
-                                       COALESCE(b.procurement_source, '') AS procurement_source,
-                                       COALESCE(b.item_view, '') AS item_view,
-                                       COALESCE(b.default_unit, '') AS default_unit,
-                                       b.represented_part_id,
-                                       b.current_revision_id,
-                                       b.current_iteration_id,
-                                       COALESCE(b.pending_revision_code, '') AS pending_revision_code,
-                                       b.released_by,
-                                       COALESCE(b.released_at, '') AS released_at,
-                                       COALESCE(b.created, '') AS created,
-                                       COALESCE(b.modified, '') AS modified,
+                                       {bom_expr('drawing_number')} AS drawing_number,
+                                       {bom_expr('filename')} AS filename,
+                                       {bom_expr('base_file_name')} AS base_file_name,
+                                       {bom_expr('base_drw_name')} AS base_drw_name,
+                                       {bom_expr('material')} AS material,
+                                       {bom_expr('weight')} AS weight,
+                                       {bom_expr('notes')} AS notes,
+                                       {bom_expr('revision', 'A')} AS revision,
+                                       COALESCE({bom_expr('lifecycle_state')}, {bom_expr('status')}, '') AS lifecycle_state,
+                                       {bom_expr('item_type')} AS item_type,
+                                       {bom_expr('assembly_mode')} AS assembly_mode,
+                                       {bom_expr('classification')} AS classification,
+                                       {bom_expr('default_ebom_behavior')} AS default_ebom_behavior,
+                                       {bom_expr('cad_requirement')} AS cad_requirement,
+                                       {bom_expr('drawing_requirement')} AS drawing_requirement,
+                                       {bom_expr('cad_control_mode')} AS cad_control_mode,
+                                       {bom_expr('procurement_source')} AS procurement_source,
+                                       {bom_expr('item_view')} AS item_view,
+                                       {bom_expr('default_unit')} AS default_unit,
+                                       {('b.represented_part_id' if 'represented_part_id' in bom_columns else 'NULL')} AS represented_part_id,
+                                       {('b.current_revision_id' if 'current_revision_id' in bom_columns else 'NULL')} AS current_revision_id,
+                                       {('b.current_iteration_id' if 'current_iteration_id' in bom_columns else 'NULL')} AS current_iteration_id,
+                                       {bom_expr('pending_revision_code')} AS pending_revision_code,
+                                       {('b.released_by' if 'released_by' in bom_columns else 'NULL')} AS released_by,
+                                       {bom_expr('released_at')} AS released_at,
+                                       {bom_expr('created')} AS created,
+                                       {bom_expr('modified')} AS modified,
                                        EXISTS (
                                            SELECT 1 FROM {relation_table} u
                                            WHERE {relation_project_clause} AND u.{relation_parent}=b.id
                                        ) AS has_children
                                 FROM bom b
-                                WHERE b.project_id=? AND b.represented_part_id IS NULL
+                                WHERE b.project_id=?
+                                  {"AND b.represented_part_id IS NULL" if "represented_part_id" in bom_columns else ""}
                                   AND b.id IN ({placeholders})
                             """
                             for row in conn.execute(fetch_sql, [int(self.session.project_id), *chunk]).fetchall():
@@ -7329,7 +7432,12 @@ class BomPage(QWidget):
                 item.setData(0, PDM_NODE_PAYLOAD_ROLE, dict(info))
                 item.setData(0, PDM_CHILDREN_PAYLOAD_ROLE, [])
                 item.setData(0, BOM_TREE_IS_ASSEMBLY_ROLE, bool(row.get("has_children")))
-                item.setData(0, BOM_TREE_CHILDREN_LOADED_ROLE, False)
+                # This is a filtered SQL projection.  Do not mark it as a live
+                # lazy branch or add a Loading... placeholder; the real EBOM
+                # tree owns lazy loading.  Otherwise a searched-but-unloaded
+                # assembly can get stuck showing a loading spinner.
+                item.setData(0, BOM_TREE_CHILDREN_LOADED_ROLE, True)
+                item.setData(0, BOM_TREE_LOADING_ROLE, False)
                 item.setData(
                     0,
                     PDM_EBOM_ASSOCIATIONS_ROLE,
@@ -7337,7 +7445,6 @@ class BomPage(QWidget):
                 )
                 item.setData(0, PDM_ASSOCIATIONS_SHOWN_ROLE, False)
                 item.setIcon(BOM_COL_NAME, _pdm_item_icon())
-                self._ensure_pdm_lazy_placeholder(item)
                 path = tuple(row.get("_filter_path") or (part_id,))
                 item.setData(0, BOM_TREE_PATH_ROLE, " > ".join(str(value) for value in path))
                 path_items[path] = item
@@ -9019,6 +9126,17 @@ class BomPage(QWidget):
         ):
             return
         tree = item.treeWidget()
+        if tree is getattr(self, "_ebom_filter_tree", None):
+            # The filter tree is a lightweight SQL projection, not the live lazy
+            # EBOM tree. Its nodes intentionally do not carry complete child
+            # payloads, so expanding them must never start lazy loading/spinners.
+            item.setData(0, BOM_TREE_CHILDREN_LOADED_ROLE, True)
+            item.setData(0, BOM_TREE_LOADING_ROLE, False)
+            try:
+                tree.setItemLoading(item, False)
+            except Exception:
+                pass
+            return
         if not isinstance(tree, BomTreeWidget):
             self._load_pdm_lazy_children_for_item(item, refresh_filters=True)
             return
@@ -10803,6 +10921,371 @@ class BomPage(QWidget):
             focus_cad_id=int(cad_id),
         )
 
+    def _selected_pdm_rows(self, tree: QTreeWidget, fallback: QTreeWidgetItem) -> list[QTreeWidgetItem]:
+        """Return the stable right-click selection, preserving multi-select."""
+        rows = []
+        try:
+            cached = list(getattr(tree, "_context_menu_selection", []) or [])
+            selected = cached or list(tree.selectedItems())
+        except Exception:
+            selected = []
+        for row in selected or []:
+            if row is None or self._is_lazy_placeholder(row) or self._is_folder_tree_item(row):
+                continue
+            if row not in rows:
+                rows.append(row)
+        if fallback is not None and fallback not in rows:
+            rows.append(fallback)
+        return rows
+
+    def _pdm_ebom_relation_parent_for_item(self, item: QTreeWidgetItem) -> int | None:
+        if item is None:
+            return None
+        try:
+            occurrence = item.data(0, BOM_TREE_OCCURRENCE_ROLE) or {}
+            parent_id = occurrence.get("parent_id")
+            if parent_id is not None:
+                return int(parent_id)
+        except Exception:
+            pass
+        try:
+            payload = item.data(0, PDM_NODE_PAYLOAD_ROLE) or {}
+            parent_id = payload.get("effective_parent_bom_id") or payload.get("relation_parent_id")
+            if parent_id is not None:
+                return int(parent_id)
+        except Exception:
+            pass
+        parent = item.parent()
+        while parent is not None:
+            if self._is_folder_tree_item(parent):
+                parent = parent.parent()
+                continue
+            if parent.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+                parent = parent.parent()
+                continue
+            try:
+                value = parent.data(0, Qt.UserRole)
+                return int(value) if value is not None else None
+            except Exception:
+                return None
+        return None
+
+    def _pdm_ebom_relation_selection_for_item(self, item: QTreeWidgetItem) -> dict | None:
+        if item is None or item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+            return None
+        try:
+            child_id = int(item.data(0, Qt.UserRole))
+        except Exception:
+            return None
+        return {
+            "child_id": child_id,
+            "child_name": str(item.text(BOM_COL_NAME) or child_id),
+            "source_parent_id": self._pdm_ebom_relation_parent_for_item(item),
+        }
+
+    def _apply_pdm_ebom_structure_operation(
+        self,
+        selected_items: list[QTreeWidgetItem],
+        mode: str,
+    ) -> None:
+        selections = []
+        for row in selected_items or []:
+            payload = self._pdm_ebom_relation_selection_for_item(row)
+            if payload is not None:
+                selections.append(payload)
+        if not selections:
+            return QMessageBox.warning(self, "Item Structure", "Select one or more EBOM Items.")
+        self._start_pdm_structure_target_selection(
+            "EBOM",
+            str(mode).lower(),
+            selections,
+            "Select the target EBOM assembly in the tree. You can search, filter, expand, or isolate first. Press Esc to cancel.",
+        )
+
+    def _finish_pdm_ebom_structure_operation(
+        self,
+        target_parent_id: int,
+        selections: list[dict],
+        mode: str,
+    ) -> None:
+        try:
+            result = self.bom_service.apply_child_relation_operation(
+                int(target_parent_id), selections, str(mode).lower()
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Item Structure", str(exc))
+            return
+        affected = {int(result.get("target_parent_id") or target_parent_id)}
+        affected.update(int(value) for value in (result.get("source_parent_ids") or []))
+        affected.update(int(value) for value in (result.get("child_ids") or []))
+        for item_id in sorted(affected):
+            self._refresh_pdm_ebom_structure_branch(int(item_id))
+        try:
+            self._refresh_ebom_filters()
+        except Exception:
+            pass
+        verb = "moved" if str(mode).lower() == "move" else "copied"
+        try:
+            self.window().statusBar().showMessage(
+                f"{len(result.get('child_ids') or [])} Item usage(s) {verb}."
+            )
+        except Exception:
+            pass
+
+    def _remove_pdm_ebom_children_from_tree(
+        self,
+        parent_item_id: int,
+        parent_name: str,
+        selected_items: list[QTreeWidgetItem],
+    ) -> None:
+        child_ids = []
+        for row in selected_items or []:
+            selection = self._pdm_ebom_relation_selection_for_item(row)
+            if not selection:
+                continue
+            if selection.get("source_parent_id") != int(parent_item_id):
+                continue
+            child_ids.append(int(selection["child_id"]))
+        child_ids = sorted(set(child_ids))
+        if not child_ids:
+            return
+        if QMessageBox.question(
+            self,
+            "Remove EBOM Children",
+            f"Remove {len(child_ids)} child usage(s) from {parent_name or parent_item_id}?\n\n"
+            "The Item masters are not deleted.",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        ) != QMessageBox.Yes:
+            return
+        try:
+            result = self.bom_service.remove_children_from_parent(
+                int(parent_item_id), child_ids
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Remove EBOM Children", str(exc))
+            return
+        affected = {int(parent_item_id), *child_ids}
+        for item_id in sorted(affected):
+            self._refresh_pdm_ebom_structure_branch(int(item_id))
+        moved_items = result.get("moved_to_root_items") or []
+        if moved_items:
+            QMessageBox.information(
+                self,
+                "Moved to Top Level",
+                "Some removed children have no remaining parent, so they are now top-level EBOM Items.",
+            )
+
+    def _cad_structure_selection_for_item(self, item: QTreeWidgetItem) -> dict | None:
+        if item is None or item.data(0, PDM_OBJECT_KIND_ROLE) != PDM_OBJECT_CAD:
+            return None
+        try:
+            child_cad_id = int(item.data(0, PDM_CAD_DOCUMENT_ID_ROLE))
+        except Exception:
+            return None
+        payload = dict(item.data(0, PDM_CAD_PAYLOAD_ROLE) or {})
+        member_id = item.data(0, PDM_CAD_MEMBER_ID_ROLE)
+        parent_item = item.parent()
+        source_parent_id = None
+        try:
+            if parent_item is not None:
+                source_parent_id = int(parent_item.data(0, PDM_CAD_DOCUMENT_ID_ROLE))
+        except Exception:
+            source_parent_id = None
+        return {
+            "member_id": int(member_id) if member_id is not None else None,
+            "child_cad_document_id": child_cad_id,
+            "source_parent_cad_id": source_parent_id,
+            "quantity": max(1, int(payload.get("quantity") or 1)),
+            "build_excluded": bool(
+                payload.get("member_build_excluded") or payload.get("build_excluded")
+            ),
+        }
+
+    def _apply_pdm_cad_structure_operation(
+        self,
+        selected_items: list[QTreeWidgetItem],
+        mode: str,
+    ) -> None:
+        selections = []
+        for row in selected_items or []:
+            payload = self._cad_structure_selection_for_item(row)
+            if payload is not None:
+                selections.append(payload)
+        if not selections:
+            return QMessageBox.warning(self, "CAD Structure", "Select one or more CAD Documents.")
+        self._start_pdm_structure_target_selection(
+            "CAD",
+            str(mode).lower(),
+            selections,
+            "Select the target CAD assembly in the CAD Structure tree. You can search, filter, expand, or isolate first. Press Esc to cancel.",
+        )
+
+    def _finish_pdm_cad_structure_operation(
+        self,
+        target_parent_cad_id: int,
+        selections: list[dict],
+        mode: str,
+    ) -> None:
+        try:
+            result = self.bom_service.apply_pdm_cad_member_operation(
+                int(target_parent_cad_id), selections, str(mode).lower()
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "CAD Structure", str(exc))
+            return
+        affected = {int(result.get("target_parent_cad_id") or target_parent_cad_id)}
+        affected.update(int(value) for value in (result.get("source_parent_cad_ids") or []))
+        affected.update(int(value) for value in (result.get("child_cad_document_ids") or []))
+        for cad_id in sorted(affected):
+            self._refresh_pdm_cad_structure_branch(int(cad_id))
+        try:
+            self._refresh_pdm_cad_filter()
+        except Exception:
+            pass
+
+    def _start_pdm_structure_target_selection(
+        self,
+        scope: str,
+        mode: str,
+        selections: list[dict],
+        message: str,
+    ) -> None:
+        self._exit_pdm_structure_target_selection(clear_status=False)
+        self._pdm_structure_target_state = {
+            "scope": str(scope or "").upper(),
+            "mode": str(mode or "").lower(),
+            "selections": list(selections or []),
+        }
+        trees = (
+            (getattr(self, "_cad_tree", None),)
+            if str(scope or "").upper() == "CAD"
+            else (getattr(self, "_ebom_tree", None), getattr(self, "_ebom_filter_tree", None))
+        )
+        for tree in trees:
+            if tree is None:
+                continue
+            try:
+                tree.itemClicked.connect(self._on_pdm_structure_target_clicked)
+            except Exception:
+                pass
+        try:
+            self.setCursor(Qt.PointingHandCursor)
+            self.window().statusBar().showMessage(message)
+        except Exception:
+            pass
+
+    def _exit_pdm_structure_target_selection(self, clear_status: bool = True) -> None:
+        for tree in (
+            getattr(self, "_cad_tree", None),
+            getattr(self, "_ebom_tree", None),
+            getattr(self, "_ebom_filter_tree", None),
+        ):
+            if tree is None:
+                continue
+            try:
+                tree.itemClicked.disconnect(self._on_pdm_structure_target_clicked)
+            except Exception:
+                pass
+        self._pdm_structure_target_state = None
+        try:
+            self.setCursor(Qt.ArrowCursor)
+            if clear_status:
+                self.window().statusBar().showMessage("Structure operation cancelled.")
+        except Exception:
+            pass
+
+    def _on_pdm_structure_target_clicked(self, item: QTreeWidgetItem, _column: int = 0) -> None:
+        state = getattr(self, "_pdm_structure_target_state", None)
+        if not state or item is None:
+            return
+        scope = str(state.get("scope") or "").upper()
+        selections = list(state.get("selections") or [])
+        mode = str(state.get("mode") or "copy").lower()
+        if scope == "CAD":
+            if item.data(0, PDM_OBJECT_KIND_ROLE) != PDM_OBJECT_CAD:
+                self.window().statusBar().showMessage("Select an ASM CAD Document as target.")
+                return
+            try:
+                target_cad_id = int(item.data(0, PDM_CAD_DOCUMENT_ID_ROLE))
+            except Exception:
+                return
+            payload = dict(item.data(0, PDM_CAD_PAYLOAD_ROLE) or {})
+            category = str(payload.get("category") or item.text(CAD_COL_CATEGORY) or "").upper()
+            if category != "ASSEMBLY":
+                self.window().statusBar().showMessage("The target CAD Document must be an ASM.")
+                return
+            if target_cad_id in {
+                int(row.get("child_cad_document_id"))
+                for row in selections
+                if row.get("child_cad_document_id") is not None
+            }:
+                self.window().statusBar().showMessage("A CAD assembly cannot be selected as its own target.")
+                return
+            self._exit_pdm_structure_target_selection(clear_status=False)
+            self._finish_pdm_cad_structure_operation(target_cad_id, selections, mode)
+            return
+
+        if self._is_folder_tree_item(item) or item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+            self.window().statusBar().showMessage("Select an EBOM assembly Item as target.")
+            return
+        try:
+            target_item_id = int(item.data(0, Qt.UserRole))
+        except Exception:
+            return
+        if str(item.text(BOM_COL_TYPE) or "").strip().lower() not in {"asm", "assembly"}:
+            self.window().statusBar().showMessage("The target EBOM Item must be an assembly.")
+            return
+        if target_item_id in {
+            int(row.get("child_id"))
+            for row in selections
+            if row.get("child_id") is not None
+        }:
+            self.window().statusBar().showMessage("An Item cannot be selected as its own target parent.")
+            return
+        self._exit_pdm_structure_target_selection(clear_status=False)
+        self._finish_pdm_ebom_structure_operation(target_item_id, selections, mode)
+
+    def _remove_pdm_cad_members_from_tree(
+        self,
+        selected_items: list[QTreeWidgetItem],
+    ) -> None:
+        member_rows = []
+        for row in selected_items or []:
+            member_id = row.data(0, PDM_CAD_MEMBER_ID_ROLE)
+            if member_id is None:
+                continue
+            parent = row.parent()
+            parent_id = None
+            try:
+                parent_id = int(parent.data(0, PDM_CAD_DOCUMENT_ID_ROLE)) if parent is not None else None
+            except Exception:
+                parent_id = None
+            if parent_id is None:
+                continue
+            member_rows.append((int(member_id), parent_id, row.text(CAD_COL_FILE)))
+        if not member_rows:
+            return
+        if QMessageBox.question(
+            self,
+            "Remove CAD Components",
+            f"Remove {len(member_rows)} CAD occurrence(s) from their assemblies?\n\n"
+            "The CAD Documents themselves are not deleted.",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        ) != QMessageBox.Yes:
+            return
+        affected = set()
+        try:
+            for member_id, parent_id, _label in member_rows:
+                self.bom_service.remove_pdm_cad_member(int(member_id))
+                affected.add(int(parent_id))
+        except Exception as exc:
+            QMessageBox.warning(self, "Remove CAD Components", str(exc))
+            return
+        for cad_id in sorted(affected):
+            self._refresh_pdm_cad_structure_branch(int(cad_id))
+
     def _change_cad_item_association(
         self, cad_id: int, item_id: int, association_id, current_type: str
     ) -> None:
@@ -11375,10 +11858,13 @@ class BomPage(QWidget):
                 as_user_id=as_user_id,
                 **workspace_descriptor,
             )
-            materialized = (
-                workspace_service.materialize_cad_document(workspace["id"], int(cad_id))
-                if copy_to_workspace and workspace_service and workspace else None
+            materialized_files = (
+                workspace_service.materialize_cad_document_package(
+                    workspace["id"], int(cad_id), preserve_existing=True
+                )
+                if copy_to_workspace and workspace_service and workspace else []
             )
+            materialized = materialized_files[0] if materialized_files else None
         except Exception as exc:
             try:
                 current = self.bom_service.pdm_service.repo.get_cad_document(int(cad_id)) or {}
@@ -11412,14 +11898,17 @@ class BomPage(QWidget):
             "Check Out CAD Document",
             "CAD Document checked out." + suffix
             + (
-                f"\n\nWorkspace: {workspace['name']}\nFile: {materialized['path']}"
+                f"\n\nWorkspace: {workspace['name']}\nFiles:\n"
+                + "\n".join(f"- {row['path']}" for row in materialized_files)
                 if materialized else
                 "\n\nNo workspace copy was created."
             ),
         )
         self._refresh_pdm_context_rows(
             item_ids=associated_item_ids,
-            cad_ids=[int(cad_id)],
+            cad_ids=[int(cad_id)] + [
+                int(value) for value in (result or {}).get("related_drawing_checkout_ids", [])
+            ],
         )
         self._reselect_cad_in_current_view(int(cad_id))
 
@@ -11858,6 +12347,10 @@ class BomPage(QWidget):
                 create_item_from_cad_context(data, parent_value)
             )
             if tree is self._cad_tree:
+                selected_cad_rows = [
+                    row for row in self._selected_pdm_rows(tree, item)
+                    if row.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD
+                ]
                 if category == "ASSEMBLY":
                     menu.addSeparator()
                     add_member_action = menu.addAction("Add CAD Component...")
@@ -11868,6 +12361,37 @@ class BomPage(QWidget):
                     add_member_action.triggered.connect(
                         lambda _checked=False, value=cad_id: self._add_cad_member_from_tree(value)
                     )
+                structure_menu = menu.addMenu("CAD Structure")
+                copy_occurrence_action = structure_menu.addAction(
+                    "Copy Selected Occurrence(s) To..."
+                )
+                copy_occurrence_action.setEnabled(can_manage and bool(selected_cad_rows))
+                copy_occurrence_action.triggered.connect(
+                    lambda _checked=False, rows=list(selected_cad_rows):
+                    self._apply_pdm_cad_structure_operation(rows, "copy")
+                )
+                move_occurrence_action = structure_menu.addAction(
+                    "Move Selected Occurrence(s) To..."
+                )
+                move_occurrence_action.setEnabled(can_manage and bool(selected_cad_rows))
+                move_occurrence_action.triggered.connect(
+                    lambda _checked=False, rows=list(selected_cad_rows):
+                    self._apply_pdm_cad_structure_operation(rows, "move")
+                )
+                removable_cad_rows = [
+                    row for row in selected_cad_rows
+                    if row.data(0, PDM_CAD_MEMBER_ID_ROLE) is not None
+                ]
+                remove_occurrences_action = structure_menu.addAction(
+                    "Remove Selected Occurrence(s)"
+                )
+                remove_occurrences_action.setEnabled(
+                    can_manage and bool(removable_cad_rows)
+                )
+                remove_occurrences_action.triggered.connect(
+                    lambda _checked=False, rows=list(removable_cad_rows):
+                    self._remove_pdm_cad_members_from_tree(rows)
+                )
                 member_id = item.data(0, PDM_CAD_MEMBER_ID_ROLE)
                 if member_id is not None:
                     parent_item = item.parent()
@@ -11990,6 +12514,10 @@ class BomPage(QWidget):
             lambda _checked=False, value=item_id: self._register_and_associate_cad(value)
         )
         structure_menu = menu.addMenu("Item Structure")
+        selected_ebom_rows = [
+            row for row in self._selected_pdm_rows(tree, item)
+            if row.data(0, PDM_OBJECT_KIND_ROLE) != PDM_OBJECT_CAD
+        ]
         add_usage_action = structure_menu.addAction("Add Manual Item Usage...")
         add_usage_action.setEnabled(can_manage)
         add_usage_action.triggered.connect(
@@ -11997,6 +12525,37 @@ class BomPage(QWidget):
                 setattr(self, "current_part_id", value), self.add_manual_item_usage()
             )
         )
+        copy_usage_action = structure_menu.addAction("Copy Selected Usage(s) To...")
+        copy_usage_action.setEnabled(can_manage and bool(selected_ebom_rows))
+        copy_usage_action.triggered.connect(
+            lambda _checked=False, rows=list(selected_ebom_rows):
+            self._apply_pdm_ebom_structure_operation(rows, "copy")
+        )
+        move_usage_action = structure_menu.addAction("Move Selected Usage(s) To...")
+        move_usage_action.setEnabled(can_manage and bool(selected_ebom_rows))
+        move_usage_action.triggered.connect(
+            lambda _checked=False, rows=list(selected_ebom_rows):
+            self._apply_pdm_ebom_structure_operation(rows, "move")
+        )
+        try:
+            relation_parent_id = self._pdm_ebom_relation_parent_for_item(item)
+        except Exception:
+            relation_parent_id = None
+        if relation_parent_id is not None:
+            same_parent_rows = [
+                row for row in selected_ebom_rows
+                if self._pdm_ebom_relation_parent_for_item(row) == int(relation_parent_id)
+            ]
+            remove_usage_action = structure_menu.addAction(
+                "Remove Selected Usage(s)" if len(same_parent_rows) > 1 else "Remove Usage"
+            )
+            remove_usage_action.setEnabled(can_manage and bool(same_parent_rows))
+            remove_usage_action.triggered.connect(
+                lambda _checked=False, parent_id=int(relation_parent_id),
+                       parent_name=str(item.parent().text(BOM_COL_NAME) if item.parent() is not None else ""),
+                       rows=list(same_parent_rows):
+                self._remove_pdm_ebom_children_from_tree(parent_id, parent_name, rows)
+            )
         compare_action = structure_menu.addAction("Compare with OWNER CAD...")
         compare_action.triggered.connect(
             lambda _checked=False, value=item_id: (
@@ -15143,7 +15702,9 @@ class BomPage(QWidget):
 
     def keyPressEvent(self, event: QKeyEvent):
         """Handle ESC to cancel add-child mode."""
-        if getattr(self, "_relation_selection_state", None) and event.key() == Qt.Key_Escape:
+        if getattr(self, "_pdm_structure_target_state", None) and event.key() == Qt.Key_Escape:
+            self._exit_pdm_structure_target_selection()
+        elif getattr(self, "_relation_selection_state", None) and event.key() == Qt.Key_Escape:
             self._exit_relation_selection_mode()
         elif getattr(self, "add_child_mode", False) and event.key() == Qt.Key_Escape:
             self.window().statusBar().showMessage("Add-child operation cancelled.")
@@ -17324,20 +17885,26 @@ class BomPage(QWidget):
                     include_owner_cad=False,
                 )
                 materialized = None
+                cad_checkout_results = []
                 if selected_cad_rows:
                     try:
                         for cad_row in selected_cad_rows:
-                            self.bom_service.checkout_pdm_cad_document(
+                            cad_checkout_result = self.bom_service.checkout_pdm_cad_document(
                                 int(cad_row["id"]),
                                 released_item_revision_codes=selected_item_revision_codes,
                                 as_user_id=as_user_id,
                                 **workspace_descriptor,
                             )
+                            cad_checkout_results.append(cad_checkout_result)
                             if workspace:
-                                materialized = self._local_cad_workspaces().materialize_cad_document(
-                                    workspace["id"], int(cad_row["id"])
+                                materialized_files = self._local_cad_workspaces().materialize_cad_document_package(
+                                    workspace["id"],
+                                    int(cad_row["id"]),
+                                    preserve_existing=True,
                                 )
-                                materialized_paths.append(materialized["path"])
+                                materialized_paths.extend(
+                                    row["path"] for row in materialized_files
+                                )
                     except Exception:
                         for cad_row in selected_cad_rows:
                             try:
@@ -17363,7 +17930,13 @@ class BomPage(QWidget):
                 )
                 self._refresh_pdm_context_rows(
                     item_ids=[int(part_id)] + sorted(related_item_rows_by_id),
-                    cad_ids=[int(row["id"]) for row in selected_cad_rows],
+                    cad_ids=[
+                        int(row["id"]) for row in selected_cad_rows
+                    ] + [
+                        int(value)
+                        for cad_result in locals().get("cad_checkout_results", [])
+                        for value in (cad_result or {}).get("related_drawing_checkout_ids", [])
+                    ],
                 )
                 self._refresh_current_tree_item_indicator()
                 try:

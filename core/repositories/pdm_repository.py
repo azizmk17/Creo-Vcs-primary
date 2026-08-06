@@ -2283,6 +2283,173 @@ class PdmRepository:
             )
             return int(cur.lastrowid)
 
+    def apply_item_usage_relations(
+        self, project_id: int, target_parent_id: int, selections, mode: str
+    ) -> dict:
+        """Atomically copy or move persisted EBOM usages to a target Item."""
+        action = str(mode or "").strip().lower()
+        if action not in {"copy", "move"}:
+            raise ValueError("Relation action must be Copy or Move.")
+
+        normalized = []
+        seen = set()
+        for selection in selections or []:
+            child_id = int(selection.get("child_id"))
+            source_value = selection.get("source_parent_id")
+            source_parent_id = int(source_value) if source_value is not None else None
+            key = (child_id, source_parent_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append((child_id, source_parent_id))
+        if not normalized:
+            raise ValueError("Select at least one child usage.")
+
+        affected_sources = set()
+        changed_children = set()
+        skipped = []
+        with self.get_conn() as conn:
+            usage_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(item_usages)").fetchall()
+            }
+            for child_id, source_parent_id in normalized:
+                if action == "move" and source_parent_id == int(target_parent_id):
+                    skipped.append(child_id)
+                    continue
+
+                quantity = 1
+                source_type = "MANUAL"
+                build_status = "EXCLUDED"
+                cad_member_id = None
+                if source_parent_id is not None:
+                    source = conn.execute(
+                        """
+                        SELECT *
+                        FROM item_usages
+                        WHERE project_id=? AND parent_item_id=? AND child_item_id=?
+                        """,
+                        (int(project_id), int(source_parent_id), int(child_id)),
+                    ).fetchone()
+                    if not source:
+                        raise ValueError(
+                            f"The selected source usage for item {child_id} no longer exists."
+                        )
+                    quantity = max(1, int(source["quantity"] or 1))
+                    # A user-driven EBOM move/copy is an Item Structure edit.
+                    # Do not duplicate the CAD-built occurrence ownership:
+                    # item_usages.cad_member_id is intentionally unique for
+                    # CAD_BUILD rows, so copied/moved usages must be manual.
+                    source_type = "MANUAL"
+                    build_status = "EXCLUDED"
+                    cad_member_id = None
+
+                target = conn.execute(
+                    """
+                    SELECT id, quantity
+                    FROM item_usages
+                    WHERE project_id=? AND parent_item_id=? AND child_item_id=?
+                    """,
+                    (int(project_id), int(target_parent_id), int(child_id)),
+                ).fetchone()
+                if target:
+                    conn.execute(
+                        """
+                        UPDATE item_usages
+                        SET quantity=?,modified_at=datetime('now')
+                        WHERE id=?
+                        """,
+                        (int(target["quantity"] or 0) + quantity, int(target["id"])),
+                    )
+                else:
+                    order = conn.execute(
+                        """
+                        SELECT COALESCE(MAX(sort_order),0)+10
+                        FROM item_usages
+                        WHERE project_id=? AND parent_item_id=?
+                        """,
+                        (int(project_id), int(target_parent_id)),
+                    ).fetchone()[0]
+                    insert_columns = [
+                        "project_id", "parent_item_id", "child_item_id",
+                        "quantity", "sort_order",
+                    ]
+                    insert_values = [
+                        int(project_id), int(target_parent_id), int(child_id),
+                        quantity, int(order or 10),
+                    ]
+                    if "source" in usage_columns:
+                        insert_columns.append("source")
+                        insert_values.append(source_type)
+                    if "cad_member_id" in usage_columns:
+                        insert_columns.append("cad_member_id")
+                        insert_values.append(int(cad_member_id) if cad_member_id else None)
+                    if "build_status" in usage_columns:
+                        insert_columns.append("build_status")
+                        insert_values.append(build_status)
+                    placeholders = ",".join("?" for _ in insert_columns)
+                    conn.execute(
+                        f"""
+                        INSERT INTO item_usages({','.join(insert_columns)})
+                        VALUES({placeholders})
+                        """,
+                        insert_values,
+                    )
+
+                if action == "move" and source_parent_id is not None:
+                    conn.execute(
+                        """
+                        DELETE FROM item_usages
+                        WHERE project_id=? AND parent_item_id=? AND child_item_id=?
+                        """,
+                        (int(project_id), int(source_parent_id), int(child_id)),
+                    )
+                    affected_sources.add(int(source_parent_id))
+                changed_children.add(int(child_id))
+
+        return {
+            "mode": action,
+            "target_parent_id": int(target_parent_id),
+            "child_ids": sorted(changed_children),
+            "source_parent_ids": sorted(affected_sources),
+            "skipped_child_ids": skipped,
+            "had_root_sources": any(source is None for _child, source in normalized),
+        }
+
+    def remove_item_usages_from_parent(
+        self, project_id: int, parent_item_id: int, child_item_ids
+    ) -> dict:
+        child_ids = sorted({int(value) for value in (child_item_ids or [])})
+        if not child_ids:
+            return {"removed_child_ids": [], "moved_to_root_ids": []}
+        placeholders = ",".join("?" for _ in child_ids)
+        moved_to_root = []
+        with self.get_conn() as conn:
+            conn.execute(
+                f"""
+                DELETE FROM item_usages
+                WHERE project_id=? AND parent_item_id=? AND child_item_id IN ({placeholders})
+                """,
+                [int(project_id), int(parent_item_id), *child_ids],
+            )
+            rows = conn.execute(
+                f"""
+                SELECT b.id
+                FROM bom b
+                WHERE b.project_id=? AND b.id IN ({placeholders})
+                  AND NOT EXISTS (
+                      SELECT 1 FROM item_usages u
+                      WHERE u.project_id=b.project_id AND u.child_item_id=b.id
+                  )
+                """,
+                [int(project_id), *child_ids],
+            ).fetchall()
+            moved_to_root = [int(row["id"]) for row in rows]
+        return {
+            "removed_child_ids": child_ids,
+            "moved_to_root_ids": moved_to_root,
+        }
+
     def list_cad_members(self, parent_cad_document_id: int) -> list[dict]:
         with self.get_conn() as conn:
             rows = conn.execute(

@@ -3131,10 +3131,11 @@ class CommitPage(QWidget):
             **descriptor,
         )
         try:
-            self.cad_workspace_service.materialize_cad_document(
+            self.cad_workspace_service.materialize_cad_document_package(
                 workspace["id"],
                 int(cad_document_id),
                 preserve_existing=True,
+                source_path=row.get("path"),
             )
         except Exception:
             try:

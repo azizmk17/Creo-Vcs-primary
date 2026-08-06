@@ -367,10 +367,16 @@ class CadWorkspaceService:
                 f"{logical}. Review that workspace or choose another one."
             )
 
-        source = (
-            Path(source_path).expanduser().resolve()
-            if source_path else self.resolve_controlled_source(document)
-        )
+        if source_path:
+            source = Path(source_path).expanduser().resolve()
+        elif preserve_existing and existing:
+            def _version_key(candidate: Path) -> tuple[int, str]:
+                match = _CREO_RE.match(candidate.name)
+                version = int(match.group(2)) if match else 0
+                return version, candidate.name.casefold()
+            source = max(existing, key=_version_key).resolve()
+        else:
+            source = self.resolve_controlled_source(document)
         if not source.is_file():
             raise ValueError("The controlled CAD source file does not exist.")
         baseline_hash = self._sha256(source)
@@ -405,6 +411,38 @@ class CadWorkspaceService:
             "workspace_path": str(path),
             "path": str(destination),
         }
+
+    def materialize_cad_document_package(
+        self,
+        workspace_id: str,
+        cad_document_id: int,
+        *,
+        preserve_existing: bool = False,
+        source_path: str | os.PathLike | None = None,
+        include_related_drawings: bool = True,
+    ) -> list[dict]:
+        """Materialize a model CAD Document and its related DRW documents."""
+        primary = self.materialize_cad_document(
+            workspace_id,
+            int(cad_document_id),
+            preserve_existing=preserve_existing,
+            source_path=source_path,
+        )
+        materialized = [primary]
+        if not include_related_drawings:
+            return materialized
+        document = self.pdm_service.repo.get_cad_document(int(cad_document_id)) or {}
+        if str(document.get("category") or "").upper() == "DRAWING":
+            return materialized
+        for drawing in self.pdm_service.repo.list_related_drawings(int(cad_document_id)) or []:
+            materialized.append(
+                self.materialize_cad_document(
+                    workspace_id,
+                    int(drawing["id"]),
+                    preserve_existing=True,
+                )
+            )
+        return materialized
 
     def release_cad_document(self, workspace_id: str | None, cad_document_id: int) -> None:
         if not workspace_id:

@@ -1895,6 +1895,24 @@ class BomService(BaseService):
         """Return direct source occurrences for resolving a flat search result."""
         if not self.session.project_id:
             return []
+        try:
+            sources = self.pdm_service.item_where_used(
+                int(self.session.project_id), int(child_id)
+            )
+            if sources:
+                return [
+                    {
+                        "parent_id": int(row["effective_parent_bom_id"]),
+                        "parent_name": str(row.get("parent_name") or ""),
+                        "parent_part_number": str(row.get("parent_item_number") or ""),
+                        "parent_aes_number": str(row.get("parent_aes_number") or ""),
+                        "quantity": max(1, int(row.get("source_quantity") or 1)),
+                    }
+                    for row in sources
+                    if row.get("effective_parent_bom_id") is not None
+                ]
+        except Exception:
+            pass
         sources = []
         for relation in self.children_repo.get_parents(int(child_id)) or []:
             parent = self.bom_repo.get_by_id(int(relation.parent_id))
@@ -1934,12 +1952,6 @@ class BomService(BaseService):
         if not normalized:
             raise ValueError("Select at least one child occurrence.")
         action = str(mode or "").strip().lower()
-        if action == "copy" and any(row["source_parent_id"] is None for row in normalized):
-            raise ValueError(
-                "A top-level component cannot be copied because top-level membership is derived from having no parent. "
-                "Use Move to place it under the target assembly."
-            )
-
         affected_parent_ids = {int(target_parent_id)}
         if action == "move":
             affected_parent_ids.update(
@@ -1951,20 +1963,24 @@ class BomService(BaseService):
         for affected_parent_id in sorted(affected_parent_ids):
             self._assert_checked_out_for_change(affected_parent_id, "change its structure")
 
-        preferred_by_child = {}
-        for row in normalized:
-            source_parent_id = row.get("source_parent_id")
-            if source_parent_id is None:
-                continue
-            binding = self.revision_repo.get_effective_child_binding(
-                int(source_parent_id), int(row["child_id"])
-            )
-            if binding:
-                preferred_by_child[int(row["child_id"])] = binding
-
         children_by_parent = defaultdict(list)
-        for row in self.children_repo.get_structure_rows(int(self.session.project_id)):
-            children_by_parent[int(row["parent_id"])].append(int(row["child_id"]))
+        try:
+            with self.pdm_service.repo.get_conn() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT parent_item_id,child_item_id
+                    FROM item_usages
+                    WHERE project_id=?
+                    """,
+                    (int(self.session.project_id),),
+                ).fetchall()
+                for row in rows:
+                    children_by_parent[int(row["parent_item_id"])].append(
+                        int(row["child_item_id"])
+                    )
+        except Exception:
+            for row in self.children_repo.get_structure_rows(int(self.session.project_id)):
+                children_by_parent[int(row["parent_id"])].append(int(row["child_id"]))
 
         def contains_descendant(start_id: int, wanted_id: int) -> bool:
             pending = list(children_by_parent.get(int(start_id), []))
@@ -1985,14 +2001,16 @@ class BomService(BaseService):
                 name = str(getattr(child, "name", "") or selection["child_id"])
                 raise ValueError(f"Cannot place {name} here because it would create a circular BOM structure.")
 
-        result = self.children_repo.apply_child_relations(
-            int(target_parent_id), normalized, action
+        result = self.pdm_service.repo.apply_item_usage_relations(
+            int(self.session.project_id), int(target_parent_id), normalized, action
         )
-        self.revision_repo.sync_working_bindings(
-            int(target_parent_id), int(self.user_id), preferred_by_child=preferred_by_child
+        self.pdm_service.repo.capture_item_structure_iteration(
+            int(target_parent_id), "MANUAL", created_by=self.user_id
         )
         for source_parent_id in result.get("source_parent_ids") or []:
-            self.revision_repo.sync_working_bindings(int(source_parent_id), int(self.user_id))
+            self.pdm_service.repo.capture_item_structure_iteration(
+                int(source_parent_id), "MANUAL", created_by=self.user_id
+            )
         if action == "move":
             for selection in normalized:
                 source_parent_id = selection.get("source_parent_id")
@@ -2654,6 +2672,122 @@ class BomService(BaseService):
         )
         return self.pdm_service.remove_cad_member(int(member_id))
 
+    def cad_occurrence_sources_for_document(self, child_cad_document_id: int) -> List[Dict]:
+        """Return direct CAD assembly occurrences for a CAD Document."""
+        if not self.session.project_id:
+            return []
+        with self.pdm_service.repo.get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT m.id AS member_id,
+                       m.parent_cad_document_id,
+                       m.child_cad_document_id,
+                       m.quantity,
+                       m.build_excluded,
+                       p.file_name AS parent_file_name,
+                       p.name AS parent_name,
+                       p.category AS parent_category
+                FROM cad_document_members m
+                JOIN cad_documents p ON p.id=m.parent_cad_document_id
+                WHERE m.child_cad_document_id=?
+                  AND p.project_id=?
+                ORDER BY lower(COALESCE(p.file_name,'')),m.id
+                """,
+                (int(child_cad_document_id), int(self.session.project_id)),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def apply_pdm_cad_member_operation(
+        self,
+        target_parent_cad_id: int,
+        selections,
+        mode: str,
+    ) -> Dict:
+        """Copy or move CAD occurrences under a checked-out ASM CAD Document."""
+        action = str(mode or "").strip().lower()
+        if action not in {"copy", "move"}:
+            raise ValueError("CAD structure operation must be Copy or Move.")
+        target = self._assert_owned_cad_checkout(
+            int(target_parent_cad_id), "change its CAD structure"
+        )
+        if str(target.get("category") or "").upper() != "ASSEMBLY":
+            raise ValueError("Only an ASM CAD Document can contain CAD members.")
+
+        normalized = []
+        affected_parent_ids = {int(target_parent_cad_id)}
+        child_ids = set()
+        for selection in selections or []:
+            member_id = selection.get("member_id")
+            member = (
+                self.pdm_service.repo.get_cad_member(int(member_id))
+                if member_id is not None else None
+            )
+            child_id = int(
+                selection.get("child_cad_document_id")
+                or (member or {}).get("child_cad_document_id")
+            )
+            source_parent_id = selection.get("source_parent_cad_id")
+            if source_parent_id is None and member:
+                source_parent_id = member.get("parent_cad_document_id")
+            source_parent_id = int(source_parent_id) if source_parent_id is not None else None
+            if source_parent_id == int(target_parent_cad_id):
+                continue
+            child = self.pdm_service.repo.get_cad_document(child_id)
+            if not child:
+                raise ValueError(f"CAD Document {child_id} was not found.")
+            if str(child.get("category") or "").upper() not in {"ASSEMBLY", "COMPONENT"}:
+                raise ValueError("Drawings cannot be inserted as CAD structure members.")
+            if child_id == int(target_parent_cad_id):
+                raise ValueError("A CAD assembly cannot contain itself.")
+            quantity = max(1, int(selection.get("quantity") or (member or {}).get("quantity") or 1))
+            build_excluded = bool(
+                selection.get("build_excluded")
+                if selection.get("build_excluded") is not None
+                else (member or {}).get("build_excluded")
+            )
+            normalized.append({
+                "member_id": int(member_id) if member_id is not None else None,
+                "child_cad_document_id": child_id,
+                "source_parent_cad_id": source_parent_id,
+                "quantity": quantity,
+                "build_excluded": build_excluded,
+            })
+            child_ids.add(child_id)
+            if action == "move" and source_parent_id is not None:
+                affected_parent_ids.add(source_parent_id)
+
+        if not normalized:
+            raise ValueError("Select at least one CAD occurrence outside the target assembly.")
+        if action == "move":
+            for source_parent_id in sorted(affected_parent_ids - {int(target_parent_cad_id)}):
+                self._assert_owned_cad_checkout(
+                    int(source_parent_id), "move CAD occurrences from it"
+                )
+
+        added_member_ids = []
+        removed_member_ids = []
+        for row in normalized:
+            added_member_ids.append(
+                self.pdm_service.add_cad_member(
+                    int(target_parent_cad_id),
+                    int(row["child_cad_document_id"]),
+                    int(row["quantity"]),
+                    build_excluded=bool(row["build_excluded"]),
+                )
+            )
+            if action == "move" and row.get("member_id") is not None:
+                if self.pdm_service.remove_cad_member(int(row["member_id"])):
+                    removed_member_ids.append(int(row["member_id"]))
+
+        return {
+            "mode": action,
+            "target_parent_cad_id": int(target_parent_cad_id),
+            "source_parent_cad_ids": sorted(affected_parent_ids - {int(target_parent_cad_id)}),
+            "child_cad_document_ids": sorted(child_ids),
+            "added_member_ids": added_member_ids,
+            "removed_member_ids": removed_member_ids,
+        }
+
     def checkout_pdm_cad_document(
         self,
         cad_document_id: int,
@@ -2764,7 +2898,44 @@ class BomService(BaseService):
                 workspace_name=workspace_name,
                 workspace_machine_id=workspace_machine_id,
             )
+            related_drawing_ids = []
+            if str(document.get("category") or "").upper() != "DRAWING":
+                for drawing in self.pdm_service.repo.list_related_drawings(cad_document_id) or []:
+                    drawing_id = int(drawing["id"])
+                    drawing_owner = drawing.get("checked_out_by")
+                    if drawing_owner is not None and int(drawing_owner) != actor_id:
+                        raise ValueError(
+                            f"Related drawing {drawing.get('file_name') or drawing_id} "
+                            "is checked out by another user."
+                        )
+                    if str(drawing.get("lifecycle_state") or "").upper() == "RELEASED":
+                        raise ValueError(
+                            f"Related drawing {drawing.get('file_name') or drawing_id} "
+                            "is Released. Create its next CAD revision before checkout."
+                        )
+                    self.pdm_service.checkout_cad_document(
+                        drawing_id,
+                        actor_id,
+                        workspace_id=workspace_id,
+                        workspace_name=workspace_name,
+                        workspace_machine_id=workspace_machine_id,
+                    )
+                    related_drawing_ids.append(drawing_id)
         except Exception:
+            for drawing_id in reversed(locals().get("related_drawing_ids", [])):
+                try:
+                    self.pdm_service.undo_checkout_cad_document(
+                        int(drawing_id), actor_id, "Parent CAD checkout failed"
+                    )
+                except Exception:
+                    pass
+            try:
+                if "result" in locals():
+                    self.pdm_service.undo_checkout_cad_document(
+                        cad_document_id, actor_id, "Related drawing checkout failed"
+                    )
+            except Exception:
+                pass
             for associated_item_id in reversed(auto_item_checkout_ids):
                 try:
                     self.undo_checkout(
@@ -2787,6 +2958,7 @@ class BomService(BaseService):
             "associated_item_id": (
                 recorded_item_ids[0] if recorded_item_ids else None
             ),
+            "related_drawing_checkout_ids": related_drawing_ids,
             "item_checkout_auto_created": bool(auto_item_checkout_ids),
             "item_checkout_auto_created_ids": auto_item_checkout_ids,
         }
@@ -2836,9 +3008,15 @@ class BomService(BaseService):
         )
         try:
             from core.services.cad_workspace_service import CadWorkspaceService
-            CadWorkspaceService().release_cad_document(
+            workspace_service = CadWorkspaceService()
+            workspace_service.release_cad_document(
                 document.get("checkout_workspace_id"), cad_document_id
             )
+            if str(document.get("category") or "").upper() != "DRAWING":
+                for drawing in self.pdm_service.repo.list_related_drawings(cad_document_id) or []:
+                    workspace_service.release_cad_document(
+                        document.get("checkout_workspace_id"), int(drawing["id"])
+                    )
         except Exception:
             pass
         return {**result, **item_result}
@@ -2856,17 +3034,40 @@ class BomService(BaseService):
         document = self.pdm_service.repo.get_cad_document(cad_document_id)
         if not document:
             raise ValueError("The CAD Document was not found.")
+        related_drawing_ids = []
+        if str(document.get("category") or "").upper() != "DRAWING":
+            for drawing in self.pdm_service.repo.list_related_drawings(cad_document_id) or []:
+                if drawing.get("checked_out_by") is None:
+                    continue
+                if int(drawing.get("checked_out_by")) != actor_id:
+                    continue
+                try:
+                    self.pdm_service.undo_checkout_cad_document(
+                        int(drawing["id"]), actor_id, note or "Parent CAD checkout undone"
+                    )
+                    related_drawing_ids.append(int(drawing["id"]))
+                except Exception:
+                    pass
         result = self.pdm_service.undo_checkout_cad_document(
             cad_document_id, actor_id, note
         )
         try:
             from core.services.cad_workspace_service import CadWorkspaceService
-            CadWorkspaceService().release_cad_document(
+            workspace_service = CadWorkspaceService()
+            workspace_service.release_cad_document(
                 document.get("checkout_workspace_id"), cad_document_id
             )
+            for drawing_id in related_drawing_ids:
+                workspace_service.release_cad_document(
+                    document.get("checkout_workspace_id"), drawing_id
+                )
         except Exception:
             pass
-        return {**result, "item_checkout": "RETAINED_BY_RULE"}
+        return {
+            **result,
+            "related_drawing_checkout_ids": related_drawing_ids,
+            "item_checkout": "RETAINED_BY_RULE",
+        }
 
     def revise_pdm_cad_document(self, cad_document_id: int) -> Dict:
         return self.pdm_service.revise_cad_document(
@@ -3162,10 +3363,12 @@ class BomService(BaseService):
         if not self.session.project_id:
             raise ValueError("Select a project before changing the BOM structure.")
         self._assert_checked_out_for_change(int(parent_id), "change its structure")
-        result = self.children_repo.remove_children_from_parent(
+        result = self.pdm_service.repo.remove_item_usages_from_parent(
             int(self.session.project_id), int(parent_id), child_ids
         )
-        self.revision_repo.sync_working_bindings(int(parent_id), int(self.user_id))
+        self.pdm_service.repo.capture_item_structure_iteration(
+            int(parent_id), "MANUAL", created_by=self.user_id
+        )
         for child_id in result.get("removed_child_ids") or []:
             try:
                 self.folder_repo.unassign_from_context(
