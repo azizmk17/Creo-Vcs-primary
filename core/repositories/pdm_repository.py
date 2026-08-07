@@ -1049,11 +1049,26 @@ class PdmRepository:
         ).fetchone()
         if not document:
             return []
+        try:
+            conn.execute(
+                """
+                UPDATE cad_item_associations
+                SET active=0,modified_at=datetime('now')
+                WHERE active=1
+                  AND item_id IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM bom b WHERE b.id=cad_item_associations.item_id
+                  )
+                """
+            )
+        except Exception:
+            pass
         rows = conn.execute(
             """
-            SELECT item_id,association_type,id
-            FROM cad_item_associations
-            WHERE cad_document_id=? AND active=1
+            SELECT a.item_id,a.association_type,a.id
+            FROM cad_item_associations a
+            JOIN bom b ON b.id=a.item_id
+            WHERE a.cad_document_id=? AND a.active=1
             ORDER BY CASE upper(association_type)
                 WHEN 'OWNER' THEN 0
                 WHEN 'CONTRIBUTING_IMAGE' THEN 1
@@ -1069,9 +1084,10 @@ class PdmRepository:
         if not rows and document["drawing_owner_cad_document_id"] is not None:
             rows = conn.execute(
                 """
-                SELECT item_id,association_type,id
-                FROM cad_item_associations
-                WHERE cad_document_id=? AND active=1
+                SELECT a.item_id,a.association_type,a.id
+                FROM cad_item_associations a
+                JOIN bom b ON b.id=a.item_id
+                WHERE a.cad_document_id=? AND a.active=1
                 ORDER BY CASE upper(association_type)
                     WHEN 'OWNER' THEN 0
                     WHEN 'CONTRIBUTING_IMAGE' THEN 1
@@ -2449,6 +2465,67 @@ class PdmRepository:
             "removed_child_ids": child_ids,
             "moved_to_root_ids": moved_to_root,
         }
+
+    def delete_item_pdm_links(self, item_id: int) -> dict:
+        """Remove PDM-side links owned by an Item before deleting the Item master."""
+        item_id = int(item_id)
+        with self.get_conn() as conn:
+            counts = {}
+            cur = conn.execute(
+                "DELETE FROM cad_item_associations WHERE item_id=?",
+                (item_id,),
+            )
+            counts["cad_item_associations"] = int(cur.rowcount or 0)
+            try:
+                cur = conn.execute(
+                    "DELETE FROM cad_document_checkout_items WHERE item_id=?",
+                    (item_id,),
+                )
+                counts["cad_document_checkout_items"] = int(cur.rowcount or 0)
+            except Exception:
+                counts["cad_document_checkout_items"] = 0
+            try:
+                cur = conn.execute(
+                    """
+                    DELETE FROM item_usages
+                    WHERE parent_item_id=? OR child_item_id=?
+                    """,
+                    (item_id, item_id),
+                )
+                counts["item_usages"] = int(cur.rowcount or 0)
+            except Exception:
+                counts["item_usages"] = 0
+            try:
+                cur = conn.execute(
+                    """
+                    DELETE FROM item_occurrences
+                    WHERE parent_item_id=? OR child_item_id=?
+                    """,
+                    (item_id, item_id),
+                )
+                counts["item_occurrences"] = int(cur.rowcount or 0)
+            except Exception:
+                counts["item_occurrences"] = 0
+            return counts
+
+    def cleanup_orphan_item_associations(self) -> int:
+        """Deactivate active CAD associations whose Item master no longer exists."""
+        with self.get_conn() as conn:
+            try:
+                cur = conn.execute(
+                    """
+                    UPDATE cad_item_associations
+                    SET active=0,modified_at=datetime('now')
+                    WHERE active=1
+                      AND item_id IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM bom b WHERE b.id=cad_item_associations.item_id
+                      )
+                    """
+                )
+                return int(cur.rowcount or 0)
+            except Exception:
+                return 0
 
     def list_cad_members(self, parent_cad_document_id: int) -> list[dict]:
         with self.get_conn() as conn:

@@ -503,9 +503,17 @@ class BomService(BaseService):
         # First remove any child relationships
         self.children_repo.delete_by_parent(part.id)
         self.children_repo.delete_by_child(part.id)
+        try:
+            self.pdm_service.repo.delete_item_pdm_links(int(part.id))
+        except Exception:
+            pass
         
         # Then delete the part
         result = self.bom_repo.delete(part.id)
+        try:
+            self.pdm_service.repo.cleanup_orphan_item_associations()
+        except Exception:
+            pass
         self._tree_dirty.add(int(self.session.project_id))
         return result
 

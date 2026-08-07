@@ -73,6 +73,13 @@ class PartDialog(QDialog):
         "REFERENCE": "Reference / non-controlled",
         "SKELETON": "Skeleton / layout reference",
     }
+    MECHANICAL_TYPE_LABELS = {
+        "prt": "Part / PRT",
+        "asm": "Assembly / ASM",
+        "drw": "Drawing / DRW",
+        "bulk": "Bulk Item",
+        "other": "Other Mechanical",
+    }
 
     def __init__(
         self,
@@ -275,6 +282,12 @@ class PartDialog(QDialog):
         self.assembly_mode_input = QComboBox()
         for value in ASSEMBLY_MODES:
             self.assembly_mode_input.addItem(self.ASSEMBLY_MODE_LABELS[value], value)
+        self.mechanical_type_input = QComboBox()
+        for value, label in self.MECHANICAL_TYPE_LABELS.items():
+            self.mechanical_type_input.addItem(label, value)
+        self.mechanical_type_input.setToolTip(
+            "Mechanical object type stored in the BOM tree, e.g. prt or asm."
+        )
         self.procurement_source_input = QComboBox()
         for value in PROCUREMENT_SOURCES:
             self.procurement_source_input.addItem(self.SOURCE_LABELS[value], value)
@@ -291,6 +304,7 @@ class PartDialog(QDialog):
         self.weight_input.setSuffix(" g")
         attributes_form.addRow("Name *", self.part_name_input)
         attributes_form.addRow("Assembly Mode", self.assembly_mode_input)
+        attributes_form.addRow("Mechanical Type", self.mechanical_type_input)
         attributes_form.addRow("Source", self.procurement_source_input)
         attributes_form.addRow("View", self.item_view_input)
         attributes_form.addRow("Default Unit", self.default_unit_input)
@@ -396,6 +410,8 @@ class PartDialog(QDialog):
         root.addWidget(footer)
 
         self.item_type_input.currentIndexChanged.connect(self._apply_item_type_defaults)
+        self.item_type_input.currentIndexChanged.connect(self._sync_mechanical_type_enabled)
+        self.assembly_mode_input.currentIndexChanged.connect(self._sync_mechanical_type_from_assembly)
         self.delivery_input.currentIndexChanged.connect(self._sync_aes_requirement)
 
     @staticmethod
@@ -442,7 +458,29 @@ class PartDialog(QDialog):
         self._set_combo_data(
             self.delivery_input, "NORMAL" if defaults["deliverable"] else "EXCLUDE"
         )
+        self._sync_mechanical_type_enabled()
         self._sync_aes_requirement()
+
+    def _sync_mechanical_type_enabled(self, _index: int = 0) -> None:
+        is_mechanical = str(self.item_type_input.currentData() or "") == "MECHANICAL_PART"
+        self.mechanical_type_input.setEnabled(is_mechanical)
+        self.mechanical_type_input.setToolTip(
+            "Mechanical object type stored in the BOM tree, e.g. prt or asm."
+            if is_mechanical else
+            "Only Mechanical Parts expose a PRT/ASM-style BOM type."
+        )
+
+    def _sync_mechanical_type_from_assembly(self, _index: int = 0) -> None:
+        if self._loading:
+            return
+        if str(self.item_type_input.currentData() or "") != "MECHANICAL_PART":
+            return
+        assembly_mode = str(self.assembly_mode_input.currentData() or "COMPONENT")
+        current_type = str(self.mechanical_type_input.currentData() or "prt")
+        if assembly_mode != "COMPONENT" and current_type == "prt":
+            self._set_combo_data(self.mechanical_type_input, "asm")
+        elif assembly_mode == "COMPONENT" and current_type == "asm":
+            self._set_combo_data(self.mechanical_type_input, "prt")
 
     def _sync_aes_requirement(self, _index: int = 0) -> None:
         required = requires_aes_number(
@@ -473,6 +511,10 @@ class PartDialog(QDialog):
                 else "COMPONENT"
             )
         self._set_combo_data(self.assembly_mode_input, assembly_mode)
+        stored_type = str(self.part_data.get("type") or "").strip().lower()
+        if stored_type not in self.MECHANICAL_TYPE_LABELS:
+            stored_type = "asm" if legacy_assembly else "prt"
+        self._set_combo_data(self.mechanical_type_input, stored_type)
         self._set_combo_data(
             self.procurement_source_input,
             self.part_data.get("procurement_source") or "MAKE",
@@ -515,6 +557,7 @@ class PartDialog(QDialog):
             self.part_data.get("cad_control_mode") or "CONTROLLED",
         )
         self.notes_input.setText(str(self.part_data.get("notes") or ""))
+        self._sync_mechanical_type_enabled()
 
     def accept(self) -> None:
         if not self.part_name_input.text().strip():
@@ -537,6 +580,11 @@ class PartDialog(QDialog):
         now = QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm")
         assembly_mode = str(self.assembly_mode_input.currentData() or "COMPONENT")
         item_type = str(self.item_type_input.currentData() or "MECHANICAL_PART")
+        mechanical_type = str(self.mechanical_type_input.currentData() or "").strip().lower()
+        if item_type == "MECHANICAL_PART":
+            bom_type = mechanical_type or ("asm" if assembly_mode != "COMPONENT" else "prt")
+        else:
+            bom_type = str(self.part_data.get("type") or "").strip().lower() or "item"
         classification = str(self.classification_input.currentData() or "PHYSICAL")
         if item_type == "REFERENCE_PART":
             classification = "REFERENCE"
@@ -544,7 +592,7 @@ class PartDialog(QDialog):
             "aes_number": self.part_aes_input.text().strip(),
             "represented_part_id": self._represented_part_id,
             "name": self.part_name_input.text().strip(),
-            "type": "asm" if assembly_mode != "COMPONENT" else "prt",
+            "type": bom_type,
             "part_number": self.part_number_input.text().strip(),
             "item_type": item_type,
             "assembly_mode": assembly_mode,
