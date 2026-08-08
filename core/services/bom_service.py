@@ -2671,6 +2671,27 @@ class BomService(BaseService):
             int(quantity), build_excluded=bool(build_excluded),
         )
 
+    def ordered_pdm_cad_member_ids(self, parent_cad_document_id: int) -> List[int]:
+        return self.pdm_service.repo.ordered_cad_member_ids(int(parent_cad_document_id))
+
+    def reorder_pdm_cad_members(
+        self, parent_cad_document_id: int, ordered_member_ids
+    ) -> bool:
+        self._assert_owned_cad_checkout(
+            int(parent_cad_document_id), "reorder its CAD structure"
+        )
+        current = self.pdm_service.repo.ordered_cad_member_ids(
+            int(parent_cad_document_id)
+        )
+        requested = [int(value) for value in ordered_member_ids or []]
+        if set(current) != set(requested):
+            raise ValueError("Reorder must keep the same CAD members.")
+        result = self.pdm_service.repo.set_cad_member_order(
+            int(parent_cad_document_id), requested
+        )
+        self._tree_dirty.add(int(self.session.project_id))
+        return result
+
     def remove_pdm_cad_member(self, member_id: int) -> bool:
         member = self.pdm_service.repo.get_cad_member(int(member_id))
         if not member:
@@ -3336,6 +3357,26 @@ class BomService(BaseService):
         result = self.pdm_service.add_manual_item_usage(
             int(self.session.project_id), int(parent_item_id), int(child_item_id),
             int(quantity), self.user_id,
+        )
+        self._tree_dirty.add(int(self.session.project_id))
+        return result
+
+    def ordered_pdm_item_usage_ids(self, parent_item_id: int) -> List[int]:
+        return self.pdm_service.repo.ordered_item_usage_ids(int(parent_item_id))
+
+    def reorder_pdm_item_usages(self, parent_item_id: int, ordered_usage_ids) -> bool:
+        self._assert_checked_out_for_change(
+            int(parent_item_id), "reorder its Item Structure"
+        )
+        current = self.pdm_service.repo.ordered_item_usage_ids(int(parent_item_id))
+        requested = [int(value) for value in ordered_usage_ids or []]
+        if set(current) != set(requested):
+            raise ValueError("Reorder must keep the same Item usages.")
+        result = self.pdm_service.repo.set_item_usage_order(
+            int(parent_item_id), requested
+        )
+        self.pdm_service.repo.capture_item_structure_iteration(
+            int(parent_item_id), "MANUAL", created_by=self.user_id
         )
         self._tree_dirty.add(int(self.session.project_id))
         return result

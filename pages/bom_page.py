@@ -224,15 +224,52 @@ class BomTreeWidget(QTreeWidget):
         if target in selected:
             event.ignore()
             return
+
+        scope = str(self.property("pdmScope") or "").upper()
         selected_ids = []
-        for item in selected:
-            try:
-                selected_ids.append(int(item.data(0, Qt.UserRole)))
-            except Exception:
-                pass
-        if len(selected_ids) != len(selected) or target_id is None or target_parent_id is None:
-            event.ignore()
-            return
+        if scope == "CAD" or target.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+            parent_cad_id = target_parent.data(0, PDM_CAD_DOCUMENT_ID_ROLE)
+            target_member_id = target.data(0, PDM_CAD_MEMBER_ID_ROLE)
+            if parent_cad_id is None or target_member_id is None:
+                event.ignore()
+                return
+            for item in selected:
+                if item.data(0, PDM_OBJECT_KIND_ROLE) != PDM_OBJECT_CAD:
+                    event.ignore()
+                    return
+                member_id = item.data(0, PDM_CAD_MEMBER_ID_ROLE)
+                if member_id is None:
+                    event.ignore()
+                    return
+                selected_ids.append(int(member_id))
+            target_id = int(target_member_id)
+            target_parent_id = int(parent_cad_id)
+        elif scope == "EBOM" or target.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_ITEM:
+            occurrence = target.data(0, BOM_TREE_OCCURRENCE_ROLE) or {}
+            target_usage_id = occurrence.get("usage_id")
+            if target_usage_id is None:
+                event.ignore()
+                return
+            for item in selected:
+                if item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+                    event.ignore()
+                    return
+                usage_id = (item.data(0, BOM_TREE_OCCURRENCE_ROLE) or {}).get("usage_id")
+                if usage_id is None:
+                    event.ignore()
+                    return
+                selected_ids.append(int(usage_id))
+            target_id = int(target_usage_id)
+            target_parent_id = int(target_parent_id)
+        else:
+            for item in selected:
+                try:
+                    selected_ids.append(int(item.data(0, Qt.UserRole)))
+                except Exception:
+                    pass
+            if len(selected_ids) != len(selected) or target_id is None or target_parent_id is None:
+                event.ignore()
+                return
 
         if indicator == QAbstractItemView.AboveItem:
             where = "above"
@@ -3357,6 +3394,7 @@ class BomPage(QWidget):
         )
         payload["status"] = str(payload.get("state") or payload.get("status") or "")
         payload["relation_parent_id"] = payload.get("effective_parent_bom_id")
+        payload["usage_id"] = payload.get("item_usage_id") or payload.get("usage_id")
         payload["quantity"] = int(payload.get("source_quantity") or 1)
         payload["_has_children"] = bool(payload.get("children"))
         item = QTreeWidgetItem([""] * self._ebom_tree.columnCount())
@@ -8073,9 +8111,7 @@ class BomPage(QWidget):
         # The persisted Item Structure has its own tree so CAD Document and Item
         # selection/editing state remain independent.
         self._ebom_tree = BomTreeWidget()
-        self._ebom_tree.setDragEnabled(False)
-        self._ebom_tree.setAcceptDrops(False)
-        self._ebom_tree.setDragDropMode(QAbstractItemView.NoDragDrop)
+        self._ebom_tree.setProperty("pdmScope", "EBOM")
         self._configure_bom_tree_columns(self._ebom_tree, ebom=True)
         self._ebom_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._ebom_tree.setAlternatingRowColors(True)
@@ -8091,6 +8127,7 @@ class BomPage(QWidget):
         self._ebom_tree.customContextMenuRequested.connect(
             self._show_pdm_tree_context_menu
         )
+        self._ebom_tree.reorderRequested.connect(self._handle_pdm_tree_drag_reorder)
         self._tree_stack.addWidget(self._ebom_tree)             # index 3
 
         # Flat advanced-filter results live in a separate view.  A child row
@@ -8122,9 +8159,7 @@ class BomPage(QWidget):
         # Managed CAD Documents have their own native structure browser.  This
         # schema intentionally has no Item PDF/STEP or integrity columns.
         self._cad_tree = BomTreeWidget()
-        self._cad_tree.setDragEnabled(False)
-        self._cad_tree.setAcceptDrops(False)
-        self._cad_tree.setDragDropMode(QAbstractItemView.NoDragDrop)
+        self._cad_tree.setProperty("pdmScope", "CAD")
         self._cad_tree.setHeaderLabels([
             "CAD Name", "Description", "Category", "CAD / Creo Ver",
             "Lifecycle", "Related Item", "Checkout", "Build", "Qty",
@@ -8147,6 +8182,7 @@ class BomPage(QWidget):
         self._cad_tree.customContextMenuRequested.connect(
             self._show_pdm_tree_context_menu
         )
+        self._cad_tree.reorderRequested.connect(self._handle_pdm_tree_drag_reorder)
         self._tree_stack.addWidget(self._cad_tree)              # index 5
 
         _bom_tree_qss = f"""
@@ -10771,6 +10807,7 @@ class BomPage(QWidget):
                 )
                 payload["status"] = str(payload.get("state") or payload.get("status") or "")
                 payload["relation_parent_id"] = payload.get("effective_parent_bom_id")
+                payload["usage_id"] = payload.get("item_usage_id") or payload.get("usage_id")
                 payload["quantity"] = int(payload.get("source_quantity") or 1)
                 payload["_has_children"] = bool(payload.get("children"))
                 self._apply_tree_item_data(item, payload)
@@ -11285,6 +11322,172 @@ class BomPage(QWidget):
             return
         for cad_id in sorted(affected):
             self._refresh_pdm_cad_structure_branch(int(cad_id))
+
+    def _selected_pdm_sibling_reorder_context(self, scope: str):
+        scope = str(scope or "").upper()
+        tree = getattr(self, "_cad_tree", None) if scope == "CAD" else getattr(self, "_ebom_tree", None)
+        if tree is None:
+            raise ValueError("The structure tree is not available.")
+        selected = [
+            item for item in tree.selectedItems()
+            if item is not None
+            and not self._is_lazy_placeholder(item)
+            and not self._is_folder_tree_item(item)
+        ]
+        if not selected:
+            current = tree.currentItem()
+            selected = [current] if current is not None else []
+        if not selected:
+            raise ValueError("Select one or more sibling rows to reorder.")
+        visual_parent = selected[0].parent()
+        if visual_parent is None:
+            raise ValueError("Top-level rows cannot be reordered here.")
+        if any(item.parent() is not visual_parent for item in selected):
+            raise ValueError("Reorder works only for rows under the same parent.")
+
+        if scope == "CAD":
+            parent_id = visual_parent.data(0, PDM_CAD_DOCUMENT_ID_ROLE)
+            if parent_id is None:
+                raise ValueError("The parent CAD assembly was not found.")
+            selected_ids = []
+            for item in selected:
+                if item.data(0, PDM_OBJECT_KIND_ROLE) != PDM_OBJECT_CAD:
+                    raise ValueError("Only CAD component rows can be reordered in CAD Structure.")
+                member_id = item.data(0, PDM_CAD_MEMBER_ID_ROLE)
+                if member_id is None:
+                    raise ValueError("Top-level CAD Documents cannot be reordered here.")
+                selected_ids.append(int(member_id))
+            current_order = [
+                int(value) for value in self.bom_service.ordered_pdm_cad_member_ids(int(parent_id))
+            ]
+        else:
+            parent_id = self._pdm_ebom_relation_parent_for_item(selected[0])
+            if parent_id is None:
+                raise ValueError("Top-level EBOM Items cannot be reordered here.")
+            selected_ids = []
+            for item in selected:
+                if item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+                    raise ValueError("Associated CAD rows are not EBOM usage rows.")
+                usage_id = (item.data(0, BOM_TREE_OCCURRENCE_ROLE) or {}).get("usage_id")
+                if usage_id is None:
+                    raise ValueError("This EBOM row has no persisted usage to reorder.")
+                selected_ids.append(int(usage_id))
+            current_order = [
+                int(value) for value in self.bom_service.ordered_pdm_item_usage_ids(int(parent_id))
+            ]
+
+        selected_set = set(selected_ids)
+        selected_in_order = [value for value in current_order if value in selected_set]
+        if not selected_in_order:
+            raise ValueError("No valid selected rows to reorder.")
+        return int(parent_id), current_order, selected_in_order
+
+    def _apply_pdm_reordered_children(self, scope: str, parent_id: int, ordered_ids: list[int]) -> None:
+        scope = str(scope or "").upper()
+        if scope == "CAD":
+            self.bom_service.reorder_pdm_cad_members(int(parent_id), ordered_ids)
+            self._refresh_pdm_cad_structure_branch(int(parent_id))
+            self._refresh_pdm_cad_filter()
+        else:
+            self.bom_service.reorder_pdm_item_usages(int(parent_id), ordered_ids)
+            self._refresh_pdm_ebom_structure_branch(int(parent_id))
+            self._refresh_ebom_filters()
+        try:
+            self.window().statusBar().showMessage(
+                "CAD child order updated." if scope == "CAD" else "EBOM child order updated."
+            )
+        except Exception:
+            pass
+
+    def _reorder_selected_pdm_siblings(self, scope: str, mode: str) -> None:
+        if not self.perm.can("manage_parts"):
+            return QMessageBox.warning(self, "Permission", "You do not have permission to reorder structure rows.")
+        try:
+            parent_id, current_order, selected_in_order = self._selected_pdm_sibling_reorder_context(scope)
+            selected_set = set(selected_in_order)
+            remaining = [value for value in current_order if value not in selected_set]
+            if mode == "top":
+                new_order = selected_in_order + remaining
+            elif mode == "bottom":
+                new_order = remaining + selected_in_order
+            elif mode == "up":
+                new_order = list(current_order)
+                positions = [index for index, value in enumerate(new_order) if value in selected_set]
+                if positions and positions[0] > 0:
+                    before = new_order.pop(positions[0] - 1)
+                    new_order.insert(positions[-1], before)
+            elif mode == "down":
+                new_order = list(current_order)
+                positions = [index for index, value in enumerate(new_order) if value in selected_set]
+                if positions and positions[-1] < len(new_order) - 1:
+                    after = new_order.pop(positions[-1] + 1)
+                    new_order.insert(positions[0], after)
+            elif mode == "position":
+                pos, ok = QInputDialog.getInt(
+                    self,
+                    "Move To Position",
+                    f"New position for selected row(s), 1 to {len(current_order)}:",
+                    1,
+                    1,
+                    max(1, len(current_order)),
+                    1,
+                )
+                if not ok:
+                    return
+                insert_at = max(0, min(int(pos) - 1, len(remaining)))
+                new_order = remaining[:insert_at] + selected_in_order + remaining[insert_at:]
+            else:
+                return
+            if new_order != current_order:
+                self._apply_pdm_reordered_children(scope, parent_id, new_order)
+        except Exception as exc:
+            QMessageBox.warning(self, "Reorder", str(exc))
+
+    def _handle_pdm_tree_drag_reorder(
+        self, selected_ids: list, target_id: int, target_parent_id: int, where: str
+    ) -> None:
+        if not self.perm.can("manage_parts"):
+            return QMessageBox.warning(self, "Permission", "You do not have permission to reorder structure rows.")
+        tree = self.sender()
+        scope = str(tree.property("pdmScope") or "").upper() if tree is not None else ""
+        try:
+            selected_set = {int(value) for value in selected_ids or []}
+            current_order = (
+                [int(value) for value in self.bom_service.ordered_pdm_cad_member_ids(int(target_parent_id))]
+                if scope == "CAD" else
+                [int(value) for value in self.bom_service.ordered_pdm_item_usage_ids(int(target_parent_id))]
+            )
+            if int(target_id) not in current_order or not selected_set.issubset(set(current_order)):
+                raise ValueError("Drag reorder works only between sibling rows under the same parent.")
+            if int(target_id) in selected_set:
+                return
+            selected_in_order = [value for value in current_order if value in selected_set]
+            remaining = [value for value in current_order if value not in selected_set]
+            target_index = remaining.index(int(target_id))
+            if where == "below":
+                target_index += 1
+            new_order = remaining[:target_index] + selected_in_order + remaining[target_index:]
+            if new_order != current_order:
+                self._apply_pdm_reordered_children(scope, int(target_parent_id), new_order)
+        except Exception as exc:
+            QMessageBox.warning(self, "Reorder", str(exc))
+
+    def _add_pdm_reorder_menu(self, menu: QMenu, scope: str) -> None:
+        reorder_menu = menu.addMenu("Reorder")
+        actions = (
+            ("Move Up", "up"),
+            ("Move Down", "down"),
+            ("Move To Top", "top"),
+            ("Move To Bottom", "bottom"),
+            ("Move To Position...", "position"),
+        )
+        for label, mode in actions:
+            action = reorder_menu.addAction(label)
+            action.setEnabled(self.perm.can("manage_parts"))
+            action.triggered.connect(
+                lambda _checked=False, value=mode, current_scope=str(scope).upper():
+                self._reorder_selected_pdm_siblings(current_scope, value)
+            )
 
     def _change_cad_item_association(
         self, cad_id: int, item_id: int, association_id, current_type: str
@@ -12392,6 +12595,8 @@ class BomPage(QWidget):
                     lambda _checked=False, rows=list(removable_cad_rows):
                     self._remove_pdm_cad_members_from_tree(rows)
                 )
+                structure_menu.addSeparator()
+                self._add_pdm_reorder_menu(structure_menu, "CAD")
                 member_id = item.data(0, PDM_CAD_MEMBER_ID_ROLE)
                 if member_id is not None:
                     parent_item = item.parent()
@@ -12556,6 +12761,8 @@ class BomPage(QWidget):
                        rows=list(same_parent_rows):
                 self._remove_pdm_ebom_children_from_tree(parent_id, parent_name, rows)
             )
+        structure_menu.addSeparator()
+        self._add_pdm_reorder_menu(structure_menu, "EBOM")
         compare_action = structure_menu.addAction("Compare with OWNER CAD...")
         compare_action.triggered.connect(
             lambda _checked=False, value=item_id: (

@@ -1069,12 +1069,12 @@ class PdmRepository:
             FROM cad_item_associations a
             JOIN bom b ON b.id=a.item_id
             WHERE a.cad_document_id=? AND a.active=1
-            ORDER BY CASE upper(association_type)
+            ORDER BY CASE upper(a.association_type)
                 WHEN 'OWNER' THEN 0
                 WHEN 'CONTRIBUTING_IMAGE' THEN 1
                 WHEN 'IMAGE' THEN 2
                 WHEN 'CONTRIBUTING_CONTENT' THEN 3
-                WHEN 'CONTENT' THEN 4 ELSE 9 END,id
+                WHEN 'CONTENT' THEN 4 ELSE 9 END,a.id
             """,
             (int(cad_document_id),),
         ).fetchall()
@@ -1088,12 +1088,12 @@ class PdmRepository:
                 FROM cad_item_associations a
                 JOIN bom b ON b.id=a.item_id
                 WHERE a.cad_document_id=? AND a.active=1
-                ORDER BY CASE upper(association_type)
+                ORDER BY CASE upper(a.association_type)
                     WHEN 'OWNER' THEN 0
                     WHEN 'CONTRIBUTING_IMAGE' THEN 1
                     WHEN 'IMAGE' THEN 2
                     WHEN 'CONTRIBUTING_CONTENT' THEN 3
-                    WHEN 'CONTENT' THEN 4 ELSE 9 END,id
+                    WHEN 'CONTENT' THEN 4 ELSE 9 END,a.id
                 LIMIT 1
                 """,
                 (int(document["drawing_owner_cad_document_id"]),),
@@ -2611,6 +2611,60 @@ class PdmRepository:
                     record[field] = selected.get(field)
             return records
 
+    def ordered_cad_member_ids(self, parent_cad_document_id: int) -> list[int]:
+        with self.get_conn() as conn:
+            return [
+                int(row["id"])
+                for row in conn.execute(
+                    """
+                    SELECT id FROM cad_document_members
+                    WHERE parent_cad_document_id=?
+                    ORDER BY COALESCE(sort_order,id),id
+                    """,
+                    (int(parent_cad_document_id),),
+                ).fetchall()
+            ]
+
+    def set_cad_member_order(self, parent_cad_document_id: int, ordered_member_ids) -> bool:
+        ordered = []
+        seen = set()
+        for value in ordered_member_ids or []:
+            try:
+                member_id = int(value)
+            except Exception:
+                continue
+            if member_id in seen:
+                continue
+            ordered.append(member_id)
+            seen.add(member_id)
+        if not ordered:
+            return False
+        with self.get_conn() as conn:
+            existing = [
+                int(row["id"])
+                for row in conn.execute(
+                    """
+                    SELECT id FROM cad_document_members
+                    WHERE parent_cad_document_id=?
+                    ORDER BY COALESCE(sort_order,id),id
+                    """,
+                    (int(parent_cad_document_id),),
+                ).fetchall()
+            ]
+            existing_set = set(existing)
+            final_order = [member_id for member_id in ordered if member_id in existing_set]
+            final_order.extend(member_id for member_id in existing if member_id not in set(final_order))
+            for index, member_id in enumerate(final_order):
+                conn.execute(
+                    """
+                    UPDATE cad_document_members
+                    SET sort_order=?
+                    WHERE id=? AND parent_cad_document_id=?
+                    """,
+                    ((index + 1) * 10, int(member_id), int(parent_cad_document_id)),
+                )
+            return True
+
     def get_cad_member(self, member_id: int) -> Optional[dict]:
         with self.get_conn() as conn:
             return self._dict(conn.execute(
@@ -2703,6 +2757,60 @@ class PdmRepository:
                 (int(parent_item_id),),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def ordered_item_usage_ids(self, parent_item_id: int) -> list[int]:
+        with self.get_conn() as conn:
+            return [
+                int(row["id"])
+                for row in conn.execute(
+                    """
+                    SELECT id FROM item_usages
+                    WHERE parent_item_id=?
+                    ORDER BY COALESCE(sort_order,id),id
+                    """,
+                    (int(parent_item_id),),
+                ).fetchall()
+            ]
+
+    def set_item_usage_order(self, parent_item_id: int, ordered_usage_ids) -> bool:
+        ordered = []
+        seen = set()
+        for value in ordered_usage_ids or []:
+            try:
+                usage_id = int(value)
+            except Exception:
+                continue
+            if usage_id in seen:
+                continue
+            ordered.append(usage_id)
+            seen.add(usage_id)
+        if not ordered:
+            return False
+        with self.get_conn() as conn:
+            existing = [
+                int(row["id"])
+                for row in conn.execute(
+                    """
+                    SELECT id FROM item_usages
+                    WHERE parent_item_id=?
+                    ORDER BY COALESCE(sort_order,id),id
+                    """,
+                    (int(parent_item_id),),
+                ).fetchall()
+            ]
+            existing_set = set(existing)
+            final_order = [usage_id for usage_id in ordered if usage_id in existing_set]
+            final_order.extend(usage_id for usage_id in existing if usage_id not in set(final_order))
+            for index, usage_id in enumerate(final_order):
+                conn.execute(
+                    """
+                    UPDATE item_usages
+                    SET sort_order=?,modified_at=datetime('now')
+                    WHERE id=? AND parent_item_id=?
+                    """,
+                    ((index + 1) * 10, int(usage_id), int(parent_item_id)),
+                )
+            return True
 
     def add_manual_item_usage(
         self, project_id: int, parent_item_id: int, child_item_id: int,
