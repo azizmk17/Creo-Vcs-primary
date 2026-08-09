@@ -57,7 +57,6 @@ class BomService(BaseService):
         self._tree_cache: dict = {}    # project_id -> tree dict
         self._tree_dirty: set = set()  # project_ids that need re-fetch
         self._lazy_index_cache: dict = {}
-        print(self.user_id)
 
     @staticmethod
     def _clean_drawing_number(value) -> str:

@@ -3169,6 +3169,21 @@ def _migration_39(conn):
         )
 
 
+def _migration_40(conn):
+    """Per-user feature flag for the controlled Engineer CLI panel."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id INTEGER PRIMARY KEY,
+            last_project_id INTEGER,
+            cli_enabled INTEGER DEFAULT 0,
+            updated_at TEXT DEFAULT (datetime('now'))
+        )
+        """
+    )
+    _ensure_column(conn, "user_settings", "cli_enabled", "cli_enabled INTEGER DEFAULT 0")
+
+
 MIGRATIONS = {
     1: """
     CREATE TABLE IF NOT EXISTS users (
@@ -3557,6 +3572,8 @@ WHERE r.name = 'designer' AND p.name = 'manage_issues';
     38: _migration_38,
 
     39: _migration_39,
+
+    40: _migration_40,
 
 }
 

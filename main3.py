@@ -89,6 +89,11 @@ PAGE_PRESENTATION = {
         "Snapshots",
         "Recorded product configurations and comparison baselines",
     ),
+    7: (
+        "AUTOMATION",
+        "Engineer CLI",
+        "Controlled command panel for API-driven PDM operations",
+    ),
 }
 
 
@@ -483,6 +488,7 @@ class BomGUI(QMainWindow):
         self.diag_page = self._lazy_page_placeholder("Diagnostic")
         self.admin_page = self._lazy_page_placeholder("Admin")
         self.snap_page = self._lazy_page_placeholder("Snapshots")
+        self.cli_page = self._lazy_page_placeholder("Engineer CLI")
         startup_stage("Connecting application modules...")
         self.pages.addWidget(self.bom_page)
         self.pages.addWidget(self.commit_page)
@@ -491,6 +497,7 @@ class BomGUI(QMainWindow):
         self.pages.addWidget(self.admin_page)
         self.pages.addWidget(self.snap_page)
         self.pages.addWidget(self.dashboard_page)
+        self.pages.addWidget(self.cli_page)
         self.bom_page.issue_requested.connect(self.open_issues_for_part)
         self.bom_page.create_issue_requested.connect(self.create_issue_for_part)
         self.issue_page.issue_changed.connect(self.bom_page.refresh_issue_indicators)
@@ -689,6 +696,16 @@ class BomGUI(QMainWindow):
             page_index=5,
             tooltip="Open recorded configuration snapshots",
         )
+        if self._engineer_cli_available():
+            add_action(
+                toolbar,
+                "CLI",
+                lambda _checked=False: self.switch_page(7),
+                "SP_CommandLink",
+                role="navigation",
+                page_index=7,
+                tooltip="Open the controlled Nexus Engineer CLI",
+            )
 
         # Admin remains permission-controlled; only its presentation moved.
         if UIPermissionHelper().can("admin_panel"):
@@ -809,7 +826,9 @@ class BomGUI(QMainWindow):
             self.workspace_module_label.setText(module)
             self.workspace_title_label.setText(title)
             self.workspace_subtitle_label.setText(subtitle)
-            self.workspace_position_label.setText(f"{int(index) + 1:02d} / 06")
+            self.workspace_position_label.setText(
+                f"{int(index) + 1:02d} / {len(PAGE_PRESENTATION):02d}"
+            )
         action = getattr(self, "navigation_actions", {}).get(int(index))
         if action is not None:
             action.setChecked(True)
@@ -1155,6 +1174,13 @@ class BomGUI(QMainWindow):
             )
 
     def switch_page(self, index):
+        if int(index) == 7 and not self._engineer_cli_available():
+            QMessageBox.warning(
+                self,
+                "Engineer CLI",
+                "The Engineer CLI is disabled for this user. Ask an administrator to activate it.",
+            )
+            return
         self._ensure_lazy_page(index)
         self.pages.setCurrentIndex(index)
         self._set_active_shell_page(index)
@@ -1194,6 +1220,31 @@ class BomGUI(QMainWindow):
             self.snap_page = page
             self.pages.insertWidget(5, self.snap_page)
             self._snap_loaded = True
+        elif index == 7 and not getattr(self, "_cli_loaded", False):
+            self.statusBar().showMessage("Loading Engineer CLI...")
+            QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+            from pages.engineer_cli_page import EngineerCliPage
+            page = EngineerCliPage()
+            self.pages.removeWidget(self.cli_page)
+            self.cli_page.deleteLater()
+            self.cli_page = page
+            self.pages.insertWidget(7, self.cli_page)
+            self._cli_loaded = True
+            try:
+                self.cli_page.refresh_context()
+            except Exception:
+                pass
+
+    def _engineer_cli_available(self):
+        try:
+            if UIPermissionHelper().can("admin_panel"):
+                return True
+            user_id = getattr(self.session, "user_id", None)
+            if not user_id:
+                return False
+            return bool(self.user_repo.is_cli_enabled(int(user_id)))
+        except Exception:
+            return False
 
     def open_issues_for_part(self, part_id):
         self.issue_page.open_for_part(int(part_id))
@@ -1245,6 +1296,11 @@ class BomGUI(QMainWindow):
         elif current_index == 6:
             self.dashboard_page.refresh()
             self.statusBar().showMessage("Manager Dashboard refreshing")
+            return
+        elif current_index == 7:
+            if getattr(self, "_cli_loaded", False):
+                self.cli_page.refresh_context()
+            self.statusBar().showMessage("Engineer CLI ready")
             return
 
     def export_current(self):

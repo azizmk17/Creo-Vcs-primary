@@ -5,7 +5,8 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QListWidget,
     QComboBox, QFrame, QGroupBox, QTabWidget, QTableWidget, QTableWidgetItem,
     QMessageBox, QHeaderView, QInputDialog, QFileDialog, QLineEdit,
-    QSizePolicy, QSplitter, QAbstractItemView, QApplication, QPlainTextEdit
+    QSizePolicy, QSplitter, QAbstractItemView, QApplication, QPlainTextEdit,
+    QCheckBox
 )
 from PyQt5.QtGui import QFont
 from PyQt5.QtCore import Qt
@@ -429,6 +430,13 @@ class AdminPage(QWidget):
         for u in self.user_service.get_all_users():
             self.user_combo.addItem(u.username, u.id)
         assigned_layout.addWidget(self.user_combo)
+        self.user_cli_enabled_check = QCheckBox("Engineer CLI enabled")
+        self.user_cli_enabled_check.setToolTip(
+            "Allow this user to open the controlled Nexus command panel. "
+            "Admins always have access."
+        )
+        self.user_cli_enabled_check.stateChanged.connect(self.set_user_cli_access)
+        assigned_layout.addWidget(self.user_cli_enabled_check)
         assigned_layout.addWidget(self._field_label("Assigned roles"))
         self.user_roles_list = QListWidget()
         self.user_roles_list.setAlternatingRowColors(True)
@@ -932,12 +940,41 @@ class AdminPage(QWidget):
         user_id = self.user_combo.currentData()
         if not user_id:
             return
+        if hasattr(self, "user_cli_enabled_check"):
+            self.user_cli_enabled_check.blockSignals(True)
+            try:
+                enabled = self.user_service.user_repository.is_cli_enabled(int(user_id))
+                user = self.user_service.get_user_by_id(int(user_id))
+                if user and bool(getattr(user, "is_admin", False)):
+                    enabled = True
+                    self.user_cli_enabled_check.setToolTip("Admins always have Engineer CLI access.")
+                else:
+                    self.user_cli_enabled_check.setToolTip(
+                        "Allow this user to open the controlled Nexus command panel."
+                    )
+                self.user_cli_enabled_check.setChecked(bool(enabled))
+                self.user_cli_enabled_check.setEnabled(not bool(user and getattr(user, "is_admin", False)))
+            finally:
+                self.user_cli_enabled_check.blockSignals(False)
         roles = self.admin_service.get_roles_for_user(user_id)
         for r in roles:
             from PyQt5.QtWidgets import QListWidgetItem
             li = QListWidgetItem(r["name"])
             li.setData(Qt.UserRole, int(r["id"]))
             self.user_roles_list.addItem(li)
+
+    def set_user_cli_access(self, state):
+        user_id = self.user_combo.currentData()
+        if not user_id:
+            return
+        try:
+            self.user_service.user_repository.set_cli_enabled(
+                int(user_id), bool(state == Qt.Checked)
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Engineer CLI", str(exc))
+        else:
+            self.stats_label.setText("Engineer CLI access updated")
 
     def load_role_permissions(self):
         self.role_permissions_list.clear()
