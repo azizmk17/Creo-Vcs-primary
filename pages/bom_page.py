@@ -6,10 +6,10 @@ from PyQt5.QtWidgets import (
     QMessageBox, QInputDialog, QFileDialog, QMenu, QAction, QDialog, QDialogButtonBox, QFrame,
     QPlainTextEdit, QStackedWidget, QSizePolicy, QCheckBox, QGridLayout, QScrollArea,
     QGraphicsDropShadowEffect, QToolTip, QStyledItemDelegate, QStyle, QStyleOptionViewItem,
-    QApplication, QProgressDialog,
+    QApplication, QProgressDialog, QShortcut,
 )
 from PyQt5.QtCore import Qt, QDateTime, pyqtSignal, QTimer, QObject, QThread, QSize, QRect, QRectF, QPointF, QEvent, QSettings
-from PyQt5.QtGui import QColor, QPen, QFont, QBrush, QCursor, QPalette, QFontMetrics, QPolygonF
+from PyQt5.QtGui import QColor, QPen, QFont, QBrush, QCursor, QPalette, QFontMetrics, QPolygonF, QKeySequence
 from datetime import datetime, timedelta
 from pages.part_dialog import PartDialog
 from collections import deque, Counter, defaultdict
@@ -35,6 +35,7 @@ from core.services.part_doc_ack_service import PartDocAckService
 from core.services.issue_service import IssueService
 from core.services.traceability_service import TraceabilityService
 from core.services.assembly_configuration_service import AssemblyConfigurationService
+from core.services.undo_service import UndoService
 from core.bom_filter import (
     deduplicate_bom_items_by_id,
     matches_bom_filter_text,
@@ -2527,6 +2528,7 @@ class BomPage(QWidget):
         self.issue_service = IssueService()
         self.traceability_service = TraceabilityService()
         self.assembly_configuration_service = AssemblyConfigurationService()
+        self.undo_service = UndoService()
         self._issue_summary_cache = {}
 
         self.working_dir = None
@@ -2591,6 +2593,7 @@ class BomPage(QWidget):
         self._pdm_ebom_scope_path = []
         self._ebom_associations_by_item = defaultdict(list)
         self.init_ui()
+        self._install_undo_shortcuts()
         self.advanced_filter_btn.setEnabled(True)
         self.saved_filters_btn.setEnabled(True)
 
@@ -2629,6 +2632,51 @@ class BomPage(QWidget):
             self.destroyed.connect(lambda *_: self._cancel_background_work())
         except Exception:
             pass
+
+    def _install_undo_shortcuts(self) -> None:
+        shortcut = QShortcut(QKeySequence("Ctrl+Z"), self)
+        shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        shortcut.activated.connect(self._undo_last_nexus_action)
+        self._undo_shortcut = shortcut
+
+    def _undo_last_nexus_action(self) -> None:
+        # Let focused editors keep their native text undo.  Nexus-level undo
+        # handles committed app actions such as delete/remove.
+        focused = QApplication.focusWidget()
+        if isinstance(focused, (QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QComboBox)):
+            try:
+                if hasattr(focused, "undo") and focused.isEnabled():
+                    focused.undo()
+                    return
+            except Exception:
+                pass
+        try:
+            record = self.undo_service.undo_last()
+        except Exception as exc:
+            QMessageBox.information(self, "Undo", str(exc))
+            return
+        try:
+            self._refresh_after_undo(record.label)
+        except Exception:
+            self.load_tree()
+        try:
+            self.window().statusBar().showMessage(f"Undone: {record.label}", 5000)
+        except Exception:
+            pass
+
+    def _refresh_after_undo(self, label: str = "") -> None:
+        # Prefer contextual refresh when the tree is already in PDM mode; fall
+        # back to the normal tree loader for older/legacy views.
+        try:
+            if str(getattr(self, "_bom_mode", "")).lower() == "cad":
+                self._load_pdm_cad_tree()
+                return
+            if str(getattr(self, "_bom_mode", "")).lower() == "ebom":
+                self._load_pdm_ebom_tree()
+                return
+        except Exception:
+            pass
+        self.load_tree()
 
     def _cancel_background_work(self) -> None:
         self._cancel_lazy_level_requests(wait=True)
@@ -3673,8 +3721,16 @@ class BomPage(QWidget):
             if member_id is None:
                 QMessageBox.information(dialog, "CAD Structure", "Select a child CAD member, not a root.")
                 return
+            undo_record = self.undo_service.snapshot_cad_member_remove(
+                int(member_id), f"Remove CAD Component {selected.text(0)}"
+            )
             self.bom_service.remove_pdm_cad_member(int(member_id))
+            self.undo_service.push(undo_record)
             refresh()
+            try:
+                self.window().statusBar().showMessage("CAD component removed. Press Ctrl+Z to undo.", 6000)
+            except Exception:
+                pass
 
         def selected_cad_id():
             selected = tree.currentItem()
@@ -5774,9 +5830,9 @@ class BomPage(QWidget):
             new_item_id = self.bom_service.add_part(dialog.get_data())
             if not isinstance(new_item_id, int):
                 raise ValueError("The Item could not be created.")
-            self.bom_service.checkout_item(int(new_item_id))
-            self.bom_service.associate_cad_document(
-                int(new_item_id), int(cad_id), association_type
+            self.bom_service.pdm_service.associate(
+                int(self.session.project_id), int(new_item_id), int(cad_id),
+                association_type, self.bom_service.user_id,
             )
         except Exception as exc:
             QMessageBox.warning(self, "Create EBOM Item from CAD", str(exc))
@@ -11313,15 +11369,27 @@ class BomPage(QWidget):
         ) != QMessageBox.Yes:
             return
         affected = set()
+        undo_records = []
         try:
             for member_id, parent_id, _label in member_rows:
+                undo_records.append(
+                    self.undo_service.snapshot_cad_member_remove(
+                        int(member_id), f"Remove CAD Component {_label}"
+                    )
+                )
                 self.bom_service.remove_pdm_cad_member(int(member_id))
                 affected.add(int(parent_id))
+            for record in undo_records:
+                self.undo_service.push(record)
         except Exception as exc:
             QMessageBox.warning(self, "Remove CAD Components", str(exc))
             return
         for cad_id in sorted(affected):
             self._refresh_pdm_cad_structure_branch(int(cad_id))
+        try:
+            self.window().statusBar().showMessage("CAD component(s) removed. Press Ctrl+Z to undo.", 6000)
+        except Exception:
+            pass
 
     def _selected_pdm_sibling_reorder_context(self, scope: str):
         scope = str(scope or "").upper()
@@ -11630,7 +11698,11 @@ class BomPage(QWidget):
         ) != QMessageBox.Yes:
             return
         try:
+            undo_record = self.undo_service.snapshot_cad_member_remove(
+                int(member_id), f"Remove CAD Component {label}"
+            )
             self.bom_service.remove_pdm_cad_member(int(member_id))
+            self.undo_service.push(undo_record)
         except Exception as exc:
             QMessageBox.warning(self, "Remove CAD Component", str(exc))
             return
@@ -11639,6 +11711,10 @@ class BomPage(QWidget):
             refresh_cad_branches=True,
         )
         self._reselect_cad_in_current_view(int(parent_cad_id))
+        try:
+            self.window().statusBar().showMessage("CAD component removed. Press Ctrl+Z to undo.", 6000)
+        except Exception:
+            pass
 
     def _edit_cad_member_from_tree(self, item: QTreeWidgetItem) -> None:
         parent = item.parent()
@@ -17678,12 +17754,16 @@ class BomPage(QWidget):
                 QMessageBox.warning(self, "Validation Error", "Name is required.")
                 return
             try:
+                undo_record = self.undo_service.snapshot_item_update(
+                    int(id), f"Edit Item {id}"
+                )
                 self.bom_service.update_part(id, updated_data)
+                self.undo_service.push(undo_record)
                 self._refresh_part_in_tree(int(id))
                 self._refresh_ebom_association_rows_for_item(int(id))
                 number = updated_data.get("part_number") or id
                 self.window().statusBar().showMessage(
-                    f"Item {number} attributes updated.", 6000
+                    f"Item {number} attributes updated. Press Ctrl+Z to undo.", 6000
                 )
                 self.display_details(id)
             except Exception as e:
@@ -17713,20 +17793,24 @@ class BomPage(QWidget):
         reply = QMessageBox.question(
             self,
             "Delete Item",
-            f"Delete Item {id}? This action cannot be undone.",
+            f"Delete Item {id}?\n\nYou can press Ctrl+Z immediately after deletion to restore it.",
             QMessageBox.Yes | QMessageBox.No
         )
         if reply == QMessageBox.Yes:
             try:
+                undo_record = self.undo_service.snapshot_item_delete(
+                    int(id), f"Delete Item {id}"
+                )
                 try:
                     parent_ids = list(self.bom_service.direct_parent_ids([int(id)]) or [])
                 except Exception:
                     parent_ids = []
                 self.bom_service.delete_part(id)
+                self.undo_service.push(undo_record)
                 self._remove_part_from_trees(int(id))
                 for parent_id in parent_ids:
                     self._refresh_loaded_part_branch(int(parent_id))
-                self.window().statusBar().showMessage("Item deleted.", 6000)
+                self.window().statusBar().showMessage("Item deleted. Press Ctrl+Z to undo.", 6000)
                 self.clear_details()
             except Exception as e:
                 QMessageBox.critical(self, "Delete Item", f"Could not delete Item:\n{str(e)}")

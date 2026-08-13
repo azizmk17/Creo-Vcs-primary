@@ -2487,6 +2487,31 @@ class PdmRepository:
             try:
                 cur = conn.execute(
                     """
+                    DELETE FROM item_occurrences
+                    WHERE parent_item_id=? OR child_item_id=?
+                    """,
+                    (item_id, item_id),
+                )
+                counts["item_occurrences_direct"] = int(cur.rowcount or 0)
+            except Exception:
+                counts["item_occurrences_direct"] = 0
+            try:
+                cur = conn.execute(
+                    """
+                    DELETE FROM item_occurrences
+                    WHERE item_usage_id IN (
+                        SELECT id FROM item_usages
+                        WHERE parent_item_id=? OR child_item_id=?
+                    )
+                    """,
+                    (item_id, item_id),
+                )
+                counts["item_occurrences_by_usage"] = int(cur.rowcount or 0)
+            except Exception:
+                counts["item_occurrences_by_usage"] = 0
+            try:
+                cur = conn.execute(
+                    """
                     DELETE FROM item_usages
                     WHERE parent_item_id=? OR child_item_id=?
                     """,
@@ -2495,17 +2520,6 @@ class PdmRepository:
                 counts["item_usages"] = int(cur.rowcount or 0)
             except Exception:
                 counts["item_usages"] = 0
-            try:
-                cur = conn.execute(
-                    """
-                    DELETE FROM item_occurrences
-                    WHERE parent_item_id=? OR child_item_id=?
-                    """,
-                    (item_id, item_id),
-                )
-                counts["item_occurrences"] = int(cur.rowcount or 0)
-            except Exception:
-                counts["item_occurrences"] = 0
             return counts
 
     def cleanup_orphan_item_associations(self) -> int:
@@ -2674,8 +2688,51 @@ class PdmRepository:
 
     def remove_cad_member(self, member_id: int) -> bool:
         with self.get_conn() as conn:
+            member_id = int(member_id)
+            # CAD members can drive generated EBOM usages, item occurrences,
+            # and historical build-result rows.  With FK enforcement enabled
+            # those dependents must be removed/detached before the occurrence
+            # itself is deleted.
+            try:
+                usage_ids = [
+                    int(row["id"])
+                    for row in conn.execute(
+                        "SELECT id FROM item_usages WHERE cad_member_id=?",
+                        (member_id,),
+                    ).fetchall()
+                ]
+                if usage_ids:
+                    placeholders = ",".join("?" for _ in usage_ids)
+                    conn.execute(
+                        f"DELETE FROM item_occurrences WHERE item_usage_id IN ({placeholders})",
+                        usage_ids,
+                    )
+                    conn.execute(
+                        f"DELETE FROM item_usages WHERE id IN ({placeholders}) AND upper(COALESCE(source,''))='CAD_BUILD'",
+                        usage_ids,
+                    )
+                    conn.execute(
+                        "UPDATE item_usages SET cad_member_id=NULL,modified_at=datetime('now') WHERE cad_member_id=?",
+                        (member_id,),
+                    )
+            except Exception:
+                pass
+            try:
+                conn.execute(
+                    "DELETE FROM item_occurrences WHERE source_cad_member_id=?",
+                    (member_id,),
+                )
+            except Exception:
+                pass
+            try:
+                conn.execute(
+                    "DELETE FROM pdm_build_results WHERE cad_member_id=?",
+                    (member_id,),
+                )
+            except Exception:
+                pass
             cur = conn.execute(
-                "DELETE FROM cad_document_members WHERE id=?", (int(member_id),)
+                "DELETE FROM cad_document_members WHERE id=?", (member_id,)
             )
             return bool(cur.rowcount)
 

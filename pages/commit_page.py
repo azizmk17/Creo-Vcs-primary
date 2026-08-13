@@ -3611,13 +3611,6 @@ class CommitPage(QWidget):
         )
         if not accepted:
             return
-        workspace = WorkspaceSelectionDialog.choose(
-            self.cad_workspace_service,
-            self,
-            title="Registered CAD Checkout Workspace",
-        )
-        if not workspace:
-            return
         try:
             cad_document_id = self.bom_service.create_pdm_cad_document(
                 number=clean_file,
@@ -3627,27 +3620,23 @@ class CommitPage(QWidget):
                 authoring_application="CREO",
                 drawing_owner_cad_document_id=drawing_owner_id,
             )
-            descriptor = self.cad_workspace_service.checkout_descriptor(workspace["id"])
-            self.bom_service.checkout_pdm_cad_document(
-                int(cad_document_id), **descriptor
-            )
-            self.cad_workspace_service.materialize_cad_document(
-                workspace["id"],
-                int(cad_document_id),
-                source_path=source_path,
-            )
         except Exception as exc:
             QMessageBox.critical(
                 self,
                 "Register CAD Document",
-                f"Could not register/check out the CAD Document:\n{exc}",
+                f"Could not register the CAD Document:\n{exc}",
             )
             return
         self.window().statusBar().showMessage(
-            f"CAD Document {clean_file} registered and checked out.",
+            f"CAD Document {clean_file} registered. Check it out explicitly when you want to edit it.",
             6000,
         )
-        self.commit_changes()
+        QMessageBox.information(
+            self,
+            "CAD Registered",
+            f"{clean_file} is now a managed CAD Document and remains checked in.\n\n"
+            "Use CAD checkout if you want to edit or stage it from a workspace.",
+        )
 
     def add_part(self, filename):
         dialog = PartDialog(self, filename=filename)
@@ -3663,10 +3652,9 @@ class CommitPage(QWidget):
                     raise ValueError("The Item could not be created.")
                 created = self.bom_service.get_part_details(added_part_id) or {}
                 self.window().statusBar().showMessage(
-                    f"Item {created.get('part_number') or added_part_id} created and associated.",
+                    f"Item {created.get('part_number') or added_part_id} created.",
                     6000,
                 )
-                self.bom_service.checkout_part(int(added_part_id))
                 self.commit_changes()
             except Exception as e:
                 QMessageBox.critical(self, "Create Item",

@@ -916,6 +916,22 @@ class BomRepository:
                 base_file_name, base_drw_name, id, project_id
             ))
 
+    def clear_legacy_cad_links(self, bom_id: int) -> bool:
+        """Clear legacy Item CAD fallback fields after PDM associations are removed."""
+        with self.get_conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE bom
+                SET filename=NULL,
+                    base_file_name=NULL,
+                    drawing=NULL,
+                    base_drw_name=NULL
+                WHERE id=?
+                """,
+                (int(bom_id),),
+            )
+            return bool(cur.rowcount)
+
     def checkin_bom(self, id):
         with self.get_conn() as conn:
             cur = conn.cursor()
@@ -944,6 +960,40 @@ class BomRepository:
     def delete(self, bom_id: int):
         with self.get_conn() as conn:
             cur = conn.cursor()
+            # Remove dependent records that intentionally belong to the Item
+            # master before deleting bom.id.  Newer projects have foreign-key
+            # enforcement enabled, so legacy "delete the bom row first" logic
+            # is no longer safe.
+            try:
+                file_ids = [
+                    int(row["id"])
+                    for row in cur.execute(
+                        "SELECT id FROM part_files WHERE part_id=?", (int(bom_id),)
+                    ).fetchall()
+                ]
+                if file_ids:
+                    placeholders = ",".join("?" for _ in file_ids)
+                    try:
+                        cur.execute(
+                            f"DELETE FROM bom_iteration_files WHERE part_file_id IN ({placeholders})",
+                            file_ids,
+                        )
+                    except sqlite3.OperationalError:
+                        pass
+                    cur.execute(
+                        f"DELETE FROM part_file_versions WHERE file_id IN ({placeholders})",
+                        file_ids,
+                    )
+                    cur.execute(
+                        f"DELETE FROM part_files WHERE id IN ({placeholders})",
+                        file_ids,
+                    )
+            except sqlite3.OperationalError:
+                pass
+            try:
+                cur.execute("DELETE FROM issue_parts WHERE part_id=?", (int(bom_id),))
+            except sqlite3.OperationalError:
+                pass
             cur.execute("DELETE FROM bom_item_categories WHERE bom_id=?", (bom_id,))
             try:
                 cur.execute("DELETE FROM bom_folder_items WHERE bom_id=?", (bom_id,))

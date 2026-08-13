@@ -3305,7 +3305,17 @@ class BomService(BaseService):
         )
         removed = self.pdm_service.remove_association(int(association_id))
         if removed:
-            self.lock_repo.set_checkout_origin(int(association["item_id"]), "ITEM")
+            item_id = int(association["item_id"])
+            self.lock_repo.set_checkout_origin(item_id, "ITEM")
+            try:
+                remaining = self.pdm_service.list_item_cad_documents(item_id) or []
+            except Exception:
+                remaining = []
+            if not remaining:
+                try:
+                    self.bom_repo.clear_legacy_cad_links(item_id)
+                except Exception:
+                    pass
         return removed
 
     def auto_associate_cad_documents(self) -> Dict:
