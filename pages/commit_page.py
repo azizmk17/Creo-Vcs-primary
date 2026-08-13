@@ -3090,11 +3090,15 @@ class CommitPage(QWidget):
                 return
 
         try:
-            associated_item_ids = list(
-                self.bom_service.pdm_service.checkout_target_item_ids(
-                    int(cad_document_id)
-                ) or []
-            )
+            associated_item_ids = sorted({
+                int(row["item_id"])
+                for row in (
+                    self.bom_service.pdm_service.list_cad_item_associations(
+                        int(cad_document_id)
+                    ) or []
+                )
+                if row.get("item_id") is not None
+            })
         except Exception:
             associated_item_ids = []
         released_revision_codes = {}
@@ -3125,11 +3129,35 @@ class CommitPage(QWidget):
         descriptor = self.cad_workspace_service.checkout_descriptor(workspace["id"])
         if needs_cad_revision:
             self.bom_service.revise_pdm_cad_document(int(cad_document_id))
-        self.bom_service.checkout_pdm_cad_document(
+        checkout_result = self.bom_service.checkout_pdm_cad_document(
             int(cad_document_id),
             released_item_revision_codes=released_revision_codes,
+            checkout_item_ids=associated_item_ids,
             **descriptor,
         )
+        checked_item_ids = sorted({
+            int(value)
+            for value in (
+                checkout_result.get("associated_item_ids")
+                or associated_item_ids
+                or []
+            )
+            if value is not None
+        })
+        for item_id in checked_item_ids:
+            item_lock = self.bom_service.lock_repo.get_by_part(int(item_id))
+            if not item_lock:
+                try:
+                    self.bom_service.undo_checkout_pdm_cad_document(
+                        int(cad_document_id),
+                        "Associated Item checkout failed during workspace checkout",
+                    )
+                except Exception:
+                    pass
+                raise ValueError(
+                    f"CAD checkout did not reserve associated Item {item_id}. "
+                    "The workspace checkout was stopped to protect the CAD/Item binding."
+                )
         try:
             self.cad_workspace_service.materialize_cad_document_package(
                 workspace["id"],

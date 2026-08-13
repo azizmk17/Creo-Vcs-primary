@@ -285,10 +285,13 @@ if (-not $SkipPipInstall) {
         "nuitka", "ordered-set", "zstandard", "wheel"
     ) (Join-Path $BuildLogRoot "pip-build-deps.log")
 }
-foreach ($module in @("nuitka", "ordered_set", "zstandard", "PyQt5")) {
+foreach ($module in @("nuitka", "ordered_set", "zstandard", "PyQt5", "openpyxl", "fitz")) {
     if (-not (Test-PythonModule $Python $module)) {
         throw "Required Python module is missing in build environment: $module"
     }
+}
+if (-not $SkipCadViewer -and -not (Test-PythonModule $Python "OCC")) {
+    throw "Required Python module is missing in build environment: OCC. Use the pyoccenv environment or pass -SkipCadViewer. Without OCC, STEP comparison and CAD viewing cannot work in the packaged app."
 }
 
 $CommonArgs = @(
@@ -335,25 +338,34 @@ $MainArgs = @($CommonArgs) + @(
     "--include-package=pages",
     "--include-package=setup",
     "--include-package=openpyxl",
+    "--include-package=fitz",
+    "--include-module=fitz",
     "--include-module=utils",
     "--include-module=config",
     "--include-module=tools.CAD.step_viewer.launcher",
     "--include-package=tools.CAD.step_diff_engine",
-    "--nofollow-import-to=OCC",
     "--nofollow-import-to=tools.CAD.step_viewer.main_window",
     "--nofollow-import-to=tools.CAD.step_diff_engine.step_diff_gui",
     "--output-filename=$MainExeName",
-    "--report=$OutputRoot\nuitka-main-report.xml",
-    $MainEntry
+    "--report=$OutputRoot\nuitka-main-report.xml"
 )
+if (Test-PythonModule $Python "pymupdf") {
+    $MainArgs += "--include-package=pymupdf"
+}
+if (-not $SkipCadViewer) {
+    # STEP comparison runs inside Nexus during commit validation, so the main
+    # app needs the OCC runtime too.  The separate CADViewer.exe also includes
+    # OCC, but it cannot satisfy imports made by Nexus.exe itself.
+    $MainArgs += "--include-package=OCC"
+} else {
+    $MainArgs += "--nofollow-import-to=OCC"
+}
+$MainArgs += $MainEntry
 Invoke-Checked "Nuitka main build" $Python (@("-m", "nuitka") + $MainArgs) (Join-Path $BuildLogRoot "nuitka-main.log")
 
 if (-not $SkipCadViewer) {
     if (-not (Test-Path -LiteralPath $CadEntry)) {
         throw "CAD Viewer entry point missing: $CadEntry"
-    }
-    if (-not (Test-PythonModule $Python "OCC")) {
-        throw "OCC module is missing. Use the pyoccenv environment or pass -SkipCadViewer."
     }
     Write-Stage "Compiling CAD Viewer with OpenCascade"
     $CadArgs = @($CommonArgs) + @(

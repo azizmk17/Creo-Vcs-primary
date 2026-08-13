@@ -2826,6 +2826,7 @@ class BomService(BaseService):
         workspace_id: str | None = None,
         workspace_name: str | None = None,
         workspace_machine_id: str | None = None,
+        checkout_item_ids: list[int] | tuple[int, ...] | None = None,
     ) -> Dict:
         """Check out CAD and coordinate every affected Item working copy."""
         cad_document_id = int(cad_document_id)
@@ -2851,8 +2852,10 @@ class BomService(BaseService):
         if state == "OBSOLETE":
             raise ValueError("An Obsolete CAD Document cannot be checked out.")
 
-        associated_item_ids = self.pdm_service.checkout_target_item_ids(
-            cad_document_id
+        associated_item_ids = (
+            [int(value) for value in checkout_item_ids]
+            if checkout_item_ids is not None
+            else self.pdm_service.checkout_target_item_ids(cad_document_id)
         )
         revision_codes = {
             int(item_id): str(value or "").strip()

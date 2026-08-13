@@ -400,6 +400,11 @@ class CadWorkspaceService:
             "checkout_user_id": int(document["checked_out_by"])
             if document.get("checked_out_by") is not None else None,
             "editable": True,
+            # When checkout is started from the staging dialog, the source is
+            # already the user's workspace file.  The local file should remain
+            # stageable immediately after checkout even if it equals the newly
+            # recorded baseline hash.
+            "stage_ready_after_checkout": bool(source_path),
             "materialized_at": _utc_now(),
         }
         manifest.setdefault("entries", {})[str(int(cad_document_id))] = entry
@@ -498,6 +503,12 @@ class CadWorkspaceService:
                     status, detail = "NOT_CHECKED_OUT", "Check out this CAD Document before staging it."
                 elif int(owner) != int(user_id):
                     status, detail = "CHECKED_OUT_BY_OTHER", "This CAD Document is checked out by another user."
+                elif entry.get("stage_ready_after_checkout"):
+                    status, detail, selectable = (
+                        "READY",
+                        "Checked out from this workspace and ready to stage.",
+                        True,
+                    )
                 elif not modified:
                     status, detail = "UNCHANGED", "The latest local content matches the checkout baseline."
                 else:

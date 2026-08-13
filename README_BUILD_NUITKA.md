@@ -85,12 +85,17 @@ powershell -ExecutionPolicy Bypass -File .\build_nuitka.ps1 -Python "C:\Users\mk
 For a full build with CAD Viewer, the Python environment must contain:
 
 - `PyQt5`
+- `openpyxl`
+- `fitz` / `PyMuPDF`
 - `nuitka`
 - `ordered-set`
 - `zstandard`
 - `OCC`
 
 For a main-app-only build, `OCC` is not required if `-SkipCadViewer` is used.
+However, STEP comparison inside Nexus also uses `OCC`, so a build made with
+`-SkipCadViewer` must be treated as a no-CAD-runtime build: PDF preview still
+works if `PyMuPDF` is present, but STEP comparison/CAD viewing will not.
 
 ## Skip pip installation
 
@@ -152,10 +157,13 @@ The main app build includes:
 - `utils.py`
 - `config.py`
 - `openpyxl`
+- `fitz` / `PyMuPDF` for embedded PDF preview
 - `modern_theme.qss`
 - `assets\pictures`
 - the CAD Viewer launcher module
 - STEP diff engine package
+- `OCC` when CAD Viewer is not skipped, because STEP comparison runs inside
+  `Nexus.exe` during commit validation
 
 The CAD Viewer build includes:
 

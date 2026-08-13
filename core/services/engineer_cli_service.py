@@ -2,8 +2,10 @@ import os
 import re
 import inspect
 import json
+import shutil
 import shlex
 import sqlite3
+import subprocess
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -50,6 +52,13 @@ class EngineerCliService:
         self._pending_clarification: dict | None = None
         self.ollama_host = os.environ.get("NEXUS_OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
         self.ollama_model = os.environ.get("NEXUS_OLLAMA_MODEL", "llama3.1")
+        self.ollama_trace = str(os.environ.get("NEXUS_OLLAMA_TRACE", "1")).lower() not in {"0", "false", "no", "off"}
+        self.ollama_raw = str(os.environ.get("NEXUS_OLLAMA_RAW", "0")).lower() in {"1", "true", "yes", "on"}
+        self._last_ollama_prompt = ""
+        self._last_ollama_response = ""
+        self._last_ollama_error = ""
+        self._last_ollama_plan: dict | None = None
+        self._service_catalog_cache = ""
 
     @property
     def bom_service(self) -> BomService:
@@ -127,6 +136,8 @@ class EngineerCliService:
             return self._sql(args)
         if verb in {"service", "svc"}:
             return self._service(args)
+        if verb in {"python", "py"}:
+            return self._python(args, launcher=verb)
         if verb in {"context", "ctx"}:
             return self._context()
         if verb == "find":
@@ -266,6 +277,80 @@ class EngineerCliService:
                 return self._format_rows(rows, columns)
             return f"SQL executed. Rows affected: {cur.rowcount}"
 
+    def _python(self, args: list[str], launcher: str = "python") -> str:
+        exe = self._python_executable(launcher)
+        if not exe:
+            raise FileNotFoundError(
+                "Python is not available on this device PATH. Install Python or add it to PATH, then retry."
+            )
+        if not args:
+            return "\n".join([
+                "Python passthrough is available.",
+                "This CLI is single-command, so interactive REPL mode is not opened here.",
+                "",
+                "Examples:",
+                "  python --version",
+                "  python print('hello')",
+                "  python -c \"import sys; print(sys.executable)\"",
+                "  python C:\\work\\script.py arg1 arg2",
+            ])
+
+        normalized_args = self._python_args(args)
+        cmd = [exe, *normalized_args]
+        try:
+            completed = subprocess.run(
+                cmd,
+                cwd=os.getcwd(),
+                capture_output=True,
+                text=True,
+                timeout=120,
+                shell=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            output = (exc.stdout or "") + (exc.stderr or "")
+            return "\n".join([
+                "Python execution timed out after 120 seconds.",
+                self._truncate_output(output),
+            ]).strip()
+        output_parts = [
+            f"Python: {exe}",
+            f"Command: {' '.join(cmd)}",
+            f"Exit code: {completed.returncode}",
+        ]
+        stdout = (completed.stdout or "").rstrip()
+        stderr = (completed.stderr or "").rstrip()
+        if stdout:
+            output_parts.extend(["", "STDOUT:", self._truncate_output(stdout)])
+        if stderr:
+            output_parts.extend(["", "STDERR:", self._truncate_output(stderr)])
+        if not stdout and not stderr:
+            output_parts.append("")
+            output_parts.append("(no output)")
+        return "\n".join(output_parts)
+
+    @staticmethod
+    def _python_executable(launcher: str) -> str | None:
+        preferred = "py" if str(launcher).lower() == "py" else "python"
+        return shutil.which(preferred) or shutil.which("python") or shutil.which("py")
+
+    @staticmethod
+    def _python_args(args: list[str]) -> list[str]:
+        if not args:
+            return []
+        first = str(args[0] or "").strip()
+        if first.startswith("-") or first.lower().endswith(".py"):
+            return list(args)
+        if os.path.exists(first):
+            return list(args)
+        return ["-c", " ".join(str(a) for a in args)]
+
+    @staticmethod
+    def _truncate_output(text: str, limit: int = 20000) -> str:
+        value = str(text or "")
+        if len(value) <= limit:
+            return value
+        return value[:limit] + f"\n... output truncated ({len(value) - limit} more chars)"
+
     def _ollama(self, args: list[str]) -> str:
         action = (args[0].lower() if args else "status")
         if action == "status":
@@ -276,6 +361,9 @@ class EngineerCliService:
                 f"  Model: {self.ollama_model}",
                 f"  Status: {'available' if ok else 'unavailable'}",
                 f"  Detail: {detail}",
+                f"  Trace visible in agent replies: {'on' if self.ollama_trace else 'off'}",
+                f"  Raw JSON visible in agent replies: {'on' if self.ollama_raw else 'off'}",
+                f"  Service functions visible to model: {self._service_catalog_count()}",
             ])
         if action == "models":
             models = self._ollama_models()
@@ -290,7 +378,38 @@ class EngineerCliService:
                 f"Ollama model for this CLI session set to: {self.ollama_model}\n"
                 "To make it permanent, set environment variable NEXUS_OLLAMA_MODEL."
             )
-        raise ValueError("Usage: ollama status | ollama models | ollama model <name>")
+        if action == "trace":
+            if len(args) < 2:
+                return f"Ollama trace is {'on' if self.ollama_trace else 'off'}."
+            self.ollama_trace = str(args[1]).lower() in {"1", "true", "yes", "on"}
+            return f"Ollama trace set to {'on' if self.ollama_trace else 'off'} for this CLI session."
+        if action == "raw":
+            if len(args) < 2:
+                return f"Ollama raw JSON display is {'on' if self.ollama_raw else 'off'}."
+            self.ollama_raw = str(args[1]).lower() in {"1", "true", "yes", "on"}
+            return f"Ollama raw JSON display set to {'on' if self.ollama_raw else 'off'} for this CLI session."
+        if action == "last":
+            if not any((self._last_ollama_response, self._last_ollama_error)):
+                return "No Ollama planner call has been recorded in this CLI session."
+            parts = [
+                "Last Ollama planner call",
+                f"Model: {self.ollama_model}",
+            ]
+            if self._last_ollama_error:
+                parts.extend(["", "Error:", self._last_ollama_error])
+            if self._last_ollama_plan:
+                parts.extend(["", "Normalized plan:", self._format_value(self._last_ollama_plan)])
+            if self._last_ollama_response:
+                parts.extend(["", "Raw response:", self._last_ollama_response])
+            return "\n".join(parts)
+        if action == "prompt":
+            return self._last_ollama_prompt or "No Ollama prompt has been recorded in this CLI session."
+        if action in {"catalog", "functions"}:
+            return "\n".join([
+                "Service functions available to Ollama:",
+                self._service_catalog_for_prompt(force=True),
+            ])
+        raise ValueError("Usage: ollama status | ollama models | ollama model <name> | ollama trace on|off | ollama raw on|off | ollama last | ollama prompt | ollama catalog")
 
     def _service(self, args: list[str]) -> str:
         if not args:
@@ -376,8 +495,14 @@ class EngineerCliService:
                 "  ollama status",
                 "  ollama models",
                 "  ollama model llama3.1",
+                "  ollama trace on        # show the model planner summary and rationale",
+                "  ollama raw on          # also show raw JSON returned by Ollama",
+                "  ollama last            # inspect last normalized plan + raw response",
+                "  ollama prompt          # inspect the exact prompt sent to Ollama",
+                "  ollama catalog         # show backend service functions exposed to Ollama",
                 "  Environment: NEXUS_OLLAMA_HOST=http://127.0.0.1:11434",
                 "  Environment: NEXUS_OLLAMA_MODEL=llama3.1",
+                "  Environment: NEXUS_OLLAMA_TRACE=1",
                 "",
                 "Database power tools:",
                 "  db tables",
@@ -393,6 +518,14 @@ class EngineerCliService:
                 "  service help bom.checkout_item",
                 "  service call bom.checkout_item --args \"[123]\" --kwargs \"{\\\"include_owner_cad\\\": true}\" --confirm",
                 "  service call pdm.list_cad_documents --args \"[5]\"",
+                "",
+                "Local Python passthrough:",
+                "  python --version",
+                "  python print('hello from Nexus')",
+                "  python -c \"import sys; print(sys.executable)\"",
+                "  python C:\\work\\script.py arg1 arg2",
+                "  py -m pip --version",
+                "  The CLI runs Python directly if it is installed; it is not an OS shell.",
                 "",
                 "Read commands:",
                 "  context",
@@ -428,7 +561,9 @@ class EngineerCliService:
                 "  script --path \"C:\\work\\nexus_commands.txt\"",
                 "",
                 "Rules:",
-                "  - No SQL, no Python, no OS shell execution.",
+                "  - SQL writes require --apply --confirm and admin permission.",
+                "  - Python commands run through the installed Python executable only.",
+                "  - No OS shell execution.",
                 "  - Admin users may use --as to act for another Nexus user.",
                 "  - Commands use Nexus backend services and respect lifecycle/checkout rules.",
             ]
@@ -825,6 +960,7 @@ class EngineerCliService:
         plan = self._ollama_plan(raw, mode=mode) or self._plan_from_text(raw)
         if not plan:
             return self._agent_unknown(raw)
+        planner = str(plan.get("planner") or "rules")
 
         should_execute = mode == "act" or (
             mode == "auto" and bool(plan.get("auto_execute"))
@@ -836,11 +972,26 @@ class EngineerCliService:
 
         lines = [
             "Nexus Agent",
+            f"Planner: {planner}",
             f"Understood: {plan['summary']}",
             f"Confidence: {plan.get('confidence', 0):.0%}",
         ]
         if plan.get("risk"):
             lines.append(f"Risk: {plan['risk']}")
+        if planner == "ollama" and self.ollama_trace:
+            lines.extend([
+                "",
+                "Ollama interaction:",
+                f"  Host: {self.ollama_host}",
+                f"  Model: {self.ollama_model}",
+                f"  Prompt size: {len(self._last_ollama_prompt)} chars",
+            ])
+            rationale = plan.get("rationale") or []
+            if rationale:
+                lines.extend(["  Rationale:"])
+                lines.extend([f"    - {x}" for x in rationale])
+            if self.ollama_raw and self._last_ollama_response:
+                lines.extend(["", "Ollama raw JSON:", self._last_ollama_response])
         if plan.get("analysis"):
             lines.extend(["", "Analysis:", *[f"  - {x}" for x in plan["analysis"]]])
         commands = plan.get("commands") or []
@@ -1101,8 +1252,13 @@ class EngineerCliService:
     def _ollama_plan(self, raw: str, mode: str = "auto") -> dict | None:
         ok, _detail = self._ollama_status()
         if not ok:
+            self._last_ollama_error = _detail
             return None
         prompt = self._ollama_planner_prompt(raw, mode)
+        self._last_ollama_prompt = prompt
+        self._last_ollama_response = ""
+        self._last_ollama_error = ""
+        self._last_ollama_plan = None
         payload = {
             "model": self.ollama_model,
             "messages": [
@@ -1111,7 +1267,8 @@ class EngineerCliService:
                     "content": (
                         "You are Nexus PDM Agent, a local engineering data management planner. "
                         "Return ONLY valid JSON. Do not wrap in markdown. "
-                        "You do not execute tools; you produce a safe plan using allowed Nexus CLI commands."
+                        "You do not execute tools; you produce a safe plan using allowed Nexus CLI commands. "
+                        "Do not reveal hidden chain-of-thought; provide only concise engineering rationale."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -1130,11 +1287,17 @@ class EngineerCliService:
             with urllib.request.urlopen(req, timeout=45) as resp:
                 data = json.loads(resp.read().decode("utf-8") or "{}")
             content = ((data.get("message") or {}).get("content") or "").strip()
+            self._last_ollama_response = content
             if not content:
                 return None
             plan = json.loads(content)
-            return self._normalize_ollama_plan(plan)
-        except Exception:
+            normalized = self._normalize_ollama_plan(plan)
+            if normalized:
+                normalized["planner"] = "ollama"
+                self._last_ollama_plan = normalized
+            return normalized
+        except Exception as exc:
+            self._last_ollama_error = str(exc)
             return None
 
     def _ollama_planner_prompt(self, raw: str, mode: str) -> str:
@@ -1143,6 +1306,7 @@ class EngineerCliService:
             context = self._context()
         except Exception:
             context = "No active project context."
+        service_catalog = self._service_catalog_for_prompt()
         return f"""
 User request:
 {raw}
@@ -1151,6 +1315,9 @@ Mode: {mode}
 
 Current Nexus context:
 {context}
+
+Live backend service function catalog:
+{service_catalog}
 
 Allowed CLI commands you may put in commands[]:
 - context
@@ -1183,14 +1350,21 @@ Allowed CLI commands you may put in commands[]:
 - db schema <table>
 - db count <table>
 - sql "<SELECT/PRAGMA/WITH/EXPLAIN only>"
+- python <code|args>
+- py <code|args>
 - service list
 - service help <service>
 - service help <service.function>
 - service call <service.function> --args "<json list>" --kwargs "<json object>"
 
+When the requested feature is not covered by the explicit commands, choose the best backend function from the live catalog and emit a service call command.
+Use service calls with JSON args/kwargs that match the function signature.
+Mutating service calls should include --confirm only when the user clearly asked to perform the action.
+If a service function needs an ID and the user gave only a name, search first instead of guessing.
 If an action needs missing information, do NOT invent it. Put it in missing[].
 For name-based object requests, prefer commands that search first if no ID is known.
 Never include destructive SQL unless the user explicitly asked for SQL.
+Do not include private reasoning. Use analysis[] and rationale[] for short engineering reasons only.
 
 Return JSON object:
 {{
@@ -1198,6 +1372,7 @@ Return JSON object:
   "confidence": 0.0,
   "risk": "low|medium|high",
   "analysis": ["short reason"],
+  "rationale": ["short reason why these commands/functions were selected"],
   "commands": ["allowed command"],
   "missing": [{{"field":"...", "question":"...", "option":"--..."}}],
   "requires_confirmation": false,
@@ -1224,6 +1399,9 @@ Return JSON object:
         analysis = plan.get("analysis") or []
         if isinstance(analysis, str):
             analysis = [analysis]
+        rationale = plan.get("rationale") or []
+        if isinstance(rationale, str):
+            rationale = [rationale]
         try:
             confidence = float(plan.get("confidence", 0.6))
         except Exception:
@@ -1236,6 +1414,7 @@ Return JSON object:
             "confidence": max(0.0, min(1.0, confidence)),
             "risk": risk,
             "analysis": [str(x) for x in analysis[:8]],
+            "rationale": [str(x) for x in rationale[:6]],
             "commands": safe_commands,
             "missing": missing,
             "requires_confirmation": bool(plan.get("requires_confirmation", False)),
@@ -1248,7 +1427,7 @@ Return JSON object:
         return first in {
             "context", "find", "show", "diag", "bulk", "item", "associate",
             "unassociate", "drawing", "build", "auto-associate", "fix",
-            "export", "db", "sql", "service",
+            "export", "db", "sql", "service", "python", "py",
         }
 
     def _parse_create_project_item_intent(self, text: str) -> dict | None:
@@ -2088,6 +2267,44 @@ Return JSON object:
                 continue
             methods[name] = func
         return dict(sorted(methods.items()))
+
+    def _service_catalog_for_prompt(self, force: bool = False) -> str:
+        """Compact live service catalog used by Ollama to plan service calls."""
+        if self._service_catalog_cache and not force:
+            return self._service_catalog_cache
+        lines = []
+        try:
+            registry = self._service_registry()
+            for service_name, service in sorted(registry.items()):
+                methods = self._service_methods(service)
+                lines.append(f"[{service_name}] {service.__class__.__name__}")
+                for method_name, func in methods.items():
+                    signature = self._safe_signature(func)
+                    risk = self._service_call_risk(method_name)
+                    doc = (inspect.getdoc(func) or "").strip().splitlines()
+                    doc_hint = f" - {doc[0][:120]}" if doc else ""
+                    lines.append(f"- {service_name}.{method_name}{signature} [{risk}]{doc_hint}")
+        except Exception as exc:
+            lines.append(f"Service catalog unavailable: {exc}")
+        catalog = "\n".join(lines)
+        self._service_catalog_cache = catalog
+        return catalog
+
+    def _service_catalog_count(self) -> int:
+        try:
+            return sum(len(self._service_methods(service)) for service in self._service_registry().values())
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _safe_signature(func) -> str:
+        try:
+            text = str(inspect.signature(func))
+        except Exception:
+            text = "(...)"
+        if len(text) > 180:
+            text = text[:177] + "...)"
+        return text
 
     def _get_service(self, name: str, registry: dict[str, object]) -> object:
         key = str(name or "").strip()
