@@ -3434,8 +3434,10 @@ class BomPage(QWidget):
     def _add_released_ebom_node(
         self, info: dict, parent_item: QTreeWidgetItem | None = None,
         associations_by_item: dict | None = None,
-    ) -> QTreeWidgetItem:
+    ) -> QTreeWidgetItem | None:
         payload = dict(info or {})
+        if self._is_deleted_bom_payload(payload):
+            return None
         payload["id"] = int(payload.get("bom_id") or payload.get("id"))
         payload["current_version"] = str(
             payload.get("version_label") or payload.get("current_version") or ""
@@ -3497,6 +3499,16 @@ class BomPage(QWidget):
             parent_item.addChild(item)
         self._ensure_pdm_lazy_placeholder(item)
         return item
+
+    @staticmethod
+    def _is_deleted_bom_payload(payload: dict | None) -> bool:
+        data = payload or {}
+        if data.get("deleted_at"):
+            return True
+        for key in ("status", "state", "lifecycle_state", "revision_state"):
+            if str(data.get(key) or "").strip().casefold() == "deleted":
+                return True
+        return False
 
     def _load_released_ebom_tree(self) -> None:
         self._set_tree_loading(True)
@@ -7175,6 +7187,12 @@ class BomPage(QWidget):
 
         if "represented_part_id" in bom_columns:
             where.append("b.represented_part_id IS NULL")
+        if "deleted_at" in bom_columns:
+            where.append("b.deleted_at IS NULL")
+        if "status" in bom_columns:
+            where.append("lower(COALESCE(b.status,''))<>'deleted'")
+        if "lifecycle_state" in bom_columns:
+            where.append("lower(COALESCE(b.lifecycle_state,''))<>'deleted'")
 
         if q:
             like = f"%{q.lower()}%"
@@ -7371,6 +7389,9 @@ class BomPage(QWidget):
                             JOIN bom p ON p.id=u.{relation_parent}
                             JOIN bom c ON c.id=u.{relation_child}
                             WHERE u.project_id=? AND p.project_id=? AND c.project_id=?
+                              {"AND p.deleted_at IS NULL AND c.deleted_at IS NULL" if "deleted_at" in bom_columns else ""}
+                              {"AND lower(COALESCE(p.status,''))<>'deleted' AND lower(COALESCE(c.status,''))<>'deleted'" if "status" in bom_columns else ""}
+                              {"AND lower(COALESCE(p.lifecycle_state,''))<>'deleted' AND lower(COALESCE(c.lifecycle_state,''))<>'deleted'" if "lifecycle_state" in bom_columns else ""}
                             ORDER BY {relation_order_expr}, u.id
                         """
                         rel_params = (int(self.session.project_id),) * 3
@@ -7382,6 +7403,9 @@ class BomPage(QWidget):
                             JOIN bom p ON p.id=u.{relation_parent}
                             JOIN bom c ON c.id=u.{relation_child}
                             WHERE p.project_id=? AND c.project_id=?
+                              {"AND p.deleted_at IS NULL AND c.deleted_at IS NULL" if "deleted_at" in bom_columns else ""}
+                              {"AND lower(COALESCE(p.status,''))<>'deleted' AND lower(COALESCE(c.status,''))<>'deleted'" if "status" in bom_columns else ""}
+                              {"AND lower(COALESCE(p.lifecycle_state,''))<>'deleted' AND lower(COALESCE(c.lifecycle_state,''))<>'deleted'" if "lifecycle_state" in bom_columns else ""}
                             ORDER BY {relation_order_expr}, u.id
                         """
                         rel_params = (int(self.session.project_id), int(self.session.project_id))
@@ -7454,6 +7478,9 @@ class BomPage(QWidget):
                                 FROM bom b
                                 WHERE b.project_id=?
                                   {"AND b.represented_part_id IS NULL" if "represented_part_id" in bom_columns else ""}
+                                  {"AND b.deleted_at IS NULL" if "deleted_at" in bom_columns else ""}
+                                  {"AND lower(COALESCE(b.status,''))<>'deleted'" if "status" in bom_columns else ""}
+                                  {"AND lower(COALESCE(b.lifecycle_state,''))<>'deleted'" if "lifecycle_state" in bom_columns else ""}
                                   AND b.id IN ({placeholders})
                             """
                             for row in conn.execute(fetch_sql, [int(self.session.project_id), *chunk]).fetchall():
@@ -9194,6 +9221,8 @@ class BomPage(QWidget):
             tree.resetLoadingIndicators()
             tree.clear()
             for root in list(roots or []):
+                if self._is_deleted_bom_payload(root):
+                    continue
                 self._add_released_ebom_node(
                     root,
                     associations_by_item=getattr(self, "_ebom_associations_by_item", {}),
@@ -9289,6 +9318,8 @@ class BomPage(QWidget):
                     )
             else:
                 for child in children:
+                    if self._is_deleted_bom_payload(child):
+                        continue
                     self._add_released_ebom_node(
                         child,
                         item,
@@ -10890,6 +10921,8 @@ class BomPage(QWidget):
                         item.setData(0, PDM_ASSOCIATIONS_SHOWN_ROLE, False)
                         self._show_ebom_cad_associations(item, refresh_filters=False)
                     for child in children:
+                        if self._is_deleted_bom_payload(child):
+                            continue
                         self._add_released_ebom_node(child, item, associations_by_item)
                     self._render_pdm_folder_context("EBOM", int(item_id), [item])
                     item.setData(0, BOM_TREE_CHILDREN_LOADED_ROLE, True)
@@ -16751,7 +16784,15 @@ class BomPage(QWidget):
                 try:
                     if item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
                         continue
-                    if int(item.data(0, Qt.UserRole)) == pid:
+                    payload = item.data(0, PDM_NODE_PAYLOAD_ROLE) or {}
+                    occurrence = item.data(0, BOM_TREE_OCCURRENCE_ROLE) or {}
+                    candidate_values = (
+                        item.data(0, Qt.UserRole),
+                        payload.get("id") if isinstance(payload, dict) else None,
+                        payload.get("item_id") if isinstance(payload, dict) else None,
+                        occurrence.get("child_item_id") if isinstance(occurrence, dict) else None,
+                    )
+                    if any(value is not None and int(value) == pid for value in candidate_values):
                         matches.append(item)
                 except Exception:
                     continue
@@ -17810,6 +17851,7 @@ class BomPage(QWidget):
                 self._remove_part_from_trees(int(id))
                 for parent_id in parent_ids:
                     self._refresh_loaded_part_branch(int(parent_id))
+                self._remove_part_from_trees(int(id))
                 self.window().statusBar().showMessage("Item deleted. Press Ctrl+Z to undo.", 6000)
                 self.clear_details()
             except Exception as e:

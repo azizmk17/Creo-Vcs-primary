@@ -370,6 +370,12 @@ class BomService(BaseService):
             pdm_service = getattr(self, "pdm_service", None)
             if pdm_service is not None:
                 pdm_service.sync_legacy_item(int(result))
+            self.emit_project_event(
+                "item.created",
+                entity_type="ITEM",
+                entity_id=int(result),
+                payload={"item_ids": [int(result)]},
+            )
         self._tree_dirty.add(int(self.session.project_id))
         return result
 
@@ -452,6 +458,12 @@ class BomService(BaseService):
         result = self.bom_repo.update(part)
         if part.represented_part_id is None:
             self.bom_repo.sync_representation_aes(int(part.id), str(part.aes_number or ""))
+        self.emit_project_event(
+            "item.updated",
+            entity_type="ITEM",
+            entity_id=int(part.id),
+            payload={"item_ids": [int(part.id)]},
+        )
         self._tree_dirty.add(int(self.session.project_id))
         return result
 
@@ -460,14 +472,22 @@ class BomService(BaseService):
     # -------------------------------
     def assert_item_fully_checked_in_for_delete(self, part_id: int) -> None:
         """Require the Item and all associated CAD Documents to be checked in."""
-        lock = self.lock_repo.get_by_part(int(part_id))
-        if lock:
-            raise ValueError(
-                "This Item is checked out. "
-                "Check it in or undo its checkout before deleting it."
+        item_ids = [int(part_id)]
+        try:
+            item_ids.extend(
+                int(row.id) for row in self.bom_repo.get_representations(int(part_id)) or []
             )
+        except Exception:
+            pass
+        for item_id in sorted(set(item_ids)):
+            lock = self.lock_repo.get_by_part(int(item_id))
+            if lock:
+                raise ValueError(
+                    "This Item or one of its CAD-only representation Items is checked out. "
+                    "Check it in or undo its checkout before deleting it."
+                )
         self._assert_no_active_cad_checkouts(
-            [int(part_id)], "delete this Item"
+            item_ids, "delete this Item"
         )
 
     def delete_part(self, part_id: str) -> bool:
@@ -477,16 +497,15 @@ class BomService(BaseService):
         part = self.bom_repo.get_by_id(part_id)
         if not part:
             return False
-        # Deletion is never a working-copy operation.  The Item and every CAD
-        # Document connected to it must be back in a checked-in state first.
-        self.assert_item_fully_checked_in_for_delete(int(part.id))
+        # Deletion is never a working-copy operation.  The Item, legacy CAD-only
+        # representation rows, and every connected CAD Document must be checked
+        # in first.  Representation rows are implementation details of the old
+        # architecture; they must not block a normal Item delete forever.
         representations = self.bom_repo.get_representations(int(part.id))
-        if representations:
-            labels = ", ".join(str(item.name or item.filename or item.id) for item in representations[:3])
-            raise ValueError(
-                "This deliverable part has linked CAD representations. "
-                f"Unlink or delete them first: {labels}"
-            )
+        delete_item_ids = [int(part.id)] + [
+            int(item.id) for item in representations or [] if item and item.id
+        ]
+        self.assert_item_fully_checked_in_for_delete(int(part.id))
         dependency_count = self.bom_repo.count_cad_dependencies(int(part.id))
         if dependency_count:
             raise ValueError(
@@ -499,7 +518,18 @@ class BomService(BaseService):
                 "Released BOM items cannot be deleted. Create or obsolete a controlled revision instead."
             )
             
-        # First remove any child relationships
+        # First remove current product-structure and CAD/Item links.  Legacy
+        # representation rows are deleted first so they cannot survive as
+        # invisible stale children of the physical Item.
+        for item_id in sorted(set(delete_item_ids) - {int(part.id)}):
+            self.children_repo.delete_by_parent(item_id)
+            self.children_repo.delete_by_child(item_id)
+            try:
+                self.pdm_service.repo.delete_item_pdm_links(int(item_id))
+            except Exception:
+                pass
+            self.bom_repo.delete(item_id, deleted_by=self.user_id)
+
         self.children_repo.delete_by_parent(part.id)
         self.children_repo.delete_by_child(part.id)
         try:
@@ -508,11 +538,17 @@ class BomService(BaseService):
             pass
         
         # Then delete the part
-        result = self.bom_repo.delete(part.id)
+        result = self.bom_repo.delete(part.id, deleted_by=self.user_id)
         try:
             self.pdm_service.repo.cleanup_orphan_item_associations()
         except Exception:
             pass
+        self.emit_project_event(
+            "item.deleted",
+            entity_type="ITEM",
+            entity_id=int(part.id),
+            payload={"item_ids": sorted(set(delete_item_ids)), "deleted_item_id": int(part.id)},
+        )
         self._tree_dirty.add(int(self.session.project_id))
         return result
 
@@ -735,6 +771,14 @@ class BomService(BaseService):
             iteration_id = context.get("current_iteration_id")
             if log_id and iteration_id is not None:
                 self.lock_repo.set_log_object_iteration(log_id, int(iteration_id))
+        affected = [int(related.id) for related in related_parts]
+        self.emit_project_event(
+            "item.checkin",
+            entity_type="ITEM",
+            entity_id=int(part.id),
+            payload={"item_ids": affected},
+            actor_user_id=effective_user_id,
+        )
         self._tree_dirty.add(int(self.session.project_id))
         return True
 
@@ -808,6 +852,13 @@ class BomService(BaseService):
                 self.lock_repo.upgrade_to_item_checkout(
                     int(part.id), int(effective_user_id)
                 )
+                self.emit_project_event(
+                    "item.checkout",
+                    entity_type="ITEM",
+                    entity_id=int(part.id),
+                    payload={"item_ids": [int(part.id)], "origin": origin},
+                    actor_user_id=effective_user_id,
+                )
             return True
 
         for related in related_parts:
@@ -842,6 +893,14 @@ class BomService(BaseService):
                         related_id, str(released_revision_code)
                     )
             self.revision_repo.initialize_checkout(related_id, effective_user_id)
+        affected = [int(related.id) for related in related_parts]
+        self.emit_project_event(
+            "item.checkout",
+            entity_type="ITEM",
+            entity_id=int(part.id),
+            payload={"item_ids": affected, "origin": origin},
+            actor_user_id=effective_user_id,
+        )
         self._tree_dirty.add(int(self.session.project_id))
         return True
 
@@ -1084,6 +1143,12 @@ class BomService(BaseService):
             self.bom_repo.checkin_bom(related_id)
             affected_ids.append(related_id)
 
+        self.emit_project_event(
+            "item.checkin",
+            entity_type="ITEM",
+            entity_id=int(part_id),
+            payload={"item_ids": sorted(set(affected_ids)), "non_cad": True},
+        )
         self._tree_dirty.add(int(self.session.project_id))
         return {
             "context": result_context or self.revision_repo.get_current_context(int(part_id)),
@@ -1172,6 +1237,17 @@ class BomService(BaseService):
                 ),
             )
             self.bom_repo.checkin_bom(related_id)
+        affected = [int(related.id) for related in related_parts]
+        self.emit_project_event(
+            "item.undo_checkout",
+            entity_type="ITEM",
+            entity_id=int(part_id),
+            payload={
+                "item_ids": affected,
+                "cad_document_ids": sorted(set(int(cad["id"]) for cad in active_cad if cad.get("id") is not None)),
+            },
+            actor_user_id=effective_user_id,
+        )
         self._tree_dirty.add(int(self.session.project_id))
         return True
 
@@ -1197,6 +1273,13 @@ class BomService(BaseService):
                     raise ValueError("This Item is checked out by another user.")
                 if origin == "ITEM":
                     self.lock_repo.upgrade_to_item_checkout(int(part.id), int(user_id))
+                    self.emit_project_event(
+                        "item.checkout",
+                        entity_type="ITEM",
+                        entity_id=int(part.id),
+                        payload={"item_ids": [int(part.id)], "origin": origin},
+                        actor_user_id=int(user_id),
+                    )
                 return True
         for related in related_parts:
             context = self.revision_repo.get_current_context(int(related.id))
@@ -1222,6 +1305,14 @@ class BomService(BaseService):
             if released:
                 self.revision_repo.prepare_released_checkout(int(related.id), target_revision)
             self.revision_repo.initialize_checkout(int(related.id), int(user_id))
+        affected = [int(related.id) for related in related_parts]
+        self.emit_project_event(
+            "item.checkout",
+            entity_type="ITEM",
+            entity_id=int(part_id),
+            payload={"item_ids": affected, "origin": origin},
+            actor_user_id=int(user_id),
+        )
         self._tree_dirty.add(int(self.session.project_id))
         return True
 
@@ -2613,9 +2704,16 @@ class BomService(BaseService):
         ]
 
     def create_pdm_cad_document(self, **values) -> int:
-        return self.pdm_service.create_cad_document(
+        cad_id = self.pdm_service.create_cad_document(
             int(self.session.project_id), **values
         )
+        self.emit_project_event(
+            "cad.created",
+            entity_type="CAD_DOCUMENT",
+            entity_id=int(cad_id),
+            payload={"cad_document_ids": [int(cad_id)]},
+        )
+        return cad_id
 
     def delete_pdm_cad_document(
         self, cad_document_id: int, *, delete_related_drawings: bool = False
@@ -2665,10 +2763,17 @@ class BomService(BaseService):
         self._assert_owned_cad_checkout(
             int(parent_cad_document_id), "change its CAD structure"
         )
-        return self.pdm_service.add_cad_member(
+        result = self.pdm_service.add_cad_member(
             int(parent_cad_document_id), int(child_cad_document_id),
             int(quantity), build_excluded=bool(build_excluded),
         )
+        self.emit_project_event(
+            "cad.structure_changed",
+            entity_type="CAD_DOCUMENT",
+            entity_id=int(parent_cad_document_id),
+            payload={"cad_document_ids": [int(parent_cad_document_id), int(child_cad_document_id)]},
+        )
+        return result
 
     def ordered_pdm_cad_member_ids(self, parent_cad_document_id: int) -> List[int]:
         return self.pdm_service.repo.ordered_cad_member_ids(int(parent_cad_document_id))
@@ -2688,6 +2793,12 @@ class BomService(BaseService):
         result = self.pdm_service.repo.set_cad_member_order(
             int(parent_cad_document_id), requested
         )
+        self.emit_project_event(
+            "cad.structure_changed",
+            entity_type="CAD_DOCUMENT",
+            entity_id=int(parent_cad_document_id),
+            payload={"cad_document_ids": [int(parent_cad_document_id)]},
+        )
         self._tree_dirty.add(int(self.session.project_id))
         return result
 
@@ -2698,7 +2809,20 @@ class BomService(BaseService):
         self._assert_owned_cad_checkout(
             int(member["parent_cad_document_id"]), "change its CAD structure"
         )
-        return self.pdm_service.remove_cad_member(int(member_id))
+        result = self.pdm_service.remove_cad_member(int(member_id))
+        if result:
+            self.emit_project_event(
+                "cad.structure_changed",
+                entity_type="CAD_DOCUMENT",
+                entity_id=int(member["parent_cad_document_id"]),
+                payload={
+                    "cad_document_ids": [
+                        int(member["parent_cad_document_id"]),
+                        int(member["child_cad_document_id"]),
+                    ]
+                },
+            )
+        return result
 
     def cad_occurrence_sources_for_document(self, child_cad_document_id: int) -> List[Dict]:
         """Return direct CAD assembly occurrences for a CAD Document."""
@@ -2983,6 +3107,17 @@ class BomService(BaseService):
         )
         if not recorded_item_ids:
             recorded_item_ids = list(associated_item_ids)
+        cad_ids = [int(cad_document_id), *related_drawing_ids]
+        self.emit_project_event(
+            "cad.checkout",
+            entity_type="CAD_DOCUMENT",
+            entity_id=int(cad_document_id),
+            payload={
+                "cad_document_ids": sorted(set(cad_ids)),
+                "item_ids": sorted(set(int(value) for value in recorded_item_ids)),
+            },
+            actor_user_id=actor_id,
+        )
         return {
             **result,
             "associated_item_ids": recorded_item_ids,
@@ -3050,7 +3185,26 @@ class BomService(BaseService):
                     )
         except Exception:
             pass
-        return {**result, **item_result}
+        combined = {**result, **item_result}
+        item_ids = sorted(set(int(value) for value in (associated_item_ids or [])))
+        cad_ids = [int(cad_document_id)]
+        if str(document.get("category") or "").upper() != "DRAWING":
+            try:
+                cad_ids.extend(
+                    int(drawing["id"])
+                    for drawing in self.pdm_service.repo.list_related_drawings(cad_document_id) or []
+                    if drawing.get("id") is not None
+                )
+            except Exception:
+                pass
+        self.emit_project_event(
+            "cad.checkin",
+            entity_type="CAD_DOCUMENT",
+            entity_id=int(cad_document_id),
+            payload={"cad_document_ids": sorted(set(cad_ids)), "item_ids": item_ids},
+            actor_user_id=actor_id,
+        )
+        return combined
 
     def undo_checkout_pdm_cad_document(
         self, cad_document_id: int, note: str = "", *, as_user_id: int | None = None
@@ -3094,6 +3248,17 @@ class BomService(BaseService):
                 )
         except Exception:
             pass
+        payload = {
+            "cad_document_ids": sorted(set([int(cad_document_id), *related_drawing_ids])),
+            "item_ids": sorted(set(int(value) for value in (result.get("checkout_item_ids") or result.get("associated_item_ids") or []) if value is not None)),
+        }
+        self.emit_project_event(
+            "cad.undo_checkout",
+            entity_type="CAD_DOCUMENT",
+            entity_id=int(cad_document_id),
+            payload=payload,
+            actor_user_id=actor_id,
+        )
         return {
             **result,
             "related_drawing_checkout_ids": related_drawing_ids,
@@ -3287,6 +3452,12 @@ class BomService(BaseService):
             requested_type, self.user_id,
         )
         self.lock_repo.set_checkout_origin(item_id, "ITEM")
+        self.emit_project_event(
+            "association.changed",
+            entity_type="ITEM",
+            entity_id=int(item_id),
+            payload={"item_ids": [int(item_id)], "cad_document_ids": [int(cad_document_id)]},
+        )
         return result
 
     def remove_cad_item_association(self, association_id: int) -> bool:
@@ -3316,6 +3487,15 @@ class BomService(BaseService):
                     self.bom_repo.clear_legacy_cad_links(item_id)
                 except Exception:
                     pass
+            self.emit_project_event(
+                "association.changed",
+                entity_type="ITEM",
+                entity_id=int(item_id),
+                payload={
+                    "item_ids": [int(item_id)],
+                    "cad_document_ids": [int(association["cad_document_id"])],
+                },
+            )
         return removed
 
     def auto_associate_cad_documents(self) -> Dict:
@@ -3370,6 +3550,12 @@ class BomService(BaseService):
             int(self.session.project_id), int(parent_item_id), int(child_item_id),
             int(quantity), self.user_id,
         )
+        self.emit_project_event(
+            "item.structure_changed",
+            entity_type="ITEM",
+            entity_id=int(parent_item_id),
+            payload={"item_ids": [int(parent_item_id), int(child_item_id)]},
+        )
         self._tree_dirty.add(int(self.session.project_id))
         return result
 
@@ -3389,6 +3575,12 @@ class BomService(BaseService):
         )
         self.pdm_service.repo.capture_item_structure_iteration(
             int(parent_item_id), "MANUAL", created_by=self.user_id
+        )
+        self.emit_project_event(
+            "item.structure_changed",
+            entity_type="ITEM",
+            entity_id=int(parent_item_id),
+            payload={"item_ids": [int(parent_item_id)]},
         )
         self._tree_dirty.add(int(self.session.project_id))
         return result
@@ -3447,6 +3639,16 @@ class BomService(BaseService):
                     "aes_number": str(child.aes_number or ""),
                 })
         result["moved_to_root_items"] = moved_items
+        removed_child_ids = [int(value) for value in (result.get("removed_child_ids") or child_ids or [])]
+        self.emit_project_event(
+            "item.structure_changed",
+            entity_type="ITEM",
+            entity_id=int(parent_id),
+            payload={
+                "item_ids": sorted(set([int(parent_id), *removed_child_ids])),
+                "removed_child_ids": removed_child_ids,
+            },
+        )
         self._tree_dirty.add(int(self.session.project_id))
         return result
 

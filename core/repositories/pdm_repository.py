@@ -470,7 +470,11 @@ class PdmRepository:
             FROM cad_item_associations a
             JOIN bom b ON b.id=a.item_id
             {version_join}
-            WHERE a.active=1 AND a.cad_document_id IN ({placeholders})
+            WHERE a.active=1
+              AND b.deleted_at IS NULL
+              AND lower(COALESCE(b.status,''))<>'deleted'
+              AND lower(COALESCE(b.lifecycle_state,''))<>'deleted'
+              AND a.cad_document_id IN ({placeholders})
             ORDER BY a.cad_document_id,
                      CASE upper(a.association_type)
                          WHEN 'OWNER' THEN 0
@@ -1057,7 +1061,11 @@ class PdmRepository:
                 WHERE active=1
                   AND item_id IS NOT NULL
                   AND NOT EXISTS (
-                      SELECT 1 FROM bom b WHERE b.id=cad_item_associations.item_id
+                      SELECT 1 FROM bom b
+                      WHERE b.id=cad_item_associations.item_id
+                        AND b.deleted_at IS NULL
+                        AND lower(COALESCE(b.status,''))<>'deleted'
+                        AND lower(COALESCE(b.lifecycle_state,''))<>'deleted'
                   )
                 """
             )
@@ -1069,6 +1077,9 @@ class PdmRepository:
             FROM cad_item_associations a
             JOIN bom b ON b.id=a.item_id
             WHERE a.cad_document_id=? AND a.active=1
+              AND b.deleted_at IS NULL
+              AND lower(COALESCE(b.status,''))<>'deleted'
+              AND lower(COALESCE(b.lifecycle_state,''))<>'deleted'
             ORDER BY CASE upper(a.association_type)
                 WHEN 'OWNER' THEN 0
                 WHEN 'CONTRIBUTING_IMAGE' THEN 1
@@ -1088,6 +1099,9 @@ class PdmRepository:
                 FROM cad_item_associations a
                 JOIN bom b ON b.id=a.item_id
                 WHERE a.cad_document_id=? AND a.active=1
+                  AND b.deleted_at IS NULL
+                  AND lower(COALESCE(b.status,''))<>'deleted'
+                  AND lower(COALESCE(b.lifecycle_state,''))<>'deleted'
                 ORDER BY CASE upper(a.association_type)
                     WHEN 'OWNER' THEN 0
                     WHEN 'CONTRIBUTING_IMAGE' THEN 1
@@ -1612,6 +1626,9 @@ class PdmRepository:
                 JOIN cad_documents d ON d.id=a.cad_document_id
                 {item_version_join}
                 WHERE a.item_id=? AND a.active=1
+                  AND (b.id IS NULL OR b.deleted_at IS NULL)
+                  AND (b.id IS NULL OR lower(COALESCE(b.status,''))<>'deleted')
+                  AND (b.id IS NULL OR lower(COALESCE(b.lifecycle_state,''))<>'deleted')
                 ORDER BY CASE a.association_type
                     WHEN 'OWNER' THEN 0 WHEN 'CONTRIBUTING_IMAGE' THEN 1
                     WHEN 'IMAGE' THEN 2 WHEN 'CONTRIBUTING_CONTENT' THEN 3
@@ -1754,6 +1771,9 @@ class PdmRepository:
                 FROM cad_item_associations a
                 JOIN bom b ON b.id=a.item_id
                 WHERE a.cad_document_id=? AND a.active=1
+                  AND b.deleted_at IS NULL
+                  AND lower(COALESCE(b.status,''))<>'deleted'
+                  AND lower(COALESCE(b.lifecycle_state,''))<>'deleted'
                 ORDER BY CASE upper(a.association_type)
                     WHEN 'OWNER' THEN 0
                     WHEN 'CONTRIBUTING_IMAGE' THEN 1
@@ -1785,6 +1805,9 @@ class PdmRepository:
                 FROM cad_item_associations a
                 JOIN bom b ON b.id=a.item_id
                 WHERE a.cad_document_id=? AND a.item_id=? AND a.active=1
+                  AND b.deleted_at IS NULL
+                  AND lower(COALESCE(b.status,''))<>'deleted'
+                  AND lower(COALESCE(b.lifecycle_state,''))<>'deleted'
                 LIMIT 1
                 """,
                 (int(cad_document_id), int(item_id)),
@@ -2453,6 +2476,9 @@ class PdmRepository:
                 SELECT b.id
                 FROM bom b
                 WHERE b.project_id=? AND b.id IN ({placeholders})
+                  AND b.deleted_at IS NULL
+                  AND lower(COALESCE(b.status,''))<>'deleted'
+                  AND lower(COALESCE(b.lifecycle_state,''))<>'deleted'
                   AND NOT EXISTS (
                       SELECT 1 FROM item_usages u
                       WHERE u.project_id=b.project_id AND u.child_item_id=b.id
@@ -2534,6 +2560,9 @@ class PdmRepository:
                       AND item_id IS NOT NULL
                       AND NOT EXISTS (
                           SELECT 1 FROM bom b WHERE b.id=cad_item_associations.item_id
+                            AND b.deleted_at IS NULL
+                            AND lower(COALESCE(b.status,''))<>'deleted'
+                            AND lower(COALESCE(b.lifecycle_state,''))<>'deleted'
                       )
                     """
                 )
@@ -2572,6 +2601,9 @@ class PdmRepository:
                     FROM cad_item_associations a
                     JOIN bom b ON b.id=a.item_id
                     WHERE a.active=1
+                      AND b.deleted_at IS NULL
+                      AND lower(COALESCE(b.status,''))<>'deleted'
+                      AND lower(COALESCE(b.lifecycle_state,''))<>'deleted'
                       AND a.cad_document_id IN ({placeholders})
                     ORDER BY a.cad_document_id,
                              CASE upper(a.association_type)
@@ -2809,6 +2841,9 @@ class PdmRepository:
                        b.lifecycle_state
                 FROM item_usages u JOIN bom b ON b.id=u.child_item_id
                 WHERE u.parent_item_id=?
+                  AND b.deleted_at IS NULL
+                  AND lower(COALESCE(b.status,''))<>'deleted'
+                  AND lower(COALESCE(b.lifecycle_state,''))<>'deleted'
                 ORDER BY COALESCE(u.sort_order,u.id),u.id
                 """,
                 (int(parent_item_id),),

@@ -2027,11 +2027,72 @@ class CommitPage(QWidget):
         )
         self._set_pending_commit_groups(commits)
 
+    @staticmethod
+    def _pending_group_key(group: dict) -> tuple:
+        commit_id = str(group.get("commit_id") or group.get("id") or "").strip()
+        project_id = group.get("project_id")
+        try:
+            project_id = int(project_id) if project_id is not None else None
+        except Exception:
+            project_id = None
+        return (project_id, commit_id or str(group.get("title") or group.get("filename") or ""))
+
+    @staticmethod
+    def _pending_status_rank(status: str) -> int:
+        return {
+            "pending": 10,
+            "validated": 20,
+            "approved": 30,
+            "pushed": 30,
+            "released": 30,
+            "reverted": 40,
+        }.get(str(status or "").strip().lower(), 0)
+
+    def _dedupe_pending_commit_groups(self, commits) -> list[dict]:
+        by_key = {}
+        order = []
+        for raw in commits or []:
+            group = dict(raw or {})
+            key = self._pending_group_key(group)
+            if key not in by_key:
+                by_key[key] = group
+                order.append(key)
+                continue
+            existing = by_key[key]
+            if self._pending_status_rank(group.get("status")) >= self._pending_status_rank(existing.get("status")):
+                merged = dict(existing)
+                merged.update(group)
+            else:
+                merged = dict(group)
+                merged.update(existing)
+            parts = []
+            seen = set()
+            for source in (existing.get("parts") or [], group.get("parts") or []):
+                text = str(source or "").strip()
+                if text and text not in seen:
+                    seen.add(text)
+                    parts.append(text)
+            if parts:
+                merged["parts"] = parts
+            by_key[key] = merged
+        return [by_key[key] for key in order if key in by_key]
+
     def _set_pending_commit_groups(self, commits):
-        # Clear old cards
+        commits = self._dedupe_pending_commit_groups(commits)
+        selected_key = (
+            self._pending_group_key(self.selected_group)
+            if getattr(self, "selected_group", None) else None
+        )
+
+        # Clear old cards immediately. deleteLater() alone leaves the widget in
+        # the layout until the event loop runs, which can briefly show both the
+        # old Pending card and the new Validated card for the same commit.
         for i in reversed(range(self.pending_container_layout.count())):
-            w = self.pending_container_layout.itemAt(i).widget()
+            layout_item = self.pending_container_layout.takeAt(i)
+            w = layout_item.widget() if layout_item else None
             if w:
+                w.hide()
+                w.setParent(None)
                 w.deleteLater()
 
         self.selected_card = None
@@ -2047,6 +2108,10 @@ class CommitPage(QWidget):
             card.browse_requested.connect(self.browse_commit_directory)
             self.pending_container_layout.addWidget(card)
             self._pending_cards.append(card)
+            if selected_key is not None and self._pending_group_key(group) == selected_key:
+                self.selected_card = card
+                self.selected_group = group
+                card.set_selected(True)
 
     def _on_pending_card_clicked(self, group):
         for c in self._pending_cards:
@@ -3699,6 +3764,21 @@ class CommitPage(QWidget):
             else:
                 affected_part_ids = merge_result or []
                 affected_cad_document_ids = []
+            try:
+                self.commit_service.emit_project_event(
+                    "commit.merged",
+                    entity_type="COMMIT",
+                    entity_id=str(group.get("commit_id") or ""),
+                    payload={
+                        "commit_id": str(group.get("commit_id") or ""),
+                        "item_ids": [int(value) for value in affected_part_ids if value is not None],
+                        "cad_document_ids": [int(value) for value in affected_cad_document_ids if value is not None],
+                        "status": "Approved",
+                    },
+                    project_id=group.get("project_id") or self.session.project_id,
+                )
+            except Exception:
+                pass
             return {
                 "affected_part_ids": affected_part_ids,
                 "affected_cad_document_ids": affected_cad_document_ids,

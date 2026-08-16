@@ -99,10 +99,28 @@ class BomRepository:
                     "default_unit": (
                         "default_unit TEXT NOT NULL DEFAULT 'EA'"
                     ),
+                    "deleted_at": "deleted_at TEXT",
+                    "deleted_by": "deleted_by INTEGER",
+                    "delete_reason": "delete_reason TEXT",
                 }
                 for name, definition in definitions.items():
                     if name not in columns:
                         conn.execute(f"ALTER TABLE bom ADD COLUMN {definition}")
+                conn.execute(
+                    """
+                    UPDATE bom
+                    SET deleted_at=COALESCE(deleted_at, datetime('now')),
+                        delete_reason=COALESCE(
+                            NULLIF(delete_reason, ''),
+                            'Legacy deleted Item hidden from active product structure.'
+                        )
+                    WHERE deleted_at IS NULL
+                      AND (
+                          lower(COALESCE(status, ''))='deleted'
+                          OR lower(COALESCE(lifecycle_state, ''))='deleted'
+                      )
+                    """
+                )
                 conn.executescript(
                     """
                     CREATE TABLE IF NOT EXISTS bom_cad_dependencies (
@@ -299,7 +317,7 @@ class BomRepository:
     def get_by_id(self, bom_id: int) -> Optional[Bom]:
         with self.get_conn() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT * FROM bom WHERE id=?", (bom_id,))
+            cur.execute("SELECT * FROM bom WHERE id=? AND deleted_at IS NULL", (bom_id,))
             row = cur.fetchone()
             if row:
                 return Bom(**row)
@@ -310,6 +328,7 @@ class BomRepository:
             cur = conn.cursor()
             cur.execute(
                 """SELECT * FROM bom WHERE aes_number=? AND project_id=?
+                     AND deleted_at IS NULL
                    ORDER BY CASE WHEN represented_part_id IS NULL THEN 0 ELSE 1 END, id
                    LIMIT 1""",
                 (aes_number, project_id),
@@ -322,7 +341,7 @@ class BomRepository:
     def get_by_base_file_name(self, base_file_name: str) -> Optional[Bom]:
         with self.get_conn() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT * FROM bom WHERE base_file_name=?", (base_file_name,))
+            cur.execute("SELECT * FROM bom WHERE base_file_name=? AND deleted_at IS NULL", (base_file_name,))
             row = cur.fetchone()
             if row:
                 return Bom(**row)
@@ -347,6 +366,7 @@ class BomRepository:
                 FROM bom b
                 LEFT JOIN locks l ON l.part_id = b.id
                 WHERE b.base_file_name = ? AND b.project_id = ?
+                  AND b.deleted_at IS NULL
                 ORDER BY
                     CASE WHEN l.user_id = ? THEN 1 ELSE 0 END DESC,
                     CASE WHEN l.user_id IS NOT NULL THEN 1 ELSE 0 END DESC,
@@ -371,6 +391,7 @@ class BomRepository:
                 SELECT * FROM bom
                 WHERE project_id=? AND lower(trim(part_number))=lower(?)
                   AND represented_part_id IS NULL
+                  AND deleted_at IS NULL
                 ORDER BY id LIMIT 1
                 """,
                 (int(project_id), number),
@@ -396,7 +417,7 @@ class BomRepository:
             ).fetchone()
             candidate = max(ITEM_NUMBER_START, int(row[0] if row else ITEM_NUMBER_START))
             while conn.execute(
-                "SELECT 1 FROM bom WHERE lower(trim(part_number))=lower(?) LIMIT 1",
+                "SELECT 1 FROM bom WHERE lower(trim(part_number))=lower(?) AND deleted_at IS NULL LIMIT 1",
                 (str(candidate).zfill(ITEM_NUMBER_WIDTH),),
             ).fetchone():
                 candidate += 1
@@ -425,6 +446,7 @@ class BomRepository:
                 FROM bom b
                 LEFT JOIN locks l ON l.part_id = b.id
                 WHERE b.base_file_name = ? AND b.project_id = ?
+                  AND b.deleted_at IS NULL
                 ORDER BY
                     CASE WHEN l.user_id = ? THEN 1 ELSE 0 END DESC,
                     CASE WHEN l.user_id IS NOT NULL THEN 1 ELSE 0 END DESC,
@@ -438,7 +460,7 @@ class BomRepository:
     def get_by_drawing_file_name(self, base_drw_name: str) -> Optional[Bom]:
         with self.get_conn() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT * FROM bom WHERE base_drw_name=?", (base_drw_name,))
+            cur.execute("SELECT * FROM bom WHERE base_drw_name=? AND deleted_at IS NULL", (base_drw_name,))
             row = cur.fetchone()
             if row:
                 return Bom(**row)
@@ -459,6 +481,7 @@ class BomRepository:
                 FROM bom b
                 LEFT JOIN locks l ON l.part_id = b.id
                 WHERE b.base_drw_name = ? AND b.project_id = ?
+                  AND b.deleted_at IS NULL
                 ORDER BY
                     CASE WHEN l.user_id = ? THEN 1 ELSE 0 END DESC,
                     CASE WHEN l.user_id IS NOT NULL THEN 1 ELSE 0 END DESC,
@@ -475,7 +498,7 @@ class BomRepository:
     def get_all(self, project_id) -> List[Bom]:
         with self.get_conn() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT * FROM bom WHERE project_id=?", (project_id,))
+            cur.execute("SELECT * FROM bom WHERE project_id=? AND deleted_at IS NULL", (project_id,))
             rows = cur.fetchall()
             return [Bom(**row) for row in rows]
 
@@ -493,6 +516,7 @@ class BomRepository:
                 FROM bom
                 WHERE project_id=?
                   AND represented_part_id IS NULL
+                  AND deleted_at IS NULL
                   AND UPPER(COALESCE(classification, 'PHYSICAL'))='PHYSICAL'
                   {exclude_clause}
                 ORDER BY lower(COALESCE(part_number, '')), lower(name), id
@@ -504,7 +528,7 @@ class BomRepository:
     def get_representations(self, represented_part_id: int) -> List[Bom]:
         with self.get_conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM bom WHERE represented_part_id=? ORDER BY id",
+                "SELECT * FROM bom WHERE represented_part_id=? AND deleted_at IS NULL ORDER BY id",
                 (int(represented_part_id),),
             ).fetchall()
             return [Bom(**row) for row in rows]
@@ -529,6 +553,7 @@ class BomRepository:
                 FROM bom b
                 LEFT JOIN bom_cad_dependencies d ON d.owner_bom_id=b.id
                 WHERE b.project_id=?
+                  AND b.deleted_at IS NULL
                   AND UPPER(COALESCE(b.cad_control_mode,'CONTROLLED'))='SUPPLIER_PACKAGE'
                 GROUP BY b.id
                 ORDER BY lower(COALESCE(b.part_number,'')), lower(b.name), b.id
@@ -556,6 +581,7 @@ class BomRepository:
                 """
                 SELECT id FROM bom
                 WHERE id=? AND project_id=?
+                  AND deleted_at IS NULL
                   AND UPPER(COALESCE(cad_control_mode,'CONTROLLED'))='SUPPLIER_PACKAGE'
                 """,
                 (int(owner_bom_id), int(project_id)),
@@ -592,7 +618,7 @@ class BomRepository:
                        b.aes_number AS owner_aes_number, b.name AS owner_name
                 FROM bom_cad_dependencies d
                 JOIN bom b ON b.id=d.owner_bom_id
-                WHERE d.project_id=? {owner_clause}
+                WHERE d.project_id=? AND b.deleted_at IS NULL {owner_clause}
                 ORDER BY lower(COALESCE(b.part_number,'')), lower(d.base_file_name), d.id
                 """,
                 params,
@@ -630,6 +656,7 @@ class BomRepository:
                 FROM bom_cad_dependencies d
                 JOIN bom b ON b.id=d.owner_bom_id
                 WHERE d.project_id=?
+                  AND b.deleted_at IS NULL
                   AND UPPER(COALESCE(b.cad_control_mode,'CONTROLLED'))='SUPPLIER_PACKAGE'
                 """,
                 (int(project_id),),
@@ -645,6 +672,7 @@ class BomRepository:
                 FROM bom_cad_dependencies d
                 JOIN bom b ON b.id=d.owner_bom_id
                 WHERE d.project_id=? AND d.base_file_name=? COLLATE NOCASE
+                  AND b.deleted_at IS NULL
                   AND UPPER(COALESCE(b.cad_control_mode,'CONTROLLED'))='SUPPLIER_PACKAGE'
                 LIMIT 1
                 """,
@@ -664,7 +692,7 @@ class BomRepository:
         """Return the lightweight project membership used by the lazy BOM index."""
         with self.get_conn() as conn:
             rows = conn.execute(
-                "SELECT id FROM bom WHERE project_id=? ORDER BY id",
+                "SELECT id FROM bom WHERE project_id=? AND deleted_at IS NULL ORDER BY id",
                 (int(project_id),),
             ).fetchall()
             return [int(row["id"]) for row in rows]
@@ -689,7 +717,7 @@ class BomRepository:
                 chunk = ids[offset:offset + 800]
                 placeholders = ",".join("?" for _ in chunk)
                 fetched.extend(conn.execute(
-                    f"SELECT * FROM bom WHERE project_id=? AND id IN ({placeholders})",
+                    f"SELECT * FROM bom WHERE project_id=? AND deleted_at IS NULL AND id IN ({placeholders})",
                     [int(project_id), *chunk],
                 ).fetchall())
         by_id = {int(row["id"]): Bom(**row) for row in fetched}
@@ -701,6 +729,7 @@ class BomRepository:
         sql = """
                 SELECT * FROM bom
                 WHERE project_id=?
+                  AND deleted_at IS NULL
                   AND (
                     instr(lower(COALESCE(aes_number, '')), lower(?)) > 0 OR
                     instr(lower(COALESCE(name, '')), lower(?)) > 0 OR
@@ -837,6 +866,7 @@ class BomRepository:
                 FROM bom_item_categories ic
                 JOIN bom b ON b.id=ic.bom_id
                 WHERE ic.category_id=? AND b.project_id=?
+                  AND b.deleted_at IS NULL
                 ORDER BY lower(COALESCE(b.part_number, '')), lower(b.name), b.id
                 """,
                 (int(category_id), int(project_id)),
@@ -857,6 +887,7 @@ class BomRepository:
                 FROM bom_item_categories ic
                 JOIN bom b ON b.id=ic.bom_id
                 WHERE ic.category_id=? AND b.project_id=?
+                  AND b.deleted_at IS NULL
                 ORDER BY lower(COALESCE(b.part_number, '')), lower(b.name), b.id
                 """,
                 (int(category_id), int(project_id)),
@@ -957,44 +988,213 @@ class BomRepository:
     # -------------------------------
     # DELETE
     # -------------------------------
-    def delete(self, bom_id: int):
+    @staticmethod
+    def _table_exists(conn, table_name: str) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (str(table_name),),
+        ).fetchone()
+        return bool(row)
+
+    @staticmethod
+    def _table_columns(conn, table_name: str) -> set[str]:
+        try:
+            return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+        except sqlite3.OperationalError:
+            return set()
+
+    @staticmethod
+    def _delete_if_table(conn, table_name: str, where_sql: str, params) -> int:
+        if not BomRepository._table_exists(conn, table_name):
+            return 0
+        cur = conn.execute(f"DELETE FROM {table_name} WHERE {where_sql}", tuple(params))
+        return int(cur.rowcount or 0)
+
+    @staticmethod
+    def _has_rows(conn, table_name: str, where_sql: str, params) -> bool:
+        if not BomRepository._table_exists(conn, table_name):
+            return False
+        try:
+            row = conn.execute(
+                f"SELECT 1 FROM {table_name} WHERE {where_sql} LIMIT 1",
+                tuple(params),
+            ).fetchone()
+            return bool(row)
+        except sqlite3.OperationalError:
+            return False
+
+    def _has_traceability_refs_conn(self, conn, bom_id: int) -> bool:
+        """Return True when a BOM row is referenced by history that should survive."""
+        checks = (
+            ("audit_log", "part_id=?", (int(bom_id),)),
+            ("commits", "part_id=?", (int(bom_id),)),
+            ("lock_logs", "part_id=?", (int(bom_id),)),
+            ("bom_revisions", "bom_id=?", (int(bom_id),)),
+            ("bom_iteration_files", "bom_id=?", (int(bom_id),)),
+            ("commit_file_links", "part_id=?", (int(bom_id),)),
+            ("commit_engineering_file_links", "part_id=?", (int(bom_id),)),
+            ("commit_validation_docs", "part_id=?", (int(bom_id),)),
+        )
+        return any(self._has_rows(conn, table, where_sql, params) for table, where_sql, params in checks)
+
+    def _soft_delete_conn(
+        self,
+        conn,
+        bom_id: int,
+        deleted_by: Optional[int] = None,
+        reason: str = "",
+    ) -> bool:
+        """Archive an Item when immutable history prevents physical deletion.
+
+        Engineering systems must preserve traceability.  If old commits,
+        baselines, audit rows, or signatures still point to bom.id, the Item is
+        removed from the active product structure but the historical row stays
+        available for those records.
+        """
+        cur = conn.execute(
+            """
+            UPDATE bom
+            SET deleted_at=datetime('now'),
+                deleted_by=?,
+                delete_reason=?,
+                status='Deleted',
+                lifecycle_state='Deleted',
+                part_number=NULL,
+                aes_number=NULL,
+                filename=NULL,
+                base_file_name=NULL,
+                drawing=NULL,
+                base_drw_name=NULL,
+                modified=datetime('now')
+            WHERE id=? AND deleted_at IS NULL
+            """,
+            (
+                deleted_by,
+                reason
+                or "Deleted from active product structure; retained because traceability/history references exist.",
+                int(bom_id),
+            ),
+        )
+        return bool(cur.rowcount)
+
+    def delete(self, bom_id: int, deleted_by: Optional[int] = None):
         with self.get_conn() as conn:
             cur = conn.cursor()
+            has_traceability_refs = self._has_traceability_refs_conn(conn, int(bom_id))
             # Remove dependent records that intentionally belong to the Item
             # master before deleting bom.id.  Newer projects have foreign-key
             # enforcement enabled, so legacy "delete the bom row first" logic
             # is no longer safe.
-            try:
-                file_ids = [
-                    int(row["id"])
-                    for row in cur.execute(
-                        "SELECT id FROM part_files WHERE part_id=?", (int(bom_id),)
-                    ).fetchall()
-                ]
-                if file_ids:
-                    placeholders = ",".join("?" for _ in file_ids)
-                    try:
+            if not has_traceability_refs:
+                try:
+                    file_ids = [
+                        int(row["id"])
+                        for row in cur.execute(
+                            "SELECT id FROM part_files WHERE part_id=?", (int(bom_id),)
+                        ).fetchall()
+                    ]
+                    if file_ids:
+                        placeholders = ",".join("?" for _ in file_ids)
+                        try:
+                            cur.execute(
+                                f"DELETE FROM bom_iteration_files WHERE part_file_id IN ({placeholders})",
+                                file_ids,
+                            )
+                        except sqlite3.OperationalError:
+                            pass
                         cur.execute(
-                            f"DELETE FROM bom_iteration_files WHERE part_file_id IN ({placeholders})",
+                            f"DELETE FROM part_file_versions WHERE file_id IN ({placeholders})",
                             file_ids,
                         )
-                    except sqlite3.OperationalError:
-                        pass
-                    cur.execute(
-                        f"DELETE FROM part_file_versions WHERE file_id IN ({placeholders})",
-                        file_ids,
-                    )
-                    cur.execute(
-                        f"DELETE FROM part_files WHERE id IN ({placeholders})",
-                        file_ids,
-                    )
-            except sqlite3.OperationalError:
-                pass
+                        cur.execute(
+                            f"DELETE FROM part_files WHERE id IN ({placeholders})",
+                            file_ids,
+                        )
+                except sqlite3.OperationalError:
+                    pass
             try:
                 cur.execute("DELETE FROM issue_parts WHERE part_id=?", (int(bom_id),))
             except sqlite3.OperationalError:
                 pass
-            cur.execute("DELETE FROM bom_item_categories WHERE bom_id=?", (bom_id,))
+            for table_name, where_sql, params in (
+                ("part_doc_ack", "part_id=?", (int(bom_id),)),
+                ("bom_item_categories", "bom_id=?", (int(bom_id),)),
+                ("bom_children", "parent_id=? OR child_id=?", (int(bom_id), int(bom_id))),
+                ("bom_cad_dependencies", "owner_bom_id=?", (int(bom_id),)),
+                ("cad_item_associations", "item_id=?", (int(bom_id),)),
+                ("cad_document_checkout_items", "item_id=?", (int(bom_id),)),
+            ):
+                try:
+                    self._delete_if_table(conn, table_name, where_sql, params)
+                except sqlite3.OperationalError:
+                    pass
+            try:
+                usage_ids = [
+                    int(row["id"])
+                    for row in conn.execute(
+                        """
+                        SELECT id FROM item_usages
+                        WHERE parent_item_id=? OR child_item_id=?
+                        """,
+                        (int(bom_id), int(bom_id)),
+                    ).fetchall()
+                ] if self._table_exists(conn, "item_usages") else []
+                if usage_ids:
+                    placeholders = ",".join("?" for _ in usage_ids)
+                    self._delete_if_table(
+                        conn,
+                        "item_occurrences",
+                        f"item_usage_id IN ({placeholders})",
+                        usage_ids,
+                    )
+                    cur.execute(
+                        f"DELETE FROM item_usages WHERE id IN ({placeholders})",
+                        usage_ids,
+                    )
+            except sqlite3.OperationalError:
+                pass
+            try:
+                self._delete_if_table(
+                    conn,
+                    "item_structure_iterations",
+                    "parent_item_id=?",
+                    (int(bom_id),),
+                )
+            except sqlite3.OperationalError:
+                pass
+            try:
+                self._delete_if_table(
+                    conn,
+                    "bom_working_bindings",
+                    "parent_bom_id=? OR child_bom_id=?",
+                    (int(bom_id), int(bom_id)),
+                )
+            except sqlite3.OperationalError:
+                pass
+            try:
+                self._delete_if_table(
+                    conn,
+                    "bom_iteration_children",
+                    "child_bom_id=?",
+                    (int(bom_id),),
+                )
+            except sqlite3.OperationalError:
+                pass
+            try:
+                self._delete_if_table(
+                    conn,
+                    "assembly_configuration_members",
+                    "bom_id=?",
+                    (int(bom_id),),
+                )
+                self._delete_if_table(
+                    conn,
+                    "assembly_configurations",
+                    "root_bom_id=?",
+                    (int(bom_id),),
+                )
+            except sqlite3.OperationalError:
+                pass
             try:
                 cur.execute("DELETE FROM bom_folder_items WHERE bom_id=?", (bom_id,))
                 folder_ids = []
@@ -1020,6 +1220,28 @@ class BomRepository:
                     cur.execute(f"DELETE FROM bom_folders WHERE id IN ({placeholders})", folder_ids)
             except sqlite3.OperationalError:
                 pass
-            cur.execute("DELETE FROM bom WHERE id=?", (bom_id,))
+            if has_traceability_refs:
+                return self._soft_delete_conn(
+                    conn,
+                    int(bom_id),
+                    deleted_by=deleted_by,
+                    reason=(
+                        "Deleted from active product structure; historical commits, "
+                        "audit records, baselines, or file links still reference this Item."
+                    ),
+                )
+            try:
+                cur.execute("DELETE FROM bom WHERE id=?", (int(bom_id),))
+                return bool(cur.rowcount)
+            except sqlite3.IntegrityError:
+                return self._soft_delete_conn(
+                    conn,
+                    int(bom_id),
+                    deleted_by=deleted_by,
+                    reason=(
+                        "Delete converted to archive because commits, audits, baselines, "
+                        "or other traceability records still reference this Item."
+                    ),
+                )
 
     

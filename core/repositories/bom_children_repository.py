@@ -139,7 +139,14 @@ class BomChildrenRepository:
                        COALESCE(bc.ebom_behavior, 'INHERIT') AS ebom_behavior
                 FROM bom_children bc
                 JOIN bom b ON b.id = bc.parent_id
+                JOIN bom child ON child.id = bc.child_id
                 WHERE b.project_id = ?
+                  AND b.deleted_at IS NULL
+                  AND child.deleted_at IS NULL
+                  AND lower(COALESCE(b.status,''))<>'deleted'
+                  AND lower(COALESCE(b.lifecycle_state,''))<>'deleted'
+                  AND lower(COALESCE(child.status,''))<>'deleted'
+                  AND lower(COALESCE(child.lifecycle_state,''))<>'deleted'
                 ORDER BY bc.parent_id, COALESCE(bc.sort_order, bc.id), bc.id
                 """,
                 (int(project_id),),
@@ -160,6 +167,12 @@ class BomChildrenRepository:
                 JOIN bom parent ON parent.id=bc.parent_id
                 JOIN bom child ON child.id=bc.child_id
                 WHERE parent.project_id=? AND child.project_id=?
+                  AND parent.deleted_at IS NULL
+                  AND child.deleted_at IS NULL
+                  AND lower(COALESCE(parent.status,''))<>'deleted'
+                  AND lower(COALESCE(parent.lifecycle_state,''))<>'deleted'
+                  AND lower(COALESCE(child.status,''))<>'deleted'
+                  AND lower(COALESCE(child.lifecycle_state,''))<>'deleted'
                 ORDER BY bc.parent_id, COALESCE(bc.sort_order, bc.id), bc.id
                 """,
                 (int(project_id), int(project_id)),
@@ -186,6 +199,12 @@ class BomChildrenRepository:
                 LEFT JOIN bom_children bc ON bc.child_id=b.id
                 LEFT JOIN bom parent ON parent.id=bc.parent_id
                 WHERE b.project_id=?
+                  AND b.deleted_at IS NULL
+                  AND (parent.id IS NULL OR parent.deleted_at IS NULL)
+                  AND lower(COALESCE(b.status,''))<>'deleted'
+                  AND lower(COALESCE(b.lifecycle_state,''))<>'deleted'
+                  AND (parent.id IS NULL OR lower(COALESCE(parent.status,''))<>'deleted')
+                  AND (parent.id IS NULL OR lower(COALESCE(parent.lifecycle_state,''))<>'deleted')
                   AND (parent.id IS NULL OR parent.project_id=?)
                   AND (
                     instr(lower(COALESCE(b.name, '')), lower(?)) > 0 OR

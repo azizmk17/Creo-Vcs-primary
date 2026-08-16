@@ -128,10 +128,20 @@ class PdmService:
         """Return deterministic proposals; never silently creates Items."""
         documents = self.repo.list_cad_documents(int(project_id))
         with self.repo.get_conn() as conn:
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(bom)").fetchall()}
+            active_predicates = []
+            if "deleted_at" in columns:
+                active_predicates.append("deleted_at IS NULL")
+            if "status" in columns:
+                active_predicates.append("lower(COALESCE(status,''))<>'deleted'")
+            if "lifecycle_state" in columns:
+                active_predicates.append("lower(COALESCE(lifecycle_state,''))<>'deleted'")
+            active_sql = (" AND " + " AND ".join(active_predicates)) if active_predicates else ""
             items = [dict(row) for row in conn.execute(
-                """
+                f"""
                 SELECT id,aes_number,part_number,name,base_file_name
                 FROM bom WHERE project_id=? AND represented_part_id IS NULL
+                {active_sql}
                 ORDER BY id
                 """,
                 (int(project_id),),
@@ -460,6 +470,9 @@ class PdmService:
                        b.aes_number AS item_aes_number,b.name AS item_name
                 FROM item_usages u JOIN bom b ON b.id=u.child_item_id
                 WHERE u.parent_item_id=? AND u.source='CAD_BUILD'
+                  AND b.deleted_at IS NULL
+                  AND lower(COALESCE(b.status,''))<>'deleted'
+                  AND lower(COALESCE(b.lifecycle_state,''))<>'deleted'
                 """,
                 (parent_item_id,),
             ).fetchall()
@@ -489,6 +502,12 @@ class PdmService:
             predicates = ["project_id=?"]
             if "represented_part_id" in columns:
                 predicates.append("represented_part_id IS NULL")
+            if "deleted_at" in columns:
+                predicates.append("deleted_at IS NULL")
+            if "status" in columns:
+                predicates.append("lower(COALESCE(status,''))<>'deleted'")
+            if "lifecycle_state" in columns:
+                predicates.append("lower(COALESCE(lifecycle_state,''))<>'deleted'")
             items = [dict(row) for row in conn.execute(
                 f"SELECT * FROM bom WHERE {' AND '.join(predicates)} ORDER BY id",
                 (int(project_id),),

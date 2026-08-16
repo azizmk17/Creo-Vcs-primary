@@ -754,13 +754,31 @@ class CommitService(BaseService):
             if msg.startswith(("cad404:", "drw404:", "cad_register_required:", "Error:", "Commit blocked:", "STEP compare failed")):
                 raise ValueError(msg)
             raise ValueError(f"Commit failed: {msg}")
+        affected_part_ids = sorted({
+            int(part_id)
+            for item in commit_plan
+            for part_id in (item.get("part_ids") or [])
+        })
+        affected_cad_ids = sorted({
+            int(item["cad_document_id"])
+            for item in commit_plan
+            if item.get("cad_document_id") is not None
+        })
+        self.emit_project_event(
+            "commit.created",
+            entity_type="COMMIT",
+            entity_id=commit_id,
+            payload={
+                "commit_id": commit_id,
+                "item_ids": affected_part_ids,
+                "cad_document_ids": affected_cad_ids,
+                "status": "Pending",
+            },
+        )
         return {
             "commit_id": commit_id,
-            "affected_part_ids": sorted({
-                int(part_id)
-                for item in commit_plan
-                for part_id in (item.get("part_ids") or [])
-            }),
+            "affected_part_ids": affected_part_ids,
+            "affected_cad_document_ids": affected_cad_ids,
         }
 
 
@@ -1046,11 +1064,20 @@ class CommitService(BaseService):
 
     
     def revert_commit(self, commit_id: int, project_id: int = None):
-        return self.traceability_service.mark_commit_reverted(
+        effective_project_id = int(project_id) if project_id is not None else self.session.project_id
+        result = self.traceability_service.mark_commit_reverted(
             str(commit_id),
-            int(project_id) if project_id is not None else self.session.project_id,
+            effective_project_id,
             "Reverted from Commit page",
         )
+        self.emit_project_event(
+            "commit.reverted",
+            entity_type="COMMIT",
+            entity_id=str(commit_id),
+            payload={"commit_id": str(commit_id), "status": "Reverted"},
+            project_id=effective_project_id,
+        )
+        return result
     
     @require_permission("validate")
     def validate_commit(self, commit_id: int, project_id: int = None,
@@ -1062,5 +1089,13 @@ class CommitService(BaseService):
         )
         self.issue_service.validate_commit_issues(
             str(commit_id), confirmed_issue_ids or [], rejected_issue_ids or [], validation_comment
+        )
+        effective_project_id = int(project_id) if project_id is not None else self.session.project_id
+        self.emit_project_event(
+            "commit.validated",
+            entity_type="COMMIT",
+            entity_id=str(commit_id),
+            payload={"commit_id": str(commit_id), "status": "Validated"},
+            project_id=effective_project_id,
         )
         return result

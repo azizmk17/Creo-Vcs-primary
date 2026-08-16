@@ -34,6 +34,7 @@ from PyQt5.QtCore import (
 from PyQt5.QtGui import QPainter, QColor, QPen, QPixmap, QFont, QIcon
 import math
 import os
+import json
 
 
 # ── PyInstaller resource helper ─────────────────────────────────────────────
@@ -124,6 +125,7 @@ from core.repositories.user_repository import UserRepository
 from core.services.project_service import ProjectService
 from core.services.ui_permission import UIPermissionHelper
 from core.session_manager import SessionManager
+from core.repositories.project_event_repository import ProjectEventRepository
 from core.startup_gate import MINIMUM_STARTUP_LOADER_MS, StartupGate
 
 
@@ -348,6 +350,9 @@ class BomGUI(QMainWindow):
         # Services
         self.bom_service = BomService(BomRepository(), BomChildrenRepository(), LockRepository(), SignatureRepository())
         self.project_service = ProjectService()
+        self.project_event_repo = ProjectEventRepository()
+        self._sync_last_event_id = 0
+        self._sync_poll_in_progress = False
 
         self._project_combo_initializing = False
         self._projects_for_user = []
@@ -358,6 +363,7 @@ class BomGUI(QMainWindow):
         self.init_toolbar()
 
         self._build_ui(startup_progress=startup_progress)
+        self._start_project_event_sync()
 
     def _configure_status_bar(self):
         status = self.statusBar()
@@ -1083,6 +1089,7 @@ class BomGUI(QMainWindow):
                     self.user_repo.set_last_project_id(self.session.user_id, None)
             except Exception:
                 pass
+            self._reset_project_event_sync_cursor()
             try:
                 self.refresh_project_label()
             except Exception:
@@ -1122,6 +1129,7 @@ class BomGUI(QMainWindow):
                     self.user_repo.set_last_project_id(self.session.user_id, None)
             except Exception:
                 pass
+            self._reset_project_event_sync_cursor()
 
             # revert UI selection to placeholder if present
             try:
@@ -1146,6 +1154,7 @@ class BomGUI(QMainWindow):
                 self.user_repo.set_last_project_id(self.session.user_id, pid)
         except Exception:
             pass
+        self._reset_project_event_sync_cursor()
         self.refresh_project_label()
         self.statusBar().showMessage(f"Project set to: {self.project_label.text().replace('Current: ', '')}")
         self.reload_main_window()
@@ -1302,6 +1311,178 @@ class BomGUI(QMainWindow):
                 self.cli_page.refresh_context()
             self.statusBar().showMessage("Engineer CLI ready")
             return
+
+    def _start_project_event_sync(self):
+        """Start lightweight multi-user invalidation polling.
+
+        Only the append-only project_events table is polled.  Expensive BOM,
+        CAD, commit, and dashboard refreshes happen only after a new event is
+        detected, and then only for affected rows/panels.
+        """
+        try:
+            self._sync_last_event_id = self.project_event_repo.current_id(
+                self.session.project_id
+            )
+        except Exception:
+            self._sync_last_event_id = 0
+        timer = getattr(self, "_project_event_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setInterval(4000)
+            timer.timeout.connect(self._poll_project_events)
+            self._project_event_timer = timer
+        if not timer.isActive():
+            timer.start()
+
+    def _reset_project_event_sync_cursor(self):
+        try:
+            self._sync_last_event_id = self.project_event_repo.current_id(
+                self.session.project_id
+            )
+        except Exception:
+            self._sync_last_event_id = 0
+
+    def _poll_project_events(self):
+        if self._sync_poll_in_progress or not getattr(self.session, "project_id", None):
+            return
+        self._sync_poll_in_progress = True
+        try:
+            events = self.project_event_repo.list_after(
+                int(getattr(self, "_sync_last_event_id", 0) or 0),
+                self.session.project_id,
+                limit=100,
+            )
+            if not events:
+                return
+            self._sync_last_event_id = max(
+                int(event.get("id") or 0) for event in events
+            )
+            external = [
+                event for event in events
+                if event.get("actor_user_id") is None
+                or self.session.user_id is None
+                or int(event.get("actor_user_id") or 0) != int(self.session.user_id)
+            ]
+            if external:
+                self._apply_project_events(external)
+            try:
+                if self._sync_last_event_id % 250 == 0:
+                    self.project_event_repo.prune_old()
+            except Exception:
+                pass
+        finally:
+            self._sync_poll_in_progress = False
+
+    @staticmethod
+    def _event_ints(payload: dict, *keys) -> list[int]:
+        result = []
+        seen = set()
+        for key in keys:
+            values = payload.get(key) if isinstance(payload, dict) else None
+            if values is None:
+                continue
+            if not isinstance(values, (list, tuple, set)):
+                values = [values]
+            for value in values:
+                try:
+                    number = int(value)
+                except Exception:
+                    continue
+                if number not in seen:
+                    seen.add(number)
+                    result.append(number)
+        return result
+
+    def _apply_project_events(self, events: list[dict]):
+        item_ids = set()
+        cad_ids = set()
+        commit_changed = False
+        issue_changed = False
+        structure_changed = False
+        messages = []
+
+        for event in events:
+            payload = event.get("payload") or {}
+            event_type = str(event.get("event_type") or "").strip()
+            item_ids.update(self._event_ints(payload, "item_ids", "affected_part_ids"))
+            cad_ids.update(self._event_ints(payload, "cad_document_ids", "affected_cad_document_ids"))
+            if event_type.startswith("commit."):
+                commit_changed = True
+                if event_type in {"commit.validated", "commit.merged", "commit.reverted"}:
+                    issue_changed = True
+            if event_type.startswith("item.") or event_type.startswith("cad."):
+                structure_changed = structure_changed or event_type in {
+                    "item.created", "item.deleted", "cad.created", "cad.deleted",
+                    "item.structure_changed", "cad.structure_changed",
+                }
+            if len(messages) < 2:
+                label = event_type.replace("_", " ").replace(".", " ")
+                messages.append(label)
+
+        item_list = sorted(item_ids)
+        cad_list = sorted(cad_ids)
+        try:
+            bom_page = getattr(self, "bom_page", None)
+            if bom_page:
+                deleted_items = [
+                    int((event.get("payload") or {}).get("deleted_item_id"))
+                    for event in events
+                    if str(event.get("event_type") or "") == "item.deleted"
+                    and (event.get("payload") or {}).get("deleted_item_id") is not None
+                ]
+                for deleted_id in deleted_items:
+                    try:
+                        if hasattr(bom_page, "_remove_part_from_trees"):
+                            bom_page._remove_part_from_trees(int(deleted_id))
+                    except Exception:
+                        pass
+                if structure_changed and hasattr(bom_page, "refresh_after_pdm_merge"):
+                    bom_page.refresh_after_pdm_merge(item_list, cad_list)
+                elif hasattr(bom_page, "_refresh_pdm_context_rows"):
+                    bom_page._refresh_pdm_context_rows(
+                        item_ids=item_list,
+                        cad_ids=cad_list,
+                        refresh_cad_branches=bool(cad_list),
+                    )
+                elif item_list and hasattr(bom_page, "refresh_parts_after_merge"):
+                    bom_page.refresh_parts_after_merge(item_list)
+                if issue_changed and hasattr(bom_page, "refresh_issue_indicators"):
+                    bom_page.refresh_issue_indicators(item_list)
+        except Exception:
+            pass
+
+        try:
+            commit_page = getattr(self, "commit_page", None)
+            if commit_changed and commit_page and hasattr(commit_page, "load_pending_commits"):
+                commit_page.load_pending_commits()
+                if hasattr(commit_page, "load_commit_history"):
+                    commit_page.load_commit_history()
+        except Exception:
+            pass
+
+        try:
+            if issue_changed and getattr(self, "issue_page", None):
+                self.issue_page.refresh()
+        except Exception:
+            pass
+
+        try:
+            if (commit_changed or item_list or cad_list) and getattr(self, "dashboard_page", None):
+                self.dashboard_page.refresh()
+        except Exception:
+            pass
+
+        try:
+            if getattr(self, "_cli_loaded", False) and getattr(self, "cli_page", None):
+                self.cli_page.refresh_context()
+        except Exception:
+            pass
+
+        if messages:
+            suffix = "" if len(events) == 1 else f" (+{len(events) - 1})"
+            self.statusBar().showMessage(
+                f"Live sync: {', '.join(messages)}{suffix}", 5000
+            )
 
     def export_current(self):
         current_index = self.pages.currentIndex()
