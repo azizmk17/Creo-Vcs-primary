@@ -80,6 +80,21 @@ class MergeService(BaseService):
         except Exception:
             return ""
 
+    def _associated_item_ids_for_cad(self, cad_document_id: int | None) -> list[int]:
+        """Return all active EBOM Items affected by a CAD Document approval."""
+        if cad_document_id is None:
+            return []
+        try:
+            return [
+                int(value)
+                for value in self.bom_service.pdm_service.checkout_target_item_ids(
+                    int(cad_document_id)
+                )
+                if value is not None
+            ]
+        except Exception:
+            return []
+
     def _legacy_engineering_filename(
         self,
         part_id: int,
@@ -643,6 +658,13 @@ class MergeService(BaseService):
                 if part_id is not None:
                     pdm_item_checkin_sources.setdefault(
                         int(part_id),
+                        str(item.get('source_commit_id') or item.get('commit_id') or ''),
+                    )
+                for associated_item_id in self._associated_item_ids_for_cad(
+                    cad_document_id
+                ):
+                    pdm_item_checkin_sources.setdefault(
+                        int(associated_item_id),
                         str(item.get('source_commit_id') or item.get('commit_id') or ''),
                     )
             elif part_id is not None:

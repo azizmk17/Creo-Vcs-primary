@@ -58,6 +58,38 @@ class CommitService(BaseService):
         except Exception:
             return None
 
+    def _commit_history_item_ids(self, item: dict) -> list[int | None]:
+        """Return Item ids that must receive this CAD commit in history.
+
+        A managed CAD Document can legitimately be associated to several EBOM
+        Items: family-table style Items, drawing-specific deliverables, image
+        representations, etc.  The physical CAD check-in is still one operation,
+        but every associated Item must get a commit/history row so its details,
+        approved CAD version, and object-iteration checks do not look stale.
+        """
+        result: list[int] = []
+        seen: set[int] = set()
+
+        def add(value):
+            if value is None:
+                return
+            try:
+                normalized = int(value)
+            except Exception:
+                return
+            if normalized in seen:
+                return
+            seen.add(normalized)
+            result.append(normalized)
+
+        # Keep the canonical/OWNER Item first for legacy callers that still use
+        # the first row as the representative row of the logical commit.
+        add(item.get("part_id"))
+        for value in item.get("part_ids") or []:
+            add(value)
+
+        return result or [None]
+
     def _canonical_part_root(self, value: str) -> str:
         base = os.path.basename(value or "")
         return (base.split(".")[0] if base else "").strip().lower()
@@ -696,37 +728,40 @@ class CommitService(BaseService):
 
             # Phase 3: persist all rows and traceability links.
             for item in commit_plan:
-                signature = self.signature_repo.add_signature("commit", designer_id, message)
                 step_meta = item.get("step_meta") or {}
-                self.commit_repository.insert(
-                    item["part_id"],
-                    item["part_type"],
-                    item["filename"],
-                    item["filepath"],
-                    item["base_f_name"],
-                    designer_id,
-                    self.user_id,
-                    message,
-                    signature,
-                    self.session.project_id,
-                    title,
-                    commit_id,
-                    step_compare_enabled=step_meta.get("step_compare_enabled", 0),
-                    step_file_path=step_meta.get("step_file_path"),
-                    step_prev_file_path=step_meta.get("step_prev_file_path"),
-                    step_diff_path=step_meta.get("step_diff_path"),
-                    step_diff_summary=step_meta.get("step_diff_summary"),
-                    step_diff_status=step_meta.get("step_diff_status"),
-                    step_error=step_meta.get("step_error"),
-                    step_face_map_path=step_meta.get("step_face_map_path"),
-                    object_iteration_id=(
-                        self._object_iteration_id(item["part_id"])
-                        if item.get("part_id") is not None else None
-                    ),
-                    cad_document_id=item.get("cad_document_id"),
-                    creo_file_version=item.get("creo_file_version"),
-                )
-                inserted_any = True
+                for history_part_id in self._commit_history_item_ids(item):
+                    signature = self.signature_repo.add_signature(
+                        "commit", designer_id, message
+                    )
+                    self.commit_repository.insert(
+                        history_part_id,
+                        item["part_type"],
+                        item["filename"],
+                        item["filepath"],
+                        item["base_f_name"],
+                        designer_id,
+                        self.user_id,
+                        message,
+                        signature,
+                        self.session.project_id,
+                        title,
+                        commit_id,
+                        step_compare_enabled=step_meta.get("step_compare_enabled", 0),
+                        step_file_path=step_meta.get("step_file_path"),
+                        step_prev_file_path=step_meta.get("step_prev_file_path"),
+                        step_diff_path=step_meta.get("step_diff_path"),
+                        step_diff_summary=step_meta.get("step_diff_summary"),
+                        step_diff_status=step_meta.get("step_diff_status"),
+                        step_error=step_meta.get("step_error"),
+                        step_face_map_path=step_meta.get("step_face_map_path"),
+                        object_iteration_id=(
+                            self._object_iteration_id(history_part_id)
+                            if history_part_id is not None else None
+                        ),
+                        cad_document_id=item.get("cad_document_id"),
+                        creo_file_version=item.get("creo_file_version"),
+                    )
+                    inserted_any = True
 
             self.traceability_service.repo.backfill_commit_groups()
             if resolved_issue_ids:
@@ -757,7 +792,8 @@ class CommitService(BaseService):
         affected_part_ids = sorted({
             int(part_id)
             for item in commit_plan
-            for part_id in (item.get("part_ids") or [])
+            for part_id in self._commit_history_item_ids(item)
+            if part_id is not None
         })
         affected_cad_ids = sorted({
             int(item["cad_document_id"])

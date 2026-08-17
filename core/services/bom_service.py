@@ -153,6 +153,13 @@ class BomService(BaseService):
         self._tree_dirty.add(int(self.session.project_id))
         return result
 
+    def reorder_bom_folders(self, ordered_folder_ids) -> List[int]:
+        result = self.folder_repo.reorder(
+            int(self.session.project_id), ordered_folder_ids
+        )
+        self._tree_dirty.add(int(self.session.project_id))
+        return result
+
     def eligible_bom_folder_items(self, folder_id: int) -> List[Dict]:
         return self.folder_repo.eligible_items(int(self.session.project_id), int(folder_id))
 
@@ -3155,6 +3162,20 @@ class BomService(BaseService):
         )
         if not associated_item_ids and document.get("checkout_item_id") is not None:
             associated_item_ids = [int(document["checkout_item_id"])]
+        try:
+            association_item_ids = self.pdm_service.checkout_target_item_ids(
+                cad_document_id
+            )
+            associated_item_ids = sorted({
+                int(value)
+                for value in [
+                    *(associated_item_ids or []),
+                    *(association_item_ids or []),
+                ]
+                if value is not None
+            })
+        except Exception:
+            pass
         result = self.pdm_service.checkin_cad_document(
             cad_document_id,
             actor_id,
@@ -3168,7 +3189,11 @@ class BomService(BaseService):
             int(value) for value in (result.get("checkout_item_ids") or [])
         ]
         if returned_item_ids:
-            associated_item_ids = returned_item_ids
+            associated_item_ids = sorted({
+                int(value)
+                for value in [*(associated_item_ids or []), *returned_item_ids]
+                if value is not None
+            })
         item_result = self._release_auto_item_checkouts_after_cad(
             associated_item_ids, actor_id
         )

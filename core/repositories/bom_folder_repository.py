@@ -232,6 +232,47 @@ class BomFolderRepository:
         )
         return next(row for row in rows if int(row["id"]) == int(folder_id))
 
+    def reorder(self, project_id: int, ordered_folder_ids) -> list[int]:
+        ordered = [int(value) for value in (ordered_folder_ids or [])]
+        if not ordered:
+            return []
+        with self.get_conn() as conn:
+            placeholders = ",".join("?" for _ in ordered)
+            rows = [
+                dict(row)
+                for row in conn.execute(
+                    f"""
+                    SELECT *
+                    FROM bom_folders
+                    WHERE project_id=? AND id IN ({placeholders})
+                    """,
+                    (int(project_id), *ordered),
+                ).fetchall()
+            ]
+            if len(rows) != len(set(ordered)):
+                raise ValueError("One or more folders were not found in the current project.")
+            by_id = {int(row["id"]): row for row in rows}
+            first = by_id[ordered[0]]
+            scope = str(first["scope"] or "EBOM").upper()
+            parent_bom_id = first["parent_bom_id"]
+            parent_cad_document_id = first["parent_cad_document_id"]
+            parent_folder_id = first["parent_folder_id"]
+            for folder_id in ordered:
+                row = by_id[folder_id]
+                if (
+                    str(row["scope"] or "EBOM").upper() != scope
+                    or row["parent_bom_id"] != parent_bom_id
+                    or row["parent_cad_document_id"] != parent_cad_document_id
+                    or row["parent_folder_id"] != parent_folder_id
+                ):
+                    raise ValueError("Folders can be reordered only with sibling folders.")
+            for index, folder_id in enumerate(ordered, start=1):
+                conn.execute(
+                    "UPDATE bom_folders SET sort_order=? WHERE id=? AND project_id=?",
+                    (index * 10, int(folder_id), int(project_id)),
+                )
+        return ordered
+
     def eligible_items(self, project_id: int, folder_id: int) -> list[dict]:
         with self.get_conn() as conn:
             parent_bom_id = self.effective_parent_bom_id(conn, project_id, folder_id)

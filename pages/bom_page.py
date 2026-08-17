@@ -101,6 +101,7 @@ class FileDropTable(QTableWidget):
 
 class BomTreeWidget(QTreeWidget):
     reorderRequested = pyqtSignal(list, int, int, str)
+    folderReorderRequested = pyqtSignal(list, int, str)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -205,6 +206,29 @@ class BomTreeWidget(QTreeWidget):
         indicator = self.dropIndicatorPosition()
         if indicator not in (QAbstractItemView.AboveItem, QAbstractItemView.BelowItem):
             event.ignore()
+            return
+
+        target_folder_id = target.data(0, BOM_TREE_FOLDER_ROLE)
+        if target_folder_id is not None:
+            if target in selected:
+                event.ignore()
+                return
+            visual_parent = target.parent()
+            if any(item.parent() is not visual_parent for item in selected):
+                event.ignore()
+                return
+            selected_folder_ids = []
+            for item in selected:
+                folder_id = item.data(0, BOM_TREE_FOLDER_ROLE)
+                if folder_id is None:
+                    event.ignore()
+                    return
+                selected_folder_ids.append(int(folder_id))
+            where = "above" if indicator == QAbstractItemView.AboveItem else "below"
+            self.folderReorderRequested.emit(
+                selected_folder_ids, int(target_folder_id), where
+            )
+            event.acceptProposedAction()
             return
 
         target_id = target.data(0, Qt.UserRole)
@@ -2888,6 +2912,158 @@ class BomPage(QWidget):
             return f"{base_name}.{version}" if base_name else f"Creo .{version}"
         return ""
 
+    @staticmethod
+    def _creo_name_parts(name: str) -> tuple[str, int | None]:
+        """Return (base Creo file, numeric file suffix) for PRT/ASM/DRW names."""
+        cleaned = os.path.basename(str(name or "").replace("\\", "/")).strip()
+        match = re.match(
+            r"^(?P<base>.+\.(?:prt|asm|drw))(?:\.(?P<version>\d+))?$",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return cleaned, None
+        version = match.group("version")
+        return match.group("base"), int(version) if version else None
+
+    def _build_pdm_cad_working_file_index(self) -> dict:
+        """Index Creo files physically present in the project working directory."""
+        root = str(self.get_working_dir() or self.working_dir or "").strip()
+        if root:
+            self.working_dir = root
+        index: dict[str, list[dict]] = {}
+        if not root or not safe_exists(root):
+            return index
+        skip_dirs = {
+            ".git", ".nexus", "__pycache__", "commits", "snapshots",
+            "baselines", "exports",
+        }
+        try:
+            walker = os.walk(root)
+            for folder, dirs, files in walker:
+                dirs[:] = [
+                    d for d in dirs
+                    if d not in skip_dirs and not d.startswith(".nexus")
+                ]
+                for file_name in files:
+                    base, version = self._creo_name_parts(file_name)
+                    if not base or not re.search(r"\.(?:prt|asm|drw)$", base, re.IGNORECASE):
+                        continue
+                    key = base.casefold()
+                    index.setdefault(key, []).append({
+                        "base": base,
+                        "version": version,
+                        "name": file_name,
+                        "path": os.path.join(folder, file_name),
+                    })
+        except Exception:
+            return index
+        for rows in index.values():
+            rows.sort(
+                key=lambda row: (
+                    row.get("version") is None,
+                    int(row.get("version") or -1),
+                    str(row.get("name") or "").casefold(),
+                )
+            )
+        return index
+
+    def _pdm_cad_iteration_warnings(self, document: dict) -> list[str]:
+        """Detect local Creo file/version problems for a CAD Document row."""
+        category = str(document.get("category") or "").upper()
+        if category not in {"ASSEMBLY", "COMPONENT", "DRAWING"}:
+            return []
+        index = getattr(self, "_pdm_cad_working_file_index", None)
+        if index is None:
+            index = self._build_pdm_cad_working_file_index()
+            self._pdm_cad_working_file_index = index
+
+        file_name = str(document.get("file_name") or "").strip()
+        expected_source = str(
+            document.get("latest_creo_file_name")
+            or document.get("source_file_name")
+            or ""
+        ).strip()
+        expected_base, source_version = self._creo_name_parts(
+            expected_source or file_name
+        )
+        if not expected_base:
+            return ["CAD file name is missing."]
+
+        try:
+            expected_version = document.get("latest_creo_file_version")
+            if expected_version is None:
+                expected_version = document.get("creo_file_version")
+            expected_version = (
+                int(expected_version)
+                if expected_version is not None and str(expected_version).strip()
+                else source_version
+            )
+        except Exception:
+            expected_version = source_version
+
+        rows = list(index.get(expected_base.casefold()) or [])
+        warnings = []
+        if expected_version is None:
+            warnings.append(
+                "No approved Creo file iteration is recorded for this CAD Document."
+            )
+        if not rows:
+            warnings.append(
+                f"{expected_base} does not exist in the project working directory."
+            )
+        else:
+            numbered_versions = sorted({
+                int(row["version"])
+                for row in rows
+                if row.get("version") is not None
+            })
+            if expected_version is not None and numbered_versions:
+                if int(expected_version) not in numbered_versions:
+                    warnings.append(
+                        f"Approved Creo file {expected_base}.{expected_version} is missing from the working directory."
+                    )
+                newer = [value for value in numbered_versions if value > int(expected_version)]
+                older = [value for value in numbered_versions if value < int(expected_version)]
+                if newer:
+                    warnings.append(
+                        f"Newer local Creo version exists: {expected_base}.{max(newer)}."
+                    )
+                if older:
+                    warnings.append(
+                        f"Older local Creo version(s) exist: "
+                        + ", ".join(f"{expected_base}.{value}" for value in older[-3:])
+                        + (" ..." if len(older) > 3 else "")
+                    )
+            elif expected_version is not None and not numbered_versions:
+                warnings.append(
+                    f"{expected_base} exists only without a Creo numeric suffix; expected .{expected_version}."
+                )
+        for drawing in document.get("related_drawings") or []:
+            for drawing_warning in self._pdm_cad_iteration_warnings(drawing):
+                drawing_name = str(
+                    drawing.get("file_name") or drawing.get("name") or "DRW"
+                )
+                warnings.append(f"Drawing {drawing_name}: {drawing_warning}")
+        return warnings
+
+    def _decorate_pdm_cad_iteration_health(
+        self, item: QTreeWidgetItem, document: dict
+    ) -> list[str]:
+        warnings = self._pdm_cad_iteration_warnings(document)
+        base_revision = self._pdm_cad_revision_text(document)
+        item.setText(CAD_COL_REV, f"⚠ {base_revision}" if warnings else base_revision)
+        tooltip = "\n".join(warnings) if warnings else "CAD file iteration is consistent with the working directory."
+        item.setToolTip(CAD_COL_REV, tooltip)
+        item.setData(CAD_COL_REV, Qt.UserRole, list(warnings))
+        color = QColor("#b45309") if warnings else QColor("#0f172a")
+        item.setForeground(CAD_COL_REV, QBrush(color))
+        if warnings:
+            item.setForeground(CAD_COL_NAME, QBrush(QColor("#b45309")))
+        else:
+            item.setForeground(CAD_COL_NAME, QBrush(QColor("#0f172a")))
+        return warnings
+
     def _pdm_cad_revision_text(self, document: dict) -> str:
         revision = f"CAD {document.get('revision') or 'A'}.{int(document.get('iteration') or 1)}"
         creo_file = self._pdm_creo_file_text(document)
@@ -3117,11 +3293,15 @@ class BomPage(QWidget):
             for drawing in document.get("related_drawings") or []
         ) or "None"
         association_lines = self._pdm_item_association_lines(document)
+        iteration_warnings = self._decorate_pdm_cad_iteration_health(item, document)
         item.setToolTip(
             CAD_COL_NUMBER,
             "CAD Document\n"
             f"File: {document.get('file_name') or '-'}\n"
             f"Creo file version: {self._pdm_creo_file_text(document) or '-'}\n"
+            f"CAD iteration health:\n"
+            + ("\n".join(f"  ⚠ {line}" for line in iteration_warnings) if iteration_warnings else "  OK")
+            + "\n"
             f"Related drawings: {drawing_files}\n"
             f"CAD BOM location:\n{self._cad_representation_path_text(document)}\n"
             f"Item associations ({len(association_lines)}):\n"
@@ -3168,6 +3348,7 @@ class BomPage(QWidget):
         item.setData(0, PDM_ASSOCIATED_ITEM_ID_ROLE, payload.get("item_id"))
         item.setData(0, Qt.UserRole, payload.get("item_id"))
         item.setIcon(CAD_COL_NUMBER, _pdm_cad_icon(payload.get("category")))
+        iteration_warnings = self._decorate_pdm_cad_iteration_health(item, payload)
         drawing_files = ", ".join(
             str(drawing.get("file_name") or drawing.get("name") or "")
             for drawing in payload.get("related_drawings") or []
@@ -3178,6 +3359,9 @@ class BomPage(QWidget):
             "CAD Document\n"
             f"File: {payload.get('file_name') or '-'}\n"
             f"Creo file version: {self._pdm_creo_file_text(payload) or '-'}\n"
+            f"CAD iteration health:\n"
+            + ("\n".join(f"  ⚠ {line}" for line in iteration_warnings) if iteration_warnings else "  OK")
+            + "\n"
             f"Related drawings: {drawing_files}\n"
             f"CAD BOM location:\n{self._cad_representation_path_text(payload)}\n"
             f"Item associations ({len(association_lines)}):\n"
@@ -3258,7 +3442,8 @@ class BomPage(QWidget):
                 )
                 for drawing in payload.get("related_drawings") or []
             )
-            own_text = f"{own_text} {drawing_text}".casefold()
+            warning_text = " ".join(self._pdm_cad_iteration_warnings(payload))
+            own_text = f"{own_text} {drawing_text} {warning_text}".casefold()
             own_match = not query or query in own_text
             child_match = False
             for index in range(item.childCount()):
@@ -3281,6 +3466,7 @@ class BomPage(QWidget):
             return
         self._set_tree_loading(True)
         try:
+            self._pdm_cad_working_file_index = self._build_pdm_cad_working_file_index()
             data = (
                 self.bom_service.get_pdm_cad_structure()
                 if self.session.project_id else {"roots": [], "document_count": 0}
@@ -3301,13 +3487,21 @@ class BomPage(QWidget):
             unassociated = sum(1 for row in models if not row.get("association_id"))
             drawing_count = int(data.get("drawing_count") or 0)
             unbound_drawings = int(data.get("unbound_drawing_count") or 0)
+            cad_iteration_warning_count = sum(
+                1
+                for row in all_documents
+                if self._pdm_cad_iteration_warnings(row)
+            )
             self.bom_health_label.setText(
                 f"Models: {int(data.get('document_count') or len(models))}  |  "
                 f"Drawings: {drawing_count}  |  Unassociated: {unassociated}"
                 + (f"  |  Drawings to bind: {unbound_drawings}" if unbound_drawings else "")
+                + (f"  |  CAD file warnings: {cad_iteration_warning_count}" if cad_iteration_warning_count else "")
             )
             self.bom_health_label.setStyleSheet(
-                "font-size:8pt;font-weight:700;color:#475569;background:transparent;border:none;"
+                "font-size:8pt;font-weight:700;"
+                f"color:{'#b45309' if cad_iteration_warning_count else '#475569'};"
+                "background:transparent;border:none;"
             )
             self.bom_mode_selector.setToolTip(
                 "Native CAD Document assembly/member structure. Item delivery files and "
@@ -5740,6 +5934,147 @@ class BomPage(QWidget):
             return "Create EBOM Items only from PRT/ASM CAD Documents."
         return ""
 
+    def _related_drawings_for_cad_document(self, cad_document: dict) -> list[dict]:
+        cad_id = cad_document.get("id") or cad_document.get("child_cad_document_id")
+        drawings = [dict(row) for row in (cad_document.get("related_drawings") or []) if row]
+        if drawings or cad_id is None:
+            return drawings
+        try:
+            for document in self.bom_service.list_pdm_cad_documents() or []:
+                try:
+                    if int(document.get("id") or 0) != int(cad_id):
+                        continue
+                except Exception:
+                    continue
+                return [
+                    dict(row)
+                    for row in (document.get("related_drawings") or [])
+                    if row
+                ]
+        except Exception:
+            return []
+        return []
+
+    def _select_drawings_for_new_cad_item(
+        self, cad_document: dict
+    ) -> tuple[list[int], int | None] | None:
+        drawings = self._related_drawings_for_cad_document(cad_document)
+        if not drawings:
+            return ([], None)
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Select Item Drawing")
+        dialog.resize(620, 420)
+        layout = QVBoxLayout(dialog)
+        title = QLabel(
+            "Select the drawing(s) that correspond to the new EBOM Item."
+        )
+        title.setStyleSheet("font-weight:700;color:#172635;")
+        layout.addWidget(title)
+        hint = QLabel(
+            "The selected DRW will be associated to the new Item as CONTENT. "
+            "If several drawings are selected, choose the primary drawing."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#526577;")
+        layout.addWidget(hint)
+
+        drawing_list = QListWidget()
+        drawing_list.setAlternatingRowColors(True)
+        drawing_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        primary_combo = QComboBox()
+        row_by_id = {}
+        for drawing in drawings:
+            try:
+                drawing_id = int(drawing.get("id"))
+            except Exception:
+                continue
+            label = str(
+                drawing.get("file_name")
+                or drawing.get("name")
+                or f"Drawing {drawing_id}"
+            )
+            creo_text = self._pdm_creo_file_text(drawing)
+            if creo_text:
+                label = f"{label}  |  Creo {creo_text}"
+            row = QListWidgetItem(label)
+            row.setFlags(row.flags() | Qt.ItemIsUserCheckable)
+            row.setCheckState(
+                Qt.Checked if bool(drawing.get("is_primary_drawing")) else Qt.Unchecked
+            )
+            row.setData(Qt.UserRole, drawing_id)
+            row.setToolTip(
+                "CAD Drawing\n"
+                f"File: {drawing.get('file_name') or '-'}\n"
+                f"CAD version: {drawing.get('revision') or 'A'}.{int(drawing.get('iteration') or 1)}\n"
+                f"Creo file: {creo_text or '-'}"
+            )
+            drawing_list.addItem(row)
+            row_by_id[drawing_id] = row
+
+        if drawing_list.count() == 1:
+            drawing_list.item(0).setCheckState(Qt.Checked)
+
+        def selected_ids() -> list[int]:
+            result = []
+            for index in range(drawing_list.count()):
+                row = drawing_list.item(index)
+                if row.checkState() == Qt.Checked:
+                    try:
+                        result.append(int(row.data(Qt.UserRole)))
+                    except Exception:
+                        pass
+            return result
+
+        def refresh_primary_combo() -> None:
+            previous = primary_combo.currentData()
+            primary_combo.blockSignals(True)
+            primary_combo.clear()
+            for index in range(drawing_list.count()):
+                row = drawing_list.item(index)
+                if row.checkState() != Qt.Checked:
+                    continue
+                primary_combo.addItem(row.text(), int(row.data(Qt.UserRole)))
+            if previous is not None:
+                match_index = primary_combo.findData(previous)
+                if match_index >= 0:
+                    primary_combo.setCurrentIndex(match_index)
+            primary_combo.setEnabled(primary_combo.count() > 1)
+            primary_combo.blockSignals(False)
+
+        drawing_list.itemChanged.connect(lambda _row: refresh_primary_combo())
+        refresh_primary_combo()
+
+        layout.addWidget(drawing_list, 1)
+        layout.addWidget(QLabel("Primary drawing:"))
+        layout.addWidget(primary_combo)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+
+        def accept_dialog() -> None:
+            ids = selected_ids()
+            if not ids:
+                QMessageBox.warning(
+                    dialog,
+                    "Select Item Drawing",
+                    "Select at least one drawing for this new Item, or cancel creation.",
+                )
+                return
+            dialog.accept()
+
+        buttons.accepted.connect(accept_dialog)
+        buttons.rejected.connect(dialog.reject)
+        if dialog.exec_() != QDialog.Accepted:
+            return None
+
+        ids = selected_ids()
+        primary = primary_combo.currentData()
+        try:
+            primary_id = int(primary) if primary is not None else (ids[0] if len(ids) == 1 else None)
+        except Exception:
+            primary_id = ids[0] if len(ids) == 1 else None
+        return (ids, primary_id)
+
     def _create_ebom_item_from_cad_document(
         self,
         cad_document: dict,
@@ -5817,6 +6152,10 @@ class BomPage(QWidget):
             value for label, value in association_choices
             if label == selected_type_label
         )
+        drawing_selection = self._select_drawings_for_new_cad_item(cad_document)
+        if drawing_selection is None:
+            return None
+        selected_drawing_ids, primary_drawing_id = drawing_selection
         file_name = str(cad_document.get("file_name") or "").strip()
         stem = os.path.splitext(file_name)[0] if file_name else ""
         part_data = {
@@ -5846,6 +6185,14 @@ class BomPage(QWidget):
                 int(self.session.project_id), int(new_item_id), int(cad_id),
                 association_type, self.bom_service.user_id,
             )
+            if selected_drawing_ids:
+                self.bom_service.pdm_service.set_item_model_drawings(
+                    int(new_item_id),
+                    int(cad_id),
+                    selected_drawing_ids,
+                    primary_drawing_id=primary_drawing_id,
+                    actor_id=self.bom_service.user_id,
+                )
         except Exception as exc:
             QMessageBox.warning(self, "Create EBOM Item from CAD", str(exc))
             return None
@@ -5882,13 +6229,18 @@ class BomPage(QWidget):
             self._refresh_pdm_ebom_structure_branch(int(new_item_id))
         self._refresh_pdm_context_rows(
             item_ids=affected_items,
-            cad_ids=[int(cad_id)],
+            cad_ids=sorted({int(cad_id), *[int(value) for value in selected_drawing_ids]}),
         )
         QMessageBox.information(
             self,
             "Create EBOM Item from CAD",
             f"Created Item from {file_name or cad_id} and associated it as "
             f"{association_type.replace('_', ' ')}."
+            + (
+                "\nSelected drawing(s): "
+                + ", ".join(str(value) for value in selected_drawing_ids)
+                if selected_drawing_ids else ""
+            )
             + usage_message,
         )
         return int(new_item_id)
@@ -8211,6 +8563,9 @@ class BomPage(QWidget):
             self._show_pdm_tree_context_menu
         )
         self._ebom_tree.reorderRequested.connect(self._handle_pdm_tree_drag_reorder)
+        self._ebom_tree.folderReorderRequested.connect(
+            self._handle_pdm_folder_drag_reorder
+        )
         self._tree_stack.addWidget(self._ebom_tree)             # index 3
 
         # Flat advanced-filter results live in a separate view.  A child row
@@ -8266,6 +8621,9 @@ class BomPage(QWidget):
             self._show_pdm_tree_context_menu
         )
         self._cad_tree.reorderRequested.connect(self._handle_pdm_tree_drag_reorder)
+        self._cad_tree.folderReorderRequested.connect(
+            self._handle_pdm_folder_drag_reorder
+        )
         self._tree_stack.addWidget(self._cad_tree)              # index 5
 
         _bom_tree_qss = f"""
@@ -10064,16 +10422,19 @@ class BomPage(QWidget):
                     )
                 }
                 candidates = []
-                for index in range(self._container_count(container)):
-                    candidate = self._container_item(container, index)
+                search_container = display_parent
+                for index in range(self._container_count(search_container)):
+                    candidate = self._container_item(search_container, index)
                     candidate_id = self._pdm_folder_object_id(candidate, scope)
                     if candidate_id is not None and candidate_id in assigned:
                         candidates.append(candidate_id)
                 for object_id in candidates:
-                    for index in range(self._container_count(container)):
-                        candidate = self._container_item(container, index)
+                    for index in range(self._container_count(search_container)):
+                        candidate = self._container_item(search_container, index)
                         if self._pdm_folder_object_id(candidate, scope) == object_id:
-                            folder_item.addChild(self._container_take(container, index))
+                            folder_item.addChild(
+                                self._container_take(search_container, index)
+                            )
                             break
                 for child_folder in children_by_folder.get(
                     int(folder["id"]), []
@@ -10174,7 +10535,7 @@ class BomPage(QWidget):
         selected = (
             parent_item
             if isinstance(parent_item, QTreeWidgetItem)
-            else (tree.currentItem() if tree is not None else None)
+            else None
         )
         parent_bom_id = None
         parent_cad_document_id = None
@@ -11572,6 +11933,66 @@ class BomPage(QWidget):
                 self._apply_pdm_reordered_children(scope, int(target_parent_id), new_order)
         except Exception as exc:
             QMessageBox.warning(self, "Reorder", str(exc))
+
+    def _handle_pdm_folder_drag_reorder(
+        self, selected_folder_ids: list, target_folder_id: int, where: str
+    ) -> None:
+        if not self.perm.can("manage_parts"):
+            return QMessageBox.warning(
+                self, "Permission",
+                "You do not have permission to reorder folders.",
+            )
+        try:
+            selected_set = {int(value) for value in (selected_folder_ids or [])}
+            target_folder_id = int(target_folder_id)
+            if target_folder_id in selected_set:
+                return
+            target = self._folder_record(target_folder_id)
+            if not target:
+                raise ValueError("Target folder was not found.")
+            scope = str(target.get("scope") or "EBOM").upper()
+
+            def same_location(folder: dict) -> bool:
+                return (
+                    str(folder.get("scope") or "EBOM").upper() == scope
+                    and folder.get("parent_bom_id") == target.get("parent_bom_id")
+                    and folder.get("parent_cad_document_id") == target.get("parent_cad_document_id")
+                    and folder.get("parent_folder_id") == target.get("parent_folder_id")
+                )
+
+            sibling_folders = [
+                dict(folder)
+                for folder in self._pdm_folders(scope)
+                if same_location(dict(folder))
+            ]
+            sibling_folders.sort(
+                key=lambda row: (
+                    int(row.get("sort_order") or 0),
+                    str(row.get("name") or "").casefold(),
+                    int(row["id"]),
+                )
+            )
+            current_order = [int(folder["id"]) for folder in sibling_folders]
+            if (
+                target_folder_id not in current_order
+                or not selected_set.issubset(set(current_order))
+            ):
+                raise ValueError("Folders can be reordered only with sibling folders.")
+            selected_in_order = [value for value in current_order if value in selected_set]
+            remaining = [value for value in current_order if value not in selected_set]
+            target_index = remaining.index(target_folder_id)
+            if str(where or "").lower() == "below":
+                target_index += 1
+            new_order = (
+                remaining[:target_index]
+                + selected_in_order
+                + remaining[target_index:]
+            )
+            if new_order != current_order:
+                self.bom_service.reorder_bom_folders(new_order)
+                self._reload_pdm_folder_scope(scope)
+        except Exception as exc:
+            QMessageBox.warning(self, "Reorder Folder", str(exc))
 
     def _add_pdm_reorder_menu(self, menu: QMenu, scope: str) -> None:
         reorder_menu = menu.addMenu("Reorder")
@@ -16405,8 +16826,9 @@ class BomPage(QWidget):
             self._container_add(display_parent, folder_item)
             assigned_ids = {int(value) for value in (folder.get("item_ids") or [])}
             ordered_assigned_ids = []
-            for index in range(self._container_count(base_container)):
-                candidate = self._container_item(base_container, index)
+            search_container = display_parent
+            for index in range(self._container_count(search_container)):
+                candidate = self._container_item(search_container, index)
                 if self._is_folder_tree_item(candidate):
                     continue
                 try:
@@ -16416,11 +16838,11 @@ class BomPage(QWidget):
                 if candidate_id in assigned_ids:
                     ordered_assigned_ids.append(candidate_id)
             for part_id in ordered_assigned_ids:
-                bom_item = self._take_direct_bom_item(base_container, int(part_id))
+                bom_item = self._take_direct_bom_item(search_container, int(part_id))
                 if bom_item is not None:
                     folder_item.addChild(bom_item)
             for child_folder in children_by_folder.get(int(folder["id"]), []):
-                add_folder(child_folder, folder_item, base_container)
+                add_folder(child_folder, folder_item, search_container)
             folder_item.setExpanded(False)
 
         base_containers = containers if containers is not None else self._folder_context_containers(parent_bom_id)
