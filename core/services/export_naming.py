@@ -11,7 +11,7 @@ def safe_filename(value: str) -> str:
 def normalize_name_part(value: Optional[str]) -> str:
     if value is None:
         return ""
-    return "_".join(str(value).split())
+    return " ".join(str(value).split())
 
 
 def is_project_revision(revision: Optional[str], project_version_label: Optional[str]) -> bool:
@@ -46,17 +46,10 @@ def real_drawing_number(value: Optional[str]) -> str:
     return text
 
 
-def drawing_index_for_part(part) -> str:
-    for field_name in (
-        "drawing_index",
-        "draw_index",
-        "drawing_indice",
-        "indice",
-        "index",
-    ):
-        value = str(getattr(part, field_name, "") or "").strip()
-        if value and not _looks_like_cad_or_document_filename(value):
-            return value
+def aes_number_for_part(part) -> str:
+    value = str(getattr(part, "aes_number", "") or "").strip()
+    if value and not _looks_like_cad_or_document_filename(value):
+        return value
     return ""
 
 
@@ -69,21 +62,33 @@ def exported_document_filename(
     project_version_label: Optional[str] = "",
     include_date: bool = True,
 ) -> str:
-    """Build customer-facing export names without leaking project version labels."""
+    """Build customer-facing export names.
+
+    Required order:
+        drawing number - aes number - name - revision - date
+
+    Empty/invalid metadata fields are skipped, but their order is preserved.
+    Drawing numbers that are actually CAD/document file names are ignored so a
+    bad legacy value never leaks into delivery filenames.
+    """
 
     file_type_upper = str(file_type or "").strip().upper()
     drawing_no = real_drawing_number(getattr(part, "drawing_number", ""))
-    index = drawing_index_for_part(part)
+    aes_no = aes_number_for_part(part)
     part_name = str(getattr(part, "name", "") or "").strip()
-    rev = normalize_name_part(revision)
+    rev = normalize_name_part(revision or getattr(part, "revision", "") or "")
 
-    parts = [drawing_no, index, normalize_name_part(part_name)]
-    if file_type_upper == "PDF" and rev and not is_project_revision(rev, project_version_label):
+    parts = [drawing_no, aes_no, normalize_name_part(part_name)]
+    if file_type_upper != "STEP":
         parts.append(rev)
     if include_date:
         parts.append(datetime.now().strftime("%Y%m%d"))
 
-    safe_parts = [safe_filename(p).strip("._- ") for p in parts if p and str(p).strip()]
+    safe_parts = [
+        safe_filename(p).upper().replace(" ", "_").strip("._- ")
+        for p in parts
+        if p and str(p).strip()
+    ]
     stem = "-".join(p for p in safe_parts if p)
     if not stem:
         stem = safe_filename(os.path.splitext(os.path.basename(source_path or ""))[0] or "export")
