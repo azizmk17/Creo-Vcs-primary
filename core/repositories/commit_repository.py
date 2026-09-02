@@ -24,6 +24,119 @@ class CommitRepository:
                 except Exception:
                     return False
 
+            def table_exists(table_name: str) -> bool:
+                try:
+                    return cur.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                        (table_name,),
+                    ).fetchone() is not None
+                except Exception:
+                    return False
+
+            def repair_interrupted_nullable_rebuild() -> None:
+                stale_tables = (
+                    "commits_part_id_not_null_backup",
+                    "commits_nullable_rebuild",
+                )
+                if not table_exists("commits"):
+                    for table_name in stale_tables:
+                        if table_exists(table_name):
+                            cur.execute(f"ALTER TABLE {table_name} RENAME TO commits")
+                            return
+                if table_exists("commits_nullable_rebuild"):
+                    cur.execute("DROP TABLE IF EXISTS commits_nullable_rebuild")
+
+            def cleanup_stale_nullable_rebuild_tables() -> None:
+                for table_name in (
+                    "commits_part_id_not_null_backup",
+                    "commits_nullable_rebuild",
+                ):
+                    if table_exists(table_name):
+                        cur.execute(f"DROP TABLE IF EXISTS {table_name}")
+
+            def repair_backup_commit_foreign_keys() -> None:
+                stale_name = "commits_part_id_not_null_backup"
+                rows = cur.execute(
+                    """
+                    SELECT name,sql FROM sqlite_master
+                    WHERE type='table' AND sql LIKE ?
+                    ORDER BY name
+                    """,
+                    (f"%{stale_name}%",),
+                ).fetchall()
+                for row in rows:
+                    table_name = str(row["name"] if hasattr(row, "keys") else row[0])
+                    create_sql = str(row["sql"] if hasattr(row, "keys") else row[1])
+                    if table_name == "commits":
+                        continue
+                    temp_table = f"{table_name}_fk_rebuild"
+                    cur.execute(f"DROP TABLE IF EXISTS {temp_table}")
+                    repaired_sql = (
+                        create_sql
+                        .replace(f'"{stale_name}"', "commits")
+                        .replace(stale_name, "commits")
+                    )
+                    repaired_sql = repaired_sql.replace(
+                        f"CREATE TABLE {table_name}",
+                        f"CREATE TABLE {temp_table}",
+                        1,
+                    ).replace(
+                        f'CREATE TABLE "{table_name}"',
+                        f'CREATE TABLE "{temp_table}"',
+                        1,
+                    )
+                    cur.execute(repaired_sql)
+                    columns = [
+                        str(col[1])
+                        for col in cur.execute(f"PRAGMA table_info({table_name})").fetchall()
+                    ]
+                    if columns:
+                        column_csv = ", ".join(columns)
+                        cur.execute(
+                            f"INSERT INTO {temp_table} ({column_csv}) "
+                            f"SELECT {column_csv} FROM {table_name}"
+                        )
+                    cur.execute(f"DROP TABLE {table_name}")
+                    cur.execute(f"ALTER TABLE {temp_table} RENAME TO {table_name}")
+
+            def make_commits_part_id_nullable() -> None:
+                columns = cur.execute("PRAGMA table_info(commits)").fetchall()
+                part_column = next((col for col in columns if col[1] == "part_id"), None)
+                if part_column is None or not int(part_column[3] or 0):
+                    return
+                temp_table = "commits_nullable_rebuild"
+                cur.execute(f"DROP TABLE IF EXISTS {temp_table}")
+                column_defs = []
+                column_names = []
+                for col in columns:
+                    name = str(col[1])
+                    column_names.append(name)
+                    col_type = str(col[2] or "TEXT")
+                    if int(col[5] or 0):
+                        if name == "id":
+                            column_defs.append("id INTEGER PRIMARY KEY AUTOINCREMENT")
+                        else:
+                            column_defs.append(f"{name} {col_type} PRIMARY KEY")
+                        continue
+                    definition = f"{name} {col_type}"
+                    if name != "part_id" and int(col[3] or 0):
+                        definition += " NOT NULL"
+                    default_value = col[4]
+                    if default_value is not None:
+                        definition += f" DEFAULT {default_value}"
+                    column_defs.append(definition)
+                cur.execute(f"CREATE TABLE {temp_table} ({', '.join(column_defs)})")
+                column_csv = ", ".join(column_names)
+                cur.execute(
+                    f"INSERT INTO {temp_table} ({column_csv}) SELECT {column_csv} FROM commits"
+                )
+                cur.execute("DROP TABLE commits")
+                cur.execute(f"ALTER TABLE {temp_table} RENAME TO commits")
+
+            repair_interrupted_nullable_rebuild()
+            repair_backup_commit_foreign_keys()
+            cleanup_stale_nullable_rebuild_tables()
+
             try:
                 if not has_column("commits", "step_compare_enabled"):
                     cur.execute("ALTER TABLE commits ADD COLUMN step_compare_enabled INTEGER DEFAULT 0")
@@ -41,11 +154,33 @@ class CommitRepository:
                     cur.execute("ALTER TABLE commits ADD COLUMN step_error TEXT")
                 if not has_column("commits", "step_face_map_path"):
                     cur.execute("ALTER TABLE commits ADD COLUMN step_face_map_path TEXT")
+                if not has_column("commits", "object_iteration_id"):
+                    cur.execute("ALTER TABLE commits ADD COLUMN object_iteration_id INTEGER")
+                if not has_column("commits", "cad_document_id"):
+                    cur.execute("ALTER TABLE commits ADD COLUMN cad_document_id INTEGER")
+                if not has_column("commits", "creo_file_version"):
+                    cur.execute("ALTER TABLE commits ADD COLUMN creo_file_version INTEGER")
+                cur.execute(
+                    """
+                    UPDATE commits
+                    SET creo_file_version=CAST(substr(filename, length(base_file_name) + 2) AS INTEGER)
+                    WHERE creo_file_version IS NULL
+                      AND base_file_name IS NOT NULL
+                      AND filename LIKE base_file_name || '.%'
+                      AND substr(filename, length(base_file_name) + 2) GLOB '[0-9]*'
+                    """
+                )
+            except Exception:
+                pass
+
+            try:
+                make_commits_part_id_nullable()
             except Exception:
                 pass
 
             try:
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_commits_step_part_project ON commits(part_id, project_id)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_commits_cad_document ON commits(cad_document_id, project_id)")
             except Exception:
                 pass
 
@@ -75,6 +210,9 @@ class CommitRepository:
         step_diff_status=None,
         step_error=None,
         step_face_map_path=None,
+        object_iteration_id=None,
+        cad_document_id=None,
+        creo_file_version=None,
     ) -> int:
         with self.get_conn() as conn:
             cur = conn.cursor()
@@ -83,9 +221,10 @@ class CommitRepository:
                     part_id, type, filename, file_path, base_file_name, designer, message,
                     committed_by, status, committed_at, signature, project_id, title, commit_id,
                     step_compare_enabled, step_file_path, step_prev_file_path, step_diff_path,
-                    step_diff_summary, step_diff_status, step_error, step_face_map_path
+                    step_diff_summary, step_diff_status, step_error, step_face_map_path,
+                    object_iteration_id, cad_document_id, creo_file_version
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 part_id,
                 part_type,
@@ -109,6 +248,9 @@ class CommitRepository:
                 step_diff_status,
                 step_error,
                 step_face_map_path,
+                object_iteration_id,
+                cad_document_id,
+                creo_file_version,
             ))
             return cur.lastrowid
 
@@ -420,6 +562,9 @@ class CommitRepository:
             'step_diff_status',
             'step_error',
             'step_face_map_path',
+            'object_iteration_id',
+            'cad_document_id',
+            'creo_file_version',
         ]
         filtered = {k: data.get(k) for k in keys}
         return Commit(**filtered)

@@ -194,44 +194,199 @@ class TraceabilityRepository:
         try:
             if not self._table_exists(conn, "commits"):
                 return
+            commit_columns = self._table_columns(conn, "commits")
+            has_projects = self._table_exists(conn, "projects")
+            has_users = self._table_exists(conn, "users")
+            has_bom = self._table_exists(conn, "bom")
+
+            if self._table_exists(conn, "commit_groups"):
+                if not has_projects:
+                    conn.execute("UPDATE commit_groups SET project_id=NULL")
+                else:
+                    conn.execute(
+                        """
+                        UPDATE commit_groups
+                        SET project_id=NULL
+                        WHERE project_id IS NOT NULL
+                          AND NOT EXISTS (
+                              SELECT 1 FROM projects p WHERE p.id=commit_groups.project_id
+                          )
+                        """
+                    )
+                if not has_users:
+                    conn.execute("UPDATE commit_groups SET author_id=NULL")
+                    conn.execute("UPDATE commit_groups SET reverted_by=NULL")
+                else:
+                    conn.execute(
+                        """
+                        UPDATE commit_groups
+                        SET author_id=NULL
+                        WHERE author_id IS NOT NULL
+                          AND NOT EXISTS (
+                              SELECT 1 FROM users u WHERE u.id=commit_groups.author_id
+                          )
+                        """
+                    )
+                    conn.execute(
+                        """
+                        UPDATE commit_groups
+                        SET reverted_by=NULL
+                        WHERE reverted_by IS NOT NULL
+                          AND NOT EXISTS (
+                              SELECT 1 FROM users u WHERE u.id=commit_groups.reverted_by
+                          )
+                        """
+                    )
+
+            if self._table_exists(conn, "commit_file_links"):
+                conn.execute(
+                    """
+                    DELETE FROM commit_file_links
+                    WHERE commit_group_id IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM commit_groups cg
+                          WHERE cg.id=commit_file_links.commit_group_id
+                      )
+                    """
+                )
+                conn.execute(
+                    """
+                    DELETE FROM commit_file_links
+                    WHERE commit_row_id IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM commits c
+                          WHERE c.id=commit_file_links.commit_row_id
+                      )
+                    """
+                )
+                if not has_bom:
+                    conn.execute("UPDATE commit_file_links SET part_id=NULL")
+                else:
+                    conn.execute(
+                        """
+                        UPDATE commit_file_links
+                        SET part_id=NULL
+                        WHERE part_id IS NOT NULL
+                          AND NOT EXISTS (
+                              SELECT 1 FROM bom b WHERE b.id=commit_file_links.part_id
+                          )
+                        """
+                    )
+
+            project_join = (
+                "LEFT JOIN projects p ON p.id=c.project_id"
+                if has_projects and "project_id" in commit_columns else ""
+            )
+            project_expr = (
+                "p.id"
+                if has_projects and "project_id" in commit_columns else "NULL"
+            )
+            user_join = (
+                "LEFT JOIN users u ON u.id=c.committed_by"
+                if has_users and "committed_by" in commit_columns else ""
+            )
+            author_expr = (
+                "MAX(CASE WHEN u.id IS NOT NULL THEN c.committed_by END)"
+                if has_users and "committed_by" in commit_columns else "NULL"
+            )
+            title_expr = "MAX(c.title)" if "title" in commit_columns else "NULL"
+            message_expr = "MAX(c.message)" if "message" in commit_columns else "NULL"
+            created_expr = (
+                "MIN(c.committed_at)" if "committed_at" in commit_columns
+                else "MIN(COALESCE(c.created_at, datetime('now')))"
+                if "created_at" in commit_columns else "datetime('now')"
+            )
+            status_expr = "MAX(c.status)" if "status" in commit_columns else "NULL"
             conn.execute(
-                """
+                f"""
                 INSERT OR IGNORE INTO commit_groups(
                     project_id, commit_id, title, message, author_id, created_at, status
                 )
                 SELECT
-                    c.project_id,
-                    c.commit_id,
-                    MAX(c.title),
-                    MAX(c.message),
-                    MAX(c.committed_by),
-                    MIN(c.committed_at),
-                    MAX(c.status)
-                FROM commits c
-                WHERE c.commit_id IS NOT NULL AND TRIM(c.commit_id) <> ''
-                GROUP BY c.project_id, c.commit_id
-                """
-            )
-            conn.execute(
-                """
-                UPDATE commit_groups
-                SET status = COALESCE(
-                    (SELECT MAX(c.status) FROM commits c
-                     WHERE c.project_id IS commit_groups.project_id
-                       AND c.commit_id = commit_groups.commit_id),
-                    status
+                    grouped.project_id,
+                    grouped.commit_id,
+                    grouped.title,
+                    grouped.message,
+                    grouped.author_id,
+                    grouped.created_at,
+                    grouped.status
+                FROM (
+                    SELECT
+                        {project_expr} AS project_id,
+                        c.commit_id AS commit_id,
+                        {title_expr} AS title,
+                        {message_expr} AS message,
+                        {author_expr} AS author_id,
+                        {created_expr} AS created_at,
+                        {status_expr} AS status
+                    FROM commits c
+                    {project_join}
+                    {user_join}
+                    WHERE c.commit_id IS NOT NULL AND TRIM(c.commit_id) <> ''
+                    GROUP BY {project_expr}, c.commit_id
+                ) grouped
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM commit_groups cg
+                    WHERE cg.commit_id = grouped.commit_id
+                      AND cg.project_id IS grouped.project_id
                 )
                 """
             )
+            if "status" in commit_columns:
+                status_project_join = (
+                    "LEFT JOIN projects p ON p.id=c.project_id"
+                    if has_projects and "project_id" in commit_columns else ""
+                )
+                status_project_match = (
+                    "p.id IS commit_groups.project_id"
+                    if has_projects and "project_id" in commit_columns
+                    else "commit_groups.project_id IS NULL"
+                )
+                conn.execute(
+                    f"""
+                    UPDATE commit_groups
+                    SET status = COALESCE(
+                        (SELECT MAX(c.status)
+                         FROM commits c
+                         {status_project_join}
+                         WHERE {status_project_match}
+                           AND c.commit_id = commit_groups.commit_id),
+                        status
+                    )
+                    """
+                )
+            link_project_join = (
+                "LEFT JOIN projects p ON p.id=c.project_id"
+                if has_projects and "project_id" in commit_columns else ""
+            )
+            link_project_expr = (
+                "p.id"
+                if has_projects and "project_id" in commit_columns else "NULL"
+            )
+            bom_join = (
+                "LEFT JOIN bom b ON b.id=c.part_id"
+                if has_bom and "part_id" in commit_columns else ""
+            )
+            part_expr = (
+                "b.id"
+                if has_bom and "part_id" in commit_columns else "NULL"
+            )
             conn.execute(
-                """
+                f"""
                 INSERT OR IGNORE INTO commit_file_links(commit_group_id, commit_row_id, part_id, change_type)
-                SELECT cg.id, c.id, c.part_id, 'modified'
+                SELECT cg.id, c.id, {part_expr}, 'modified'
                 FROM commits c
+                {link_project_join}
+                {bom_join}
                 JOIN commit_groups cg
                   ON cg.commit_id = c.commit_id
-                 AND (cg.project_id IS c.project_id OR cg.project_id = c.project_id)
+                 AND cg.project_id IS {link_project_expr}
                 WHERE c.commit_id IS NOT NULL AND TRIM(c.commit_id) <> ''
+                  AND NOT EXISTS (
+                      SELECT 1 FROM commit_file_links l
+                      WHERE l.commit_group_id = cg.id
+                        AND l.commit_row_id = c.id
+                  )
                 """
             )
         finally:
@@ -726,6 +881,7 @@ class TraceabilityRepository:
                     c.committed_at,
                     c.message,
                     b.name AS part_name,
+                    b.part_number,
                     b.aes_number,
                     COALESCE(cfl.change_type, 'modified') AS change_type
                 FROM commits c

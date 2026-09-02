@@ -19,10 +19,16 @@ class UserRepository:
                 CREATE TABLE IF NOT EXISTS user_settings (
                     user_id INTEGER PRIMARY KEY,
                     last_project_id INTEGER,
+                    cli_enabled INTEGER DEFAULT 0,
                     updated_at TEXT DEFAULT (datetime('now'))
                 )
                 """
             )
+            cols = self._table_columns(conn, "user_settings")
+            if "cli_enabled" not in cols:
+                conn.execute(
+                    "ALTER TABLE user_settings ADD COLUMN cli_enabled INTEGER DEFAULT 0"
+                )
         except Exception:
             pass
 
@@ -68,6 +74,42 @@ class UserRepository:
                 return int(val) if val is not None else None
             except Exception:
                 return None
+
+    def set_cli_enabled(self, user_id: int, enabled: bool) -> None:
+        """Enable/disable the controlled Nexus CLI panel for one user."""
+        with self.get_conn() as conn:
+            self._ensure_user_settings_table(conn)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO user_settings(user_id, cli_enabled, updated_at)
+                    VALUES(?, ?, datetime('now'))
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        cli_enabled=excluded.cli_enabled,
+                        updated_at=datetime('now')
+                    """,
+                    (int(user_id), 1 if enabled else 0),
+                )
+            except Exception:
+                cur = conn.execute(
+                    "UPDATE user_settings SET cli_enabled=?, updated_at=datetime('now') WHERE user_id=?",
+                    (1 if enabled else 0, int(user_id)),
+                )
+                if getattr(cur, "rowcount", 0) == 0:
+                    conn.execute(
+                        "INSERT INTO user_settings(user_id, cli_enabled, updated_at) VALUES(?, ?, datetime('now'))",
+                        (int(user_id), 1 if enabled else 0),
+                    )
+
+    def is_cli_enabled(self, user_id: int) -> bool:
+        """Return whether the controlled Nexus CLI panel is enabled for a user."""
+        with self.get_conn() as conn:
+            self._ensure_user_settings_table(conn)
+            row = conn.execute(
+                "SELECT cli_enabled FROM user_settings WHERE user_id=?",
+                (int(user_id),),
+            ).fetchone()
+            return bool(row and int(row["cli_enabled"] or 0))
 
     def _table_columns(self, conn, table_name: str) -> set[str]:
         try:

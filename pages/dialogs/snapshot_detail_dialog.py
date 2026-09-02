@@ -1,47 +1,80 @@
 import os, json
 from PyQt5.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QTreeWidget, QTreeWidgetItem, QLineEdit, QFileDialog, QMessageBox
+    QAbstractItemView, QDialog, QFrame, QHeaderView, QVBoxLayout, QHBoxLayout,
+    QLabel, QPushButton, QTreeWidget, QTreeWidgetItem, QLineEdit, QFileDialog,
+    QMessageBox, QWidget
 )
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QFont, QIcon
+
+from pages.dialogs.professional_style import (
+    apply_professional_dialog_style,
+    make_dialog_header,
+    make_section_title,
+)
+
 
 class SnapshotDetailDialog(QDialog):
     def __init__(self, snapshot_id, data, working_dir=None):
         super().__init__()
+        self.data = dict(data or {})
+        data = self.data
         self.setWindowTitle(f"Snapshot #{snapshot_id} Details")
         self.resize(900, 600)
-        self.data = data
+        self.setMinimumSize(720, 480)
         self.working_dir = working_dir
+        apply_professional_dialog_style(self)
 
-        layout = QVBoxLayout(self)
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        root_layout.addWidget(
+            make_dialog_header(
+                str(data.get("snapshot_name") or f"Snapshot #{snapshot_id}"),
+                f"Snapshot #{snapshot_id}  |  Created by {data.get('created_by') or '-'}  |  "
+                f"{data.get('created_at') or '-'}",
+                kicker="CONFIGURATION BASELINE",
+            )
+        )
 
-        # === Snapshot Summary ===
-        summary = QLabel(f"""
-            <h3>Snapshot: {data['snapshot_name']}</h3>
-            <p><b>Created by:</b> {data['created_by']}<br>
-            <b>Date:</b> {data['created_at']}</p>
-        """)
-        layout.addWidget(summary)
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(7)
+        root_layout.addWidget(body, 1)
 
         # === Search bar ===
+        search_bar = QFrame()
+        search_bar.setObjectName("professionalCommandBar")
         search_layout = QHBoxLayout()
+        search_layout.setContentsMargins(8, 6, 8, 6)
+        search_bar.setLayout(search_layout)
+        search_layout.addWidget(QLabel("Find"))
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Search file...")
+        self.search_input.setPlaceholderText("Filter by file name or path")
         self.search_input.textChanged.connect(self.filter_tree)
-        search_layout.addWidget(self.search_input)
-        layout.addLayout(search_layout)
+        search_layout.addWidget(self.search_input, 1)
+        layout.addWidget(search_bar)
 
         # === File Tree ===
+        layout.addWidget(make_section_title("SNAPSHOT CONTENT"))
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["File / Folder", "Size (KB)", "Path"])
-        self.tree.setColumnWidth(0, 300)
-        layout.addWidget(self.tree)
+        self.tree.setHeaderLabels(["File / Object", "Size / Priority", "Modified / State", "Path / Checksum"])
+        self.tree.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setUniformRowHeights(True)
+        self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.tree.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.tree.header().setSectionResizeMode(3, QHeaderView.Stretch)
+        layout.addWidget(self.tree, 1)
 
         self.load_snapshot_content()
 
         # === Buttons ===
-        btn_layout = QHBoxLayout()
+        footer = QFrame()
+        footer.setObjectName("professionalFooter")
+        btn_layout = QHBoxLayout(footer)
+        btn_layout.setContentsMargins(8, 6, 8, 6)
+        btn_layout.setSpacing(6)
         btn_compare = QPushButton("Compare with Working Dir")
         btn_export = QPushButton("Export JSON")
         btn_copy = QPushButton("Copy All Paths")
@@ -61,7 +94,7 @@ class SnapshotDetailDialog(QDialog):
         btn_layout.addWidget(btn_copy)
         btn_layout.addStretch()
         btn_layout.addWidget(btn_close)
-        layout.addLayout(btn_layout)
+        layout.addWidget(footer)
 
     # === Load Snapshot Data into Tree ===
     def load_snapshot_content(self):

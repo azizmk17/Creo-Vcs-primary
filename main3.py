@@ -1,10 +1,40 @@
 import sys
-from PyQt5.QtWidgets import QLabel, QInputDialog, QApplication, QMainWindow, QSystemTrayIcon, QStackedWidget, QAction, QToolBar, QMessageBox, QComboBox, QFileDialog, QProgressBar
-from PyQt5.QtCore import Qt, QTimer, QPropertyAnimation, pyqtSignal, QObject, QThread, QEventLoop
+from PyQt5.QtWidgets import (
+    QAction,
+    QActionGroup,
+    QApplication,
+    QComboBox,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QSizePolicy,
+    QStackedWidget,
+    QStyle,
+    QSystemTrayIcon,
+    QToolBar,
+    QVBoxLayout,
+    QWidget,
+)
+from PyQt5.QtCore import (
+    QEventLoop,
+    QObject,
+    QPropertyAnimation,
+    QSize,
+    Qt,
+    QThread,
+    QTimer,
+    pyqtSignal,
+)
 from PyQt5.QtGui import QPainter, QColor, QPen, QPixmap, QFont, QIcon
-from PyQt5.QtWidgets import QWidget, QVBoxLayout, QPushButton
 import math
 import os
+import json
 
 
 # ── PyInstaller resource helper ─────────────────────────────────────────────
@@ -22,6 +52,50 @@ APP_NAME = "Nexus"
 APP_ICON_PATH = "assets/pictures/nexus_logo.ico"
 APP_LOADER_LOGO_PATH = "assets/pictures/nexus_logo_glow.png"
 APP_TOOLBAR_LOGO_PATH = "assets/pictures/nexus_logo_glow.png"
+
+
+PAGE_PRESENTATION = {
+    6: (
+        "MANAGEMENT",
+        "Manager Dashboard",
+        "Executive readiness, manufacturing health, risks and workload",
+    ),
+    0: (
+        "PRODUCT DATA",
+        "Product Structure",
+        "CAD Documents, Item masters, EBOM structure and engineering associations",
+    ),
+    1: (
+        "CHANGE CONTROL",
+        "Commit Workspace",
+        "Stage, review and submit controlled engineering content",
+    ),
+    2: (
+        "QUALITY",
+        "Issue Center",
+        "Engineering issues, validation evidence and resolution traceability",
+    ),
+    3: (
+        "SYSTEM CONTROL",
+        "Diagnostics",
+        "Workspace integrity, unmanaged content and corrective actions",
+    ),
+    4: (
+        "ADMINISTRATION",
+        "Administration",
+        "Users, permissions and controlled application settings",
+    ),
+    5: (
+        "CONFIGURATION",
+        "Snapshots",
+        "Recorded product configurations and comparison baselines",
+    ),
+    7: (
+        "AUTOMATION",
+        "Engineer CLI",
+        "Controlled command panel for API-driven PDM operations",
+    ),
+}
 
 
 def _run_migrations_safely():
@@ -51,6 +125,7 @@ from core.repositories.user_repository import UserRepository
 from core.services.project_service import ProjectService
 from core.services.ui_permission import UIPermissionHelper
 from core.session_manager import SessionManager
+from core.repositories.project_event_repository import ProjectEventRepository
 from core.startup_gate import MINIMUM_STARTUP_LOADER_MS, StartupGate
 
 
@@ -260,12 +335,14 @@ _PRODUCTION_PUBLIC_KEY = "fc941ecde885df70bfdcd71498d80fa8cfa7fe340c40c2292bbfc2
 
 
 class BomGUI(QMainWindow):
-    """Modern BOM Management Application with Toolbar Navigation"""
+    """Nexus PDM desktop shell with persistent module and product context."""
 
     def __init__(self, startup_progress=None):
         super().__init__()
-        self.setWindowTitle(f"BOM Manager - {APP_NAME}")
+        self.setObjectName("nexusMainWindow")
+        self.setWindowTitle(f"{APP_NAME} PDM — Product Development")
         self.resize(1400, 900)
+        self.setMinimumSize(1100, 700)
         self.setWindowIcon(QIcon(_resource_path(APP_ICON_PATH)))
 
         self.session = SessionManager()
@@ -273,18 +350,31 @@ class BomGUI(QMainWindow):
         # Services
         self.bom_service = BomService(BomRepository(), BomChildrenRepository(), LockRepository(), SignatureRepository())
         self.project_service = ProjectService()
+        self.project_event_repo = ProjectEventRepository()
+        self._sync_last_event_id = 0
+        self._sync_poll_in_progress = False
 
         self._project_combo_initializing = False
         self._projects_for_user = []
         self._ensure_valid_current_project()
 
-        # Toolbar with navigation
+        # Persistent application shell
+        self._configure_status_bar()
         self.init_toolbar()
 
-        # Status bar
-        self.statusBar().showMessage("Ready")
-
         self._build_ui(startup_progress=startup_progress)
+        self._start_project_event_sync()
+
+    def _configure_status_bar(self):
+        status = self.statusBar()
+        status.setObjectName("applicationStatusBar")
+        status.setSizeGripEnabled(False)
+        status.showMessage("Ready")
+
+        self.status_identity_label = QLabel()
+        self.status_identity_label.setObjectName("statusIdentity")
+        self.status_identity_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        status.addPermanentWidget(self.status_identity_label)
 
     def _ensure_valid_current_project(self):
         """If the session points to a missing project directory, clear it and continue startup."""
@@ -341,9 +431,47 @@ class BomGUI(QMainWindow):
         self.update()
 
     def _build_ui(self, startup_progress=None):
-         # Central stacked pages
+        # Controlled workspace header and central page stack.
+        workspace = QWidget()
+        workspace.setObjectName("applicationWorkspace")
+        workspace_layout = QVBoxLayout(workspace)
+        workspace_layout.setContentsMargins(0, 0, 0, 0)
+        workspace_layout.setSpacing(0)
+
+        workspace_header = QFrame()
+        workspace_header.setObjectName("workspaceHeader")
+        header_layout = QHBoxLayout(workspace_header)
+        header_layout.setContentsMargins(16, 6, 16, 7)
+        header_layout.setSpacing(14)
+
+        heading_block = QVBoxLayout()
+        heading_block.setContentsMargins(0, 0, 0, 0)
+        heading_block.setSpacing(0)
+        self.workspace_module_label = QLabel()
+        self.workspace_module_label.setObjectName("workspaceModule")
+        self.workspace_title_label = QLabel()
+        self.workspace_title_label.setObjectName("workspaceTitle")
+        heading_block.addWidget(self.workspace_module_label)
+        heading_block.addWidget(self.workspace_title_label)
+        header_layout.addLayout(heading_block)
+
+        self.workspace_subtitle_label = QLabel()
+        self.workspace_subtitle_label.setObjectName("workspaceSubtitle")
+        self.workspace_subtitle_label.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Preferred
+        )
+        header_layout.addWidget(self.workspace_subtitle_label, 1)
+
+        self.workspace_position_label = QLabel()
+        self.workspace_position_label.setObjectName("workspacePosition")
+        self.workspace_position_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        header_layout.addWidget(self.workspace_position_label)
+        workspace_layout.addWidget(workspace_header)
+
         self.pages = QStackedWidget()
-        self.setCentralWidget(self.pages)
+        self.pages.setObjectName("workspacePages")
+        workspace_layout.addWidget(self.pages, 1)
+        self.setCentralWidget(workspace)
 
         def startup_stage(message):
             if startup_progress:
@@ -359,10 +487,14 @@ class BomGUI(QMainWindow):
         startup_stage("Loading engineering issues...")
         from pages.issue_page import EngineeringIssuePage
         self.issue_page = EngineeringIssuePage()
+        startup_stage("Preparing manager dashboard...")
+        from pages.dashboard_page import ManagerDashboardPage
+        self.dashboard_page = ManagerDashboardPage()
         startup_stage("Preparing secondary tools...")
         self.diag_page = self._lazy_page_placeholder("Diagnostic")
         self.admin_page = self._lazy_page_placeholder("Admin")
         self.snap_page = self._lazy_page_placeholder("Snapshots")
+        self.cli_page = self._lazy_page_placeholder("Engineer CLI")
         startup_stage("Connecting application modules...")
         self.pages.addWidget(self.bom_page)
         self.pages.addWidget(self.commit_page)
@@ -370,10 +502,13 @@ class BomGUI(QMainWindow):
         self.pages.addWidget(self.diag_page)
         self.pages.addWidget(self.admin_page)
         self.pages.addWidget(self.snap_page)
+        self.pages.addWidget(self.dashboard_page)
+        self.pages.addWidget(self.cli_page)
         self.bom_page.issue_requested.connect(self.open_issues_for_part)
         self.bom_page.create_issue_requested.connect(self.create_issue_for_part)
         self.issue_page.issue_changed.connect(self.bom_page.refresh_issue_indicators)
         self.issue_page.issue_changed.connect(lambda _part_ids: self.commit_page._refresh_resolved_issues())
+        self.issue_page.issue_changed.connect(lambda _part_ids: self.dashboard_page.refresh())
 
         
 
@@ -381,11 +516,9 @@ class BomGUI(QMainWindow):
         # self.notifier.notify.connect(self.show_toast)
 
         
-        # Apply styles
-        #info: self.apply_styles()
-
-        with open(_resource_path("modern_theme.qss"), "r") as f:
-            self.setStyleSheet(f.read())
+        # Apply the shared enterprise visual system after all shell widgets exist.
+        self.apply_styles()
+        self._set_active_shell_page(0)
 
         # Restore last project
         #self.load_last_project()
@@ -409,10 +542,11 @@ class BomGUI(QMainWindow):
 
     def _lazy_page_placeholder(self, label):
         page = QWidget()
+        page.setObjectName("lazyWorkspacePage")
         layout = QVBoxLayout(page)
         layout.setAlignment(Qt.AlignCenter)
         msg = QLabel(f"{label} will load when opened.")
-        msg.setStyleSheet("font-size: 14px; color: #66758a;")
+        msg.setObjectName("workspaceEmptyState")
         layout.addWidget(msg)
         return page
 
@@ -440,122 +574,270 @@ class BomGUI(QMainWindow):
 
 
     def init_toolbar(self):
-        toolbar = QToolBar("Main Toolbar")
+        self.navigation_actions = {}
+        self.navigation_action_group = QActionGroup(self)
+        self.navigation_action_group.setExclusive(True)
+
+        def standard_icon(name):
+            pixmap = getattr(QStyle, name, QStyle.SP_FileIcon)
+            return self.style().standardIcon(pixmap)
+
+        def add_action(
+            target_toolbar,
+            label,
+            callback,
+            icon_name,
+            *,
+            role="utility",
+            page_index=None,
+            tooltip="",
+        ):
+            action = QAction(standard_icon(icon_name), label, self)
+            if tooltip:
+                action.setToolTip(tooltip)
+            if page_index is not None:
+                action.setCheckable(True)
+                self.navigation_action_group.addAction(action)
+                self.navigation_actions[int(page_index)] = action
+            action.triggered.connect(callback)
+            target_toolbar.addAction(action)
+            button = target_toolbar.widgetForAction(action)
+            if button is not None:
+                button.setProperty("shellRole", role)
+                button.setCursor(Qt.PointingHandCursor)
+            return action
+
+        toolbar = QToolBar("Application Navigation")
+        toolbar.setObjectName("applicationBar")
         toolbar.setMovable(False)
+        toolbar.setFloatable(False)
+        toolbar.setContextMenuPolicy(Qt.PreventContextMenu)
+        toolbar.setIconSize(QSize(14, 14))
+        toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.addToolBar(Qt.TopToolBarArea, toolbar)
+        self.application_toolbar = toolbar
+
+        brand = QWidget()
+        brand.setObjectName("shellBrand")
+        brand_layout = QHBoxLayout(brand)
+        brand_layout.setContentsMargins(2, 0, 10, 0)
+        brand_layout.setSpacing(5)
 
         logo_label = QLabel()
+        logo_label.setObjectName("shellLogo")
         logo = QPixmap(_resource_path(APP_TOOLBAR_LOGO_PATH))
         if not logo.isNull():
-            logo_label.setPixmap(logo.scaled(34, 34, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        logo_label.setFixedSize(42, 36)
+            logo_label.setPixmap(
+                logo.scaled(23, 23, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            )
+        logo_label.setFixedSize(25, 25)
         logo_label.setAlignment(Qt.AlignCenter)
-        logo_label.setToolTip(APP_NAME)
-        logo_label.setStyleSheet("padding: 0 4px;")
-        toolbar.addWidget(logo_label)
 
-        # Navigation buttons
-        bom_action = QAction("BOM", self)
-        bom_action.triggered.connect(lambda: self.switch_page(0))
-        toolbar.addAction(bom_action)
-
-        commit_action = QAction("Commit", self)
-        commit_action.triggered.connect(lambda: self.switch_page(1))
-        toolbar.addAction(commit_action)
-
-        issue_action = QAction("Issue Center", self)
-        issue_action.triggered.connect(lambda: self.switch_page(2))
-        toolbar.addAction(issue_action)
-
+        brand_text = QVBoxLayout()
+        brand_text.setContentsMargins(0, 0, 0, 0)
+        brand_text.setSpacing(0)
+        brand_title = QLabel("NEXUS")
+        brand_title.setObjectName("shellBrandTitle")
+        brand_caption = QLabel("PRODUCT DATA MANAGEMENT")
+        brand_caption.setObjectName("shellBrandCaption")
+        brand_text.addWidget(brand_title)
+        brand_text.addWidget(brand_caption)
+        brand_layout.addWidget(logo_label)
+        brand_layout.addLayout(brand_text)
+        toolbar.addWidget(brand)
         toolbar.addSeparator()
 
-        # Refresh button
-        refresh_action = QAction("Refresh", self)
-        refresh_action.triggered.connect(self.refresh_current_page)
-        toolbar.addAction(refresh_action)
-
-        
-
-        # Export button
-        export_action = QAction("Export", self)
-        export_action.triggered.connect(self.export_current)
-        toolbar.addAction(export_action)
-
+        structure_action = add_action(
+            toolbar,
+            "Structure",
+            lambda _checked=False: self.switch_page(0),
+            "SP_FileDialogListView",
+            role="navigation",
+            page_index=0,
+            tooltip="Open CAD Structure and EBOM / Item Structure",
+        )
+        add_action(
+            toolbar,
+            "Dashboard",
+            lambda _checked=False: self.switch_page(6),
+            "SP_FileDialogDetailedView",
+            role="navigation",
+            page_index=6,
+            tooltip="Open manager dashboard for readiness, risks and workload",
+        )
+        add_action(
+            toolbar,
+            "Commit",
+            lambda _checked=False: self.switch_page(1),
+            "SP_DialogApplyButton",
+            role="navigation",
+            page_index=1,
+            tooltip="Open the controlled commit workspace",
+        )
+        add_action(
+            toolbar,
+            "Issues",
+            lambda _checked=False: self.switch_page(2),
+            "SP_MessageBoxWarning",
+            role="navigation",
+            page_index=2,
+            tooltip="Open engineering issues and traceability",
+        )
         toolbar.addSeparator()
+        add_action(
+            toolbar,
+            "Diagnostics",
+            lambda _checked=False: self.switch_page(3),
+            "SP_ComputerIcon",
+            role="navigation",
+            page_index=3,
+            tooltip="Inspect workspace and managed-content integrity",
+        )
+        add_action(
+            toolbar,
+            "Snapshots",
+            lambda _checked=False: self.switch_page(5),
+            "SP_DirOpenIcon",
+            role="navigation",
+            page_index=5,
+            tooltip="Open recorded configuration snapshots",
+        )
+        if self._engineer_cli_available():
+            add_action(
+                toolbar,
+                "CLI",
+                lambda _checked=False: self.switch_page(7),
+                "SP_CommandLink",
+                role="navigation",
+                page_index=7,
+                tooltip="Open the controlled Nexus Engineer CLI",
+            )
 
-        diag_action = QAction("Diagnostic", self)
-        diag_action.triggered.connect(lambda: self.switch_page(3))
-        toolbar.addAction(diag_action)
-
-        snap_action = QAction("Snapshots", self)
-        snap_action.triggered.connect(lambda: self.switch_page(5))
-        toolbar.addAction(snap_action)
-
-        # Admin page button — only visible to admin-level users
-        # Uses UIPermissionHelper so it covers both is_admin DB flag and "admin" role name
+        # Admin remains permission-controlled; only its presentation moved.
         if UIPermissionHelper().can("admin_panel"):
-            admin_action = QAction("Admin", self)
-            admin_action.triggered.connect(lambda: self.switch_page(4))
-            toolbar.addAction(admin_action)
+            add_action(
+                toolbar,
+                "Administration",
+                lambda _checked=False: self.switch_page(4),
+                "SP_FileDialogInfoView",
+                role="navigation",
+                page_index=4,
+                tooltip="Open controlled administration functions",
+            )
 
         toolbar.addSeparator()
+        add_action(
+            toolbar,
+            "CAD Viewer",
+            self._launch_cad_viewer,
+            "SP_DesktopIcon",
+            role="workspace",
+            tooltip="Open the Advanced CAD Viewer (STEP / IGES / BREP)",
+        )
 
-        # CAD Viewer button  — launches the advanced 3D viewer in a subprocess
-        cad_viewer_action = QAction("CAD Viewer", self)
-        cad_viewer_action.setToolTip("Open the Advanced CAD Viewer (STEP / IGES / BREP)")
-        cad_viewer_action.triggered.connect(self._launch_cad_viewer)
-        toolbar.addAction(cad_viewer_action)
+        spacer = QWidget()
+        spacer.setObjectName("shellNavigationSpacer")
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        toolbar.addWidget(spacer)
 
+        add_action(
+            toolbar,
+            "Refresh",
+            self.refresh_current_page,
+            "SP_BrowserReload",
+            role="utility",
+            tooltip="Refresh the current workspace",
+        )
+        add_action(
+            toolbar,
+            "Export",
+            self.export_current,
+            "SP_DialogSaveButton",
+            role="utility",
+            tooltip="Export from the current workspace",
+        )
         toolbar.addSeparator()
+        self.shell_user_label = QLabel(
+            str(getattr(self.session, "username", None) or "SIGNED IN").upper()
+        )
+        self.shell_user_label.setObjectName("shellUserLabel")
+        self.shell_user_label.setToolTip("Current Nexus user")
+        toolbar.addWidget(self.shell_user_label)
+        structure_action.setChecked(True)
 
-        # === Project / Version Selectors ===
+        # Product/version context is deliberately separated from module navigation.
+        self.addToolBarBreak(Qt.TopToolBarArea)
+        context_toolbar = QToolBar("Product Context")
+        context_toolbar.setObjectName("contextBar")
+        context_toolbar.setMovable(False)
+        context_toolbar.setFloatable(False)
+        context_toolbar.setContextMenuPolicy(Qt.PreventContextMenu)
+        self.addToolBar(Qt.TopToolBarArea, context_toolbar)
+        self.context_toolbar = context_toolbar
+
+        context_title = QLabel("PRODUCT CONTEXT")
+        context_title.setObjectName("contextBarTitle")
+        context_toolbar.addWidget(context_title)
+        context_toolbar.addSeparator()
+
         self.project_combo = QComboBox()
+        self.project_combo.setObjectName("productSelector")
         self.project_combo.currentIndexChanged.connect(self._on_project_root_changed)
-        self.project_combo.setMinimumWidth(210)
-        self.project_combo.setMaximumWidth(270)
+        self.project_combo.setMinimumWidth(220)
+        self.project_combo.setMaximumWidth(310)
 
         self.project_version_combo = QComboBox()
+        self.project_version_combo.setObjectName("versionSelector")
         self.project_version_combo.currentIndexChanged.connect(self.save_current_project)
-        self.project_version_combo.setMinimumWidth(90)
-        self.project_version_combo.setMaximumWidth(130)
+        self.project_version_combo.setMinimumWidth(105)
+        self.project_version_combo.setMaximumWidth(145)
 
-        project_caption = QLabel("Project")
-        project_caption.setStyleSheet("color: #e5e7eb; font-weight: 700; padding-left: 6px;")
-        toolbar.addWidget(project_caption)
-        toolbar.addWidget(self.project_combo)
+        project_caption = QLabel("PRODUCT")
+        project_caption.setObjectName("shellFieldCaption")
+        context_toolbar.addWidget(project_caption)
+        context_toolbar.addWidget(self.project_combo)
 
-        version_caption = QLabel("Version")
-        version_caption.setStyleSheet("color: #e5e7eb; font-weight: 700; padding-left: 6px;")
-        toolbar.addWidget(version_caption)
-        toolbar.addWidget(self.project_version_combo)
+        version_caption = QLabel("VERSION")
+        version_caption.setObjectName("shellFieldCaption")
+        context_toolbar.addWidget(version_caption)
+        context_toolbar.addWidget(self.project_version_combo)
 
-        new_version_button = QPushButton("Create New Version")
+        new_version_button = QPushButton("New Version...")
+        new_version_button.setObjectName("contextPrimaryAction")
         new_version_button.setCursor(Qt.PointingHandCursor)
-        new_version_button.setStyleSheet("""
-            QPushButton {
-                min-height: 26px;
-                padding: 3px 10px;
-                border-radius: 5px;
-                background: #ffffff;
-                border: 1px solid #cfd6df;
-                color: #111827;
-                font-weight: 700;
-            }
-            QPushButton:hover { background: #f3f5f7; }
-        """)
         new_version_button.clicked.connect(self.show_new_version_dialog)
-        toolbar.addWidget(new_version_button)
-        toolbar.addSeparator()
+        context_toolbar.addWidget(new_version_button)
 
-        
-        # Create and store the project label
+        context_spacer = QWidget()
+        context_spacer.setObjectName("shellContextSpacer")
+        context_spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        context_toolbar.addWidget(context_spacer)
+
         self.project_label = QLabel("Current: None")
-        self.project_label.setMinimumWidth(160)
-        self.project_label.setMaximumWidth(260)
+        self.project_label.setObjectName("currentProjectLabel")
+        self.project_label.setMinimumWidth(180)
+        self.project_label.setMaximumWidth(360)
+        self.project_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.project_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.project_label.setStyleSheet("color: #ffffff; font-weight: 700; padding: 0 8px;")
-        toolbar.addWidget(self.project_label)
-        self.refresh_project_selector(select_project_id=self.session.project_id, reload_on_change=False)
+        context_toolbar.addWidget(self.project_label)
+        self.refresh_project_selector(
+            select_project_id=self.session.project_id, reload_on_change=False
+        )
+
+    def _set_active_shell_page(self, index):
+        module, title, subtitle = PAGE_PRESENTATION.get(
+            int(index), ("WORKSPACE", "Nexus", "Product data management")
+        )
+        if hasattr(self, "workspace_module_label"):
+            self.workspace_module_label.setText(module)
+            self.workspace_title_label.setText(title)
+            self.workspace_subtitle_label.setText(subtitle)
+            self.workspace_position_label.setText(
+                f"{int(index) + 1:02d} / {len(PAGE_PRESENTATION):02d}"
+            )
+        action = getattr(self, "navigation_actions", {}).get(int(index))
+        if action is not None:
+            action.setChecked(True)
 
     def _project_root_id(self, project: dict):
         root_id = project.get("root_project_id") or project.get("id")
@@ -807,6 +1089,7 @@ class BomGUI(QMainWindow):
                     self.user_repo.set_last_project_id(self.session.user_id, None)
             except Exception:
                 pass
+            self._reset_project_event_sync_cursor()
             try:
                 self.refresh_project_label()
             except Exception:
@@ -846,6 +1129,7 @@ class BomGUI(QMainWindow):
                     self.user_repo.set_last_project_id(self.session.user_id, None)
             except Exception:
                 pass
+            self._reset_project_event_sync_cursor()
 
             # revert UI selection to placeholder if present
             try:
@@ -870,6 +1154,7 @@ class BomGUI(QMainWindow):
                 self.user_repo.set_last_project_id(self.session.user_id, pid)
         except Exception:
             pass
+        self._reset_project_event_sync_cursor()
         self.refresh_project_label()
         self.statusBar().showMessage(f"Project set to: {self.project_label.text().replace('Current: ', '')}")
         self.reload_main_window()
@@ -878,15 +1163,40 @@ class BomGUI(QMainWindow):
         p = self.project_service.get_project_by_id(self.session.project_id) or {}
         if not p:
             label = "None"
+            version = "-"
         else:
             label = self._clean_project_display_name(p.get("name") or str(self.session.project_id), p.get("version_label") or "")
-        self.project_label.setText(f"Current: {label}")
+            version = str(p.get("version_label") or "-").strip() or "-"
+
+        self._active_project_label = label
+        if hasattr(self, "project_label"):
+            context = label if label == "None" else f"{label}  /  {version}"
+            self.project_label.setText(f"Current: {context}")
+            self.project_label.setToolTip(
+                f"Active product: {label}\nActive version: {version}"
+            )
+
+        if hasattr(self, "status_identity_label"):
+            username = str(getattr(self.session, "username", None) or "Signed in")
+            self.status_identity_label.setText(
+                f"{username.upper()}   |   PRODUCT {label}   |   VERSION {version}"
+            )
 
     def switch_page(self, index):
+        if int(index) == 7 and not self._engineer_cli_available():
+            QMessageBox.warning(
+                self,
+                "Engineer CLI",
+                "The Engineer CLI is disabled for this user. Ask an administrator to activate it.",
+            )
+            return
         self._ensure_lazy_page(index)
         self.pages.setCurrentIndex(index)
-        page_names = ["BOM", "Commit", "Issue Center", "Diagnostic", "Admin", "Snapshot"]
-        self.statusBar().showMessage(f"Switched to {page_names[index]} page")
+        self._set_active_shell_page(index)
+        _module, title, _subtitle = PAGE_PRESENTATION.get(
+            int(index), ("WORKSPACE", "Nexus", "")
+        )
+        self.statusBar().showMessage(f"{title} ready")
 
     def _ensure_lazy_page(self, index):
         if index == 3 and not getattr(self, "_diag_loaded", False):
@@ -919,6 +1229,31 @@ class BomGUI(QMainWindow):
             self.snap_page = page
             self.pages.insertWidget(5, self.snap_page)
             self._snap_loaded = True
+        elif index == 7 and not getattr(self, "_cli_loaded", False):
+            self.statusBar().showMessage("Loading Engineer CLI...")
+            QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+            from pages.engineer_cli_page import EngineerCliPage
+            page = EngineerCliPage()
+            self.pages.removeWidget(self.cli_page)
+            self.cli_page.deleteLater()
+            self.cli_page = page
+            self.pages.insertWidget(7, self.cli_page)
+            self._cli_loaded = True
+            try:
+                self.cli_page.refresh_context()
+            except Exception:
+                pass
+
+    def _engineer_cli_available(self):
+        try:
+            if UIPermissionHelper().can("admin_panel"):
+                return True
+            user_id = getattr(self.session, "user_id", None)
+            if not user_id:
+                return False
+            return bool(self.user_repo.is_cli_enabled(int(user_id)))
+        except Exception:
+            return False
 
     def open_issues_for_part(self, part_id):
         self.issue_page.open_for_part(int(part_id))
@@ -949,17 +1284,205 @@ class BomGUI(QMainWindow):
 
     def refresh_current_page(self):
         current_index = self.pages.currentIndex()
-        self.pages.setCurrentIndex(0)
         if current_index == 0:
-            self.bom_page.load_tree()
+            try:
+                self.bom_page._bom_mode = "ebom"
+                self.bom_page.bom_mode_selector.setCurrentIndex(
+                    self.bom_page.bom_mode_selector.findData("ebom")
+                )
+                self.bom_page._load_released_ebom_tree()
+            except Exception:
+                self.bom_page.load_tree()
             self.statusBar().showMessage("BOM refreshed")
+            return
         elif current_index == 1:
             self.statusBar().showMessage("Commit page refreshed")
+            return
         elif current_index == 2:
             self.issue_page.refresh()
             self.statusBar().showMessage("Issue Center refreshed")
+            return
+        elif current_index == 6:
+            self.dashboard_page.refresh()
+            self.statusBar().showMessage("Manager Dashboard refreshing")
+            return
+        elif current_index == 7:
+            if getattr(self, "_cli_loaded", False):
+                self.cli_page.refresh_context()
+            self.statusBar().showMessage("Engineer CLI ready")
+            return
 
-        self.reload_main_window()
+    def _start_project_event_sync(self):
+        """Start lightweight multi-user invalidation polling.
+
+        Only the append-only project_events table is polled.  Expensive BOM,
+        CAD, commit, and dashboard refreshes happen only after a new event is
+        detected, and then only for affected rows/panels.
+        """
+        try:
+            self._sync_last_event_id = self.project_event_repo.current_id(
+                self.session.project_id
+            )
+        except Exception:
+            self._sync_last_event_id = 0
+        timer = getattr(self, "_project_event_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setInterval(4000)
+            timer.timeout.connect(self._poll_project_events)
+            self._project_event_timer = timer
+        if not timer.isActive():
+            timer.start()
+
+    def _reset_project_event_sync_cursor(self):
+        try:
+            self._sync_last_event_id = self.project_event_repo.current_id(
+                self.session.project_id
+            )
+        except Exception:
+            self._sync_last_event_id = 0
+
+    def _poll_project_events(self):
+        if self._sync_poll_in_progress or not getattr(self.session, "project_id", None):
+            return
+        self._sync_poll_in_progress = True
+        try:
+            events = self.project_event_repo.list_after(
+                int(getattr(self, "_sync_last_event_id", 0) or 0),
+                self.session.project_id,
+                limit=100,
+            )
+            if not events:
+                return
+            self._sync_last_event_id = max(
+                int(event.get("id") or 0) for event in events
+            )
+            external = [
+                event for event in events
+                if event.get("actor_user_id") is None
+                or self.session.user_id is None
+                or int(event.get("actor_user_id") or 0) != int(self.session.user_id)
+            ]
+            if external:
+                self._apply_project_events(external)
+            try:
+                if self._sync_last_event_id % 250 == 0:
+                    self.project_event_repo.prune_old()
+            except Exception:
+                pass
+        finally:
+            self._sync_poll_in_progress = False
+
+    @staticmethod
+    def _event_ints(payload: dict, *keys) -> list[int]:
+        result = []
+        seen = set()
+        for key in keys:
+            values = payload.get(key) if isinstance(payload, dict) else None
+            if values is None:
+                continue
+            if not isinstance(values, (list, tuple, set)):
+                values = [values]
+            for value in values:
+                try:
+                    number = int(value)
+                except Exception:
+                    continue
+                if number not in seen:
+                    seen.add(number)
+                    result.append(number)
+        return result
+
+    def _apply_project_events(self, events: list[dict]):
+        item_ids = set()
+        cad_ids = set()
+        commit_changed = False
+        issue_changed = False
+        structure_changed = False
+        messages = []
+
+        for event in events:
+            payload = event.get("payload") or {}
+            event_type = str(event.get("event_type") or "").strip()
+            item_ids.update(self._event_ints(payload, "item_ids", "affected_part_ids"))
+            cad_ids.update(self._event_ints(payload, "cad_document_ids", "affected_cad_document_ids"))
+            if event_type.startswith("commit."):
+                commit_changed = True
+                if event_type in {"commit.validated", "commit.merged", "commit.reverted"}:
+                    issue_changed = True
+            if event_type.startswith("item.") or event_type.startswith("cad."):
+                structure_changed = structure_changed or event_type in {
+                    "item.created", "item.deleted", "cad.created", "cad.deleted",
+                    "item.structure_changed", "cad.structure_changed",
+                }
+            if len(messages) < 2:
+                label = event_type.replace("_", " ").replace(".", " ")
+                messages.append(label)
+
+        item_list = sorted(item_ids)
+        cad_list = sorted(cad_ids)
+        try:
+            bom_page = getattr(self, "bom_page", None)
+            if bom_page:
+                deleted_items = [
+                    int((event.get("payload") or {}).get("deleted_item_id"))
+                    for event in events
+                    if str(event.get("event_type") or "") == "item.deleted"
+                    and (event.get("payload") or {}).get("deleted_item_id") is not None
+                ]
+                for deleted_id in deleted_items:
+                    try:
+                        if hasattr(bom_page, "_remove_part_from_trees"):
+                            bom_page._remove_part_from_trees(int(deleted_id))
+                    except Exception:
+                        pass
+                if structure_changed and hasattr(bom_page, "refresh_after_pdm_merge"):
+                    bom_page.refresh_after_pdm_merge(item_list, cad_list)
+                elif hasattr(bom_page, "_refresh_pdm_context_rows"):
+                    bom_page._refresh_pdm_context_rows(
+                        item_ids=item_list,
+                        cad_ids=cad_list,
+                        refresh_cad_branches=bool(cad_list),
+                    )
+                elif item_list and hasattr(bom_page, "refresh_parts_after_merge"):
+                    bom_page.refresh_parts_after_merge(item_list)
+                if issue_changed and hasattr(bom_page, "refresh_issue_indicators"):
+                    bom_page.refresh_issue_indicators(item_list)
+        except Exception:
+            pass
+
+        try:
+            commit_page = getattr(self, "commit_page", None)
+            if commit_changed and commit_page and hasattr(commit_page, "load_pending_commits"):
+                commit_page.load_pending_commits()
+                if hasattr(commit_page, "load_commit_history"):
+                    commit_page.load_commit_history()
+        except Exception:
+            pass
+
+        try:
+            if issue_changed and getattr(self, "issue_page", None):
+                self.issue_page.refresh()
+        except Exception:
+            pass
+
+        try:
+            if (commit_changed or item_list or cad_list) and getattr(self, "dashboard_page", None):
+                self.dashboard_page.refresh()
+        except Exception:
+            pass
+
+        try:
+            if getattr(self, "_cli_loaded", False) and getattr(self, "cli_page", None):
+                self.cli_page.refresh_context()
+        except Exception:
+            pass
+
+        if messages:
+            suffix = "" if len(events) == 1 else f" (+{len(events) - 1})"
+            self.statusBar().showMessage(
+                f"Live sync: {', '.join(messages)}{suffix}", 5000
+            )
 
     def export_current(self):
         current_index = self.pages.currentIndex()
@@ -967,6 +1490,8 @@ class BomGUI(QMainWindow):
             self.bom_page.export_bom()
         elif current_index == 1:
             QMessageBox.information(self, "Info", "Commit export coming soon!")
+        elif current_index == 6:
+            self.dashboard_page.export_dashboard()
 
 
     
@@ -974,10 +1499,12 @@ class BomGUI(QMainWindow):
     def show_toast(parent, message):
         toast = QLabel(message, parent)
         toast.setStyleSheet("""
-            background-color: #333;
-            color: white;
-            padding: 8px 15px;
-            border-radius: 8px;
+            background-color: #20364b;
+            color: #ffffff;
+            border: 1px solid #4f6476;
+            border-radius: 2px;
+            padding: 7px 12px;
+            font: 9pt "Segoe UI";
         """)
         toast.setWindowFlags(Qt.ToolTip)
         toast.adjustSize()
@@ -998,169 +1525,14 @@ class BomGUI(QMainWindow):
         toast._anim.start()
         QTimer.singleShot(2500, toast.close)
 
-
-
-
-    #idea: how to use css to style the app
-    #idea: self.add_file_btn = QPushButton("📂 Add File(s)")
-    #idea: self.add_file_btn.setObjectName("primary")   # blue button
-
-    #idea: self.remove_part_btn = QPushButton("❌ Remove Selected")
-    #idea: self.remove_part_btn.setObjectName("danger")  # red button
-
-    #idea: self.revert_btn = QPushButton("↩️ Revert Selected Commit")
-    #idea: self.revert_btn.setObjectName("neutral")      # gray button
-
-
     def apply_styles(self):
-        self.setStyleSheet("""
-            QMainWindow {
-                background-color: #f4f6f8;  /* light gray app background */
-            }
-
-            /* --- Toolbar --- */
-            QToolBar {
-                background: #1f2937;  /* dark slate */
-                border: none;
-                padding: 7px 10px;
-                spacing: 8px;
-            }
-
-            QToolButton {
-                color: #e5e7eb;  /* light gray text */
-                padding: 6px 14px;
-                border-radius: 6px;
-            }
-            QToolButton:hover {
-                background: #374151;
-            }
-            QToolButton:pressed {
-                background: #2563eb;
-            }
-
-            /* --- ComboBox --- */
-            QComboBox {
-                background: #ffffff;
-                color: #111827;
-                padding: 6px;
-                border-radius: 6px;
-                border: 1px solid #d1d5db;
-                min-width: 120px;
-            }
-            QComboBox:hover {
-                border: 1px solid #3b82f6;
-            }
-
-            /* --- GroupBox --- */
-            QGroupBox {
-                font-weight: bold;
-                color: #111827;
-                border: 1px solid #d1d5db;
-                border-radius: 8px;
-                margin-top: 10px;
-                background: #ffffff;
-                padding: 8px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                subcontrol-position: top left;
-                padding: 0 6px;
-                color: #2563eb;
-            }
-
-            /* --- ListWidget --- */
-            QListWidget {
-                background: #ffffff;
-                border: 1px solid #d1d5db;
-                border-radius: 6px;
-                padding: 6px;
-            }
-            QListWidget::item {
-                padding: 6px;
-            }
-            QListWidget::item:selected {
-                background: #2563eb;
-                color: white;
-                border-radius: 4px;
-            }
-            QListWidget::item:hover {
-                background: #e5e7eb;
-            }
-
-            /* --- PushButtons --- */
-            QPushButton {
-                padding: 6px 14px;
-                border-radius: 6px;
-                border: none;
-                font-weight: 500;
-            }
-
-            /* Default hover/pressed */
-            QPushButton:hover:enabled {
-                opacity: 0.9;
-            }
-            QPushButton:pressed:enabled {
-                transform: scale(0.97);
-            }
-
-            /* Primary (blue) */
-            QPushButton#primary {
-                background-color: #2563eb;
-                color: white;
-            }
-            QPushButton#primary:hover:enabled {
-                background-color: #1d4ed8;
-            }
-            QPushButton#primary:disabled {
-                background-color: #93c5fd;  /* soft blue */
-                color: #f3f4f6;             /* light gray text */
-            }
-                           
-            /* secondary (green) */
-            QPushButton#secondary {
-                background-color: #38A169;
-                color: white;
-            }
-            QPushButton#secondary:hover:enabled {
-                background-color: #2F855A;
-            }
-            QPushButton#secondary:disabled {
-                background-color: #9FD8BB;  /* soft green */
-                color: #f3f4f6;             /* light gray text */
-            }
-
-            /* Danger (red) */
-            QPushButton#danger {
-                background-color: #dc2626;
-                color: white;
-            }
-            QPushButton#danger:hover:enabled {
-                background-color: #b91c1c;
-            }
-            QPushButton#danger:disabled {
-                background-color: #fca5a5;  /* soft red */
-                color: #f3f4f6;
-            }
-
-            /* Neutral (gray) */
-            QPushButton#neutral {
-                background-color: #e5e7eb;
-                color: #111827;
-            }
-            QPushButton#neutral:hover:enabled {
-                background-color: #d1d5db;
-            }
-            QPushButton#neutral:disabled {
-                background-color: #f3f4f6;  /* pale gray */
-                color: #9ca3af;             /* muted text */
-            }
-
-        """)
-
-        
-
-
-
+        try:
+            with open(
+                _resource_path("modern_theme.qss"), "r", encoding="utf-8"
+            ) as handle:
+                self.setStyleSheet(handle.read())
+        except OSError as exc:
+            print(f"[ui] stylesheet warning: {exc}")
 
 if __name__ == "__main__":
 

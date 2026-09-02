@@ -4,6 +4,8 @@ from core.session_manager import SessionManager
 from core.repositories.commit_repository import CommitRepository
 from core.repositories.snapshot_repository import SnapshotRepository
 from core.repositories.bom_repository import BomRepository
+from core.repositories.pdm_repository import PdmRepository
+from core.services.pdm_service import PdmService
 
 import re
 import json
@@ -20,6 +22,103 @@ class DiagService:
         self.repo = CommitRepository()
         self.snap_repo = SnapshotRepository()
         self.bom_repo = BomRepository()
+        self.pdm_repo = PdmRepository()
+        self.pdm_service = PdmService(repository=self.pdm_repo)
+
+    @staticmethod
+    def _creo_base_name(filename: str) -> str:
+        """Return ``name.ext`` from a Creo versioned filename ``name.ext.N``."""
+        name = os.path.basename(str(filename or ""))
+        match = re.match(r"^(.*\.(?:prt|asm|drw))\.\d+$", name, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+        stem, suffix = os.path.splitext(name)
+        return stem if suffix.lstrip(".").isdigit() else name
+
+    def list_supplier_packages(self):
+        if not self.session.project_id:
+            return []
+        return self.bom_repo.list_supplier_packages(int(self.session.project_id))
+
+    def list_cad_dependencies(self):
+        if not self.session.project_id:
+            return []
+        return self.bom_repo.list_cad_dependencies(int(self.session.project_id))
+
+    def _managed_cad_bases(self) -> set[str]:
+        if not self.session.project_id:
+            return set()
+        pdm_repo = getattr(self, "pdm_repo", None)
+        if pdm_repo is None:
+            db_name = getattr(self.bom_repo, "db_name", None)
+            pdm_repo = PdmRepository(db_name) if db_name else PdmRepository()
+            self.pdm_repo = pdm_repo
+        return {
+            pdm_repo.normalize_base(
+                row.get("file_name") or row.get("base_file_name")
+            )
+            for row in pdm_repo.list_cad_documents(
+                int(self.session.project_id)
+            )
+            if row.get("file_name") or row.get("base_file_name")
+        }
+
+    @require_permission("merge")
+    def assign_cad_dependencies(self, owner_bom_id: int, filenames) -> int:
+        if not self.session.project_id:
+            raise ValueError("No active project.")
+        dependencies = []
+        for filename in filenames or []:
+            name = os.path.basename(str(filename or ""))
+            if not is_creo_file(name):
+                raise ValueError(f"Not a versioned Creo file: {name}")
+            dependencies.append({
+                "base_file_name": self._creo_base_name(name),
+                "original_filename": name,
+            })
+        count = self.bom_repo.assign_cad_dependencies(
+            int(self.session.project_id),
+            int(owner_bom_id),
+            dependencies,
+            assigned_by=self.session.user_id,
+        )
+        pdm_service = getattr(self, "pdm_service", None)
+        if pdm_service is None:
+            db_name = getattr(self.bom_repo, "db_name", None)
+            pdm_service = PdmService(db_name) if db_name else PdmService()
+            self.pdm_service = pdm_service
+        for dependency in dependencies:
+            pdm_service.register_supplier_dependency(
+                int(self.session.project_id), int(owner_bom_id),
+                dependency["original_filename"],
+            )
+        return count
+
+    @require_permission("merge")
+    def remove_cad_dependencies(self, dependency_ids) -> int:
+        if not self.session.project_id:
+            raise ValueError("No active project.")
+        wanted = {int(value) for value in dependency_ids or []}
+        records = [
+            row for row in self.bom_repo.list_cad_dependencies(
+                int(self.session.project_id)
+            )
+            if int(row.get("id") or 0) in wanted
+        ]
+        count = self.bom_repo.remove_cad_dependencies(
+            int(self.session.project_id), wanted
+        )
+        pdm_service = getattr(self, "pdm_service", None)
+        if pdm_service is None:
+            db_name = getattr(self.bom_repo, "db_name", None)
+            pdm_service = PdmService(db_name) if db_name else PdmService()
+            self.pdm_service = pdm_service
+        for record in records:
+            pdm_service.unregister_supplier_dependency(
+                int(self.session.project_id), int(record["owner_bom_id"]),
+                str(record.get("base_file_name") or record.get("original_filename") or ""),
+            )
+        return count
 
     # --- Filesystem ---
     def list_commit_folders(self, commits_dir):
@@ -173,10 +272,20 @@ class DiagService:
             integrated_filenames = set(self.repo.get_forced_integrated_filenames(self.session.project_id) or [])
         except Exception:
             integrated_filenames = set()
+        dependency_bases = self.bom_repo.dependency_base_names(
+            int(self.session.project_id)
+        )
+        managed_cad_bases = self._managed_cad_bases()
 
         results = []
 
         for part in working_files:
+            if self.pdm_repo.normalize_base(
+                self._creo_base_name(part)
+            ) in managed_cad_bases:
+                continue
+            if self._creo_base_name(part).casefold() in dependency_bases:
+                continue
             
             # allowlist check first
             if part in integrated_filenames:
@@ -365,7 +474,19 @@ class DiagService:
                 linked_files.add(part.base_file_name)
             if part.base_drw_name:
                 linked_files.add(part.base_drw_name)
-        orphan_files = [f for f in all_files if os.path.splitext(f)[0] not in linked_files and is_creo_file(os.path.join(working_dir, f))]
+        linked_files = {str(value).casefold() for value in linked_files if value}
+        linked_files.update(
+            self.bom_repo.dependency_base_names(int(self.session.project_id))
+        )
+        managed_cad_bases = self._managed_cad_bases()
+        orphan_files = [
+            f for f in all_files
+            if self._creo_base_name(f).casefold() not in linked_files
+            and self.pdm_repo.normalize_base(
+                self._creo_base_name(f)
+            ) not in managed_cad_bases
+            and is_creo_file(os.path.join(working_dir, f))
+        ]
         results = [(f, "🗑 Orphan", "Not linked to any BOM part") for f in orphan_files
         ]
         return results

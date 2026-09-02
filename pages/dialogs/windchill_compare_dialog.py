@@ -159,7 +159,7 @@ class WindchillCompareSetupDialog(QDialog):
 
     def _part_match_keys(self, part) -> list[tuple[str, str]]:
         keys = []
-        for attr in ("aes_number", "part_number", "base_file_name", "filename", "name"):
+        for attr in ("part_number", "aes_number", "base_file_name", "filename", "name"):
             value = str(getattr(part, attr, "") or "").strip().lower()
             if value:
                 keys.append((attr, value))
@@ -259,11 +259,13 @@ class WindchillCompareSetupDialog(QDialog):
         if self._syncing_version_widgets:
             return
         project = self._project_by_id.get(int(combo.currentData() or -1))
-        number.setText(str(project.get("name") or "-") if project else "-")
         if self.whole_bom:
+            number.setText(str(project.get("name") or "-") if project else "-")
             name.setText("Whole BOM")
         else:
+            source_number = str(getattr(self._source_part, "part_number", "") or "-")
             source_name = str(getattr(self._source_part, "name", "") or "-")
+            number.setText(source_number)
             name.setText(source_name)
         self._syncing_version_widgets = True
         try:
@@ -378,8 +380,8 @@ class WindchillPartCompareDialog(QDialog):
     def _part_sort_text(self, part) -> str:
         return str(
             getattr(part, "sort_order", "")
-            or getattr(part, "aes_number", "")
             or getattr(part, "part_number", "")
+            or getattr(part, "aes_number", "")
             or getattr(part, "name", "")
             or getattr(part, "id", "")
         ).lower()
@@ -392,7 +394,8 @@ class WindchillPartCompareDialog(QDialog):
         state = str(project.get("version_state") or "WIP").strip() or "WIP"
         node = {
             "id": f"project:{project.get('id')}",
-            "aes_number": project.get("name") or f"Project {project.get('id')}",
+            "part_number": project.get("name") or f"Project {project.get('id')}",
+            "aes_number": "",
             "name": "Whole BOM",
             "revision": label,
             "status": state,
@@ -412,7 +415,7 @@ class WindchillPartCompareDialog(QDialog):
     def _node_key(self, node: dict[str, Any] | None) -> str:
         if not node:
             return ""
-        for key in ("aes_number", "part_number", "base_file_name", "filename", "name"):
+        for key in ("part_number", "aes_number", "base_file_name", "filename", "name"):
             val = str(node.get(key) or "").strip().lower()
             if val:
                 return val
@@ -443,15 +446,20 @@ class WindchillPartCompareDialog(QDialog):
     def _identity(self, node):
         if not node:
             return ""
-        number = node.get("aes_number") or node.get("part_number") or node.get("filename") or node.get("id")
+        number = node.get("part_number") or "No Number"
         name = node.get("name") or ""
         rev = node.get("revision") or ""
         state = node.get("status") or "Design"
-        return f"{number}, {name}, {rev} ({state})"
+        identity = f"{number}, {name}, {rev} ({state})"
+        aes_number = str(node.get("aes_number") or "").strip()
+        if aes_number and aes_number.casefold() != str(number or "").strip().casefold():
+            identity += f" | AES {aes_number}"
+        return identity
 
     def _compare_nodes(self, left, right) -> ComparePair:
         attr_fields = [
-            ("Number", "aes_number"),
+            ("Number", "part_number"),
+            ("AES Number", "aes_number"),
             ("Name", "name"),
             ("Version", "revision"),
             ("State", "status"),
@@ -670,7 +678,8 @@ class WindchillPartCompareDialog(QDialog):
 
     def _fill_attrs(self, tree, node, diffs, left: bool):
         rows = [
-            ("Number", "aes_number"),
+            ("Number", "part_number"),
+            ("AES Number", "aes_number"),
             ("Name", "name"),
             ("Version", "revision"),
             ("State", "status"),

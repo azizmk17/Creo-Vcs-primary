@@ -12,3 +12,5 @@ class PartFile:
     created_by: Optional[int] = None
     created_at: Optional[str] = None
     active_version_id: Optional[int] = None
+    file_role: str = "document"
+    deleted_at: Optional[str] = None

@@ -1,38 +1,81 @@
 from PyQt5.QtWidgets import (
-    QDialog, QVBoxLayout, QLabel, QPushButton, QTreeWidget, QTreeWidgetItem, QMessageBox
+    QAbstractItemView, QDialog, QFrame, QHBoxLayout, QLabel, QPushButton,
+    QTreeWidget, QTreeWidgetItem, QMessageBox, QVBoxLayout, QWidget
 )
 from PyQt5.QtCore import Qt
+
+from pages.dialogs.professional_style import (
+    apply_professional_dialog_style,
+    make_dialog_header,
+    make_section_title,
+    set_banner_style,
+)
+
 
 class AddChildDialog(QDialog):
     def __init__(self, main_window):
         super().__init__(main_window)
         self.main_window = main_window
-        self.setWindowTitle("Add Child Relation")
+        self.setWindowTitle("Insert Existing Item")
         self.setModal(True)
+        self.resize(780, 580)
+        self.setMinimumSize(660, 460)
+        apply_professional_dialog_style(self)
 
         self.parent_item = None
         self.child_item = None
 
-        layout = QVBoxLayout()
-        self.info_label = QLabel("Select the PARENT part from the tree.")
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        root_layout.addWidget(
+            make_dialog_header(
+                "Insert Existing Item",
+                "Select a parent occurrence, then select the Item to insert below it.",
+                kicker="ITEM STRUCTURE",
+            )
+        )
+
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(7)
+        root_layout.addWidget(body, 1)
+
+        self.info_label = QLabel("Select the parent Item occurrence from the structure.")
+        set_banner_style(self.info_label, "neutral")
         layout.addWidget(self.info_label)
 
         # Use the same tree structure as main window (read-only clone)
+        layout.addWidget(make_section_title("AVAILABLE ITEM STRUCTURE"))
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Name", "AES", "Type", "Status"])
+        self.tree.setHeaderLabels(["Item", "Number", "Type", "Status"])
         self.tree.setSelectionMode(QTreeWidget.SingleSelection)
-        layout.addWidget(self.tree)
+        self.tree.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setUniformRowHeights(True)
+        layout.addWidget(self.tree, 1)
 
         # Copy items from the main tree (no logic duplication)
         self.clone_tree(self.main_window.tree, self.tree)
 
-        # Buttons
+        # Command footer
+        footer = QFrame()
+        footer.setObjectName("professionalFooter")
+        footer_layout = QHBoxLayout(footer)
+        footer_layout.setContentsMargins(8, 6, 8, 6)
+        footer_layout.setSpacing(6)
         self.confirm_btn = QPushButton("Confirm")
+        self.confirm_btn.setObjectName("primary")
         self.confirm_btn.setEnabled(False)
         self.confirm_btn.clicked.connect(self.confirm_selection)
-        layout.addWidget(self.confirm_btn)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        footer_layout.addStretch(1)
+        footer_layout.addWidget(cancel_btn)
+        footer_layout.addWidget(self.confirm_btn)
+        layout.addWidget(footer)
 
-        self.setLayout(layout)
         self.tree.itemClicked.connect(self.on_item_clicked)
 
     def clone_tree(self, source_tree, target_tree):
@@ -52,10 +95,10 @@ class AddChildDialog(QDialog):
     def on_item_clicked(self, item):
         if self.parent_item is None:
             self.parent_item = item
-            self.info_label.setText("Parent selected.\nNow select the child part.")
+            self.info_label.setText("Parent selected.\nNow select the child Item.")
         elif self.child_item is None:
             if item == self.parent_item:
-                QMessageBox.warning(self, "Invalid", "Parent and child cannot be the same part.")
+                QMessageBox.warning(self, "Invalid Selection", "Parent and child cannot be the same Item.")
                 return
             self.child_item = item
             self.info_label.setText(
@@ -66,7 +109,7 @@ class AddChildDialog(QDialog):
             # Reset if user clicks a third time
             self.parent_item = item
             self.child_item = None
-            self.info_label.setText("Select the PARENT part again.")
+            self.info_label.setText("Select the parent Item again.")
             self.confirm_btn.setEnabled(False)
 
     def confirm_selection(self):

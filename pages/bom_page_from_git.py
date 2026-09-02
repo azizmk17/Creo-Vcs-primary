@@ -3166,8 +3166,8 @@ class BomPage(QWidget):
         dialog = PartDialog(self)
         if dialog.exec_() == QDialog.Accepted:
             part_data = dialog.get_data()
-            if not part_data["aes_number"] or not part_data["name"]:
-                QMessageBox.warning(self, "Validation Error", "AES Number and Name are required fields.")
+            if not part_data["name"]:
+                QMessageBox.warning(self, "Validation Error", "Name is required.")
                 return
             try:
                 added= self.bom_service.add_part(part_data)
@@ -3207,8 +3207,8 @@ class BomPage(QWidget):
         dialog = PartDialog(self, part_data)
         if dialog.exec_() == QDialog.Accepted:
             updated_data = dialog.get_data()
-            if not updated_data["aes_number"] or not updated_data["name"]:
-                QMessageBox.warning(self, "Validation Error", "AES Number and Name are required fields.")
+            if not updated_data["name"]:
+                QMessageBox.warning(self, "Validation Error", "Name is required.")
                 return
             try:
                 self.bom_service.update_part(id, updated_data)

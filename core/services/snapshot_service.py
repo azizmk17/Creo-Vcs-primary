@@ -4,6 +4,7 @@ import json
 from core.repositories.snapshot_repository import SnapshotRepository
 from core.repositories.commit_repository import CommitRepository
 from core.repositories.issue_repository import IssueRepository
+from core.repositories.bom_revision_repository import BomRevisionRepository
 from utils import (
     is_creo_file
 )
@@ -13,6 +14,7 @@ class SnapshotService:
         self.repo = SnapshotRepository()
         self.commit_rep = CommitRepository()
         self.issue_repo = IssueRepository()
+        self.revision_repo = BomRevisionRepository()
 
     def generate_snapshot_data(self, working_dir, project_id):
         """Scans ONLY the main working directory and builds file list with metadata."""
@@ -47,6 +49,7 @@ class SnapshotService:
             "working_dir": working_dir,
             "files": files,
             "issue_state": self.issue_repo.snapshot_state(int(project_id)),
+            "object_configuration": self.revision_repo.project_configuration_snapshot(int(project_id)),
         }
 
     def create_snapshot(self, project_id, name, description, working_dir, user):
@@ -93,10 +96,28 @@ class SnapshotService:
             )
         ]
 
+        config1 = data1.get("object_configuration") or {}
+        config2 = data2.get("object_configuration") or {}
+        objects1 = {
+            str(row.get("part_number") or row.get("aes_number") or row.get("id")): row
+            for row in config1.get("objects", [])
+        }
+        objects2 = {
+            str(row.get("part_number") or row.get("aes_number") or row.get("id")): row
+            for row in config2.get("objects", [])
+        }
+        object_versions_changed = sorted(
+            key for key in set(objects1) & set(objects2)
+            if objects1[key].get("iteration_id") != objects2[key].get("iteration_id")
+        )
+        bindings_changed = (config1.get("bindings") or []) != (config2.get("bindings") or [])
+
         return {
             "added": added, "removed": removed, "modified": modified,
             "issue_added": issue_added, "issue_removed": issue_removed,
             "issue_changed": issue_changed,
+            "object_versions_changed": object_versions_changed,
+            "bindings_changed": bool(bindings_changed),
         }
 
 

@@ -167,7 +167,7 @@ class MetricCard(QFrame):
         super().__init__(parent)
         self.setStyleSheet(
             f"QFrame {{background:#fff;border:1px solid #d9dee7;border-left:4px solid {color};"
-            "border-radius:6px;} QLabel {border:none;background:transparent;}"
+            "border-radius:0;} QLabel {border:none;background:transparent;}"
         )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 8, 12, 8)
@@ -296,9 +296,10 @@ class EngineeringIssuePage(QWidget):
             pass
 
     def _build_ui(self):
+        self.setObjectName("issueCenterPage")
         root = QVBoxLayout(self)
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(8)
+        root.setContentsMargins(8, 7, 8, 8)
+        root.setSpacing(6)
 
         cards = QHBoxLayout()
         self.cards = {
@@ -315,13 +316,22 @@ class EngineeringIssuePage(QWidget):
         self.analytics_label.setWordWrap(True)
         self.analytics_label.setStyleSheet(
             "font-size:11px;color:#475569;background:#f8fafc;border:1px solid #d9dee7;"
-            "border-radius:4px;padding:5px;"
+            "border-radius:0;padding:5px 7px;"
         )
         root.addWidget(self.analytics_label)
 
-        filters = QHBoxLayout()
+        filter_panel = QFrame()
+        filter_panel.setObjectName("issueFilterPanel")
+        filter_layout = QVBoxLayout(filter_panel)
+        filter_layout.setContentsMargins(6, 5, 6, 5)
+        filter_layout.setSpacing(4)
+        primary_filters = QHBoxLayout()
+        primary_filters.setSpacing(4)
+        secondary_filters = QHBoxLayout()
+        secondary_filters.setSpacing(4)
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Search issue number, title, or description")
+        self.search_edit.setMinimumWidth(260)
         self.status_filter = QComboBox()
         self.status_filter.addItems(["All"] + list(ISSUE_STATUSES))
         self.priority_filter = QComboBox()
@@ -341,10 +351,6 @@ class EngineeringIssuePage(QWidget):
         self.date_filter.addItems(["All created dates", "Past 7 days", "Past 30 days"])
         self.overdue_filter = QComboBox()
         self.overdue_filter.addItems(["All dates", "Overdue"])
-        for widget in (self.search_edit, self.status_filter, self.priority_filter,
-                       self.assignee_filter, self.creator_filter, self.part_filter,
-                       self.date_filter, self.overdue_filter):
-            filters.addWidget(widget)
         refresh_btn = QPushButton("Refresh")
         refresh_btn.clicked.connect(self.refresh)
         all_btn = QPushButton("All Issues")
@@ -352,10 +358,28 @@ class EngineeringIssuePage(QWidget):
         new_btn = QPushButton("New Issue")
         new_btn.setObjectName("primary")
         new_btn.clicked.connect(self.create_issue)
-        filters.addWidget(refresh_btn)
-        filters.addWidget(all_btn)
-        filters.addWidget(new_btn)
-        root.addLayout(filters)
+        primary_filters.addWidget(QLabel("FIND"))
+        primary_filters.addWidget(self.search_edit, 1)
+        primary_filters.addWidget(QLabel("STATUS"))
+        primary_filters.addWidget(self.status_filter)
+        primary_filters.addWidget(QLabel("PRIORITY"))
+        primary_filters.addWidget(self.priority_filter)
+        primary_filters.addStretch()
+        primary_filters.addWidget(refresh_btn)
+        primary_filters.addWidget(all_btn)
+        primary_filters.addWidget(new_btn)
+        secondary_filters.addWidget(QLabel("ASSIGNED TO"))
+        secondary_filters.addWidget(self.assignee_filter)
+        secondary_filters.addWidget(QLabel("CREATED BY"))
+        secondary_filters.addWidget(self.creator_filter)
+        secondary_filters.addWidget(QLabel("AFFECTED ITEM"))
+        secondary_filters.addWidget(self.part_filter, 1)
+        secondary_filters.addWidget(QLabel("CREATED"))
+        secondary_filters.addWidget(self.date_filter)
+        secondary_filters.addWidget(self.overdue_filter)
+        filter_layout.addLayout(primary_filters)
+        filter_layout.addLayout(secondary_filters)
+        root.addWidget(filter_panel)
         self.search_edit.returnPressed.connect(self.refresh)
         self.status_filter.currentTextChanged.connect(self.refresh)
         self.priority_filter.currentTextChanged.connect(self.refresh)
@@ -366,7 +390,11 @@ class EngineeringIssuePage(QWidget):
         self.overdue_filter.currentIndexChanged.connect(self.refresh)
 
         splitter = QSplitter(Qt.Horizontal)
+        splitter.setObjectName("issueWorkspaceSplitter")
+        splitter.setHandleWidth(4)
+        splitter.setChildrenCollapsible(False)
         self.issue_table = QTableWidget()
+        self.issue_table.setObjectName("issueRegister")
         self.issue_table.setColumnCount(8)
         self.issue_table.setHorizontalHeaderLabels(
             ["Issue", "Title", "Status", "Priority", "Category", "Assigned To", "Due", "Affected Parts"]
@@ -377,13 +405,19 @@ class EngineeringIssuePage(QWidget):
         self.issue_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.issue_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.issue_table.setAlternatingRowColors(True)
+        self.issue_table.setShowGrid(False)
+        self.issue_table.verticalHeader().setVisible(False)
+        self.issue_table.verticalHeader().setDefaultSectionSize(24)
         self.issue_table.itemSelectionChanged.connect(self._selection_changed)
         self.issue_table.cellClicked.connect(lambda row, _col: self._sync_issue_details_from_row(row))
         self.issue_table.itemClicked.connect(lambda item: self._sync_issue_details_from_row(item.row() if item else -1))
         splitter.addWidget(self.issue_table)
 
         detail = QWidget()
+        detail.setObjectName("issueObjectWorkspace")
         detail_layout = QVBoxLayout(detail)
+        detail_layout.setContentsMargins(8, 6, 8, 8)
+        detail_layout.setSpacing(5)
         self.detail_title = QLabel("Select an issue")
         self.detail_title.setStyleSheet("font-size:16px;font-weight:700;color:#111827;")
         self.detail_meta = QLabel("")
@@ -416,6 +450,8 @@ class EngineeringIssuePage(QWidget):
         detail_layout.addLayout(actions)
 
         tabs = QTabWidget()
+        tabs.setObjectName("issueObjectTabs")
+        tabs.setDocumentMode(True)
 
         jira_tab = QWidget()
         jira_layout = QVBoxLayout(jira_tab)
@@ -509,6 +545,67 @@ class EngineeringIssuePage(QWidget):
         splitter.addWidget(detail)
         splitter.setSizes([850, 500])
         root.addWidget(splitter, 1)
+
+        self.setStyleSheet("""
+            QWidget#issueCenterPage { background: #e1e5e9; }
+            QFrame#issueFilterPanel {
+                background: #eef1f4;
+                border: 1px solid #aeb9c5;
+            }
+            QFrame#issueFilterPanel QLabel {
+                color: #53687c;
+                font-size: 9px;
+                font-weight: 700;
+            }
+            QFrame#issueFilterPanel QLineEdit,
+            QFrame#issueFilterPanel QComboBox,
+            QFrame#issueFilterPanel QPushButton {
+                min-height: 23px;
+                border-radius: 0;
+                padding: 1px 6px;
+            }
+            QSplitter#issueWorkspaceSplitter::handle { background: #aeb9c5; }
+            QSplitter#issueWorkspaceSplitter::handle:hover { background: #7695ad; }
+            QTableWidget#issueRegister {
+                background: #ffffff;
+                alternate-background-color: #f6f8f9;
+                border: 1px solid #aeb9c5;
+                border-radius: 0;
+                selection-background-color: #dbe9f4;
+                selection-color: #172c3f;
+            }
+            QTableWidget#issueRegister QHeaderView::section {
+                background: #e5e9ed;
+                color: #30475b;
+                border: 0;
+                border-right: 1px solid #c4cdd6;
+                border-bottom: 1px solid #aeb9c5;
+                padding: 4px 6px;
+                font-weight: 600;
+            }
+            QWidget#issueObjectWorkspace {
+                background: #ffffff;
+                border: 1px solid #aeb9c5;
+            }
+            QTabWidget#issueObjectTabs::pane {
+                border: 1px solid #aeb9c5;
+                background: #ffffff;
+            }
+            QTabWidget#issueObjectTabs QTabBar::tab {
+                background: #dfe4e9;
+                border: 1px solid #aeb9c5;
+                border-radius: 0;
+                padding: 5px 9px;
+                color: #344a5f;
+                font-weight: 600;
+            }
+            QTabWidget#issueObjectTabs QTabBar::tab:selected {
+                background: #ffffff;
+                color: #173f5e;
+                border-top: 2px solid #2f75a4;
+                border-bottom-color: #ffffff;
+            }
+        """)
 
     def _filters(self):
         created_after = None

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import json
 import os
-import shutil
 from datetime import datetime
 import uuid
 from core.services.permission_decorators import require_permission
@@ -18,7 +17,8 @@ from core.services.base_service import BaseService
 from core.services.issue_service import IssueService
 from core.services.traceability_service import TraceabilityService
 from core.services.part_file_service import PartFileService
-from core.services.export_naming import is_project_revision
+from core.services.managed_file_service import ManagedFileService
+from core.services.export_naming import exported_document_filename
 from utils import (
     is_creo_file,
     ensure_dir_exists,
@@ -29,6 +29,7 @@ from utils import (
     safe_exists,
     safe_isdir,
     safe_listdir,
+    safe_move,
     safe_open,
     safe_remove,
     safe_rmtree,
@@ -46,6 +47,9 @@ class MergeService(BaseService):
         self.issue_service = IssueService()
         self.traceability_service = TraceabilityService()
         self.part_file_service = PartFileService()
+        self.managed_file_service = ManagedFileService(
+            part_file_service=self.part_file_service
+        )
 
         self.working_dir = working_dir
         self.commits_dir = commits_dir
@@ -65,19 +69,6 @@ class MergeService(BaseService):
         cleaned = "".join(ch if ch.isalnum() or ch in "._- ()" else "_" for ch in os.path.basename(name or ""))
         return cleaned or f"validation_{uuid.uuid4().hex[:8]}"
 
-    def _drawing_index_for_part(self, part) -> str:
-        for field_name in (
-            "drawing_index",
-            "draw_index",
-            "drawing_indice",
-            "indice",
-            "index",
-        ):
-            value = str(getattr(part, field_name, "") or "").strip()
-            if value:
-                return value
-        return ""
-
     def _project_version_label(self, project_id: int | None) -> str:
         if not project_id:
             return ""
@@ -88,6 +79,21 @@ class MergeService(BaseService):
             return str(project.get("version_label") or "").strip().upper()
         except Exception:
             return ""
+
+    def _associated_item_ids_for_cad(self, cad_document_id: int | None) -> list[int]:
+        """Return all active EBOM Items affected by a CAD Document approval."""
+        if cad_document_id is None:
+            return []
+        try:
+            return [
+                int(value)
+                for value in self.bom_service.pdm_service.checkout_target_item_ids(
+                    int(cad_document_id)
+                )
+                if value is not None
+            ]
+        except Exception:
+            return []
 
     def _legacy_engineering_filename(
         self,
@@ -103,27 +109,17 @@ class MergeService(BaseService):
         if not ext:
             ext = ".pdf" if file_role == "exported_pdf" else ".step" if file_role == "exported_step" else ""
 
-        drawing_number = str(getattr(part, "drawing_number", "") or "").strip()
-        if not drawing_number:
-            drawing_number = str(getattr(part, "base_drw_name", "") or getattr(part, "base_file_name", "") or f"part_{part_id}").strip()
-        index = self._drawing_index_for_part(part)
-        aes = str(getattr(part, "aes_number", "") or "").strip()
-        part_name = str(getattr(part, "name", "") or "").strip()
+        if part:
+            return exported_document_filename(
+                part=part,
+                file_type=file_type,
+                source_path=source_path,
+                revision=drawing_revision if file_role == "exported_pdf" else "",
+                project_version_label=project_version_label,
+                include_date=False,
+            )
 
-        parts = [drawing_number, index, aes, part_name]
-        if file_role == "exported_pdf":
-            rev = str(drawing_revision or "").strip()
-            if rev and not is_project_revision(rev, project_version_label):
-                parts.append(rev)
-
-        stem = "_".join(
-            self._safe_filename(piece).strip("._- ")
-            for piece in parts
-            if str(piece or "").strip()
-        )
-        if not stem:
-            stem = self._safe_filename(os.path.splitext(os.path.basename(source_path or ""))[0] or f"part_{part_id}")
-        return f"{stem}{ext}"
+        return f"part_{part_id}{ext}"
 
     def _copy_with_legacy_engineering_name(
         self,
@@ -208,6 +204,13 @@ class MergeService(BaseService):
                     revision=item.get("revision") or "",
                     display_name=os.path.splitext(os.path.basename(vault_source_path))[0],
                     description=item.get("description") or "Attached during commit push",
+                    file_role=(
+                        "generated_pdf" if file_role == "exported_pdf"
+                        else "generated_step" if file_role == "exported_step"
+                        else "document"
+                    ),
+                    source_kind="generated",
+                    source_commit_id=commit_id,
                 )
                 self.traceability_service.link_commit_to_engineering_file(
                     commit_id=commit_id,
@@ -264,7 +267,15 @@ class MergeService(BaseService):
         except Exception as exc:
             print(f"Warning: Failed to remove empty commit attachment directory {commit_dir}: {exc}")
 
-        return sorted(set(changed_part_ids))
+        changed_part_ids = sorted(set(changed_part_ids))
+        for part_id in changed_part_ids:
+            try:
+                self.managed_file_service.capture_current_iteration(
+                    int(part_id), source_commit_id=commit_id
+                )
+            except Exception as exc:
+                print(f"Warning: Failed to update managed-file manifest for BOM {part_id}: {exc}")
+        return changed_part_ids
 
     def get_last_approved_version(self, base_name):
         max_version = 0
@@ -395,17 +406,29 @@ class MergeService(BaseService):
 
         return None
 
-    @staticmethod
-    def _part_ids_for_issue_gate(commits):
-        part_ids = []
+    def _part_ids_for_issue_gate(self, commits):
+        part_ids = set()
         for commit in commits:
+            cad_document_id = getattr(commit, "cad_document_id", None)
+            if cad_document_id is not None:
+                try:
+                    part_ids.update(
+                        int(value)
+                        for value in self.bom_service.pdm_service.repo.list_checkout_target_item_ids(
+                            int(cad_document_id)
+                        )
+                    )
+                except Exception:
+                    pass
             if commit.part_id is None:
+                if cad_document_id is not None:
+                    continue
                 label = commit.commit_id or commit.id
                 raise ValueError(
-                    f"Cannot merge commit {label}. It is not linked to a BOM part."
+                    f"Cannot merge commit {label}. It is not linked to an EBOM Item or CAD Document."
                 )
-            part_ids.append(int(commit.part_id))
-        return part_ids
+            part_ids.add(int(commit.part_id))
+        return sorted(part_ids)
 
     @require_permission("merge")
     def excute_merge(self, selected_ids, message):
@@ -418,7 +441,8 @@ class MergeService(BaseService):
         if not selected_commits:
             raise ValueError("No validated commits were found for the selected merge items.")
         candidate_parts = self._part_ids_for_issue_gate(selected_commits)
-        self.issue_service.assert_no_critical_issues(candidate_parts, operation="merge", include_children=True)
+        if candidate_parts:
+            self.issue_service.assert_no_critical_issues(candidate_parts, operation="merge", include_children=True)
 
         merged_entries = self._merge_commit_rows(
             selected_commits,
@@ -428,9 +452,9 @@ class MergeService(BaseService):
         if merged_entries:
             self.finalize_merge(merged_entries, self.user_id, self.merge_id, message)
             print(f"Merged {len(merged_entries)} commits.")
-            return sorted({int(item["item_id"]) for item in merged_entries if item.get("item_id") is not None})
+            return self._merge_refresh_payload(merged_entries)
 
-        return []
+        return self._merge_refresh_payload([])
     
 
     @require_permission("merge")
@@ -445,9 +469,11 @@ class MergeService(BaseService):
         commit_group_dir = self._commit_group_dir(commit_data[0])
         logical_commit_id = str(getattr(commit_data[0], "commit_id", commit_id) or commit_id)
         logical_project_id = getattr(commit_data[0], "project_id", None)
-        self.issue_service.assert_no_critical_issues(
-            self._part_ids_for_issue_gate(commit_data), operation="merge", include_children=True
-        )
+        candidate_parts = self._part_ids_for_issue_gate(commit_data)
+        if candidate_parts:
+            self.issue_service.assert_no_critical_issues(
+                candidate_parts, operation="merge", include_children=True
+            )
         
         merged_entries = self._merge_commit_rows(
             commit_data,
@@ -467,16 +493,43 @@ class MergeService(BaseService):
                 int(logical_project_id) if logical_project_id is not None else None,
             )
             print(f"Merged {len(merged_entries)} commits.")
-            return sorted(
-                {
-                    int(item["item_id"])
-                    for item in merged_entries
-                    if item.get("item_id") is not None
-                }
-                | {int(pid) for pid in attachment_part_ids}
+            return self._merge_refresh_payload(
+                merged_entries,
+                extra_part_ids=attachment_part_ids,
             )
 
-        return []
+        return self._merge_refresh_payload([])
+
+    def _merge_refresh_payload(self, merged_entries, extra_part_ids=None) -> dict:
+        part_ids = set()
+        cad_document_ids = set()
+        for item in merged_entries or []:
+            try:
+                if item.get("item_id") is not None:
+                    part_ids.add(int(item["item_id"]))
+            except Exception:
+                pass
+            try:
+                if item.get("cad_document_id") is not None:
+                    cad_document_id = int(item["cad_document_id"])
+                    cad_document_ids.add(cad_document_id)
+                    part_ids.update(
+                        int(value)
+                        for value in self.bom_service.pdm_service.repo.list_checkout_target_item_ids(
+                            cad_document_id
+                        )
+                    )
+            except Exception:
+                pass
+        for pid in extra_part_ids or []:
+            try:
+                part_ids.add(int(pid))
+            except Exception:
+                pass
+        return {
+            "affected_part_ids": sorted(part_ids),
+            "affected_cad_document_ids": sorted(cad_document_ids),
+        }
 
 
     def _approved_merge_results_for_commit(self, commit_id: str, project_id: int | None = None):
@@ -535,8 +588,16 @@ class MergeService(BaseService):
             if result:
                 merged_entries.append({
                     "item_id": commit.part_id,
+                    "cad_document_id": getattr(commit, "cad_document_id", None),
                     "commit_id": commit.id,
+                    "source_commit_id": getattr(commit, "commit_id", None),
                     "part_type": commit.type,
+                    # The Creo file version stored on the CAD Document is the
+                    # approved/master file suffix created by the merge, not the
+                    # transient staged filename uploaded by the designer.
+                    "source_file_name": result["new_filename"],
+                    "creo_file_version": result["new_version"]
+                    or get_version_number(result["new_filename"]),
                     "new_filename": result["new_filename"],
                     "new_version": result["new_version"],
                     "pr_path": result["pr_path"],
@@ -548,8 +609,11 @@ class MergeService(BaseService):
 
     def finalize_merge(self, merged_entries, merge_user_id, merge_id, message):
         """Finalize the merge by updating database entries."""
+        checkin_sources = {}
+        cad_checkin_sources = {}
+        pdm_item_checkin_sources = {}
         for item in merged_entries:
-            print(f"Finalizing merge for part ID {item['item_id']} with commit ID {item['commit_id']} with new filename {item['new_filename']}")
+            print(f"Finalizing merge for part ID {item.get('item_id')} with commit ID {item['commit_id']} with new filename {item['new_filename']}")
 
             #update commit status merge_commit(self, part_id, merge_user_id, merge_id,  message, approved_version, pr_path)
             print(f"‼️ DB inserting for COMMIT ID:{item['commit_id']}, NEW VERSION:{item['new_version']}, ITEM PATH: {item['pr_path']}  ")
@@ -558,11 +622,12 @@ class MergeService(BaseService):
             
 
             # Update BOM
-            part = self.bom_repo.get_by_id(item['item_id'])   # fetch the existing BOM entry
+            part_id = item.get("item_id")
+            part = self.bom_repo.get_by_id(int(part_id)) if part_id is not None else None
             part_type = item["part_type"]
 
             if not part:
-                print(f"BOM with ID {item['item_id']} not found.")
+                print(f"BOM with ID {part_id} not found or not linked to this CAD commit.")
             else:
                 if part_type == "Cad":
                     if hasattr(part, "filename"):
@@ -579,11 +644,100 @@ class MergeService(BaseService):
             self.signature_repo.add_signature('Merge', merge_user_id , message)
             print(f"Added signature")
 
-            # Check in the part after merge: release the checkout lock if it exists.
-            lock = self.lock_repo.get_lock_by_part(item['item_id'])
+            cad_document_id = item.get("cad_document_id")
+            if cad_document_id is not None:
+                cad_checkin_sources.setdefault(
+                    int(cad_document_id),
+                    {
+                        "source_commit_id": str(item.get('source_commit_id') or item.get('commit_id') or ''),
+                        "source_path": item.get("pr_path"),
+                        "source_file_name": item.get("source_file_name"),
+                        "creo_file_version": item.get("creo_file_version"),
+                    },
+                )
+                if part_id is not None:
+                    pdm_item_checkin_sources.setdefault(
+                        int(part_id),
+                        str(item.get('source_commit_id') or item.get('commit_id') or ''),
+                    )
+                for associated_item_id in self._associated_item_ids_for_cad(
+                    cad_document_id
+                ):
+                    pdm_item_checkin_sources.setdefault(
+                        int(associated_item_id),
+                        str(item.get('source_commit_id') or item.get('commit_id') or ''),
+                    )
+            elif part_id is not None:
+                checkin_sources.setdefault(
+                    int(part_id),
+                    str(item.get('source_commit_id') or item.get('commit_id') or ''),
+                )
+
+        # Check in managed CAD Documents. Item locks created only for CAD are
+        # released by the PDM service after the last associated CAD closes.
+        for cad_document_id, payload in cad_checkin_sources.items():
+            try:
+                document = self.bom_service.pdm_service.repo.get_cad_document(
+                    int(cad_document_id)
+                )
+                checkout_user_id = (
+                    int(document["checked_out_by"])
+                    if document and document.get("checked_out_by") is not None
+                    else None
+                )
+                if checkout_user_id is not None:
+                    self.bom_service.checkin_pdm_cad_document(
+                        int(cad_document_id),
+                        str(payload.get("source_path") or ""),
+                        message,
+                        as_user_id=checkout_user_id,
+                        source_commit_id=str(payload.get("source_commit_id") or ""),
+                        source_file_name=str(payload.get("source_file_name") or ""),
+                        creo_file_version=payload.get("creo_file_version"),
+                    )
+                    print(f"Checked in CAD Document {cad_document_id} by user ID {checkout_user_id}")
+            except Exception as exc:
+                print(f"Warning: Failed to check in CAD Document {cad_document_id}: {exc}")
+
+        # After all CAD Documents for an Item are closed, close the related
+        # EBOM Item checkout too. This keeps the CAD Structure and Item
+        # Structure in the same checked-in state after an approved merge.
+        for part_id, source_commit_id in pdm_item_checkin_sources.items():
+            try:
+                if self.bom_service.checked_out_cad_for_item(int(part_id)):
+                    continue
+                lock = self.lock_repo.get_lock_by_part(int(part_id))
+                if not lock:
+                    continue
+                self.bom_service.checkin_by_part_id(
+                    int(part_id),
+                    int(lock.user_id),
+                    note=message,
+                    source_commit_id=source_commit_id,
+                    exact_item=True,
+                )
+                print(f"Checked in related EBOM Item {part_id} by user ID {lock.user_id}")
+            except Exception as exc:
+                print(f"Warning: Failed to check in related EBOM Item {part_id}: {exc}")
+
+        # Capture one object iteration only after every legacy CAD and drawing
+        # row is updated. PDM CAD rows are handled above.
+        for part_id, source_commit_id in checkin_sources.items():
+            lock = self.lock_repo.get_lock_by_part(part_id)
             if lock:
-                self.bom_service.checkin_by_part_id(item['item_id'], lock.user_id)
-                print(f"Checked in lock for part ID {item['item_id']} by user ID {lock.user_id}")
+                self.bom_service.checkin_by_part_id(
+                    part_id,
+                    lock.user_id,
+                    note=message,
+                    source_commit_id=source_commit_id,
+                )
+                print(f"Checked in lock for part ID {part_id} by user ID {lock.user_id}")
+            try:
+                self.managed_file_service.capture_current_iteration(
+                    part_id, source_commit_id=source_commit_id
+                )
+            except Exception as exc:
+                print(f"Warning: Failed to capture managed files for BOM {part_id}: {exc}")
 
         
         print(f"Finalized merge for entries: {merged_entries}")
@@ -699,7 +853,7 @@ class MergeService(BaseService):
         try:
             for item in plan:
                 archived_path = os.path.join(archive_dir, item["approved_filename"])
-                shutil.move(item["approved_path"], archived_path)
+                safe_move(item["approved_path"], archived_path)
                 moved_files.append((archived_path, item["approved_path"]))
 
             part_updates = {}
@@ -743,7 +897,7 @@ class MergeService(BaseService):
             for archived_path, original_path in reversed(moved_files):
                 try:
                     if safe_exists(archived_path) and not safe_exists(original_path):
-                        shutil.move(archived_path, original_path)
+                        safe_move(archived_path, original_path)
                 except Exception:
                     pass
             raise

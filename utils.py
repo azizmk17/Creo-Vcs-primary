@@ -48,6 +48,11 @@ def safe_copy2(src: str, dst: str):
     return shutil.copy2(long_path(src), long_path(dst))
 
 
+def safe_move(src: str, dst: str):
+    ensure_dir_exists(os.path.dirname(dst))
+    return shutil.move(long_path(src), long_path(dst))
+
+
 def safe_remove(path: str) -> None:
     os.remove(long_path(path))
 
@@ -58,6 +63,11 @@ def safe_rmtree(path: str) -> None:
 
 def safe_open(path: str, *args, **kwargs):
     return open(long_path(path), *args, **kwargs)
+
+
+def safe_getsize(path: str) -> int:
+    """Return a file size while supporting Windows extended-length paths."""
+    return os.path.getsize(long_path(path))
 
 
 def _short_view_copy(path: str) -> str:

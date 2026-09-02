@@ -1,39 +1,45 @@
 # pages/dialogs/progress_dialog.py
 from PyQt5.QtWidgets import (
-    QDialog, QVBoxLayout, QLabel, QProgressBar, QPushButton, QHBoxLayout, QGraphicsDropShadowEffect
+    QDialog, QFrame, QVBoxLayout, QLabel, QProgressBar, QPushButton, QHBoxLayout,
+    QWidget
 )
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QColor, QFont
+
+from pages.dialogs.professional_style import (
+    apply_professional_dialog_style,
+    make_dialog_header,
+)
+
 
 class ProgressDialog(QDialog):
     def __init__(self, title="Processing...", message="Please wait...", cancel_callback=None):
         super().__init__()
         self.setWindowTitle(title)
-        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         self.setModal(True)
-        self.setFixedSize(400, 180)
+        self.setFixedSize(460, 190)
+        apply_professional_dialog_style(self)
 
-        # ---------------- Layout ----------------
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(25, 25, 25, 25)
-        layout.setSpacing(15)
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        header = make_dialog_header(
+            title,
+            "Controlled operation in progress.",
+            kicker="NEXUS PDM",
+        )
+        self.lbl_title = header.findChild(QLabel, "professionalDialogTitle")
+        root_layout.addWidget(header)
 
-        # Shadow effect
-        shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(25)
-        shadow.setColor(QColor(0, 0, 0, 150))
-        shadow.setOffset(0, 0)
-        self.setGraphicsEffect(shadow)
-
-        # Title
-        self.lbl_title = QLabel(f"<h3 style='color:#333;'>{title}</h3>")
-        self.lbl_title.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.lbl_title)
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(8)
+        root_layout.addWidget(body, 1)
 
         # Message
         self.lbl_message = QLabel(message)
-        self.lbl_message.setAlignment(Qt.AlignCenter)
-        self.lbl_message.setStyleSheet("color: #555; font-size: 13px;")
+        self.lbl_message.setObjectName("professionalMuted")
+        self.lbl_message.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         layout.addWidget(self.lbl_message)
 
         # Progress bar
@@ -41,36 +47,20 @@ class ProgressDialog(QDialog):
         self.bar.setRange(0, 100)
         self.bar.setValue(0)
         self.bar.setTextVisible(True)
-        self.bar.setStyleSheet("""
-            QProgressBar {
-                background-color: #e5e5e5;
-                border: 1px solid #ccc;
-                border-radius: 10px;
-                text-align: center;
-                height: 20px;
-                color: #333;
-            }
-            QProgressBar::chunk {
-                background-color: qlineargradient(
-                    x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #0078d7, stop:1 #00bfff
-                );
-                border-radius: 10px;
-            }
-        """)
         layout.addWidget(self.bar)
 
         # Cancel button
-        btn_layout = QHBoxLayout()
+        footer = QFrame()
+        footer.setObjectName("professionalFooter")
+        btn_layout = QHBoxLayout(footer)
+        btn_layout.setContentsMargins(8, 5, 8, 5)
         btn_layout.addStretch()
         self.btn_cancel = QPushButton("Cancel")
-        self.btn_cancel.setFixedWidth(100)
-        self.btn_cancel.setObjectName("danger")
+        self.btn_cancel.setEnabled(bool(cancel_callback))
         if cancel_callback:
             self.btn_cancel.clicked.connect(cancel_callback)
         btn_layout.addWidget(self.btn_cancel)
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
+        layout.addWidget(footer)
 
         # Loading animation (three dots)
         self._dot_count = 0
@@ -78,13 +68,6 @@ class ProgressDialog(QDialog):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._animate_text)
         self._timer.start(400)
-
-        self.setStyleSheet("""
-            QDialog {
-                background-color: #ffffff;
-                border-radius: 15px;
-            }
-        """)
 
     def _animate_text(self):
         self._dot_count = (self._dot_count + 1) % 4

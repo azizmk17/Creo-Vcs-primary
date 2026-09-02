@@ -1,17 +1,23 @@
 # Nexus (BOM Manager)
 
+> **New PDM architecture:** Start with [README_PDM.md](README_PDM.md) for the
+> CAD Document, Item, association, CAD-to-EBOM build, supplier package, and
+> migration workflows.
+
 Desktop (PyQt5) application for managing a Creo-based BOM with a lightweight, PLM-inspired workflow:
 
 - Multi-project BOM management (parts + assemblies + parent/child relationships)
-- Check-in / check-out locking
+- Check-out / undo-checkout locking with commit-only check-in
 - Commit/validate/merge workflow
 - File vault per part (attachments + version history + active version)
-- Release controls + alphabetic revisions
+- Immutable releases, configurable revision codes, automatic iterations, and exact child bindings
 - Baselines (freeze exact released deliverables for reproducible exports)
 - Delivery package export (PDF/STEP) with a `manifest.json` (+ optional ZIP)
 - BOM-integrated engineering issues, commit resolution claims, validation, risk propagation, and release gates
 
 This repository is intentionally “DB-first”: most features are backed by SQLite tables and surfaced in the UI.
+
+Detailed workflow: [Exact revisions, iterations, assembly bindings, and Creo behavior](docs/exact_revision_iteration_workflow.md)
 
 ---
 

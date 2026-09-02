@@ -37,6 +37,11 @@ from core.services.project_service import ProjectService
 from core.session_manager import SessionManager
 from core.services.issue_service import IssueService
 from pages.rich_text_image_editor import RichTextImageEditor, html_to_plain_text, looks_like_html
+from pages.dialogs.cad_workspace_dialogs import (
+    WorkspaceSelectionDialog,
+    WorkspaceStagingDialog,
+)
+from core.services.cad_workspace_service import CadWorkspaceService
 
 from utils import is_creo_file, ensure_dir_exists, safe_exists, safe_isfile, safe_startfile
 
@@ -149,7 +154,7 @@ class DropListWidget(QListWidget):
         self.callback = callback
         self._drag_active = False
         self._border_alpha = 0
-        self._placeholder_text = "Drag and drop files here\nSupported: .prt, .asm, .drw"
+        self._placeholder_text = "WORKING SET EMPTY\nAccepted native content: PRT / ASM / DRW"
 
         # Border animation
         self.border_anim = QPropertyAnimation(self, b"border_alpha")
@@ -221,7 +226,7 @@ class DropListWidget(QListWidget):
 
             painter.setPen(QColor(45, 137, 239, 200))
             painter.setFont(self.font())
-            painter.drawText(rect, Qt.AlignCenter, "Drop files here")
+            painter.drawText(rect, Qt.AlignCenter, "ADD TO WORKING SET")
 
         # Animated border
         if self._border_alpha > 0:
@@ -250,12 +255,12 @@ class AffectedBomDropCard(QFrame):
         self.setStyleSheet("""
             AffectedBomDropCard {
                 background: #ffffff;
-                border: 1px solid #d1d5db;
-                border-radius: 8px;
+                border: 1px solid #aeb8c2;
+                border-radius: 0;
             }
             AffectedBomDropCard:hover {
-                border-color: #2563eb;
-                background: #eff6ff;
+                border-color: #55768f;
+                background: #f1f4f6;
             }
             QLabel {
                 background: transparent;
@@ -266,10 +271,13 @@ class AffectedBomDropCard(QFrame):
         layout.setContentsMargins(10, 7, 10, 7)
         layout.setSpacing(2)
 
-        title = QLabel(
-            f"{self.part_info.get('name') or 'BOM item'}"
-            f"  |  {self.part_info.get('aes_number') or ''}"
-        )
+        item_number = str(self.part_info.get("part_number") or "No Number").strip()
+        item_name = str(self.part_info.get("name") or "Item").strip()
+        aes_number = str(self.part_info.get("aes_number") or "").strip()
+        identity = f"{item_number} — {item_name}"
+        if aes_number:
+            identity += f"  |  AES {aes_number}"
+        title = QLabel(identity)
         title.setStyleSheet("font-size: 11px; font-weight: 700; color: #111827;")
         title.setFixedHeight(18)
         title.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -300,7 +308,7 @@ class AffectedBomDropCard(QFrame):
         self.preview.setStyleSheet("""
             QListWidget {
                 border: 1px solid #e5e7eb;
-                border-radius: 6px;
+                border-radius: 0;
                 background: #f8fafc;
                 font-size: 9px;
                 color: #374151;
@@ -361,14 +369,14 @@ class AffectedBomDropCard(QFrame):
                 background: #ffffff;
                 color: #111827;
                 border: 1px solid #cbd5e1;
-                border-radius: 6px;
-                padding: 4px 0;
+                border-radius: 0;
+                padding: 2px 0;
             }
             QMenu::item {
                 background: transparent;
                 color: #111827;
-                padding: 6px 18px;
-                font-size: 11px;
+                padding: 4px 16px;
+                font-size: 9px;
             }
             QMenu::item:selected {
                 background: #dbeafe;
@@ -515,42 +523,47 @@ class _ProcessingWorker(QObject):
 
 
 class _StatCard(QFrame):
-    """Mini KPI card for the dashboard row."""
+    """Compact enterprise status cell used in the workspace summary strip."""
 
     def __init__(self, icon: str, value: str, label: str, accent: str, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(56)
-        self.setMinimumWidth(90)
+        self.setFixedHeight(40)
+        self.setMinimumWidth(96)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setStyleSheet(f"""
             _StatCard {{
                 background: #ffffff;
-                border: 1px solid #e5e7eb;
-                border-left: 3px solid {accent};
-                border-radius: 6px;
+                border: 1px solid #b8bec7;
+                border-top: 2px solid {accent};
+                border-radius: 1px;
             }}
         """)
-        shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(8)
-        shadow.setOffset(0, 1)
-        shadow.setColor(QColor(0, 0, 0, 20))
-        self.setGraphicsEffect(shadow)
 
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(8, 4, 8, 4)
-        lay.setSpacing(6)
+        lay.setContentsMargins(8, 3, 8, 3)
+        lay.setSpacing(7)
 
-        ic = QLabel(icon)
-        ic.setStyleSheet("font-size: 18px; background: transparent; border: none;")
-        lay.addWidget(ic)
+        if icon:
+            ic = QLabel(icon)
+            ic.setStyleSheet(
+                "font-size: 9px; font-weight: 700; color: #5b6573; "
+                "background: transparent; border: none;"
+            )
+            lay.addWidget(ic)
 
         text_lay = QVBoxLayout()
         text_lay.setSpacing(0)
         self._val = QLabel(str(value))
-        self._val.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {accent}; background: transparent; border: none;")
+        self._val.setStyleSheet(
+            f"font-size: 13px; font-weight: 700; color: {accent}; "
+            "background: transparent; border: none;"
+        )
         text_lay.addWidget(self._val)
-        self._lbl = QLabel(str(label))
-        self._lbl.setStyleSheet("font-size: 9px; color: #6b7280; background: transparent; border: none;")
+        self._lbl = QLabel(str(label).upper())
+        self._lbl.setStyleSheet(
+            "font-size: 8px; color: #5f6976; letter-spacing: 0.4px; "
+            "background: transparent; border: none;"
+        )
         text_lay.addWidget(self._lbl)
         lay.addLayout(text_lay)
         lay.addStretch()
@@ -564,7 +577,7 @@ class _StatCard(QFrame):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class _HistoryTable(QTableWidget):
-    """Rich commit-history table with coloured badges, relative times, STEP markers."""
+    """Dense audit table with restrained state and STEP indicators."""
 
     restore_requested = pyqtSignal(object)
 
@@ -572,7 +585,7 @@ class _HistoryTable(QTableWidget):
         super().__init__(parent)
         self.setColumnCount(8)
         self.setHorizontalHeaderLabels([
-            "", "Action", "Status", "File / Commit", "Designer", "Date", "STEP", "Message",
+            "", "Action", "State", "Object / Commit", "Designer", "Modified", "STEP", "Description",
         ])
         self.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -594,15 +607,16 @@ class _HistoryTable(QTableWidget):
         self.setColumnWidth(6, 50)
         self.setStyleSheet("""
             QTableWidget {
-                border: 1px solid #e5e7eb; border-radius: 8px;
-                background: #ffffff; alternate-background-color: #fafbfc;
-                gridline-color: transparent;
+                border: 1px solid #aeb5bf; border-radius: 0;
+                background: #ffffff; alternate-background-color: #f5f6f7;
+                gridline-color: #e0e3e7;
             }
-            QTableWidget::item { padding: 5px 6px; border-bottom: 1px solid #f3f4f6; }
-            QTableWidget::item:selected { background: #eff6ff; color: #111827; }
+            QTableWidget::item { padding: 2px 5px; border-bottom: 1px solid #e0e3e7; }
+            QTableWidget::item:selected { background: #d9e7f5; color: #17212b; }
             QHeaderView::section {
-                background: #f8f9fa; border: none; border-bottom: 2px solid #e5e7eb;
-                padding: 6px 4px; font-weight: 700; font-size: 10px; color: #4b5563;
+                background: #e2e5e9; border: none; border-right: 1px solid #c6cbd2;
+                border-bottom: 1px solid #9ca3ad;
+                padding: 4px 5px; font-weight: 700; font-size: 9px; color: #2f3945;
             }
         """)
 
@@ -631,11 +645,11 @@ class _HistoryTable(QTableWidget):
                 )
                 action.setStyleSheet("""
                     QPushButton {
-                        background: #ffffff; border: 1px solid #d1d5db; border-radius: 6px;
-                        padding: 3px 8px; font-size: 10px; color: #374151;
+                        background: #f5f6f7; border: 1px solid #aeb5bf; border-radius: 1px;
+                        padding: 2px 7px; font-size: 9px; color: #27313c;
                     }
-                    QPushButton:hover:enabled { background: #eff6ff; border-color: #93c5fd; color: #1d4ed8; }
-                    QPushButton:disabled { color: #9ca3af; background: #f3f4f6; }
+                    QPushButton:hover:enabled { background: #e4edf6; border-color: #738ba3; }
+                    QPushButton:disabled { color: #9299a2; background: #eceef0; }
                 """)
                 action.clicked.connect(lambda _checked=False, d=dict(c): self.restore_requested.emit(d))
                 self.setCellWidget(i, 1, action)
@@ -643,12 +657,12 @@ class _HistoryTable(QTableWidget):
                 self.setItem(i, 1, QTableWidgetItem(""))
 
             # col 1 — status badge
-            badge = QLabel(f' {sty["icon"]} {sty["label"]} ')
+            badge = QLabel(f' {sty["label"].upper()} ')
             badge.setAlignment(Qt.AlignCenter)
             badge.setStyleSheet(f"""
                 background: {sty['bg']}; color: {sty['color']};
-                border: 1px solid {sty['color']}40; border-radius: 9px;
-                padding: 1px 6px; font-size: 10px; font-weight: 600;
+                border: 1px solid {sty['color']}70; border-radius: 1px;
+                padding: 1px 5px; font-size: 8px; font-weight: 700;
             """)
             container = QWidget()
             cl = QHBoxLayout(container)
@@ -690,11 +704,11 @@ class _HistoryTable(QTableWidget):
             step_status = str(c.get("step_diff_status", "") or "").strip().upper()
             step_txt = ""
             if step_status == "BASELINE":
-                step_txt = "🟢"
+                step_txt = "BASE"
             elif step_status == "COMPARED":
-                step_txt = "🔵"
+                step_txt = "DIFF"
             elif step_status:
-                step_txt = "⚪"
+                step_txt = "YES"
             si = QTableWidgetItem(step_txt)
             si.setTextAlignment(Qt.AlignCenter)
             si.setToolTip(f"STEP: {step_status}" if step_status else "No STEP")
@@ -707,7 +721,7 @@ class _HistoryTable(QTableWidget):
             mi.setForeground(QBrush(QColor("#4b5563")))
             self.setItem(i, 7, mi)
 
-            self.setRowHeight(i, 44)
+            self.setRowHeight(i, 34)
 
     def get_data(self, row: int) -> dict:
         item = self.item(row, 0)
@@ -719,7 +733,7 @@ class _HistoryTable(QTableWidget):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class _PendingCard(QFrame):
-    """Modern card for a pending commit group."""
+    """Compact routing-queue record for a logical commit group."""
     clicked = pyqtSignal(object)
     view_requested = pyqtSignal(object)
     browse_requested = pyqtSignal(object)
@@ -730,21 +744,15 @@ class _PendingCard(QFrame):
         self._selected = False
         self.setCursor(Qt.PointingHandCursor)
         self.setFrameShape(QFrame.StyledPanel)
-        self.setMinimumHeight(70)
+        self.setMinimumHeight(62)
 
         sty = _status_style(group.get("status", ""))
         self._accent = sty["color"]
         self._refresh_style()
 
-        shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(10)
-        shadow.setOffset(0, 2)
-        shadow.setColor(QColor(0, 0, 0, 18))
-        self.setGraphicsEffect(shadow)
-
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(12, 8, 12, 8)
-        lay.setSpacing(10)
+        lay.setContentsMargins(8, 6, 8, 6)
+        lay.setSpacing(8)
 
         # Left: info
         info = QVBoxLayout()
@@ -754,14 +762,17 @@ class _PendingCard(QFrame):
         title_row = QHBoxLayout()
         title_row.setSpacing(6)
         title_lbl = QLabel(group.get("title", "Untitled"))
-        title_lbl.setStyleSheet("font-weight: bold; font-size: 12px; color: #111827; background: transparent; border: none;")
+        title_lbl.setStyleSheet(
+            "font-weight: 700; font-size: 10px; color: #202a35; "
+            "background: transparent; border: none;"
+        )
         title_row.addWidget(title_lbl)
 
-        badge = QLabel(f' {sty["icon"]} {sty["label"]} ')
+        badge = QLabel(f' {sty["label"].upper()} ')
         badge.setStyleSheet(f"""
             background: {sty['bg']}; color: {sty['color']};
-            border: 1px solid {sty['color']}40; border-radius: 8px;
-            padding: 1px 6px; font-size: 9px; font-weight: 600;
+            border: 1px solid {sty['color']}70; border-radius: 1px;
+            padding: 1px 5px; font-size: 8px; font-weight: 700;
         """)
         title_row.addWidget(badge)
         title_row.addStretch()
@@ -772,11 +783,11 @@ class _PendingCard(QFrame):
         num_files = len(group.get("parts", []))
         date_str = str(group.get("date", "") or "")
         rel = _relative_time(date_str)
-        meta_parts = [f"👤 {designer}", f"📁 {num_files} file{'s' if num_files != 1 else ''}"]
+        meta_parts = [str(designer), f"{num_files} file{'s' if num_files != 1 else ''}"]
         if rel:
-            meta_parts.append(f"🕐 {rel}")
-        meta = QLabel("   ".join(meta_parts))
-        meta.setStyleSheet("font-size: 10px; color: #6b7280; background: transparent; border: none;")
+            meta_parts.append(rel)
+        meta = QLabel("  |  ".join(meta_parts))
+        meta.setStyleSheet("font-size: 9px; color: #65707d; background: transparent; border: none;")
         info.addWidget(meta)
 
         # File chips (first 3)
@@ -785,7 +796,7 @@ class _PendingCard(QFrame):
             if num_files > 3:
                 chips_text += f"  +{num_files - 3} more"
             files_lbl = QLabel(f"  {chips_text}")
-            files_lbl.setStyleSheet("font-size: 9px; color: #9ca3af; background: transparent; border: none;")
+            files_lbl.setStyleSheet("font-size: 8px; color: #77818d; background: transparent; border: none;")
             files_lbl.setWordWrap(True)
             info.addWidget(files_lbl)
 
@@ -795,28 +806,28 @@ class _PendingCard(QFrame):
         btn_col = QVBoxLayout()
         btn_col.setSpacing(4)
 
-        view_btn = QPushButton("👁 View")
-        view_btn.setFixedSize(72, 26)
+        view_btn = QPushButton("Open")
+        view_btn.setFixedSize(58, 23)
         view_btn.setCursor(Qt.PointingHandCursor)
         view_btn.setStyleSheet("""
             QPushButton {
-                background: #eff6ff; color: #2563eb; border: 1px solid #bfdbfe;
-                border-radius: 5px; font-size: 10px; font-weight: 600;
+                background: #e4edf6; color: #244b70; border: 1px solid #9aabbc;
+                border-radius: 1px; font-size: 9px; font-weight: 600;
             }
-            QPushButton:hover { background: #dbeafe; }
+            QPushButton:hover { background: #d4e2ef; }
         """)
         view_btn.clicked.connect(lambda: self.view_requested.emit(self.group))
         btn_col.addWidget(view_btn)
 
-        browse_btn = QPushButton("📂 Browse")
-        browse_btn.setFixedSize(72, 26)
+        browse_btn = QPushButton("Folder")
+        browse_btn.setFixedSize(58, 23)
         browse_btn.setCursor(Qt.PointingHandCursor)
         browse_btn.setStyleSheet("""
             QPushButton {
-                background: #f3f4f6; color: #374151; border: 1px solid #d1d5db;
-                border-radius: 5px; font-size: 10px; font-weight: 600;
+                background: #f2f3f4; color: #37414c; border: 1px solid #aeb5bf;
+                border-radius: 1px; font-size: 9px; font-weight: 600;
             }
-            QPushButton:hover { background: #e5e7eb; }
+            QPushButton:hover { background: #e4e7ea; }
         """)
         browse_btn.clicked.connect(lambda: self.browse_requested.emit(self.group))
         btn_col.addWidget(browse_btn)
@@ -824,15 +835,15 @@ class _PendingCard(QFrame):
         lay.addLayout(btn_col)
 
     def _refresh_style(self):
-        bg = "#f0f7ff" if self._selected else "#ffffff"
-        border_color = self._accent if self._selected else "#e5e7eb"
-        border_width = "2px" if self._selected else "1px"
+        bg = "#e8f0f7" if self._selected else "#ffffff"
+        border_color = self._accent if self._selected else "#b8bec7"
+        border_width = "1px"
         self.setStyleSheet(f"""
             _PendingCard {{
                 background: {bg};
                 border: {border_width} solid {border_color};
-                border-left: 4px solid {self._accent};
-                border-radius: 8px;
+                border-left: 3px solid {self._accent};
+                border-radius: 1px;
             }}
         """)
 
@@ -859,6 +870,7 @@ class CommitPage(QWidget):
         self.part_file_service = PartFileService()
         self.project_service = ProjectService()
         self.issue_service = IssueService()
+        self.cad_workspace_service = CadWorkspaceService()
 
         self.merge_repo = MergeRepository()
         self.uncommitted_parts = []
@@ -909,6 +921,7 @@ class CommitPage(QWidget):
 
         self.commit_btn.setEnabled(project_loaded and self.perm.can("commit"))
         self.add_file_btn.setEnabled(project_loaded and self.perm.can("commit"))
+        self.workspace_file_btn.setEnabled(project_loaded and self.perm.can("commit"))
         self.push_dev_btn.setEnabled(project_loaded and self.perm.can("merge"))
         self.merge_master_btn.setEnabled(project_loaded and self.perm.can("merge"))
         self.snapshot_btn.setEnabled(project_loaded)
@@ -923,26 +936,261 @@ class CommitPage(QWidget):
     # ═══════════════════════════════════════════════════════════════════
 
     def _build_ui(self):
+        self.setObjectName("commitWorkspace")
+        self.setStyleSheet("""
+            QWidget#commitWorkspace {
+                background: #e7e9ec;
+                color: #27313c;
+            }
+            QFrame#workspaceHeader {
+                background: #f6f7f8;
+                border: 1px solid #aeb5bf;
+                border-bottom: 2px solid #5e7184;
+            }
+            QFrame#commandBar {
+                background: #dfe3e7;
+                border: 1px solid #a7aeb7;
+            }
+            QLabel#commandGroupTitle {
+                color: #4f5a66;
+                font-size: 8px;
+                font-weight: 700;
+                letter-spacing: 0.5px;
+            }
+            QFrame#commandSeparator {
+                color: #a7aeb7;
+                background: #a7aeb7;
+            }
+            QGroupBox#enterprisePanel {
+                background: #f4f5f6;
+                border: 1px solid #aeb5bf;
+                border-radius: 1px;
+                margin-top: 20px;
+                padding-top: 5px;
+                font-weight: 700;
+            }
+            QGroupBox#enterprisePanel::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 0;
+                top: 0;
+                min-height: 18px;
+                padding: 4px 9px;
+                color: #26313c;
+                background: #d9dde2;
+                border-right: 1px solid #aeb5bf;
+                border-bottom: 1px solid #aeb5bf;
+                font-size: 9px;
+                font-weight: 700;
+                letter-spacing: 0.4px;
+            }
+            QPushButton#primary {
+                min-height: 25px;
+                padding: 2px 11px;
+                background: #315f87;
+                color: #ffffff;
+                border: 1px solid #244866;
+                border-radius: 1px;
+                font-size: 9px;
+                font-weight: 700;
+            }
+            QPushButton#primary:hover { background: #264f72; }
+            QPushButton#primary:disabled {
+                background: #aeb5bc; color: #eceeef; border-color: #9da4ac;
+            }
+            QPushButton#neutral {
+                min-height: 25px;
+                padding: 2px 9px;
+                background: #f4f5f6;
+                color: #2f3944;
+                border: 1px solid #9fa7b1;
+                border-radius: 1px;
+                font-size: 9px;
+                font-weight: 600;
+            }
+            QPushButton#neutral:hover { background: #e2e8ee; border-color: #75879a; }
+            QPushButton#neutral:disabled { color: #969da5; background: #e5e7e9; }
+            QPushButton#danger {
+                min-height: 25px;
+                padding: 2px 9px;
+                background: #f4f5f6;
+                color: #9b2f2f;
+                border: 1px solid #b88787;
+                border-radius: 1px;
+                font-size: 9px;
+                font-weight: 700;
+            }
+            QPushButton#danger:hover { background: #f3dddd; }
+            QLineEdit, QComboBox, QTextEdit, QListWidget {
+                background: #ffffff;
+                color: #202a35;
+                border: 1px solid #aeb5bf;
+                border-radius: 1px;
+                selection-background-color: #cbdceb;
+                selection-color: #17212b;
+                font-size: 9px;
+            }
+            QLineEdit, QComboBox { min-height: 23px; padding: 1px 5px; }
+            QLineEdit:focus, QComboBox:focus, QTextEdit:focus, QListWidget:focus {
+                border: 1px solid #4f7598;
+            }
+            QCheckBox { color: #394450; font-size: 9px; spacing: 5px; }
+            QSplitter::handle { background: #c2c7cd; }
+        """)
         root = QVBoxLayout(self)
         # The commit history panel is a floating overlay at the bottom of this page.
         # Keep normal commit controls out from under the collapsed history header.
-        root.setContentsMargins(8, 8, 8, 60)
-        root.setSpacing(8)
+        root.setContentsMargins(6, 6, 6, 54)
+        root.setSpacing(5)
+
+        header = QFrame()
+        header.setObjectName("workspaceHeader")
+        header_lay = QHBoxLayout(header)
+        header_lay.setContentsMargins(10, 6, 10, 6)
+        header_lay.setSpacing(10)
+        header_text = QVBoxLayout()
+        header_text.setSpacing(0)
+        workspace_title = QLabel("CHECK-IN AND PROMOTION")
+        workspace_title.setStyleSheet(
+            "font-size: 12px; font-weight: 700; color: #253341; "
+            "letter-spacing: 0.6px; background: transparent; border: none;"
+        )
+        workspace_subtitle = QLabel(
+            "Prepare the working set, record change intent, and route controlled content."
+        )
+        workspace_subtitle.setStyleSheet(
+            "font-size: 8px; color: #626d78; background: transparent; border: none;"
+        )
+        header_text.addWidget(workspace_title)
+        header_text.addWidget(workspace_subtitle)
+        header_lay.addLayout(header_text)
+        header_lay.addStretch()
+        session_label = QLabel(f"ACTIVE USER  {self.username}")
+        session_label.setStyleSheet(
+            "font-size: 8px; font-weight: 700; color: #52606d; "
+            "background: #e5e8eb; border: 1px solid #b8bec7; padding: 3px 7px;"
+        )
+        header_lay.addWidget(session_label)
+        root.addWidget(header)
 
         # ── Stats dashboard ──────────────────────────────────────────
         stats_row = QHBoxLayout()
-        stats_row.setSpacing(6)
-        self._stat_staged = _StatCard("📂", "0", "Staged Files", "#0078d7")
-        self._stat_pending = _StatCard("⏳", "0", "Pending", "#ca8a04")
-        self._stat_validated = _StatCard("✅", "0", "Validated", "#16a34a")
-        self._stat_total = _StatCard("📊", "0", "Total Commits", "#374151")
-        self._stat_step = _StatCard("🧊", "0", "STEP Commits", "#7c3aed")
+        stats_row.setSpacing(4)
+        self._stat_staged = _StatCard("", "0", "Working Set", "#315f87")
+        self._stat_pending = _StatCard("", "0", "Pending Review", "#9a6a20")
+        self._stat_validated = _StatCard("", "0", "Validated", "#39704c")
+        self._stat_total = _StatCard("", "0", "Recorded", "#536171")
+        self._stat_step = _StatCard("", "0", "STEP Compared", "#665287")
         for w in (self._stat_staged, self._stat_pending, self._stat_validated,
                   self._stat_total, self._stat_step):
             stats_row.addWidget(w)
         root.addLayout(stats_row)
 
         # ── Main splitter (top: staging + pending | bottom: history) ─
+        # Grouped command bar: object actions are placed next to their workflow
+        # peers, following the compact ribbon convention used by commercial PDM.
+        command_bar = QFrame()
+        command_bar.setObjectName("commandBar")
+        command_lay = QHBoxLayout(command_bar)
+        command_lay.setContentsMargins(7, 4, 7, 4)
+        command_lay.setSpacing(7)
+
+        def command_group(title, widgets):
+            group_widget = QWidget()
+            group_lay = QVBoxLayout(group_widget)
+            group_lay.setContentsMargins(0, 0, 0, 0)
+            group_lay.setSpacing(2)
+            button_lay = QHBoxLayout()
+            button_lay.setContentsMargins(0, 0, 0, 0)
+            button_lay.setSpacing(3)
+            for widget in widgets:
+                button_lay.addWidget(widget)
+            group_lay.addLayout(button_lay)
+            caption = QLabel(str(title).upper())
+            caption.setObjectName("commandGroupTitle")
+            caption.setAlignment(Qt.AlignCenter)
+            group_lay.addWidget(caption)
+            command_lay.addWidget(group_widget)
+
+        def command_separator():
+            separator = QFrame()
+            separator.setObjectName("commandSeparator")
+            separator.setFrameShape(QFrame.VLine)
+            separator.setFrameShadow(QFrame.Plain)
+            separator.setFixedWidth(1)
+            separator.setMinimumHeight(38)
+            command_lay.addWidget(separator)
+
+        self.add_file_btn = QPushButton("Add Files")
+        self.add_file_btn.setObjectName("neutral")
+        self.add_file_btn.setCursor(Qt.PointingHandCursor)
+        self.add_file_btn.setToolTip("Add controlled files to the current working set")
+        self.add_file_btn.clicked.connect(self.add_files)
+        self.workspace_file_btn = QPushButton("From Workspace")
+        self.workspace_file_btn.setObjectName("neutral")
+        self.workspace_file_btn.setCursor(Qt.PointingHandCursor)
+        self.workspace_file_btn.setToolTip(
+            "Review modified CAD in a named local workspace and stage selected files"
+        )
+        self.workspace_file_btn.clicked.connect(self.add_files_from_workspace)
+        self.remove_part_btn = QPushButton("Remove")
+        self.remove_part_btn.setObjectName("neutral")
+        self.remove_part_btn.setCursor(Qt.PointingHandCursor)
+        self.remove_part_btn.setToolTip("Remove the selected entry from the working set")
+        self.remove_part_btn.clicked.connect(self.remove_part)
+        clear_all_btn = QPushButton("Clear")
+        clear_all_btn.setObjectName("neutral")
+        clear_all_btn.setCursor(Qt.PointingHandCursor)
+        clear_all_btn.setToolTip("Clear the current working set")
+        clear_all_btn.clicked.connect(self._clear_staging)
+        command_group(
+            "Working Set",
+            (self.add_file_btn, self.workspace_file_btn, self.remove_part_btn, clear_all_btn),
+        )
+        command_separator()
+
+        self.attach_affected_btn = QPushButton("Associate Outputs")
+        self.attach_affected_btn.setObjectName("neutral")
+        self.attach_affected_btn.setCursor(Qt.PointingHandCursor)
+        self.attach_affected_btn.setToolTip(
+            "Associate engineering documents with affected BOM Items"
+        )
+        self.attach_affected_btn.clicked.connect(self._open_affected_bom_attachment_dialog)
+        self.attach_affected_btn.setEnabled(False)
+        self.step_compare_checkbox = QCheckBox("Run STEP comparison")
+        self.step_compare_checkbox.setChecked(False)
+        self.step_compare_checkbox.setEnabled(False)
+        self.step_compare_checkbox.setToolTip(
+            "Compare the STEP attachment associated with each affected Item"
+        )
+        self.attached_step_compare_checkbox = self.step_compare_checkbox
+        command_group("Engineering Content", (self.attach_affected_btn, self.step_compare_checkbox))
+        command_separator()
+
+        self.commit_btn = QPushButton("Check In")
+        self.commit_btn.setObjectName("primary")
+        self.commit_btn.setCursor(Qt.PointingHandCursor)
+        self.commit_btn.setToolTip("Create a controlled commit from the current working set")
+        self.commit_btn.clicked.connect(self.commit_changes)
+        self.snapshot_btn = QPushButton("Create Snapshot")
+        self.snapshot_btn.setObjectName("neutral")
+        self.snapshot_btn.setCursor(Qt.PointingHandCursor)
+        self.snapshot_btn.clicked.connect(self.create_snapshot)
+        command_group("Check In", (self.commit_btn, self.snapshot_btn))
+        command_separator()
+
+        self.push_dev_btn = QPushButton("Push to Development")
+        self.push_dev_btn.setObjectName("neutral")
+        self.push_dev_btn.setCursor(Qt.PointingHandCursor)
+        self.push_dev_btn.clicked.connect(self.push_to_dev)
+        self.merge_master_btn = QPushButton("Merge to Master")
+        self.merge_master_btn.setObjectName("neutral")
+        self.merge_master_btn.setCursor(Qt.PointingHandCursor)
+        self.merge_master_btn.clicked.connect(self.merge_to_master)
+        command_group("Promotion", (self.push_dev_btn, self.merge_master_btn))
+        command_lay.addStretch()
+        root.addWidget(command_bar)
+
         main_splitter = QSplitter(Qt.Vertical)
         main_splitter.setHandleWidth(3)
         main_splitter.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
@@ -953,118 +1201,68 @@ class CommitPage(QWidget):
         top_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
         top_layout = QHBoxLayout(top_widget)
         top_layout.setContentsMargins(0, 0, 0, 0)
-        top_layout.setSpacing(8)
+        top_layout.setSpacing(5)
 
         # ── Left: staging + metadata ─────────────────────────────────
         left_splitter = QSplitter(Qt.Vertical)
         left_splitter.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
 
         # Staging area
-        staging_group = QGroupBox("📂 Staging Area")
+        staging_group = QGroupBox("WORKING SET")
+        staging_group.setObjectName("enterprisePanel")
         staging_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
-        staging_group.setStyleSheet("""
-            QGroupBox {
-                font-weight: bold; border: 1px solid #d1d5db;
-                border-radius: 8px; margin-top: 8px; padding-top: 14px;
-                background: #fafbfc;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin; left: 12px; padding: 0 6px;
-                color: #374151;
-            }
-        """)
         staging_lay = QVBoxLayout(staging_group)
-        staging_lay.setSpacing(6)
+        staging_lay.setContentsMargins(7, 8, 7, 6)
+        staging_lay.setSpacing(4)
 
         self.changes_list = DropListWidget(callback=self.add_files_from_drop)
         self.changes_list.setStyleSheet("""
             QListWidget {
-                border: 2px dashed #d1d5db; border-radius: 8px;
-                background: #ffffff; padding: 4px;
-                font-size: 11px;
+                border: 1px solid #aeb5bf; border-radius: 0;
+                background: #ffffff; padding: 1px;
+                font-size: 9px;
             }
-            QListWidget::item { padding: 4px 6px; border-bottom: 1px solid #f3f4f6; }
-            QListWidget::item:selected { background: #eff6ff; color: #1e40af; }
+            QListWidget::item { padding: 3px 5px; border-bottom: 1px solid #e2e5e8; }
+            QListWidget::item:selected { background: #d8e6f2; color: #1f2a35; }
         """)
-        self.changes_list.setMinimumHeight(100)
+        self.changes_list.setMinimumHeight(120)
         staging_lay.addWidget(self.changes_list)
 
-        # File action buttons
-        file_btns = QHBoxLayout()
-        file_btns.setSpacing(6)
-
-        self.add_file_btn = QPushButton("➕ Add Files")
-        self.add_file_btn.setObjectName("primary")
-        self.add_file_btn.setCursor(Qt.PointingHandCursor)
-        self.add_file_btn.clicked.connect(self.add_files)
-        file_btns.addWidget(self.add_file_btn)
-
-        self.remove_part_btn = QPushButton("🗑 Remove")
-        self.remove_part_btn.setObjectName("neutral")
-        self.remove_part_btn.setCursor(Qt.PointingHandCursor)
-        self.remove_part_btn.clicked.connect(self.remove_part)
-        file_btns.addWidget(self.remove_part_btn)
-
-        clear_all_btn = QPushButton("✖ Clear All")
-        clear_all_btn.setObjectName("neutral")
-        clear_all_btn.setCursor(Qt.PointingHandCursor)
-        clear_all_btn.clicked.connect(self._clear_staging)
-        file_btns.addWidget(clear_all_btn)
-
-        self.attach_affected_btn = QPushButton("Attach docs to affected BOM...")
-        self.attach_affected_btn.setObjectName("neutral")
-        self.attach_affected_btn.setCursor(Qt.PointingHandCursor)
-        self.attach_affected_btn.clicked.connect(self._open_affected_bom_attachment_dialog)
-        self.attach_affected_btn.setEnabled(False)
-        file_btns.addWidget(self.attach_affected_btn)
-
-        self.step_compare_checkbox = QCheckBox("Compare attached STEP")
-        self.step_compare_checkbox.setChecked(False)
-        self.step_compare_checkbox.setEnabled(False)
-        self.step_compare_checkbox.setToolTip(
-            "Run STEP comparison using the STEP file attached to each affected BOM item."
+        staging_footer = QHBoxLayout()
+        staging_footer.setContentsMargins(0, 0, 0, 0)
+        staging_footer.addWidget(QLabel("Drop files here or use WORKING SET commands."))
+        staging_footer.addStretch()
+        self._staged_count_lbl = QLabel("0 FILES")
+        self._staged_count_lbl.setStyleSheet(
+            "font-size: 8px; font-weight: 700; color: #56616d; "
+            "background: transparent; border: none;"
         )
-        self.attached_step_compare_checkbox = self.step_compare_checkbox
-        file_btns.addWidget(self.step_compare_checkbox)
-
-        file_btns.addStretch()
-        self._staged_count_lbl = QLabel("0 files staged")
-        self._staged_count_lbl.setStyleSheet("font-size: 10px; color: #6b7280;")
-        file_btns.addWidget(self._staged_count_lbl)
-
-        staging_lay.addLayout(file_btns)
+        staging_footer.addWidget(self._staged_count_lbl)
+        staging_lay.addLayout(staging_footer)
         left_splitter.addWidget(staging_group)
 
         # Commit metadata
-        meta_group = QGroupBox("📝 Commit Details")
+        meta_group = QGroupBox("CHECK-IN ATTRIBUTES")
+        meta_group.setObjectName("enterprisePanel")
         meta_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
-        meta_group.setStyleSheet("""
-            QGroupBox {
-                font-weight: bold; border: 1px solid #d1d5db;
-                border-radius: 8px; margin-top: 8px; padding-top: 14px;
-                background: #fafbfc;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin; left: 12px; padding: 0 6px;
-                color: #374151;
-            }
-        """)
         meta_lay = QFormLayout(meta_group)
-        meta_lay.setSpacing(6)
-        meta_lay.setContentsMargins(12, 16, 12, 8)
+        meta_lay.setHorizontalSpacing(8)
+        meta_lay.setVerticalSpacing(4)
+        meta_lay.setContentsMargins(9, 9, 9, 7)
+        meta_lay.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
         self.commit_title = QLineEdit()
-        self.commit_title.setPlaceholderText("Brief summary of changes…")
+        self.commit_title.setPlaceholderText("Required controlled-change summary")
         self.commit_title.setMaxLength(120)
         self._title_counter = QLabel("0/120")
-        self._title_counter.setStyleSheet("font-size: 9px; color: #9ca3af;")
+        self._title_counter.setStyleSheet("font-size: 8px; color: #707b87;")
         self.commit_title.textChanged.connect(
             lambda t: self._title_counter.setText(f"{len(t)}/120")
         )
         title_row = QHBoxLayout()
         title_row.addWidget(self.commit_title, 1)
         title_row.addWidget(self._title_counter)
-        meta_lay.addRow("Title:", title_row)
+        meta_lay.addRow("Change Summary:", title_row)
 
         self.designed_by = QComboBox()
         if self.is_designer:
@@ -1072,31 +1270,30 @@ class CommitPage(QWidget):
         else:
             self.designed_by.addItems(self.usernames)
         self.designed_by.currentTextChanged.connect(lambda *_: self._refresh_affected_bom_items())
-        meta_lay.addRow("Designer:", self.designed_by)
+        meta_lay.addRow("Authoring User:", self.designed_by)
 
         self.commit_message = RichTextImageEditor()
         self.commit_message.setPlaceholderText(
-            "Describe your changes in detail…\n\n"
-            "• What was modified?\n"
-            "• Why was it changed?\n"
-            "• Any related part numbers?"
+            "Required change description\n"
+            "Scope: affected Items and CAD Documents\n"
+            "Reason: engineering intent and expected result"
         )
-        self.commit_message.setMinimumHeight(150)
-        self.commit_message.setMaximumHeight(260)
+        self.commit_message.setMinimumHeight(105)
+        self.commit_message.setMaximumHeight(165)
         self.commit_message.setStyleSheet("""
-            QTextEdit { border: 1px solid #d1d5db; border-radius: 6px; padding: 6px; font-size: 11px; }
-            QTextEdit:focus { border-color: #0078d7; }
+            QTextEdit { border: 1px solid #aeb5bf; border-radius: 0; padding: 4px; font-size: 9px; }
+            QTextEdit:focus { border-color: #4f7598; }
         """)
-        meta_lay.addRow("Message:", self.commit_message)
+        meta_lay.addRow("Description:", self.commit_message)
 
         self.resolved_issues_list = QListWidget()
-        self.resolved_issues_list.setMaximumHeight(115)
+        self.resolved_issues_list.setMaximumHeight(82)
         self.resolved_issues_list.setAlternatingRowColors(True)
         self.resolved_issues_list.setToolTip(
             "Select engineering issues linked to this commit. Only the 'solves' relation "
             "can close an issue after the commit is validated."
         )
-        meta_lay.addRow("Linked Issues:", self.resolved_issues_list)
+        meta_lay.addRow("Affected Issues:", self.resolved_issues_list)
 
         self.issue_relation_combo = QComboBox()
         self.issue_relation_combo.addItems(["solves", "partial_fix", "related", "regression"])
@@ -1105,39 +1302,32 @@ class CommitPage(QWidget):
             "partial_fix: remains in progress; related: no status change; "
             "regression: reopens the issue."
         )
-        meta_lay.addRow("Issue Relation:", self.issue_relation_combo)
+        meta_lay.addRow("Relationship:", self.issue_relation_combo)
 
         self.commit_jira_key = QLineEdit()
-        self.commit_jira_key.setPlaceholderText("Optional Jira key, e.g. ENG-123")
-        meta_lay.addRow("Jira Key:", self.commit_jira_key)
+        self.commit_jira_key.setPlaceholderText("External identifier, e.g. ENG-123")
+        meta_lay.addRow("External ID:", self.commit_jira_key)
 
         self.commit_jira_url = QLineEdit()
-        self.commit_jira_url.setPlaceholderText("Optional Jira URL")
-        meta_lay.addRow("Jira URL:", self.commit_jira_url)
+        self.commit_jira_url.setPlaceholderText("External system URL")
+        meta_lay.addRow("External Link:", self.commit_jira_url)
 
-        create_issue_btn = QPushButton("Create Issue from Commit")
+        create_issue_btn = QPushButton("Create Related Issue")
         create_issue_btn.setObjectName("neutral")
         create_issue_btn.clicked.connect(self._create_issue_from_commit)
         meta_lay.addRow("", create_issue_btn)
         left_splitter.addWidget(meta_group)
+        left_splitter.setStretchFactor(0, 1)
+        left_splitter.setStretchFactor(1, 2)
 
         top_layout.addWidget(left_splitter, 2)
 
         # ── Right: pending commits ───────────────────────────────────
-        pending_group = QGroupBox("⏳ Pending Commits")
+        pending_group = QGroupBox("ROUTING QUEUE")
+        pending_group.setObjectName("enterprisePanel")
         pending_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
-        pending_group.setStyleSheet("""
-            QGroupBox {
-                font-weight: bold; border: 1px solid #d1d5db;
-                border-radius: 8px; margin-top: 8px; padding-top: 14px;
-                background: #fafbfc;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin; left: 12px; padding: 0 6px;
-                color: #374151;
-            }
-        """)
         pending_lay = QVBoxLayout(pending_group)
+        pending_lay.setContentsMargins(7, 8, 7, 6)
         pending_lay.setSpacing(4)
 
         pending_scroll = QScrollArea()
@@ -1147,11 +1337,12 @@ class CommitPage(QWidget):
         pending_content.setStyleSheet("background: transparent;")
         self.pending_container_layout = QVBoxLayout(pending_content)
         self.pending_container_layout.setAlignment(Qt.AlignTop)
-        self.pending_container_layout.setSpacing(6)
+        self.pending_container_layout.setContentsMargins(0, 0, 0, 0)
+        self.pending_container_layout.setSpacing(4)
         pending_scroll.setWidget(pending_content)
         pending_lay.addWidget(pending_scroll, 1)
 
-        self.revert_btn = QPushButton("🔄 Revert Selected")
+        self.revert_btn = QPushButton("Revert Selected Commit")
         self.revert_btn.setObjectName("danger")
         self.revert_btn.setCursor(Qt.PointingHandCursor)
         self.revert_btn.clicked.connect(self.revert_commit)
@@ -1160,61 +1351,17 @@ class CommitPage(QWidget):
         top_layout.addWidget(pending_group, 1)
         main_splitter.addWidget(top_widget)
 
-        # ── Action buttons row ───────────────────────────────────────
-        actions_frame = QFrame()
-        actions_frame.setStyleSheet("""
-            QFrame {
-                background: #f8f9fa; border: 1px solid #e5e7eb;
-                border-radius: 8px; padding: 4px;
-            }
-        """)
-        actions_lay = QHBoxLayout(actions_frame)
-        actions_lay.setContentsMargins(8, 4, 8, 4)
-        actions_lay.setSpacing(8)
-
-        self.commit_btn = QPushButton("📦 Commit")
-        self.commit_btn.setObjectName("primary")
-        self.commit_btn.setCursor(Qt.PointingHandCursor)
-        self.commit_btn.setFixedHeight(32)
-        self.commit_btn.clicked.connect(self.commit_changes)
-        actions_lay.addWidget(self.commit_btn)
-
-        self.snapshot_btn = QPushButton("📸 Snapshot")
-        self.snapshot_btn.setObjectName("neutral")
-        self.snapshot_btn.setCursor(Qt.PointingHandCursor)
-        self.snapshot_btn.setFixedHeight(32)
-        self.snapshot_btn.clicked.connect(self.create_snapshot)
-        actions_lay.addWidget(self.snapshot_btn)
-
-        actions_lay.addStretch()
-
-        self.push_dev_btn = QPushButton("⬆ Push to Dev")
-        self.push_dev_btn.setObjectName("neutral")
-        self.push_dev_btn.setCursor(Qt.PointingHandCursor)
-        self.push_dev_btn.setFixedHeight(32)
-        self.push_dev_btn.clicked.connect(self.push_to_dev)
-        actions_lay.addWidget(self.push_dev_btn)
-
-        self.merge_master_btn = QPushButton("🔀 Merge to Master")
-        self.merge_master_btn.setObjectName("neutral")
-        self.merge_master_btn.setCursor(Qt.PointingHandCursor)
-        self.merge_master_btn.setFixedHeight(32)
-        self.merge_master_btn.clicked.connect(self.merge_to_master)
-        actions_lay.addWidget(self.merge_master_btn)
-
-        root.addWidget(actions_frame)
-
         # ── BOTTOM AREA: History ─────────────────────────────────────
-        history_group = QGroupBox("📋 Commit History")
+        history_group = QGroupBox("COMMIT HISTORY")
         self.history_group = history_group
         history_group.setParent(self)
         history_group.setTitle("")
         history_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
         history_group.setStyleSheet("""
             QGroupBox {
-                font-weight: bold; border: 1px solid #111827;
-                border-radius: 8px; margin-top: 0; padding-top: 0;
-                background: #fafbfc;
+                font-weight: bold; border: 1px solid #7d8792;
+                border-radius: 1px; margin-top: 0; padding-top: 0;
+                background: #eef0f2;
             }
             QGroupBox::title {
                 subcontrol-origin: margin; left: 12px; padding: 0 6px;
@@ -1222,20 +1369,21 @@ class CommitPage(QWidget):
             }
         """)
         history_lay = QVBoxLayout(history_group)
-        history_lay.setContentsMargins(0, 0, 0, 8)
-        history_lay.setSpacing(6)
+        history_lay.setContentsMargins(0, 0, 0, 5)
+        history_lay.setSpacing(4)
 
-        self.history_header_btn = QPushButton("▲  Commit History")
+        self.history_header_btn = QPushButton("HIDE  |  COMMIT HISTORY")
         self.history_header_btn.setCursor(Qt.PointingHandCursor)
         self.history_header_btn.setToolTip("Click to expand/collapse. Drag up or down to resize when expanded.")
-        self.history_header_btn.setFixedHeight(38)
+        self.history_header_btn.setFixedHeight(34)
         self.history_header_btn.setStyleSheet("""
             QPushButton {
-                background: #111827; color: #ffffff; border: none;
-                border-top-left-radius: 7px; border-top-right-radius: 7px;
-                padding: 0 14px; text-align: left; font-size: 12px; font-weight: 700;
+                background: #4f5d6a; color: #ffffff; border: none;
+                border-radius: 0;
+                padding: 0 10px; text-align: left; font-size: 9px; font-weight: 700;
+                letter-spacing: 0.5px;
             }
-            QPushButton:hover { background: #1f2937; }
+            QPushButton:hover { background: #43515e; }
         """)
         self.history_header_btn.clicked.connect(
             lambda: self._collapse_history_section()
@@ -1246,7 +1394,7 @@ class CommitPage(QWidget):
 
         # Filter row
         self.history_filter_frame = QFrame()
-        self.history_filter_frame.setFixedHeight(36)
+        self.history_filter_frame.setFixedHeight(32)
         self.history_filter_frame.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.history_filter_frame.setStyleSheet("QFrame { background: transparent; border: none; }")
         filter_row = QHBoxLayout(self.history_filter_frame)
@@ -1254,13 +1402,13 @@ class CommitPage(QWidget):
         filter_row.setSpacing(6)
 
         self.history_search = QLineEdit()
-        self.history_search.setPlaceholderText("🔍  Search (file, user, message, status)…")
+        self.history_search.setPlaceholderText("Search object, user, description, or state")
         self.history_search.setStyleSheet("""
             QLineEdit {
-                border: 1px solid #d1d5db; border-radius: 6px;
-                padding: 5px 8px; font-size: 11px; background: #ffffff;
+                border: 1px solid #aeb5bf; border-radius: 0;
+                padding: 3px 6px; font-size: 9px; background: #ffffff;
             }
-            QLineEdit:focus { border-color: #0078d7; }
+            QLineEdit:focus { border-color: #4f7598; }
         """)
         filter_row.addWidget(self.history_search, 1)
 
@@ -1273,23 +1421,25 @@ class CommitPage(QWidget):
         filter_row.addWidget(self.history_status_filter)
 
         self.history_view_filter = QComboBox()
-        self.history_view_filter.addItems(["Items", "Commit Groups"])
-        self.history_view_filter.setToolTip("Switch between file-row history and logical commit groups")
+        self.history_view_filter.addItems(["File Records", "Commit Groups"])
+        self.history_view_filter.setToolTip(
+            "Switch between controlled-file records and logical commit groups"
+        )
         self.history_view_filter.setFixedWidth(135)
         filter_row.addWidget(self.history_view_filter)
 
-        self.history_clear_btn = QPushButton("✖")
-        self.history_clear_btn.setFixedSize(28, 28)
+        self.history_clear_btn = QPushButton("Reset")
+        self.history_clear_btn.setFixedSize(48, 24)
         self.history_clear_btn.setToolTip("Clear filters")
         self.history_clear_btn.setCursor(Qt.PointingHandCursor)
         self.history_clear_btn.setStyleSheet("""
-            QPushButton { background: #f3f4f6; border: 1px solid #d1d5db; border-radius: 6px; font-size: 12px; }
-            QPushButton:hover { background: #e5e7eb; }
+            QPushButton { background: #f3f4f5; border: 1px solid #aeb5bf; border-radius: 1px; font-size: 9px; }
+            QPushButton:hover { background: #e1e5e9; }
         """)
         filter_row.addWidget(self.history_clear_btn)
 
         self._hist_count_lbl = QLabel("")
-        self._hist_count_lbl.setStyleSheet("font-size: 10px; color: #9ca3af;")
+        self._hist_count_lbl.setStyleSheet("font-size: 8px; color: #65707c;")
         filter_row.addWidget(self._hist_count_lbl)
 
         history_lay.addWidget(self.history_filter_frame)
@@ -1390,7 +1540,9 @@ class CommitPage(QWidget):
         if not history_group:
             return
         if hasattr(self, "history_header_btn"):
-            self.history_header_btn.setText("▼  Commit History" if expanded else "▲  Commit History")
+            self.history_header_btn.setText(
+                "HIDE  |  COMMIT HISTORY" if expanded else "SHOW  |  COMMIT HISTORY"
+            )
         for widget in getattr(self, "_history_content_widgets", []):
             widget.setVisible(bool(expanded))
         self._position_history_overlay()
@@ -1402,7 +1554,7 @@ class CommitPage(QWidget):
         if not history_group:
             return
         margin = 8
-        header_h = 48
+        header_h = 42
         available_h = max(header_h, self.height() - (margin * 2))
         if getattr(self, "_history_expanded", False):
             default_h = max(220, int(available_h * 0.34))
@@ -1424,7 +1576,7 @@ class CommitPage(QWidget):
 
     def _clamp_history_overlay_height(self, requested_height: int) -> int:
         margin = 8
-        header_h = 48
+        header_h = 42
         available_h = max(header_h, self.height() - (margin * 2))
         max_h = max(header_h, available_h - 70)
         min_h = min(max_h, 170)
@@ -1456,7 +1608,9 @@ class CommitPage(QWidget):
 
     def _update_staged_count(self):
         n = len(self.uncommitted_parts)
-        self._staged_count_lbl.setText(f"{n} file{'s' if n != 1 else ''} staged")
+        self._staged_count_lbl.setText(
+            f"{n} FILE{'S' if n != 1 else ''} IN WORKING SET"
+        )
         self._stat_staged.set_value(str(n))
         self._refresh_resolved_issues()
         self._refresh_affected_bom_items()
@@ -1494,34 +1648,151 @@ class CommitPage(QWidget):
     def _clear_affected_bom_items(self):
         return
 
+    @staticmethod
+    def _optional_int(value):
+        try:
+            return int(value) if value is not None else None
+        except Exception:
+            return None
+
+    def _staged_creo_files_for_commit(self):
+        rows = []
+        for staged in self.uncommitted_parts or []:
+            path = str(staged.get("path") or staged.get("filename") or "")
+            filename = os.path.basename(path)
+            if not filename or not is_creo_file(filename):
+                continue
+            clean_filename = self._clean_creo_file_name(filename)
+            rows.append({
+                "path": path,
+                "filename": filename,
+                "clean_filename": clean_filename,
+                "base_stem": os.path.splitext(clean_filename)[0],
+            })
+        return rows
+
+    def _pdm_document_indexes_for_affected_items(self, project_id: int):
+        documents = []
+        try:
+            documents = self.bom_service.list_pdm_cad_documents(int(project_id)) or []
+        except Exception:
+            documents = []
+        by_file = {}
+        by_base = {}
+        by_id = {}
+        for document in documents:
+            doc_id = self._optional_int(document.get("id"))
+            if doc_id is not None:
+                by_id[doc_id] = document
+            file_name = self._clean_creo_file_name(document.get("file_name") or "")
+            if file_name:
+                by_file[file_name.casefold()] = document
+                by_base[os.path.splitext(file_name)[0].casefold()] = document
+            base_name = str(document.get("base_file_name") or "").strip()
+            if base_name:
+                by_base[base_name.casefold()] = document
+        return by_file, by_base, by_id
+
+    def _item_ids_for_pdm_document_in_commit_page(
+        self,
+        document: dict,
+        documents_by_id: dict,
+    ) -> list[int]:
+        """Resolve every EBOM Item affected by a staged CAD Document.
+
+        Models may legitimately describe several Items.  Drawings are more
+        specific: their direct Item associations are the user's explicit
+        drawing selections and must not be inherited by every Item that uses
+        the owning model.
+        """
+        associations = list(document.get("associations") or [])
+        item_ids = {
+            item_id
+            for association in associations
+            if (item_id := self._optional_int(association.get("item_id"))) is not None
+        }
+        if item_ids:
+            return sorted(item_ids)
+
+        # Compatibility for databases/documents loaded before association
+        # aggregation was introduced.
+        item_id = self._optional_int(document.get("item_id"))
+        if item_id is not None:
+            return [item_id]
+
+        owner_id = self._optional_int(document.get("drawing_owner_cad_document_id"))
+        if owner_id is None:
+            return []
+        owner_document = documents_by_id.get(owner_id) or {}
+        owner_associations = list(owner_document.get("associations") or [])
+        # An unassigned legacy drawing falls back only to the model OWNER.  It
+        # never becomes content of every secondary IMAGE/CONTENT Item.
+        owner_item_ids = {
+            item_id
+            for association in owner_associations
+            if str(association.get("association_type") or "").upper() == "OWNER"
+            if (item_id := self._optional_int(association.get("item_id"))) is not None
+        }
+        if owner_item_ids:
+            return sorted(owner_item_ids)
+        owner_item_id = self._optional_int(owner_document.get("item_id"))
+        return [owner_item_id] if owner_item_id is not None else []
+
+    def _legacy_affected_bom_items_for_staged_file(self, staged_file: dict, project_id: int, designer_id):
+        filename = staged_file.get("filename") or ""
+        clean_filename = staged_file.get("clean_filename") or filename
+        base_name = clean_filename
+        ext = os.path.splitext(clean_filename)[1].lstrip(".").lower()
+        try:
+            if ext == "drw":
+                bom = self.bom_repo.get_by_drawing_file_name_for_commit(
+                    base_name,
+                    int(project_id),
+                    designer_id,
+                )
+                return [bom] if bom else []
+            return self.bom_repo.get_all_by_base_file_name_for_commit(
+                base_name,
+                int(project_id),
+                designer_id,
+            ) or []
+        except Exception:
+            return []
+
     def _affected_bom_items_for_staging(self):
         project_id = self.session.project_id
         if not project_id:
             return []
         designer_id = self._designer_id_for_commit()
+        staged_creo_files = self._staged_creo_files_for_commit()
+        cad_by_file, cad_by_base, cad_by_id = self._pdm_document_indexes_for_affected_items(int(project_id))
         result = {}
-        for staged in self.uncommitted_parts or []:
-            filename = os.path.basename(staged.get("path") or staged.get("filename") or "")
-            if not filename or not is_creo_file(filename):
+        for staged in staged_creo_files:
+            clean_filename = staged.get("clean_filename") or staged.get("filename") or ""
+            cad_document = cad_by_file.get(clean_filename.casefold())
+            if cad_document is None:
+                cad_document = cad_by_base.get((staged.get("base_stem") or "").casefold())
+            item_ids = (
+                self._item_ids_for_pdm_document_in_commit_page(cad_document, cad_by_id)
+                if cad_document else []
+            )
+            resolved_from_pdm = False
+            for item_id in item_ids:
+                try:
+                    info = self.bom_service.get_part_details(int(item_id)) or {}
+                except Exception:
+                    info = {}
+                if info:
+                    result[int(item_id)] = info
+                    resolved_from_pdm = True
+            if resolved_from_pdm:
                 continue
-            base_name = ".".join(filename.split(".")[:-1])
-            ext = ".".join(base_name.split(".")[1:]).lower()
-            try:
-                if ext == "drw":
-                    bom = self.bom_repo.get_by_drawing_file_name_for_commit(
-                        base_name,
-                        int(project_id),
-                        designer_id,
-                    )
-                    boms = [bom] if bom else []
-                else:
-                    boms = self.bom_repo.get_all_by_base_file_name_for_commit(
-                        base_name,
-                        int(project_id),
-                        designer_id,
-                    ) or []
-            except Exception:
-                boms = []
+
+            boms = self._legacy_affected_bom_items_for_staged_file(
+                staged,
+                int(project_id),
+                designer_id,
+            )
             for bom in boms:
                 if not bom:
                     continue
@@ -1534,6 +1805,7 @@ class CommitPage(QWidget):
         if not hasattr(self, "attach_affected_btn"):
             return
         items = self._affected_bom_items_for_staging()
+        staged_creo_count = len(self._staged_creo_files_for_commit())
         active_part_ids = {int(item.get("id")) for item in items if item.get("id") is not None}
         pending = getattr(self, "_pending_engineering_attachments", {})
         for part_id in list(pending.keys()):
@@ -1541,32 +1813,49 @@ class CommitPage(QWidget):
                 pending.pop(part_id, None)
         count = len(items)
         pending_count = sum(len(v or []) for v in getattr(self, "_pending_engineering_attachments", {}).values())
-        enabled = count > 0 and not getattr(self, "_processing_action", False)
-        self.attach_affected_btn.setEnabled(enabled)
+        action_enabled = staged_creo_count > 0 and not getattr(self, "_processing_action", False)
+        step_enabled = count > 0 and not getattr(self, "_processing_action", False)
+        self.attach_affected_btn.setEnabled(action_enabled)
         if hasattr(self, "attached_step_compare_checkbox"):
-            self.attached_step_compare_checkbox.setEnabled(enabled)
-            if not enabled:
+            self.attached_step_compare_checkbox.setEnabled(step_enabled)
+            if not step_enabled:
                 self.attached_step_compare_checkbox.setChecked(False)
+        item_unit = "Item" if count == 1 else "Items"
+        file_unit = "File" if pending_count == 1 else "Files"
         if count and pending_count:
-            text = f"Attach docs to affected BOM ({count}, {pending_count} staged)..."
+            text = f"Associate Outputs ({count} {item_unit} / {pending_count} {file_unit})"
         elif count:
-            text = f"Attach docs to affected BOM ({count})..."
+            text = f"Associate Outputs ({count} {item_unit})"
+        elif staged_creo_count:
+            text = "Associate Outputs"
         else:
-            text = "Attach docs to affected BOM..."
+            text = "Associate Outputs"
         self.attach_affected_btn.setText(text)
 
     def _open_affected_bom_attachment_dialog(self):
         items = self._affected_bom_items_for_staging()
         if not items:
-            QMessageBox.information(self, "Affected BOM", "Stage Creo files first to resolve affected BOM items.")
+            if self._staged_creo_files_for_commit():
+                QMessageBox.information(
+                    self,
+                    "Affected Items",
+                    "The staged Creo files do not resolve to an associated EBOM Item. "
+                    "Register the CAD Document and associate it to an Item, or bind a DRW to its owning PRT/ASM.",
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "Affected Items",
+                    "Stage Creo files first to resolve affected Items.",
+                )
             return
 
         dialog = QDialog(self)
-        dialog.setWindowTitle("Attach Documents to Affected BOM Items")
+        dialog.setWindowTitle("Attach Documents to Affected Items")
         dialog.resize(560, 420)
         layout = QVBoxLayout(dialog)
         intro = QLabel(
-            "Drop PDF, STEP, or validation documents onto the correct BOM item. Files are staged with this commit and will be added to the vault only after push to master."
+            "Drop PDF, STEP, or validation documents onto the correct Item. Files are staged with this commit and will be added to the vault only after push to master."
         )
         intro.setWordWrap(True)
         intro.setStyleSheet("font-size: 10px; color: #374151;")
@@ -1689,7 +1978,7 @@ class CommitPage(QWidget):
             self._refresh_affected_bom_items()
             try:
                 self.window().statusBar().showMessage(
-                    f"{added} file(s) staged for the affected BOM item."
+                    f"{added} file(s) staged for the affected Item."
                 )
             except Exception:
                 pass
@@ -1738,11 +2027,72 @@ class CommitPage(QWidget):
         )
         self._set_pending_commit_groups(commits)
 
+    @staticmethod
+    def _pending_group_key(group: dict) -> tuple:
+        commit_id = str(group.get("commit_id") or group.get("id") or "").strip()
+        project_id = group.get("project_id")
+        try:
+            project_id = int(project_id) if project_id is not None else None
+        except Exception:
+            project_id = None
+        return (project_id, commit_id or str(group.get("title") or group.get("filename") or ""))
+
+    @staticmethod
+    def _pending_status_rank(status: str) -> int:
+        return {
+            "pending": 10,
+            "validated": 20,
+            "approved": 30,
+            "pushed": 30,
+            "released": 30,
+            "reverted": 40,
+        }.get(str(status or "").strip().lower(), 0)
+
+    def _dedupe_pending_commit_groups(self, commits) -> list[dict]:
+        by_key = {}
+        order = []
+        for raw in commits or []:
+            group = dict(raw or {})
+            key = self._pending_group_key(group)
+            if key not in by_key:
+                by_key[key] = group
+                order.append(key)
+                continue
+            existing = by_key[key]
+            if self._pending_status_rank(group.get("status")) >= self._pending_status_rank(existing.get("status")):
+                merged = dict(existing)
+                merged.update(group)
+            else:
+                merged = dict(group)
+                merged.update(existing)
+            parts = []
+            seen = set()
+            for source in (existing.get("parts") or [], group.get("parts") or []):
+                text = str(source or "").strip()
+                if text and text not in seen:
+                    seen.add(text)
+                    parts.append(text)
+            if parts:
+                merged["parts"] = parts
+            by_key[key] = merged
+        return [by_key[key] for key in order if key in by_key]
+
     def _set_pending_commit_groups(self, commits):
-        # Clear old cards
+        commits = self._dedupe_pending_commit_groups(commits)
+        selected_key = (
+            self._pending_group_key(self.selected_group)
+            if getattr(self, "selected_group", None) else None
+        )
+
+        # Clear old cards immediately. deleteLater() alone leaves the widget in
+        # the layout until the event loop runs, which can briefly show both the
+        # old Pending card and the new Validated card for the same commit.
         for i in reversed(range(self.pending_container_layout.count())):
-            w = self.pending_container_layout.itemAt(i).widget()
+            layout_item = self.pending_container_layout.takeAt(i)
+            w = layout_item.widget() if layout_item else None
             if w:
+                w.hide()
+                w.setParent(None)
                 w.deleteLater()
 
         self.selected_card = None
@@ -1758,6 +2108,10 @@ class CommitPage(QWidget):
             card.browse_requested.connect(self.browse_commit_directory)
             self.pending_container_layout.addWidget(card)
             self._pending_cards.append(card)
+            if selected_key is not None and self._pending_group_key(group) == selected_key:
+                self.selected_card = card
+                self.selected_group = group
+                card.set_selected(True)
 
     def _on_pending_card_clicked(self, group):
         for c in self._pending_cards:
@@ -1900,7 +2254,7 @@ class CommitPage(QWidget):
     def _clear_history_filter(self):
         self.history_search.setText("")
         self.history_status_filter.setCurrentText("All")
-        self.history_view_filter.setCurrentText("Items")
+        self.history_view_filter.setCurrentText("File Records")
         self._apply_history_filter()
 
     # ═══════════════════════════════════════════════════════════════════
@@ -1930,10 +2284,22 @@ class CommitPage(QWidget):
             selected_file = files[0]
         sty = _status_style(data.get("status", ""))
         dlg = QDialog(self)
-        dlg.setWindowTitle(f"{sty['icon']}  Commit Details — {data.get('filename', '')}")
+        dlg.setWindowTitle(f"Commit Details | {data.get('filename', '')}")
         dlg.setMinimumSize(760, 480)
+        dlg.setStyleSheet("""
+            QDialog { background: #e8eaed; color: #27313c; }
+            QTableWidget, QTreeWidget, QTextEdit {
+                background: #ffffff; border: 1px solid #aeb5bf; border-radius: 0;
+                alternate-background-color: #f4f5f6;
+            }
+            QHeaderView::section {
+                background: #dfe3e7; border: none; border-right: 1px solid #b8bec7;
+                border-bottom: 1px solid #9fa7b1; padding: 4px; font-size: 9px;
+                font-weight: 700; color: #303b46;
+            }
+        """)
         root = QVBoxLayout(dlg)
-        root.setSpacing(10)
+        root.setSpacing(6)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
@@ -1941,25 +2307,25 @@ class CommitPage(QWidget):
         scroll.setStyleSheet("QScrollArea { border: none; }")
         content = QWidget()
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(4, 4, 12, 4)
-        layout.setSpacing(10)
+        layout.setContentsMargins(4, 4, 9, 4)
+        layout.setSpacing(6)
 
         # Header
         header = QFrame()
         header.setStyleSheet(f"""
             QFrame {{
                 background: {sty['bg']}; border: 1px solid {sty['color']}40;
-                border-left: 5px solid {sty['color']}; border-radius: 8px;
+                border-left: 4px solid {sty['color']}; border-radius: 0;
             }}
         """)
         hl = QVBoxLayout(header)
         hl.setSpacing(4)
 
-        badge = QLabel(f'  {sty["icon"]} {sty["label"]}  ')
+        badge = QLabel(f'  {sty["label"].upper()}  ')
         badge.setStyleSheet(f"""
             background: {sty['color']}; color: #ffffff;
-            border-radius: 10px; padding: 2px 12px;
-            font-size: 11px; font-weight: bold;
+            border-radius: 0; padding: 2px 9px;
+            font-size: 9px; font-weight: 700;
         """)
         badge.setFixedWidth(badge.sizeHint().width() + 16)
         hl.addWidget(badge)
@@ -1969,17 +2335,17 @@ class CommitPage(QWidget):
 
         meta_parts = []
         if data.get("designed_by"):
-            meta_parts.append(f"👤 {data['designed_by']}")
+            meta_parts.append(f"Designer: {data['designed_by']}")
         if data.get("checked_by") and data["checked_by"] != "Unknown":
-            meta_parts.append(f"🔍 {data['checked_by']}")
+            meta_parts.append(f"Checker: {data['checked_by']}")
         if data.get("date"):
             rel = _relative_time(str(data["date"]))
-            meta_parts.append(f"📅 {str(data['date'])[:19]}  ({rel})")
+            meta_parts.append(f"Modified: {str(data['date'])[:19]} ({rel})")
         if data.get("commit_id"):
-            meta_parts.append(f"🏷 {data['commit_id'][:16]}")
+            meta_parts.append(f"Commit: {data['commit_id'][:16]}")
         if meta_parts:
-            m = QLabel("    ".join(meta_parts))
-            m.setStyleSheet("color: #4b5563; font-size: 11px; background: transparent; border: none;")
+            m = QLabel("  |  ".join(meta_parts))
+            m.setStyleSheet("color: #4b5563; font-size: 9px; background: transparent; border: none;")
             m.setWordWrap(True)
             hl.addWidget(m)
 
@@ -2121,10 +2487,15 @@ class CommitPage(QWidget):
                 ("Commit ID", item.get("commit_id")),
                 ("Status", item.get("status")),
                 ("Type", item.get("type")),
-                ("Part", item.get("part_name") or item.get("part_id")),
-                ("Part ID", item.get("part_id")),
-                ("AES", item.get("aes_number")),
-                ("Part Number", item.get("part_number")),
+                ("Item Number", item.get("part_number")),
+                ("AES Number", item.get("aes_number")),
+                ("Item", item.get("part_name") or item.get("part_id")),
+                ("Internal Item ID", item.get("part_id")),
+                ("CAD Document ID", item.get("cad_document_id")),
+                ("Approved Creo Version", (
+                    f".{item.get('approved_version')}"
+                    if item.get("approved_version") is not None else ""
+                )),
                 ("Drawing Number", item.get("drawing_number")),
                 ("Revision", item.get("part_revision")),
                 ("Lifecycle", item.get("part_lifecycle_state")),
@@ -2202,17 +2573,17 @@ class CommitPage(QWidget):
         if step_status:
             sp = str(data.get("step_file_path") or "").strip()
             if sp:
-                open_s = QPushButton("🔬 Open STEP")
+                open_s = QPushButton("Open STEP")
                 open_s.setObjectName("neutral")
                 open_s.clicked.connect(lambda _c=False, d=data: self._open_step_file_in_viewer(d))
                 btn_row.addWidget(open_s)
             if step_status.upper() == "COMPARED":
-                diff_b = QPushButton("🔍 STEP Diff")
+                diff_b = QPushButton("Compare STEP")
                 diff_b.setObjectName("primary")
                 diff_b.clicked.connect(lambda _c=False, d=data: self._show_step_diff_for_commit_history(d))
                 btn_row.addWidget(diff_b)
 
-        copy_btn = QPushButton("📋 Copy Info")
+        copy_btn = QPushButton("Copy Details")
         copy_btn.setObjectName("neutral")
         copy_btn.clicked.connect(lambda _c=False, d=data: self._copy_commit_to_clipboard(d))
         btn_row.addWidget(copy_btn)
@@ -2248,13 +2619,13 @@ class CommitPage(QWidget):
 
         menu = QMenu(self)
         menu.setStyleSheet("""
-            QMenu { background: #fff; border: 1px solid #d1d5db; border-radius: 8px; padding: 4px 0; }
-            QMenu::item { padding: 6px 16px; font-size: 11px; }
-            QMenu::item:selected { background: #eff6ff; color: #0078d7; }
-            QMenu::separator { height: 1px; background: #e5e7eb; margin: 4px 8px; }
+            QMenu { background: #fff; border: 1px solid #aeb5bf; border-radius: 0; padding: 2px 0; }
+            QMenu::item { padding: 4px 16px; font-size: 9px; }
+            QMenu::item:selected { background: #d8e6f2; color: #263746; }
+            QMenu::separator { height: 1px; background: #cdd2d7; margin: 3px 7px; }
         """)
 
-        det = menu.addAction("📋  View Full Details")
+        det = menu.addAction("View Full Details")
         det.triggered.connect(lambda _c, d=data: self._show_history_details_dialog(d))
 
         if data.get("is_commit_group"):
@@ -2262,24 +2633,24 @@ class CommitPage(QWidget):
             rst.setEnabled(bool(data.get("can_restore")))
             rst.triggered.connect(lambda _c, d=data: self._restore_commit_group_from_history(d))
 
-        cpy = menu.addAction("📝  Copy Info to Clipboard")
+        cpy = menu.addAction("Copy Details to Clipboard")
         cpy.triggered.connect(lambda _c, d=data: self._copy_commit_to_clipboard(d))
 
         step_path = str(data.get("step_file_path") or "").strip()
         if step_path:
             menu.addSeparator()
-            sa = menu.addAction("🔬  Open STEP in 3D Viewer")
+            sa = menu.addAction("Open STEP in 3D Viewer")
             sa.triggered.connect(lambda _c, d=data: self._open_step_file_in_viewer(d))
 
         step_status = str(data.get("step_diff_status") or "").strip().upper()
         if step_status == "COMPARED":
-            da = menu.addAction("🔍  Show STEP Diff Zones")
+            da = menu.addAction("Show STEP Difference Zones")
             da.triggered.connect(lambda _c, d=data: self._show_step_diff_for_commit_history(d))
 
         cid = str(data.get("commit_id") or "")
         if cid:
             menu.addSeparator()
-            ca = menu.addAction(f"🏷  Copy Commit ID: {cid[:12]}…")
+            ca = menu.addAction(f"Copy Commit ID: {cid[:12]}…")
             ca.triggered.connect(lambda _c, _v=cid: QApplication.clipboard().setText(_v))
 
         menu.exec_(self.history_table.viewport().mapToGlobal(position))
@@ -2427,18 +2798,22 @@ class CommitPage(QWidget):
 
         sty = _status_style(group.get("status", ""))
         dialog = QDialog(self)
-        dialog.setWindowTitle(f"{sty['icon']}  Review — {group.get('title', 'Commit')}")
+        dialog.setWindowTitle(f"Workflow Review | {group.get('title', 'Commit')}")
         dialog.setMinimumSize(700, 500)
         dialog.setMaximumSize(max_w, max_h)
         dialog.resize(int(max_w * 0.75), int(max_h * 0.75))
         dialog.setStyleSheet("""
-            QDialog { background: #F8FAFC; font-family: 'Segoe UI', sans-serif; }
+            QDialog { background: #e8eaed; font-family: 'Segoe UI', sans-serif; color: #27313c; }
             QLabel { background: transparent; border: none; }
+            QListWidget, QTableWidget, QTreeWidget {
+                background: #ffffff; border: 1px solid #aeb5bf; border-radius: 0;
+                alternate-background-color: #f4f5f6;
+            }
         """)
 
         outer = QVBoxLayout(dialog)
-        outer.setContentsMargins(12, 12, 12, 12)
-        outer.setSpacing(10)
+        outer.setContentsMargins(7, 7, 7, 7)
+        outer.setSpacing(6)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -2447,41 +2822,41 @@ class CommitPage(QWidget):
         scroll.setStyleSheet("QScrollArea { border: none; }")
         scroll_content = QWidget()
         main = QVBoxLayout(scroll_content)
-        main.setSpacing(14)
-        main.setContentsMargins(16, 16, 16, 16)
+        main.setSpacing(7)
+        main.setContentsMargins(9, 9, 9, 9)
 
         # ── Header ────────────────────────────────────────────────────
         header = QFrame()
         header.setStyleSheet(f"""
             QFrame {{
-                background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
-                    stop:0 {sty['color']}, stop:1 {sty['color']}cc);
-                border-radius: 10px;
+                background: #4f5d6a;
+                border-left: 4px solid {sty['color']};
+                border-radius: 0;
             }}
         """)
-        header.setFixedHeight(72)
+        header.setFixedHeight(58)
         hl = QHBoxLayout(header)
         hl.setContentsMargins(16, 10, 16, 10)
 
         left_info = QVBoxLayout()
         designer_name = group.get('username', 'Unknown')
         left_info.addWidget(QLabel(
-            f"<span style='color: rgba(255,255,255,0.7); font-size: 10px;'>Designer</span>"
-            f"  <b style='color: white; font-size: 12px;'>{designer_name}</b>"
+            f"<span style='color: #d9e0e6; font-size: 9px;'>DESIGNER</span>"
+            f"  <b style='color: white; font-size: 10px;'>{designer_name}</b>"
         ))
         cid = group.get('commit_id', '')
         left_info.addWidget(QLabel(
-            f"<span style='color: rgba(255,255,255,0.7); font-size: 10px;'>Commit</span>"
-            f"  <code style='color: white; font-size: 11px;'>{cid[:14]}</code>"
+            f"<span style='color: #d9e0e6; font-size: 9px;'>COMMIT</span>"
+            f"  <code style='color: white; font-size: 9px;'>{cid[:14]}</code>"
         ))
         hl.addLayout(left_info, 1)
 
         status_text = group.get("status", "Pending")
-        status_badge = QLabel(f"  {sty['icon']}  {status_text}  ")
+        status_badge = QLabel(f"  {str(status_text).upper()}  ")
         status_badge.setStyleSheet("""
-            background: rgba(255,255,255,0.25); color: white;
-            border-radius: 12px; padding: 4px 12px;
-            font-weight: bold; font-size: 12px;
+            background: #eef1f3; color: #26313c;
+            border: 1px solid #c4cad0; border-radius: 0; padding: 3px 9px;
+            font-weight: 700; font-size: 9px;
         """)
         hl.addWidget(status_badge)
         main.addWidget(header)
@@ -2489,21 +2864,21 @@ class CommitPage(QWidget):
         # ── Info cards ────────────────────────────────────────────────
         cards_row = QHBoxLayout()
         cards_row.setSpacing(8)
-        cards_row.addWidget(self._make_info_card("📝", "Title", group.get('title', '')))
-        cards_row.addWidget(self._make_info_card("📅", "Date",
+        cards_row.addWidget(self._make_info_card("", "Change Summary", group.get('title', '')))
+        cards_row.addWidget(self._make_info_card("", "Created",
                                                  str(group.get('date', ''))[:19]))
         num_parts = len(group.get("parts", []))
-        cards_row.addWidget(self._make_info_card("🔧", "Parts",
+        cards_row.addWidget(self._make_info_card("", "Controlled Files",
                                                  f"{num_parts} file{'s' if num_parts != 1 else ''}"))
         main.addLayout(cards_row)
 
         # ── Parts list ────────────────────────────────────────────────
-        main.addWidget(QLabel("<b style='font-size: 11px; color: #374151;'>📦 Committed Parts</b>"))
+        main.addWidget(QLabel("<b style='font-size: 9px; color: #374151;'>CONTROLLED FILES</b>"))
         parts_list = QListWidget()
         parts_list.setStyleSheet("""
-            QListWidget { border: 1px solid #e5e7eb; border-radius: 8px; background: #fff; }
-            QListWidget::item { padding: 6px 8px; border-bottom: 1px solid #f3f4f6; }
-            QListWidget::item:selected { background: #eff6ff; }
+            QListWidget { border: 1px solid #aeb5bf; border-radius: 0; background: #fff; }
+            QListWidget::item { padding: 4px 6px; border-bottom: 1px solid #e2e5e8; }
+            QListWidget::item:selected { background: #d8e6f2; }
         """)
         parts_list.setMaximumHeight(180)
         for i, part in enumerate(group.get("parts", [])):
@@ -2554,7 +2929,7 @@ class CommitPage(QWidget):
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(8)
 
-        warning_label = QLabel("⚠️ Reverting cannot be undone")
+        warning_label = QLabel("Revert is irreversible")
         warning_label.setStyleSheet("color: #dc2626; font-size: 10px;")
         warning_label.setVisible(False)
 
@@ -2572,8 +2947,7 @@ class CommitPage(QWidget):
             success = self.validate_commit(group, confirmed, rejected)
             if success:
                 group['status'] = 'Validated'
-                new_sty = _status_style('Validated')
-                status_badge.setText(f"  {new_sty['icon']}  Validated  ")
+                status_badge.setText("  VALIDATED  ")
                 validate_btn.setEnabled(False)
                 self.load_pending_commits()
                 QMessageBox.information(self, "Validated",
@@ -2589,18 +2963,18 @@ class CommitPage(QWidget):
             if success:
                 dialog.accept()
 
-        revert_btn = QPushButton("🔄 Revert")
+        revert_btn = QPushButton("Revert")
         revert_btn.setObjectName("danger")
         revert_btn.setCursor(Qt.PointingHandCursor)
         revert_btn.clicked.connect(handle_revert)
 
-        validate_btn = QPushButton("✅ Validate")
+        validate_btn = QPushButton("Validate")
         validate_btn.setObjectName("neutral")
         validate_btn.setCursor(Qt.PointingHandCursor)
         validate_btn.clicked.connect(handle_validate)
         validate_btn.setEnabled(self.perm.can("validate"))
 
-        push_btn = QPushButton("🚀 Push to Master")
+        push_btn = QPushButton("Push to Master")
         push_btn.setObjectName("primary")
         push_btn.setCursor(Qt.PointingHandCursor)
         push_btn.clicked.connect(handle_push)
@@ -2628,25 +3002,26 @@ class CommitPage(QWidget):
         card = QFrame()
         card.setStyleSheet("""
             QFrame {
-                background: #ffffff; border: 1px solid #e5e7eb;
-                border-radius: 8px; padding: 0;
+                background: #ffffff; border: 1px solid #aeb5bf;
+                border-top: 2px solid #65798c; border-radius: 0; padding: 0;
             }
         """)
         card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        card.setFixedHeight(56)
+        card.setFixedHeight(44)
         cl = QHBoxLayout(card)
-        cl.setContentsMargins(10, 6, 10, 6)
-        cl.setSpacing(8)
-        il = QLabel(icon)
-        il.setStyleSheet("font-size: 18px; background: transparent; border: none;")
-        cl.addWidget(il)
+        cl.setContentsMargins(8, 4, 8, 4)
+        cl.setSpacing(6)
+        if icon:
+            il = QLabel(icon)
+            il.setStyleSheet("font-size: 10px; background: transparent; border: none;")
+            cl.addWidget(il)
         tv = QVBoxLayout()
         tv.setSpacing(0)
         lbl = QLabel(label)
-        lbl.setStyleSheet("font-size: 9px; color: #9ca3af; font-weight: 600; background: transparent; border: none;")
+        lbl.setStyleSheet("font-size: 8px; color: #65707c; font-weight: 700; background: transparent; border: none;")
         tv.addWidget(lbl)
         val = QLabel(text)
-        val.setStyleSheet("font-size: 11px; color: #374151; font-weight: 500; background: transparent; border: none;")
+        val.setStyleSheet("font-size: 9px; color: #2d3742; font-weight: 600; background: transparent; border: none;")
         val.setWordWrap(True)
         tv.addWidget(val)
         cl.addLayout(tv, 1)
@@ -2682,11 +3057,25 @@ class CommitPage(QWidget):
         commit_id = str(group.get("commit_id") or "")
         username = str(group.get("username") or "")
         candidates = []
+        project_working_dir = ""
+        try:
+            group_project_id = group.get("project_id") or self.session.project_id
+            project = self.project_service.get_project_by_id(int(group_project_id)) or {}
+            project_working_dir = str(project.get("working_directory") or "").strip()
+        except Exception:
+            project_working_dir = str(self.working_dir or "").strip()
         commit_dir = str(group.get("commit_dir") or "").strip()
         if commit_dir:
-            candidates.append(commit_dir)
+            if not os.path.isabs(commit_dir) and project_working_dir:
+                commit_dir = os.path.join(project_working_dir, commit_dir)
+            normalized_commit_dir = os.path.normpath(commit_dir)
+            leaf = os.path.basename(normalized_commit_dir).lower()
+            if commit_id.lower() in leaf and "commits" in {
+                part.lower() for part in normalized_commit_dir.split(os.sep)
+            }:
+                candidates.append(normalized_commit_dir)
         if username and title and commit_id:
-            commits_dir = self.commits_dir or os.path.join(self.working_dir or "", "commits")
+            commits_dir = os.path.join(project_working_dir, "commits")
             candidates.append(os.path.join(commits_dir, username, f"{title}_{commit_id}"))
             safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)
             if safe_title != title:
@@ -2695,8 +3084,6 @@ class CommitPage(QWidget):
             path = os.path.normpath(path)
             if safe_exists(path):
                 return path
-        if self.working_dir and safe_exists(self.working_dir):
-            return os.path.normpath(self.working_dir)
         return os.path.normpath(candidates[0]) if candidates else ""
 
     def browse_commit_directory(self, group):
@@ -2704,8 +3091,11 @@ class CommitPage(QWidget):
         if safe_exists(path):
             try:
                 safe_startfile(path)
-            except Exception:
-                subprocess.Popen(["explorer", path])
+            except Exception as exc:
+                QMessageBox.critical(
+                    self, "Open Commit Folder",
+                    f"Failed to open the exact commit directory:\n{path}\n\n{exc}",
+                )
         else:
             QMessageBox.warning(self, "Not Found", f"Commit directory not found:\n{path}")
 
@@ -2742,6 +3132,161 @@ class CommitPage(QWidget):
                 "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
             self.add_to_uncommitted(part_entry)
+
+    def _checkout_workspace_cad(self, row: dict, workspace: dict) -> None:
+        cad_document_id = row.get("cad_document_id")
+        if cad_document_id is None:
+            raise ValueError("This file is not mapped to a managed CAD Document.")
+        document = self.bom_service.pdm_service.repo.get_cad_document(
+            int(cad_document_id)
+        ) or {}
+        needs_cad_revision = (
+            str(document.get("lifecycle_state") or "").upper() == "RELEASED"
+        )
+        if needs_cad_revision:
+            answer = QMessageBox.question(
+                self,
+                "Revise CAD Document",
+                "This CAD Document is Released. Create its next revision and check it out?",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if answer != QMessageBox.Yes:
+                return
+
+        try:
+            associated_item_ids = sorted({
+                int(row["item_id"])
+                for row in (
+                    self.bom_service.pdm_service.list_cad_item_associations(
+                        int(cad_document_id)
+                    ) or []
+                )
+                if row.get("item_id") is not None
+            })
+        except Exception:
+            associated_item_ids = []
+        released_revision_codes = {}
+        for item_id in sorted({int(value) for value in associated_item_ids}):
+            details = self.bom_service.get_part_details(item_id) or {}
+            if (
+                str(details.get("revision_state") or details.get("lifecycle_state") or "").lower()
+                == "released" and not details.get("locked")
+            ):
+                try:
+                    suggested = self.bom_service.suggest_next_revision(item_id)
+                except Exception:
+                    suggested = ""
+                revision_code, accepted = QInputDialog.getText(
+                    self,
+                    "Check Out Related Released Item",
+                    (
+                        f"{details.get('part_number') or details.get('name') or ('Item ' + str(item_id))} "
+                        "is Released. Enter the next Item revision to create:"
+                    ),
+                    QLineEdit.Normal,
+                    suggested,
+                )
+                if not accepted or not str(revision_code or "").strip():
+                    return
+                released_revision_codes[item_id] = str(revision_code).strip()
+
+        descriptor = self.cad_workspace_service.checkout_descriptor(workspace["id"])
+        if needs_cad_revision:
+            self.bom_service.revise_pdm_cad_document(int(cad_document_id))
+        checkout_result = self.bom_service.checkout_pdm_cad_document(
+            int(cad_document_id),
+            released_item_revision_codes=released_revision_codes,
+            checkout_item_ids=associated_item_ids,
+            **descriptor,
+        )
+        checked_item_ids = sorted({
+            int(value)
+            for value in (
+                checkout_result.get("associated_item_ids")
+                or associated_item_ids
+                or []
+            )
+            if value is not None
+        })
+        for item_id in checked_item_ids:
+            item_lock = self.bom_service.lock_repo.get_by_part(int(item_id))
+            if not item_lock:
+                try:
+                    self.bom_service.undo_checkout_pdm_cad_document(
+                        int(cad_document_id),
+                        "Associated Item checkout failed during workspace checkout",
+                    )
+                except Exception:
+                    pass
+                raise ValueError(
+                    f"CAD checkout did not reserve associated Item {item_id}. "
+                    "The workspace checkout was stopped to protect the CAD/Item binding."
+                )
+        try:
+            self.cad_workspace_service.materialize_cad_document_package(
+                workspace["id"],
+                int(cad_document_id),
+                preserve_existing=True,
+                source_path=row.get("path"),
+            )
+        except Exception:
+            try:
+                self.bom_service.undo_checkout_pdm_cad_document(
+                    int(cad_document_id), "Workspace materialization failed"
+                )
+            except Exception:
+                pass
+            raise
+
+    def add_files_from_workspace(self):
+        if not self.session.project_id or self.session.user_id is None:
+            QMessageBox.warning(self, "CAD Workspace", "Select a project and sign in first.")
+            return
+        checkout_user_id = self._designer_id_for_commit() or int(self.session.user_id)
+        dialog = WorkspaceStagingDialog(
+            self.cad_workspace_service,
+            int(self.session.project_id),
+            int(checkout_user_id),
+            self,
+            checkout_callback=self._checkout_workspace_cad,
+        )
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        selected = dialog.selected_rows()
+        if not selected:
+            QMessageBox.information(self, "CAD Workspace", "No modified CAD files were selected.")
+            return
+        for row in selected:
+            logical = self.cad_workspace_service.logical_name(row["filename"])
+            extension = os.path.splitext(logical)[1].lstrip(".").upper()
+            self.add_to_uncommitted({
+                "filename": row["filename"],
+                "path": row["path"],
+                "status": "Workspace Ready",
+                "type": extension,
+                "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "workspace_id": row["workspace_id"],
+                "cad_document_id": row.get("cad_document_id"),
+                "expected_sha256": row.get("candidate_sha256"),
+            })
+
+    def _validate_workspace_staging(self) -> None:
+        for staged in self.uncommitted_parts or []:
+            expected = str(staged.get("expected_sha256") or "").strip()
+            if not expected:
+                continue
+            path = str(staged.get("path") or "")
+            if not safe_isfile(path):
+                raise ValueError(
+                    f"Workspace staged file is missing: {os.path.basename(path)}"
+                )
+            current = self.cad_workspace_service._sha256(path)
+            if current.casefold() != expected.casefold():
+                raise ValueError(
+                    f"{os.path.basename(path)} changed after it was selected from the "
+                    "workspace. Review the workspace and stage it again."
+                )
 
     def remove_part(self):
         selected = self.changes_list.currentRow()
@@ -2782,6 +3327,7 @@ class CommitPage(QWidget):
         for widget, enabled in (
             (getattr(self, "commit_btn", None), can_commit),
             (getattr(self, "add_file_btn", None), can_commit),
+            (getattr(self, "workspace_file_btn", None), can_commit),
             (getattr(self, "remove_part_btn", None), can_commit),
             (getattr(self, "attach_affected_btn", None), can_commit and bool(self.uncommitted_parts)),
             (getattr(self, "push_dev_btn", None), can_merge),
@@ -2890,6 +3436,12 @@ class CommitPage(QWidget):
         if getattr(self, "_processing_action", False):
             return
 
+        try:
+            self._validate_workspace_staging()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Workspace Changed", str(exc))
+            return
+
         title = self.commit_title.text().strip()
         message = self.commit_message.content()
         designer = self.designed_by.currentText()
@@ -2914,6 +3466,16 @@ class CommitPage(QWidget):
             QMessageBox.warning(self, "Validation", "No files staged for commit.")
             return
         uncommitted_filenames = [p['path'] for p in self.uncommitted_parts]
+        workspace_expectations = [
+            {
+                "path": staged.get("path"),
+                "sha256": staged.get("expected_sha256"),
+                "workspace_id": staged.get("workspace_id"),
+                "cad_document_id": staged.get("cad_document_id"),
+            }
+            for staged in self.uncommitted_parts
+            if staged.get("workspace_id")
+        ]
         resolved_issue_ids = [
             int(self.resolved_issues_list.item(i).data(Qt.UserRole))
             for i in range(self.resolved_issues_list.count())
@@ -2944,6 +3506,7 @@ class CommitPage(QWidget):
                     jira_key=jira_key,
                     jira_url=jira_url,
                     engineering_attachments=self._pending_engineering_attachments,
+                    workspace_expectations=workspace_expectations,
                 )
                 affected_part_ids = set((commit_result or {}).get("affected_part_ids") or [])
                 affected_part_ids.update(resolved_issue_part_ids)
@@ -2957,7 +3520,7 @@ class CommitPage(QWidget):
 
             def after_commit(result):
                 if False: QMessageBox.information(self, "Success",
-                    "✅ Changes committed successfully!")
+                    "Changes were checked in successfully.")
                 def update_status():
                     self.window().statusBar().showMessage("Changes committed successfully.")
 
@@ -2982,19 +3545,21 @@ class CommitPage(QWidget):
                         lambda: self._set_pending_commit_groups((result or {}).get("pending") or []),
                     ],
                     "popup": lambda: QMessageBox.information(
-                        self, "Success", "Changes committed successfully!"
+                        self, "Check In Complete", "Changes were checked in successfully."
                     ),
                 }
 
             def on_commit_error(exc):
                 error_str = str(exc)
-                if error_str.startswith("cad404:"):
+                if error_str.startswith("cad_register_required:"):
                     missing_file = error_str.split(":", 1)[1]
-                    self.ask_new_part_action(missing_file)
+                    self.ask_register_cad_document_action(missing_file)
+                elif error_str.startswith("cad404:"):
+                    missing_file = error_str.split(":", 1)[1]
+                    self.ask_register_cad_document_action(missing_file)
                 elif error_str.startswith("drw404:"):
                     missing_file = error_str.split(":", 1)[1]
-                    QMessageBox.warning(self, "Commit Failed",
-                        f"Drawing file {missing_file} is not associated to any part.")
+                    self.ask_register_cad_document_action(missing_file)
                 elif error_str.startswith(("Commit blocked:", "Error:", "STEP compare failed")):
                     QMessageBox.warning(self, "Commit Blocked", error_str)
                 else:
@@ -3013,36 +3578,152 @@ class CommitPage(QWidget):
             pass
         QMessageBox.information(self, "Issue", "Open Issue Center to create a new issue.")
 
-    def ask_new_part_action(self, base_file_name: str):
+    def _clean_creo_file_name(self, filename: str) -> str:
+        name = os.path.basename(str(filename or "").replace("\\", "/")).strip()
+        match = re.match(r"^(.*\.(?:asm|prt|drw))\.\d+$", name, flags=re.IGNORECASE)
+        return match.group(1) if match else name
+
+    def _staged_path_for_file(self, file_name: str) -> str | None:
+        target = os.path.basename(str(file_name or ""))
+        for staged in self.uncommitted_parts or []:
+            path = str(staged.get("path") or staged.get("filename") or "")
+            if os.path.basename(path) == target:
+                return path
+        return None
+
+    def ask_register_cad_document_action(self, file_name: str):
         msg = QMessageBox(self)
         msg.setIcon(QMessageBox.Warning)
-        msg.setWindowTitle("Missing BOM Entry")
-        msg.setText(f"No BOM item found for:\n{base_file_name}")
+        msg.setWindowTitle("CAD Document Not Registered")
+        msg.setText(f"No managed CAD Document exists for:\n{file_name}")
         msg.setInformativeText(
-            "Would you like to create a new part for this file?")
-        create_btn = msg.addButton("New Part", QMessageBox.AcceptRole)
+            "Register this staged Creo file as a CAD Document? "
+            "No EBOM Item will be created automatically.")
+        register_btn = msg.addButton("Register CAD Document", QMessageBox.AcceptRole)
         msg.addButton("Cancel", QMessageBox.RejectRole)
         msg.exec_()
-        if msg.clickedButton() == create_btn:
-            self.add_part(base_file_name)
+        if msg.clickedButton() == register_btn:
+            self.register_staged_cad_document(file_name)
+
+    def register_staged_cad_document(self, file_name: str):
+        source_path = self._staged_path_for_file(file_name)
+        if not source_path:
+            QMessageBox.warning(
+                self,
+                "Register CAD Document",
+                f"The staged file is no longer available:\n{file_name}",
+            )
+            return
+        clean_file = self._clean_creo_file_name(os.path.basename(source_path))
+        stem, extension = os.path.splitext(clean_file)
+        category = {
+            ".asm": "ASSEMBLY",
+            ".prt": "COMPONENT",
+            ".drw": "DRAWING",
+        }.get(extension.casefold(), "OTHER")
+        if category == "OTHER":
+            QMessageBox.warning(
+                self,
+                "Register CAD Document",
+                "Only Creo .prt, .asm, and .drw files can be registered here.",
+            )
+            return
+
+        drawing_owner_id = None
+        if category == "DRAWING":
+            models = [
+                document
+                for document in (self.bom_service.list_pdm_cad_documents() or [])
+                if str(document.get("category") or "").upper()
+                in {"ASSEMBLY", "COMPONENT"}
+            ]
+            if not models:
+                QMessageBox.warning(
+                    self,
+                    "Register Drawing",
+                    "Register the owning PRT/ASM CAD Document first. "
+                    "A drawing cannot be registered as an isolated CAD Document.",
+                )
+                return
+            labels = [
+                f"{document.get('file_name') or document.get('name') or document.get('id')}"
+                + (
+                    f" - {document.get('name')}"
+                    if document.get("name")
+                    and str(document.get("name")).casefold()
+                    != str(document.get("file_name") or "").casefold()
+                    else ""
+                )
+                for document in models
+            ]
+            selected, accepted = QInputDialog.getItem(
+                self,
+                "Bind Drawing to Model",
+                "Owning PRT/ASM CAD Document:",
+                labels,
+                0,
+                False,
+            )
+            if not accepted:
+                return
+            drawing_owner_id = int(models[labels.index(selected)]["id"])
+
+        name, accepted = QInputDialog.getText(
+            self,
+            "Register CAD Document",
+            "CAD Document name:",
+            text=stem,
+        )
+        if not accepted:
+            return
+        try:
+            cad_document_id = self.bom_service.create_pdm_cad_document(
+                number=clean_file,
+                name=str(name or stem).strip(),
+                file_name=clean_file,
+                category=category,
+                authoring_application="CREO",
+                drawing_owner_cad_document_id=drawing_owner_id,
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Register CAD Document",
+                f"Could not register the CAD Document:\n{exc}",
+            )
+            return
+        self.window().statusBar().showMessage(
+            f"CAD Document {clean_file} registered. Check it out explicitly when you want to edit it.",
+            6000,
+        )
+        QMessageBox.information(
+            self,
+            "CAD Registered",
+            f"{clean_file} is now a managed CAD Document and remains checked in.\n\n"
+            "Use CAD checkout if you want to edit or stage it from a workspace.",
+        )
 
     def add_part(self, filename):
         dialog = PartDialog(self, filename=filename)
         if dialog.exec_() == QDialog.Accepted:
             part_data = dialog.get_data()
-            if not part_data["aes_number"] or not part_data["name"]:
-                QMessageBox.warning(self, "Validation",
-                    "AES Number and Name are required.")
+            if not part_data["name"]:
+                QMessageBox.warning(self, "Item Validation",
+                    "Name is required.")
                 return
             try:
-                self.bom_service.add_part(part_data)
-                QMessageBox.information(self, "Success",
-                    "Part added successfully.")
-                self.bom_service.checkout_part(part_data["aes_number"])
+                added_part_id = self.bom_service.add_part(part_data)
+                if not isinstance(added_part_id, int):
+                    raise ValueError("The Item could not be created.")
+                created = self.bom_service.get_part_details(added_part_id) or {}
+                self.window().statusBar().showMessage(
+                    f"Item {created.get('part_number') or added_part_id} created.",
+                    6000,
+                )
                 self.commit_changes()
             except Exception as e:
-                QMessageBox.critical(self, "Error",
-                    f"Failed to add part: {str(e)}")
+                QMessageBox.critical(self, "Create Item",
+                    f"Could not create Item: {str(e)}")
 
     # ═══════════════════════════════════════════════════════════════════
     #  WORKFLOW ACTIONS
@@ -3076,9 +3757,31 @@ class CommitPage(QWidget):
             )
             return
         def do_push():
-            affected_part_ids = self.merge_service.excute_merge_by_commit_id(group["commit_id"])
+            merge_result = self.merge_service.excute_merge_by_commit_id(group["commit_id"])
+            if isinstance(merge_result, dict):
+                affected_part_ids = merge_result.get("affected_part_ids") or []
+                affected_cad_document_ids = merge_result.get("affected_cad_document_ids") or []
+            else:
+                affected_part_ids = merge_result or []
+                affected_cad_document_ids = []
+            try:
+                self.commit_service.emit_project_event(
+                    "commit.merged",
+                    entity_type="COMMIT",
+                    entity_id=str(group.get("commit_id") or ""),
+                    payload={
+                        "commit_id": str(group.get("commit_id") or ""),
+                        "item_ids": [int(value) for value in affected_part_ids if value is not None],
+                        "cad_document_ids": [int(value) for value in affected_cad_document_ids if value is not None],
+                        "status": "Approved",
+                    },
+                    project_id=group.get("project_id") or self.session.project_id,
+                )
+            except Exception:
+                pass
             return {
                 "affected_part_ids": affected_part_ids,
+                "affected_cad_document_ids": affected_cad_document_ids,
                 "history": self.commit_service.get_commit_history() or [],
                 "pending": self.commit_service.get_pending_commits_grouped(
                     self.session.project_id, self.session.user_id, self.is_designer
@@ -3089,7 +3792,10 @@ class CommitPage(QWidget):
             result = result or {}
             return {
                 "steps": [
-                    lambda: self._refresh_bom_rows_for_parts(result.get("affected_part_ids")),
+                    lambda: self._refresh_pdm_rows_after_merge(
+                        result.get("affected_part_ids"),
+                        result.get("affected_cad_document_ids"),
+                    ),
                     lambda: self._set_pending_commit_groups(result.get("pending") or []),
                     lambda: self._set_commit_history_rows(result.get("history") or []),
                 ],
@@ -3198,6 +3904,23 @@ class CommitPage(QWidget):
             main_window = self.window()
             bom_page = getattr(main_window, "bom_page", None)
             if bom_page and hasattr(bom_page, "refresh_parts_after_merge"):
+                bom_page.refresh_parts_after_merge(part_ids)
+        except Exception:
+            pass
+
+    def _refresh_pdm_rows_after_merge(self, part_ids=None, cad_document_ids=None):
+        try:
+            main_window = self.window()
+            bom_page = getattr(main_window, "bom_page", None)
+            if not bom_page:
+                return
+            if hasattr(bom_page, "refresh_after_pdm_merge"):
+                bom_page.refresh_after_pdm_merge(
+                    part_ids or [],
+                    cad_document_ids or [],
+                )
+                return
+            if part_ids and hasattr(bom_page, "refresh_parts_after_merge"):
                 bom_page.refresh_parts_after_merge(part_ids)
         except Exception:
             pass
