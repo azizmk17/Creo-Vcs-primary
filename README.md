@@ -1,4 +1,10 @@
-# Nexus (BOM Manager)
+# Nexus
+
+## ⚠️ License & Usage
+
+This repository is published exclusively as a **public portfolio** to showcase my skills. 
+You are welcome to view and review the code, but **no permission is granted to copy, 
+modify, or reuse this code for any project.**
 
 > **New PDM architecture:** Start with [README_PDM.md](README_PDM.md) for the
 > CAD Document, Item, association, CAD-to-EBOM build, supplier package, and
