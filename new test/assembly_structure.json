@@ -1,0 +1,21 @@
+{
+  "name": "assy-alignement_link_a.asm",
+  "type": "ASM",
+  "children": [
+    {
+      "name": "ALIGNEMENT_LINK_A",
+      "type": "PRT",
+      "children": []
+    },
+    {
+      "name": "SELF_CLINCHING_PIN_2X10_MM",
+      "type": "PRT",
+      "children": []
+    },
+    {
+      "name": "SELF_CLINCHING_PIN_2X10_MM",
+      "type": "PRT",
+      "children": []
+    }
+  ]
+}
