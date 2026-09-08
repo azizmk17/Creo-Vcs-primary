@@ -1,0 +1,16 @@
+GetActivePartCmd
+Get Active Part Name
+#
+#
+GetActivePartCmdHelp
+Displays the file name of the currently active model.
+#
+#
+MetrologyTab
+METROLOGY
+#
+#
+MetrologyToolsGroup
+Metrology Tools
+#
+#

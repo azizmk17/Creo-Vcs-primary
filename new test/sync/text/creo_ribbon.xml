@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<customization xmlns="http://ptc.com" xmlns:xsi="http://w3.org">
+  <ribbon>
+    <tab id="MetrologyTab" label="METROLOGY">
+      <group id="MetrologyToolsGroup" label="Tools">
+        <button id="GetActivePartCmd" label="GetActivePartCmd" helptext="GetActivePartCmdHelp"/>
+      </group>
+    </tab>
+  </ribbon>
+</customization>

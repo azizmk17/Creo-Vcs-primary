@@ -1,0 +1,10 @@
+name            CreoRibbonButton
+startup         java
+java_app_class  CreoRibbonButton
+java_app_start  start
+java_app_stop   stop
+java_app_classpath  D:\mineDocs\WORK-SPACE\Python-scripts\metrology\jlink\20260814-test standalone script\new test\sync
+allow_stop      true
+delay_start     false
+text_dir        D:\mineDocs\WORK-SPACE\Python-scripts\metrology\jlink\20260814-test standalone script\new test\sync\text
+end
