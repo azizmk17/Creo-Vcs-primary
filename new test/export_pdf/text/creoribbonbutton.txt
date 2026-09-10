@@ -1,0 +1,47 @@
+GetActivePartCmd
+Get Active Part Name
+#
+#
+
+GetActivePartCmdHelp
+Displays the file name of the currently active model.
+#
+#
+
+ExportDrawingsPdfStepCmd
+Export PDF + STEP
+#
+#
+
+ExportDrawingsPdfStepCmdHelp
+Export all session drawings to PDF and related CAD to STEP
+#
+#
+
+MetrologyTab
+METROLOGY
+#
+#
+
+MetrologyToolsGroup
+Metrology Tools
+#
+#
+SaveOpenedVersionCmd
+Save opened versions
+#
+#
+
+SaveOpenedVersionCmdHelp
+Copy opened model versions to a dedicated folder; flag if folder has a newer version
+#
+#
+ListModifiedModelsCmd
+List modified models
+#
+#
+
+ListModifiedModelsCmdHelp
+Show all models in session that are modified since last save
+#
+#
