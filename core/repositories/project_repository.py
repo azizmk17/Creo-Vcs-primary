@@ -460,36 +460,6 @@ class ProjectRepository:
                     rdict = dict(r)
                     old_id = rdict.get("id")
 
-                    # Fix inherited absolute attachment paths when the working directory changes.
-                    # If pdf_path/step_path are absolute under the source wd, remap to new wd.
-                    try:
-                        src_wd = (rdict.get("__src_wd") or None)
-                    except Exception:
-                        src_wd = None
-                    # Source working directory is available earlier in this method as src, but
-                    # to keep changes localized we recompute it here safely.
-                    try:
-                        src_row = conn.execute("SELECT working_directory FROM projects WHERE id = ?", (source_project_id,)).fetchone()
-                        src_wd = (src_row[0] if src_row else "") or ""
-                    except Exception:
-                        src_wd = ""
-
-                    def _remap_path(p: str | None) -> str | None:
-                        if not p:
-                            return p
-                        try:
-                            if os.path.isabs(p) and src_wd and os.path.commonpath([os.path.normpath(p), os.path.normpath(src_wd)]) == os.path.normpath(src_wd):
-                                rel = os.path.relpath(os.path.normpath(p), os.path.normpath(src_wd))
-                                return os.path.normpath(os.path.join(new_working_directory, rel))
-                        except Exception:
-                            return p
-                        return p
-
-                    if "pdf_path" in rdict:
-                        rdict["pdf_path"] = _remap_path(rdict.get("pdf_path"))
-                    if "step_path" in rdict:
-                        rdict["step_path"] = _remap_path(rdict.get("step_path"))
-
                     new_id = self._insert_row_from_row(
                         conn,
                         "bom",
@@ -565,6 +535,14 @@ class ProjectRepository:
 
                 self._duplicate_cad_dependencies(
                     conn, int(source_project_id), int(new_project_id), bom_id_map
+                )
+                self._duplicate_pdm_project_data(
+                    conn,
+                    int(source_project_id),
+                    int(new_project_id),
+                    bom_id_map,
+                    relation_id_map,
+                    iteration_id_map,
                 )
 
                 # Preserve issue identity and traceability across the new project revision.
@@ -819,6 +797,405 @@ class ProjectRepository:
                 },
                 id_col="id",
             )
+
+    def _maybe_int(self, value):
+        try:
+            return int(value) if value is not None else None
+        except Exception:
+            return None
+
+    def _remap_json_ids(self, value, bom_id_map, cad_member_id_map):
+        if isinstance(value, list):
+            return [
+                self._remap_json_ids(item, bom_id_map, cad_member_id_map)
+                for item in value
+            ]
+        if not isinstance(value, dict):
+            return value
+        item_id_keys = {
+            "parent_item_id", "child_item_id", "item_id", "bom_id",
+            "parent_id", "child_id",
+        }
+        result = {}
+        for key, raw in value.items():
+            if isinstance(raw, (dict, list)):
+                result[key] = self._remap_json_ids(raw, bom_id_map, cad_member_id_map)
+                continue
+            mapped = raw
+            raw_int = self._maybe_int(raw)
+            if raw_int is not None:
+                if key in item_id_keys:
+                    mapped = bom_id_map.get(raw_int, raw)
+                elif key in {"cad_member_id", "source_cad_member_id"}:
+                    mapped = cad_member_id_map.get(raw_int, raw)
+            result[key] = mapped
+        return result
+
+    def _remap_structure_json(self, raw_json, bom_id_map, cad_member_id_map) -> str:
+        try:
+            parsed = json.loads(str(raw_json or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return raw_json
+        remapped = self._remap_json_ids(parsed, bom_id_map, cad_member_id_map)
+        return json.dumps(
+            remapped, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        )
+
+    def _duplicate_pdm_project_data(
+        self,
+        conn,
+        source_project_id: int,
+        new_project_id: int,
+        bom_id_map,
+        relation_id_map,
+        iteration_id_map,
+    ) -> None:
+        """Copy the Windchill-style CAD/Item layer into the new project version."""
+        tables = set(self._list_tables(conn))
+        cad_id_map: dict[int, int] = {}
+        cad_iteration_id_map: dict[int, int] = {}
+        cad_content_id_map: dict[int, int] = {}
+        cad_member_id_map: dict[int, int] = {}
+        item_usage_id_map: dict[int, int] = {}
+        build_run_id_map: dict[int, int] = {}
+
+        if "cad_documents" in tables:
+            cols = self._table_columns(conn, "cad_documents")
+            rows = conn.execute(
+                "SELECT * FROM cad_documents WHERE project_id=? ORDER BY id",
+                (int(source_project_id),),
+            ).fetchall()
+            checkout_reset = {
+                "checked_out_by": None,
+                "checked_out_at": None,
+                "checkout_item_id": None,
+                "checkout_workspace_id": None,
+                "checkout_workspace_name": None,
+                "checkout_workspace_machine_id": None,
+            }
+            for row in rows:
+                data = dict(row)
+                old_id = int(data["id"])
+                overrides = {
+                    "project_id": int(new_project_id),
+                    "supplier_owner_item_id": (
+                        bom_id_map.get(int(data["supplier_owner_item_id"]))
+                        if data.get("supplier_owner_item_id") is not None else None
+                    ),
+                    "legacy_bom_id": (
+                        bom_id_map.get(int(data["legacy_bom_id"]))
+                        if data.get("legacy_bom_id") is not None else None
+                    ),
+                    "drawing_owner_cad_document_id": None,
+                    **checkout_reset,
+                }
+                new_id = self._insert_row_from_row(
+                    conn, "cad_documents", cols, data,
+                    overrides=overrides, id_col="id",
+                )
+                cad_id_map[old_id] = int(new_id)
+
+            if "drawing_owner_cad_document_id" in cols:
+                for row in rows:
+                    owner = row["drawing_owner_cad_document_id"]
+                    if owner is None:
+                        continue
+                    mapped_owner = cad_id_map.get(int(owner))
+                    mapped_doc = cad_id_map.get(int(row["id"]))
+                    if mapped_owner is not None and mapped_doc is not None:
+                        conn.execute(
+                            """
+                            UPDATE cad_documents
+                            SET drawing_owner_cad_document_id=?
+                            WHERE id=?
+                            """,
+                            (int(mapped_owner), int(mapped_doc)),
+                        )
+
+        if cad_id_map and "cad_document_iterations" in tables:
+            cols = self._table_columns(conn, "cad_document_iterations")
+            placeholders = ",".join("?" for _ in cad_id_map)
+            rows = conn.execute(
+                f"""
+                SELECT * FROM cad_document_iterations
+                WHERE cad_document_id IN ({placeholders}) ORDER BY id
+                """,
+                tuple(cad_id_map.keys()),
+            ).fetchall()
+            for row in rows:
+                data = dict(row)
+                new_id = self._insert_row_from_row(
+                    conn,
+                    "cad_document_iterations",
+                    cols,
+                    data,
+                    overrides={"cad_document_id": cad_id_map[int(data["cad_document_id"])]},
+                    id_col="id",
+                )
+                cad_iteration_id_map[int(data["id"])] = int(new_id)
+
+        if cad_id_map and "cad_document_contents" in tables:
+            cols = self._table_columns(conn, "cad_document_contents")
+            placeholders = ",".join("?" for _ in cad_id_map)
+            rows = conn.execute(
+                f"""
+                SELECT * FROM cad_document_contents
+                WHERE cad_document_id IN ({placeholders}) ORDER BY id
+                """,
+                tuple(cad_id_map.keys()),
+            ).fetchall()
+            for row in rows:
+                data = dict(row)
+                new_id = self._insert_row_from_row(
+                    conn,
+                    "cad_document_contents",
+                    cols,
+                    data,
+                    overrides={
+                        "cad_document_id": cad_id_map[int(data["cad_document_id"])],
+                        "derived_from_content_id": None,
+                    },
+                    id_col="id",
+                )
+                cad_content_id_map[int(data["id"])] = int(new_id)
+            if "derived_from_content_id" in cols:
+                for row in rows:
+                    old_parent = row["derived_from_content_id"]
+                    if old_parent is None:
+                        continue
+                    mapped_child = cad_content_id_map.get(int(row["id"]))
+                    mapped_parent = cad_content_id_map.get(int(old_parent))
+                    if mapped_child is not None and mapped_parent is not None:
+                        conn.execute(
+                            """
+                            UPDATE cad_document_contents
+                            SET derived_from_content_id=?
+                            WHERE id=?
+                            """,
+                            (int(mapped_parent), int(mapped_child)),
+                        )
+
+        if cad_id_map and "cad_document_members" in tables:
+            cols = self._table_columns(conn, "cad_document_members")
+            placeholders = ",".join("?" for _ in cad_id_map)
+            rows = conn.execute(
+                f"""
+                SELECT * FROM cad_document_members
+                WHERE parent_cad_document_id IN ({placeholders})
+                   OR child_cad_document_id IN ({placeholders})
+                ORDER BY id
+                """,
+                tuple(cad_id_map.keys()) * 2,
+            ).fetchall()
+            for row in rows:
+                data = dict(row)
+                parent_id = cad_id_map.get(int(data["parent_cad_document_id"]))
+                child_id = cad_id_map.get(int(data["child_cad_document_id"]))
+                if parent_id is None or child_id is None:
+                    continue
+                new_id = self._insert_row_from_row(
+                    conn,
+                    "cad_document_members",
+                    cols,
+                    data,
+                    overrides={
+                        "parent_cad_document_id": int(parent_id),
+                        "child_cad_document_id": int(child_id),
+                        "legacy_usage_id": (
+                            relation_id_map.get(int(data["legacy_usage_id"]))
+                            if data.get("legacy_usage_id") is not None else None
+                        ),
+                    },
+                    id_col="id",
+                )
+                cad_member_id_map[int(data["id"])] = int(new_id)
+
+        if cad_id_map and "cad_item_associations" in tables:
+            cols = self._table_columns(conn, "cad_item_associations")
+            rows = conn.execute(
+                "SELECT * FROM cad_item_associations WHERE project_id=? ORDER BY id",
+                (int(source_project_id),),
+            ).fetchall()
+            for row in rows:
+                data = dict(row)
+                item_id = bom_id_map.get(int(data["item_id"]))
+                cad_id = cad_id_map.get(int(data["cad_document_id"]))
+                if item_id is None or cad_id is None:
+                    continue
+                drawing_model = data.get("drawing_model_cad_document_id")
+                self._insert_row_from_row(
+                    conn,
+                    "cad_item_associations",
+                    cols,
+                    data,
+                    overrides={
+                        "project_id": int(new_project_id),
+                        "item_id": int(item_id),
+                        "cad_document_id": int(cad_id),
+                        "drawing_model_cad_document_id": (
+                            cad_id_map.get(int(drawing_model))
+                            if drawing_model is not None else None
+                        ),
+                    },
+                    id_col="id",
+                )
+
+        if bom_id_map and "item_usages" in tables:
+            cols = self._table_columns(conn, "item_usages")
+            rows = conn.execute(
+                "SELECT * FROM item_usages WHERE project_id=? ORDER BY id",
+                (int(source_project_id),),
+            ).fetchall()
+            for row in rows:
+                data = dict(row)
+                parent_id = bom_id_map.get(int(data["parent_item_id"]))
+                child_id = bom_id_map.get(int(data["child_item_id"]))
+                if parent_id is None or child_id is None:
+                    continue
+                cad_member = data.get("cad_member_id")
+                new_id = self._insert_row_from_row(
+                    conn,
+                    "item_usages",
+                    cols,
+                    data,
+                    overrides={
+                        "project_id": int(new_project_id),
+                        "parent_item_id": int(parent_id),
+                        "child_item_id": int(child_id),
+                        "cad_member_id": (
+                            cad_member_id_map.get(int(cad_member))
+                            if cad_member is not None else None
+                        ),
+                    },
+                    id_col="id",
+                )
+                item_usage_id_map[int(data["id"])] = int(new_id)
+
+        if item_usage_id_map and "item_occurrences" in tables:
+            cols = self._table_columns(conn, "item_occurrences")
+            placeholders = ",".join("?" for _ in item_usage_id_map)
+            rows = conn.execute(
+                f"""
+                SELECT * FROM item_occurrences
+                WHERE item_usage_id IN ({placeholders}) ORDER BY id
+                """,
+                tuple(item_usage_id_map.keys()),
+            ).fetchall()
+            for row in rows:
+                data = dict(row)
+                source_member = data.get("source_cad_member_id")
+                self._insert_row_from_row(
+                    conn,
+                    "item_occurrences",
+                    cols,
+                    data,
+                    overrides={
+                        "item_usage_id": item_usage_id_map[int(data["item_usage_id"])],
+                        "source_cad_member_id": (
+                            cad_member_id_map.get(int(source_member))
+                            if source_member is not None else None
+                        ),
+                    },
+                    id_col="id",
+                )
+
+        if cad_id_map and "pdm_build_runs" in tables:
+            cols = self._table_columns(conn, "pdm_build_runs")
+            rows = conn.execute(
+                "SELECT * FROM pdm_build_runs WHERE project_id=? ORDER BY id",
+                (int(source_project_id),),
+            ).fetchall()
+            for row in rows:
+                data = dict(row)
+                root_id = cad_id_map.get(int(data["root_cad_document_id"]))
+                if root_id is None:
+                    continue
+                new_id = self._insert_row_from_row(
+                    conn,
+                    "pdm_build_runs",
+                    cols,
+                    data,
+                    overrides={
+                        "project_id": int(new_project_id),
+                        "root_cad_document_id": int(root_id),
+                    },
+                    id_col="id",
+                )
+                build_run_id_map[int(data["id"])] = int(new_id)
+
+        if build_run_id_map and "pdm_build_results" in tables:
+            cols = self._table_columns(conn, "pdm_build_results")
+            placeholders = ",".join("?" for _ in build_run_id_map)
+            rows = conn.execute(
+                f"""
+                SELECT * FROM pdm_build_results
+                WHERE build_run_id IN ({placeholders}) ORDER BY id
+                """,
+                tuple(build_run_id_map.keys()),
+            ).fetchall()
+            for row in rows:
+                data = dict(row)
+                cad_member = data.get("cad_member_id")
+                parent_item = data.get("parent_item_id")
+                child_item = data.get("child_item_id")
+                self._insert_row_from_row(
+                    conn,
+                    "pdm_build_results",
+                    cols,
+                    data,
+                    overrides={
+                        "build_run_id": build_run_id_map[int(data["build_run_id"])],
+                        "cad_member_id": (
+                            cad_member_id_map.get(int(cad_member))
+                            if cad_member is not None else None
+                        ),
+                        "parent_item_id": (
+                            bom_id_map.get(int(parent_item))
+                            if parent_item is not None else None
+                        ),
+                        "child_item_id": (
+                            bom_id_map.get(int(child_item))
+                            if child_item is not None else None
+                        ),
+                    },
+                    id_col="id",
+                )
+
+        if bom_id_map and "item_structure_iterations" in tables:
+            cols = self._table_columns(conn, "item_structure_iterations")
+            rows = conn.execute(
+                "SELECT * FROM item_structure_iterations WHERE project_id=? ORDER BY id",
+                (int(source_project_id),),
+            ).fetchall()
+            for row in rows:
+                data = dict(row)
+                parent_id = bom_id_map.get(int(data["parent_item_id"]))
+                if parent_id is None:
+                    continue
+                build_run = data.get("build_run_id")
+                item_iteration = data.get("item_iteration_id")
+                self._insert_row_from_row(
+                    conn,
+                    "item_structure_iterations",
+                    cols,
+                    data,
+                    overrides={
+                        "project_id": int(new_project_id),
+                        "parent_item_id": int(parent_id),
+                        "item_iteration_id": (
+                            iteration_id_map.get(int(item_iteration))
+                            if item_iteration is not None else None
+                        ),
+                        "build_run_id": (
+                            build_run_id_map.get(int(build_run))
+                            if build_run is not None else None
+                        ),
+                        "structure_json": self._remap_structure_json(
+                            data.get("structure_json"), bom_id_map, cad_member_id_map
+                        ),
+                    },
+                    id_col="id",
+                )
 
     def _duplicate_issue_part_links(self, conn, bom_id_map):
         """Carry issue identity across project revisions by linking it to remapped BOM rows."""

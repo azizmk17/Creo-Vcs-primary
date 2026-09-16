@@ -29,6 +29,37 @@ def _iteration_key_and_no(filename: str):
     key = ".".join(parts[:-1])  # includes ext
     return key, iter_no
 
+
+_TRANSIENT_WORKING_DIRS = {
+    ".git",
+    ".nexus",
+    "__pycache__",
+    "baselines",
+    "branch",
+    "branche",
+    "branches",
+    "commits",
+    "exports",
+    "pull requests",
+    "pull resuests",
+    "pull-request",
+    "pull-requests",
+    "pull_request",
+    "pull_requests",
+    "snapshots",
+    "vault",
+}
+
+
+_PULL_REQUEST_DIRS = {
+    "pull requests",
+    "pull resuests",
+    "pull-request",
+    "pull-requests",
+    "pull_request",
+    "pull_requests",
+}
+
 class ProjectService:
     def __init__(self):
         self.project_repo = ProjectRepository()
@@ -81,7 +112,8 @@ class ProjectService:
         """Copy only latest Creo iterations (e.g. part.prt.2) from src_dir into dst_dir.
 
         - Preserves relative directory structure
-        - Skips transient/internal folders: commits, .nexus, __pycache__, .git
+        - Skips transient/internal folders: commits, PR folders, branches, vault,
+          snapshots, baselines, exports, .nexus, __pycache__, .git
         - Requires dst_dir to be empty (or non-existent)
         """
 
@@ -94,14 +126,15 @@ class ProjectService:
             raise ValueError("Destination working directory must be empty")
         os.makedirs(dst_dir, exist_ok=True)
 
-        # Keep vault (attachments) so history/files remain available in the new revision.
-        skip_dirs = {"commits", ".nexus", "__pycache__", ".git"}
-
         for root, dirs, files in os.walk(src_dir):
             if callable(cancel_cb) and cancel_cb():
                 raise RuntimeError("Cancelled")
             # prune skipped dirs
-            dirs[:] = [d for d in dirs if d not in skip_dirs]
+            dirs[:] = [
+                d for d in dirs
+                if d.lower() not in _TRANSIENT_WORKING_DIRS
+                and not d.lower().startswith(".nexus")
+            ]
 
             rel_root = os.path.relpath(root, src_dir)
             if rel_root == ".":
@@ -139,6 +172,49 @@ class ProjectService:
                 progress_cb(100, "Working directory copied")
             except Exception:
                 pass
+
+    @staticmethod
+    def _safe_remove_direct_child(parent: str, child_name: str) -> bool:
+        parent_abs = os.path.abspath(parent)
+        target = os.path.abspath(os.path.join(parent_abs, child_name))
+        try:
+            if os.path.commonpath([parent_abs, target]) != parent_abs:
+                return False
+        except ValueError:
+            return False
+        if not os.path.isdir(target):
+            return False
+        shutil.rmtree(target)
+        return True
+
+    def _cleanup_previous_pull_request_dirs(
+        self, source_project_id: int, new_project_id: int
+    ) -> None:
+        """Best-effort cleanup of stale promotion folders in older project versions."""
+        source = self.project_repo.get_project_by_id(int(source_project_id)) or {}
+        root_id = source.get("root_project_id") or source.get("id")
+        if not root_id:
+            return
+        try:
+            projects = self.project_repo.get_all() or []
+        except Exception:
+            projects = [source]
+        for project in projects:
+            try:
+                project_id = int(project.get("id"))
+                project_root = int(project.get("root_project_id") or project_id)
+            except Exception:
+                continue
+            if project_id == int(new_project_id) or project_root != int(root_id):
+                continue
+            working_directory = str(project.get("working_directory") or "").strip()
+            if not working_directory or not os.path.isdir(working_directory):
+                continue
+            for folder_name in _PULL_REQUEST_DIRS:
+                try:
+                    self._safe_remove_direct_child(working_directory, folder_name)
+                except Exception:
+                    pass
 
     def create_new_version(
         self,
@@ -180,5 +256,8 @@ class ProjectService:
                 pass
 
         self._purge_copy_working_directory(src_wd, new_working_directory, progress_cb=progress_cb, cancel_cb=cancel_cb)
+        self._cleanup_previous_pull_request_dirs(
+            int(source_project_id), int(new_project_id)
+        )
         return int(new_project_id)
 

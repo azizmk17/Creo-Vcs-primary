@@ -5,6 +5,7 @@ import unittest
 
 from core.repositories.bom_revision_repository import BomRevisionRepository
 from core.repositories.project_repository import ProjectRepository
+from core.services.project_service import ProjectService
 from setup.migrations import _migration_22, _migration_23
 
 
@@ -280,6 +281,392 @@ class BomRevisionRepositoryTests(unittest.TestCase):
         status = copied_repo.list_child_version_status(by_aes["A01"])[0]
         self.assertEqual(status["child_bom_id"], by_aes["P01"])
         self.assertEqual(status["bound_version"], "A.2")
+
+    def test_project_version_copy_remaps_pdm_cad_layer_and_preserves_document_paths(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executescript(
+                """
+                UPDATE bom
+                SET pdf_path='D:/released/item.pdf', step_path='D:/released/item.step'
+                WHERE id=1;
+
+                CREATE TABLE cad_documents (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id INTEGER NOT NULL,
+                    number TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    base_file_name TEXT NOT NULL,
+                    authoring_application TEXT DEFAULT 'CREO',
+                    category TEXT DEFAULT 'COMPONENT',
+                    document_type TEXT DEFAULT 'CAD_DOCUMENT',
+                    lifecycle_state TEXT DEFAULT 'IN_WORK',
+                    revision TEXT DEFAULT 'A',
+                    iteration INTEGER DEFAULT 1,
+                    build_excluded INTEGER DEFAULT 0,
+                    supplier_owner_item_id INTEGER,
+                    legacy_bom_id INTEGER,
+                    drawing_owner_cad_document_id INTEGER,
+                    checked_out_by INTEGER,
+                    checked_out_at TEXT,
+                    checkout_item_id INTEGER,
+                    checkout_workspace_id TEXT,
+                    checkout_workspace_name TEXT,
+                    checkout_workspace_machine_id TEXT,
+                    latest_creo_file_version INTEGER,
+                    latest_creo_file_name TEXT,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    modified_at TEXT DEFAULT (datetime('now')),
+                    UNIQUE(project_id, file_name)
+                );
+                CREATE TABLE cad_document_iterations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cad_document_id INTEGER NOT NULL,
+                    revision TEXT DEFAULT 'A',
+                    iteration INTEGER DEFAULT 1,
+                    lifecycle_state TEXT DEFAULT 'IN_WORK',
+                    primary_path TEXT,
+                    source_file_name TEXT,
+                    created_at TEXT DEFAULT (datetime('now'))
+                );
+                CREATE TABLE cad_document_contents (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cad_document_id INTEGER NOT NULL,
+                    content_role TEXT DEFAULT 'SECONDARY',
+                    format TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    storage_path TEXT,
+                    delivery_required INTEGER DEFAULT 0,
+                    derived_from_content_id INTEGER,
+                    created_at TEXT DEFAULT (datetime('now'))
+                );
+                CREATE TABLE cad_document_members (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    parent_cad_document_id INTEGER NOT NULL,
+                    child_cad_document_id INTEGER NOT NULL,
+                    quantity INTEGER DEFAULT 1,
+                    sort_order INTEGER DEFAULT 0,
+                    reference_designator TEXT,
+                    component_path TEXT,
+                    build_excluded INTEGER DEFAULT 0,
+                    legacy_usage_id INTEGER,
+                    created_at TEXT DEFAULT (datetime('now'))
+                );
+                CREATE TABLE cad_item_associations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id INTEGER NOT NULL,
+                    item_id INTEGER NOT NULL,
+                    cad_document_id INTEGER NOT NULL,
+                    association_type TEXT NOT NULL,
+                    drives_structure INTEGER DEFAULT 0,
+                    drives_attributes INTEGER DEFAULT 0,
+                    participates_in_structure INTEGER DEFAULT 0,
+                    active INTEGER DEFAULT 1,
+                    created_by INTEGER,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    modified_at TEXT DEFAULT (datetime('now')),
+                    is_primary_drawing INTEGER DEFAULT 0,
+                    drawing_model_cad_document_id INTEGER
+                );
+                CREATE TABLE item_usages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id INTEGER NOT NULL,
+                    parent_item_id INTEGER NOT NULL,
+                    child_item_id INTEGER NOT NULL,
+                    quantity INTEGER DEFAULT 1,
+                    unit TEXT DEFAULT 'EA',
+                    sort_order INTEGER DEFAULT 0,
+                    source TEXT DEFAULT 'MANUAL',
+                    cad_member_id INTEGER,
+                    build_status TEXT DEFAULT 'COMPLETED',
+                    legacy_usage_id INTEGER,
+                    created_by INTEGER,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    modified_at TEXT DEFAULT (datetime('now'))
+                );
+                CREATE TABLE item_occurrences (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_usage_id INTEGER NOT NULL,
+                    occurrence_name TEXT,
+                    source_cad_member_id INTEGER,
+                    created_at TEXT DEFAULT (datetime('now'))
+                );
+                CREATE TABLE pdm_build_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id INTEGER NOT NULL,
+                    root_cad_document_id INTEGER NOT NULL,
+                    direction TEXT DEFAULT 'CAD_TO_EBOM',
+                    multi_level INTEGER DEFAULT 1,
+                    status TEXT DEFAULT 'COMPLETED',
+                    created_by INTEGER,
+                    started_at TEXT DEFAULT (datetime('now')),
+                    completed_at TEXT,
+                    summary_json TEXT
+                );
+                CREATE TABLE pdm_build_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    build_run_id INTEGER NOT NULL,
+                    cad_member_id INTEGER,
+                    parent_item_id INTEGER,
+                    child_item_id INTEGER,
+                    status TEXT NOT NULL,
+                    message TEXT,
+                    created_at TEXT DEFAULT (datetime('now'))
+                );
+                CREATE TABLE item_structure_iterations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id INTEGER NOT NULL,
+                    parent_item_id INTEGER NOT NULL,
+                    structure_iteration INTEGER NOT NULL,
+                    item_revision TEXT DEFAULT 'A',
+                    item_iteration_id INTEGER,
+                    source TEXT NOT NULL,
+                    build_run_id INTEGER,
+                    structure_json TEXT NOT NULL,
+                    created_by INTEGER,
+                    created_at TEXT DEFAULT (datetime('now'))
+                );
+                CREATE TABLE part_files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    part_id INTEGER NOT NULL,
+                    file_type TEXT,
+                    display_name TEXT,
+                    active_version_id INTEGER
+                );
+                CREATE TABLE part_file_versions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_id INTEGER NOT NULL,
+                    version_no INTEGER,
+                    original_filename TEXT,
+                    vault_rel_path TEXT,
+                    sha256 TEXT,
+                    size_bytes INTEGER,
+                    lifecycle_state TEXT DEFAULT 'WIP',
+                    object_iteration_id INTEGER,
+                    root_project_id INTEGER,
+                    project_version_label TEXT
+                );
+                INSERT INTO cad_documents(
+                    id,project_id,number,name,file_name,base_file_name,category,
+                    legacy_bom_id,drawing_owner_cad_document_id,checked_out_by,
+                    checkout_item_id,checkout_workspace_id,latest_creo_file_version,
+                    latest_creo_file_name
+                ) VALUES
+                    (100,10,'assembly.asm','Assembly CAD','assembly.asm','assembly','ASSEMBLY',
+                     1,NULL,7,1,'old-ws',3,'assembly.asm.3'),
+                    (101,10,'child.prt','Child CAD','child.prt','child','COMPONENT',
+                     2,NULL,NULL,NULL,NULL,2,'child.prt.2'),
+                    (102,10,'assembly.drw','Assembly Drawing','assembly.drw','assembly','DRAWING',
+                     1,100,NULL,NULL,NULL,1,'assembly.drw.1');
+                INSERT INTO cad_document_iterations(cad_document_id,revision,iteration,primary_path,source_file_name)
+                VALUES(100,'A',1,'assembly.asm','assembly.asm.3');
+                INSERT INTO cad_document_contents(
+                    id,cad_document_id,content_role,format,file_name,storage_path,derived_from_content_id
+                ) VALUES
+                    (200,100,'SECONDARY','PDF','item.pdf','D:/released/item.pdf',NULL),
+                    (201,100,'SECONDARY','STEP','item.step','D:/released/item.step',200);
+                INSERT INTO cad_document_members(
+                    id,parent_cad_document_id,child_cad_document_id,quantity,sort_order,legacy_usage_id
+                ) VALUES(300,100,101,2,10,1);
+                INSERT INTO cad_item_associations(
+                    project_id,item_id,cad_document_id,association_type,drives_structure,
+                    drives_attributes,participates_in_structure,active,is_primary_drawing,
+                    drawing_model_cad_document_id
+                ) VALUES
+                    (10,1,100,'OWNER',1,1,1,1,0,NULL),
+                    (10,1,102,'CONTENT',0,0,1,1,1,100);
+                INSERT INTO item_usages(
+                    id,project_id,parent_item_id,child_item_id,quantity,source,cad_member_id
+                ) VALUES(400,10,1,2,2,'CAD_BUILD',300);
+                INSERT INTO item_occurrences(item_usage_id,occurrence_name,source_cad_member_id)
+                VALUES(400,'child-1',300);
+                INSERT INTO pdm_build_runs(id,project_id,root_cad_document_id,status,summary_json)
+                VALUES(500,10,100,'COMPLETED','{}');
+                INSERT INTO pdm_build_results(
+                    build_run_id,cad_member_id,parent_item_id,child_item_id,status,message
+                ) VALUES(500,300,1,2,'CREATED','ok');
+                INSERT INTO item_structure_iterations(
+                    project_id,parent_item_id,structure_iteration,item_revision,
+                    item_iteration_id,source,build_run_id,structure_json,created_by
+                ) VALUES(
+                    10,1,1,'A',
+                    (SELECT current_iteration_id FROM bom WHERE id=1),
+                    'CAD_BUILD',500,
+                    '[{"id":400,"parent_item_id":1,"child_item_id":2,"cad_member_id":300}]',
+                    7
+                );
+                INSERT INTO part_files(id,part_id,file_type,display_name,active_version_id)
+                VALUES(600,1,'PDF','Released PDF',700);
+                INSERT INTO part_file_versions(
+                    id,file_id,version_no,original_filename,vault_rel_path,sha256,
+                    size_bytes,lifecycle_state,object_iteration_id,root_project_id,
+                    project_version_label
+                ) VALUES(
+                    700,600,1,'item.pdf','vault/part_1/file_600/v1/item.pdf',
+                    'abc',123,'Released',
+                    (SELECT current_iteration_id FROM bom WHERE id=1),
+                    10,'A'
+                );
+                """
+            )
+
+        new_project_id = ProjectRepository(self.db_path).create_project_version(
+            source_project_id=10,
+            user_id=7,
+            new_working_directory="C:/target",
+            version_label="B",
+        )
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            copied_items = {
+                row["aes_number"]: int(row["id"])
+                for row in conn.execute(
+                    "SELECT id,aes_number FROM bom WHERE project_id=?",
+                    (new_project_id,),
+                )
+            }
+            self.assertEqual(
+                dict(conn.execute(
+                    "SELECT pdf_path,step_path FROM bom WHERE id=?",
+                    (copied_items["A01"],),
+                ).fetchone()),
+                {"pdf_path": "D:/released/item.pdf", "step_path": "D:/released/item.step"},
+            )
+            docs = {
+                row["file_name"]: dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM cad_documents WHERE project_id=?",
+                    (new_project_id,),
+                )
+            }
+            self.assertEqual(docs["assembly.asm"]["legacy_bom_id"], copied_items["A01"])
+            self.assertIsNone(docs["assembly.asm"]["checked_out_by"])
+            self.assertIsNone(docs["assembly.asm"]["checkout_workspace_id"])
+            self.assertEqual(
+                docs["assembly.drw"]["drawing_owner_cad_document_id"],
+                docs["assembly.asm"]["id"],
+            )
+            member = conn.execute(
+                """
+                SELECT * FROM cad_document_members
+                WHERE parent_cad_document_id=? AND child_cad_document_id=?
+                """,
+                (docs["assembly.asm"]["id"], docs["child.prt"]["id"]),
+            ).fetchone()
+            new_relation_id = conn.execute(
+                "SELECT id FROM bom_children WHERE parent_id=? AND child_id=?",
+                (copied_items["A01"], copied_items["P01"]),
+            ).fetchone()[0]
+            self.assertEqual(member["legacy_usage_id"], new_relation_id)
+            drawing_assoc = conn.execute(
+                """
+                SELECT * FROM cad_item_associations
+                WHERE project_id=? AND cad_document_id=?
+                """,
+                (new_project_id, docs["assembly.drw"]["id"]),
+            ).fetchone()
+            self.assertEqual(drawing_assoc["item_id"], copied_items["A01"])
+            self.assertEqual(
+                drawing_assoc["drawing_model_cad_document_id"],
+                docs["assembly.asm"]["id"],
+            )
+            usage = conn.execute(
+                "SELECT * FROM item_usages WHERE project_id=?",
+                (new_project_id,),
+            ).fetchone()
+            self.assertEqual(usage["parent_item_id"], copied_items["A01"])
+            self.assertEqual(usage["child_item_id"], copied_items["P01"])
+            self.assertEqual(usage["cad_member_id"], member["id"])
+            occurrence = conn.execute(
+                "SELECT * FROM item_occurrences WHERE item_usage_id=?",
+                (usage["id"],),
+            ).fetchone()
+            self.assertEqual(occurrence["source_cad_member_id"], member["id"])
+            content_rows = [
+                dict(row) for row in conn.execute(
+                    "SELECT * FROM cad_document_contents WHERE cad_document_id=? ORDER BY id",
+                    (docs["assembly.asm"]["id"],),
+                )
+            ]
+            self.assertEqual(content_rows[0]["storage_path"], "D:/released/item.pdf")
+            self.assertEqual(content_rows[1]["storage_path"], "D:/released/item.step")
+            self.assertEqual(content_rows[1]["derived_from_content_id"], content_rows[0]["id"])
+            copied_version = conn.execute(
+                """
+                SELECT v.*,pf.part_id
+                FROM part_file_versions v
+                JOIN part_files pf ON pf.id=v.file_id
+                WHERE pf.part_id=?
+                """,
+                (copied_items["A01"],),
+            ).fetchone()
+            self.assertEqual(copied_version["vault_rel_path"], "vault/part_1/file_600/v1/item.pdf")
+            self.assertEqual(copied_version["project_version_label"], "A")
+            snapshot = conn.execute(
+                "SELECT * FROM item_structure_iterations WHERE project_id=?",
+                (new_project_id,),
+            ).fetchone()
+            self.assertIn(f'"parent_item_id":{copied_items["A01"]}', snapshot["structure_json"])
+            self.assertIn(f'"child_item_id":{copied_items["P01"]}', snapshot["structure_json"])
+            self.assertIn(f'"cad_member_id":{member["id"]}', snapshot["structure_json"])
+
+    def test_project_version_working_directory_copy_skips_transient_and_document_folders(self):
+        with tempfile.TemporaryDirectory() as src_dir, tempfile.TemporaryDirectory() as dst_parent:
+            dst_dir = os.path.join(dst_parent, "version_b")
+            os.makedirs(os.path.join(src_dir, "commits"), exist_ok=True)
+            os.makedirs(os.path.join(src_dir, "pull resuests"), exist_ok=True)
+            os.makedirs(os.path.join(src_dir, "branches"), exist_ok=True)
+            os.makedirs(os.path.join(src_dir, "vault"), exist_ok=True)
+            os.makedirs(os.path.join(src_dir, "cad"), exist_ok=True)
+            with open(os.path.join(src_dir, "part.prt.1"), "w", encoding="utf-8") as handle:
+                handle.write("old")
+            with open(os.path.join(src_dir, "part.prt.3"), "w", encoding="utf-8") as handle:
+                handle.write("new")
+            with open(os.path.join(src_dir, "cad", "asm.asm.2"), "w", encoding="utf-8") as handle:
+                handle.write("asm")
+            for folder in ("commits", "pull resuests", "branches", "vault"):
+                with open(os.path.join(src_dir, folder, "skip.txt"), "w", encoding="utf-8") as handle:
+                    handle.write("skip")
+
+            service = ProjectService()
+            service._purge_copy_working_directory(src_dir, dst_dir)
+
+            self.assertFalse(os.path.exists(os.path.join(dst_dir, "part.prt.1")))
+            self.assertTrue(os.path.exists(os.path.join(dst_dir, "part.prt.3")))
+            self.assertTrue(os.path.exists(os.path.join(dst_dir, "cad", "asm.asm.2")))
+            self.assertFalse(os.path.exists(os.path.join(dst_dir, "commits")))
+            self.assertFalse(os.path.exists(os.path.join(dst_dir, "pull resuests")))
+            self.assertFalse(os.path.exists(os.path.join(dst_dir, "branches")))
+            self.assertFalse(os.path.exists(os.path.join(dst_dir, "vault")))
+
+    def test_project_version_cleanup_removes_previous_pull_request_folders(self):
+        with tempfile.TemporaryDirectory() as version_a, tempfile.TemporaryDirectory() as version_b:
+            for folder in ("pull resuests", "pull_requests"):
+                os.makedirs(os.path.join(version_a, folder), exist_ok=True)
+            os.makedirs(os.path.join(version_b, "pull resuests"), exist_ok=True)
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "UPDATE projects SET working_directory=? WHERE id=10",
+                    (version_a,),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO projects(
+                        id,name,description,working_directory,root_project_id,
+                        version_label,version_state,is_readonly
+                    ) VALUES(11,'Demo','Target',?,10,'B','WIP',0)
+                    """,
+                    (version_b,),
+                )
+
+            service = ProjectService()
+            service.project_repo = ProjectRepository(self.db_path)
+            service._cleanup_previous_pull_request_dirs(10, 11)
+
+            self.assertFalse(os.path.exists(os.path.join(version_a, "pull resuests")))
+            self.assertFalse(os.path.exists(os.path.join(version_a, "pull_requests")))
+            self.assertTrue(os.path.exists(os.path.join(version_b, "pull resuests")))
 
     def test_project_snapshot_contains_checked_in_versions_and_bindings(self):
         snapshot = self.repo.project_configuration_snapshot(10)
