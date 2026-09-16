@@ -2698,9 +2698,17 @@ class BomService(BaseService):
     # -------------------------------
     # PDM CAD DOCUMENT / ITEM DOMAIN
     # -------------------------------
-    def list_pdm_cad_documents(self, project_id: int | None = None) -> List[Dict]:
+    def list_pdm_cad_documents(
+        self,
+        project_id: int | None = None,
+        *,
+        include_related_drawings: bool = True,
+        include_legacy_fallback: bool = True,
+    ) -> List[Dict]:
         return self.pdm_service.list_cad_documents(
-            int(project_id or self.session.project_id)
+            int(project_id or self.session.project_id),
+            include_related_drawings=include_related_drawings,
+            include_legacy_fallback=include_legacy_fallback,
         )
 
     def list_pdm_items(self, project_id: int | None = None) -> List[Dict]:

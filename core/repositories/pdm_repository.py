@@ -1572,7 +1572,13 @@ class PdmRepository:
             )
         return self.get_cad_document(int(cad_document_id))
 
-    def list_cad_documents(self, project_id: int) -> list[dict]:
+    def list_cad_documents(
+        self,
+        project_id: int,
+        *,
+        include_related_drawings: bool = True,
+        include_legacy_fallback: bool = True,
+    ) -> list[dict]:
         with self.get_conn() as conn:
             rows = conn.execute(
                 """
@@ -1587,8 +1593,14 @@ class PdmRepository:
             self._attach_item_associations(conn, records)
             self._attach_checkout_items(conn, records)
             self._add_checkout_usernames(conn, records)
-            self._apply_legacy_approved_creo_fallback(conn, records)
-            return self._attach_related_drawings(conn, records)
+            if include_legacy_fallback:
+                self._apply_legacy_approved_creo_fallback(conn, records)
+            if include_related_drawings:
+                self._attach_related_drawings(conn, records)
+            else:
+                for record in records:
+                    record["related_drawings"] = []
+            return records
 
     def list_item_cad_documents(self, item_id: int) -> list[dict]:
         with self.get_conn() as conn:
@@ -2647,6 +2659,98 @@ class PdmRepository:
                 elif not participating and related:
                     # Preserve NOT_PARTICIPATING diagnostics for CONTENT-only
                     # CAD rather than incorrectly reporting it unassociated.
+                    selected = related[0]
+                else:
+                    selected = {}
+                record["associations"] = related
+                record["association_count"] = len(related)
+                record["association_ambiguous"] = bool(ambiguous)
+                for field in legacy_fields:
+                    record[field] = selected.get(field)
+            return records
+
+    def list_cad_members_for_parents(self, parent_cad_document_ids) -> list[dict]:
+        parent_ids = sorted({
+            int(value) for value in (parent_cad_document_ids or [])
+            if value is not None
+        })
+        if not parent_ids:
+            return []
+        placeholders = ",".join("?" for _ in parent_ids)
+        with self.get_conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT m.*,d.id AS cad_document_id,d.number,d.name,
+                       d.file_name,d.category,
+                       d.build_excluded AS document_build_excluded
+                FROM cad_document_members m
+                JOIN cad_documents d ON d.id=m.child_cad_document_id
+                WHERE m.parent_cad_document_id IN ({placeholders})
+                ORDER BY m.parent_cad_document_id,COALESCE(m.sort_order,m.id),m.id
+                """,
+                parent_ids,
+            ).fetchall()
+            records = [dict(row) for row in rows]
+            document_ids = sorted({
+                int(record["child_cad_document_id"]) for record in records
+            })
+            if not document_ids:
+                return records
+            doc_placeholders = ",".join("?" for _ in document_ids)
+            associations = [
+                dict(row)
+                for row in conn.execute(
+                    f"""
+                    SELECT a.*,a.id AS association_id,
+                           b.part_number AS item_number,
+                           b.aes_number AS item_aes_number,b.name AS item_name
+                    FROM cad_item_associations a
+                    JOIN bom b ON b.id=a.item_id
+                    WHERE a.active=1
+                      AND b.deleted_at IS NULL
+                      AND lower(COALESCE(b.status,''))<>'deleted'
+                      AND lower(COALESCE(b.lifecycle_state,''))<>'deleted'
+                      AND a.cad_document_id IN ({doc_placeholders})
+                    ORDER BY a.cad_document_id,
+                             CASE upper(a.association_type)
+                                WHEN 'OWNER' THEN 0
+                                WHEN 'CONTRIBUTING_IMAGE' THEN 1
+                                WHEN 'IMAGE' THEN 2
+                                WHEN 'CONTRIBUTING_CONTENT' THEN 3
+                                WHEN 'CONTENT' THEN 4 ELSE 9 END,a.id
+                    """,
+                    document_ids,
+                ).fetchall()
+            ]
+            by_document = defaultdict(list)
+            for association in associations:
+                by_document[int(association["cad_document_id"])].append(
+                    association
+                )
+            legacy_fields = (
+                "association_id", "item_id", "association_type",
+                "participates_in_structure", "drives_structure",
+                "drives_attributes", "item_number", "item_aes_number",
+                "item_name",
+            )
+            for record in records:
+                related = list(
+                    by_document.get(int(record["child_cad_document_id"]), [])
+                )
+                owners = [
+                    row for row in related
+                    if str(row.get("association_type") or "").upper() == "OWNER"
+                ]
+                participating = [
+                    row for row in related
+                    if bool(row.get("participates_in_structure"))
+                ]
+                ambiguous = not owners and len(participating) > 1
+                if owners:
+                    selected = owners[0]
+                elif len(participating) == 1:
+                    selected = participating[0]
+                elif not participating and related:
                     selected = related[0]
                 else:
                     selected = {}

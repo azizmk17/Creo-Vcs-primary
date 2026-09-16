@@ -20,8 +20,18 @@ class PdmService:
         self.db_name = db_name
         self.repo = repository or PdmRepository(db_name)
 
-    def list_cad_documents(self, project_id: int) -> list[dict]:
-        return self.repo.list_cad_documents(int(project_id))
+    def list_cad_documents(
+        self,
+        project_id: int,
+        *,
+        include_related_drawings: bool = True,
+        include_legacy_fallback: bool = True,
+    ) -> list[dict]:
+        return self.repo.list_cad_documents(
+            int(project_id),
+            include_related_drawings=include_related_drawings,
+            include_legacy_fallback=include_legacy_fallback,
+        )
 
     def list_item_cad_documents(self, item_id: int) -> list[dict]:
         return self.repo.list_item_cad_documents(int(item_id))
@@ -792,9 +802,7 @@ class PdmService:
             in {"ASSEMBLY", "COMPONENT"}
         ]
         by_id = {int(row["id"]): row for row in documents}
-        members = []
-        for cad_id in by_id:
-            members.extend(self.repo.list_cad_members(cad_id))
+        members = self.repo.list_cad_members_for_parents(by_id.keys())
         children = defaultdict(list)
         child_ids = set()
         for member in members:
@@ -824,6 +832,7 @@ class PdmService:
         return {
             "project_id": int(project_id),
             "roots": roots,
+            "documents": all_documents,
             "document_count": len(documents),
             "drawing_count": sum(
                 1 for document in all_documents

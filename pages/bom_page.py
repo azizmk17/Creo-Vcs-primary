@@ -2970,6 +2970,8 @@ class BomPage(QWidget):
 
     def _pdm_cad_iteration_warnings(self, document: dict) -> list[str]:
         """Detect local Creo file/version problems for a CAD Document row."""
+        if not getattr(self, "_pdm_cad_working_file_index_ready", False):
+            return []
         category = str(document.get("category") or "").upper()
         if category not in {"ASSEMBLY", "COMPONENT", "DRAWING"}:
             return []
@@ -3186,9 +3188,8 @@ class BomPage(QWidget):
     def _cad_payload_identity(self, payload: dict) -> str:
         return str(payload.get("file_name") or payload.get("name") or payload.get("id") or "CAD")
 
-    def _cad_representation_paths(self, cad_document_id: int) -> list[str]:
-        wanted = int(cad_document_id)
-        paths = []
+    def _rebuild_cad_path_index(self) -> None:
+        paths_by_id = defaultdict(list)
 
         def walk_payload(node: dict, ancestors: list[str]) -> None:
             if not node:
@@ -3196,8 +3197,7 @@ class BomPage(QWidget):
             label = self._cad_payload_identity(node)
             current = [*ancestors, label]
             try:
-                if int(node.get("id")) == wanted:
-                    paths.append(" > ".join(current))
+                paths_by_id[int(node.get("id"))].append(" > ".join(current))
             except Exception:
                 pass
             for child in node.get("children") or []:
@@ -3205,28 +3205,18 @@ class BomPage(QWidget):
 
         for root in list(getattr(self, "_pdm_cad_roots", []) or []):
             walk_payload(root, [])
-        if paths:
-            return list(dict.fromkeys(paths))
+        self._pdm_cad_path_index = {
+            cad_id: list(dict.fromkeys(paths))
+            for cad_id, paths in paths_by_id.items()
+        }
 
-        def walk_item(item: QTreeWidgetItem, ancestors: list[str]) -> None:
-            payload = dict(item.data(0, PDM_CAD_PAYLOAD_ROLE) or {})
-            label = self._cad_payload_identity(payload) or item.text(CAD_COL_NAME)
-            current = [*ancestors, label]
-            try:
-                if int(item.data(0, PDM_CAD_DOCUMENT_ID_ROLE)) == wanted:
-                    paths.append(" > ".join(current))
-            except Exception:
-                pass
-            for index in range(item.childCount()):
-                child = item.child(index)
-                if not self._is_lazy_placeholder(child):
-                    walk_item(child, current)
-
-        tree = getattr(self, "_cad_tree", None)
-        if tree is not None:
-            for index in range(tree.topLevelItemCount()):
-                walk_item(tree.topLevelItem(index), [])
-        return list(dict.fromkeys(paths))
+    def _cad_representation_paths(self, cad_document_id: int) -> list[str]:
+        wanted = int(cad_document_id)
+        cached = getattr(self, "_pdm_cad_path_index", None)
+        if cached is None:
+            self._rebuild_cad_path_index()
+            cached = getattr(self, "_pdm_cad_path_index", {})
+        return list(cached.get(wanted, []))
 
     def _cad_representation_path_text(self, document: dict, max_paths: int = 2) -> str:
         try:
@@ -3466,19 +3456,21 @@ class BomPage(QWidget):
             return
         self._set_tree_loading(True)
         try:
-            self._pdm_cad_working_file_index = self._build_pdm_cad_working_file_index()
+            self._pdm_cad_working_file_index = {}
+            self._pdm_cad_working_file_index_ready = False
             data = (
                 self.bom_service.get_pdm_cad_structure()
                 if self.session.project_id else {"roots": [], "document_count": 0}
             )
             roots = list(data.get("roots") or [])
             self._pdm_cad_roots = roots
+            self._rebuild_cad_path_index()
             self._pdm_folders("CAD", refresh=True)
             self._pdm_cad_scope_path, render_roots = self._pdm_roots_for_reload_scope(
                 "cad", roots, getattr(self, "_pdm_cad_scope_path", []) or []
             )
             self._render_pdm_cad_roots(render_roots)
-            all_documents = list(self.bom_service.list_pdm_cad_documents() or []) if self.session.project_id else []
+            all_documents = list(data.get("documents") or []) if self.session.project_id else []
             models = [
                 row for row in all_documents
                 if str(row.get("category") or "").upper()
@@ -3713,7 +3705,10 @@ class BomPage(QWidget):
             ) if self.session.project_id else {"roots": []}
             associations_by_item = defaultdict(list)
             if self.session.project_id:
-                for document in self.bom_service.list_pdm_cad_documents() or []:
+                for document in self.bom_service.list_pdm_cad_documents(
+                    include_related_drawings=False,
+                    include_legacy_fallback=False,
+                ) or []:
                     if str(document.get("category") or "").upper() == "DRAWING":
                         continue
                     for association in self._pdm_document_associations(document):
