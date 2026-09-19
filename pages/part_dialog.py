@@ -314,6 +314,8 @@ class PartDialog(QDialog):
 
         controlled = QGroupBox("Controlled Item Parameters")
         controlled_form = self._form_layout(controlled)
+        self.cad_revision_input = QLineEdit()
+        self.cad_revision_input.setPlaceholderText("User-controlled CAD revision, e.g. A010")
         self.drawing_number_input = QLineEdit()
         self.drawing_number_input.setPlaceholderText("Optional drawing / reference designator")
         self.status_input = QLineEdit()
@@ -323,6 +325,7 @@ class PartDialog(QDialog):
             self.classification_input.addItem(
                 self.CLASSIFICATION_LABELS.get(value, value.title()), value
             )
+        controlled_form.addRow("CAD Rev", self.cad_revision_input)
         controlled_form.addRow("Drawing Number", self.drawing_number_input)
         controlled_form.addRow("Status", self.status_input)
         controlled_form.addRow("Classification", self.classification_input)
@@ -438,6 +441,15 @@ class PartDialog(QDialog):
             except Exception:
                 return "Current Product"
 
+    def _project_version_label(self) -> str:
+        parent = self.parent()
+        try:
+            project_id = int(parent.session.project_id)
+            project = parent.project_service.get_project_by_id(project_id) or {}
+            return str(project.get("version_label") or "").strip().upper()
+        except Exception:
+            return ""
+
     @staticmethod
     def _set_combo_data(combo: QComboBox, value: str) -> None:
         index = combo.findData(str(value or "").strip().upper())
@@ -533,6 +545,10 @@ class PartDialog(QDialog):
         self.drawing_number_input.setText(
             str(self.part_data.get("drawing_number") or "")
         )
+        cad_revision = str(self.part_data.get("cad_revision") or "").strip().upper()
+        if not cad_revision and not self.part_data:
+            cad_revision = self._project_version_label()
+        self.cad_revision_input.setText(cad_revision)
         self.status_input.setText(str(self.part_data.get("status") or "Design"))
         self._set_combo_data(
             self.classification_input,
@@ -601,6 +617,7 @@ class PartDialog(QDialog):
             ),
             "item_view": str(self.item_view_input.currentData() or "DESIGN"),
             "default_unit": str(self.default_unit_input.currentData() or "EA"),
+            "cad_revision": self.cad_revision_input.text().strip().upper(),
             "drawing_number": self.drawing_number_input.text().strip(),
             "classification": classification,
             "cad_control_mode": str(

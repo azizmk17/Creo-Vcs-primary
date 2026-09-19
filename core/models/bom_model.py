@@ -19,6 +19,7 @@ class Bom:
     pdf_path: Optional[str] = None
     step_path: Optional[str] = None
     revision: Optional[str] = "A"
+    cad_revision: Optional[str] = ""
     lifecycle_state: Optional[str] = "WIP"  # WIP | Released | Obsolete
     released_by: Optional[int] = None
     released_at: Optional[str] = None

@@ -13,6 +13,7 @@ from core.repositories.permission_repository import PermissionRepository
 from core.repositories.bom_folder_repository import BomFolderRepository
 from core.repositories.bom_filter_repository import BomFilterRepository
 from core.repositories.bom_revision_repository import BomRevisionRepository
+from core.repositories.part_file_repository import PartFileRepository
 from core.session_manager import SessionManager
 from config import DB_NAME
 
@@ -53,6 +54,7 @@ class BomService(BaseService):
         self.ebom_export_service = EbomExportService(self.ebom_service)
         self.release_validation_service = ReleaseValidationService()
         self.pdm_service = PdmService()
+        self.part_file_repo = PartFileRepository()
         self.session = SessionManager()
         self._tree_cache: dict = {}    # project_id -> tree dict
         self._tree_dirty: set = set()  # project_ids that need re-fetch
@@ -75,6 +77,21 @@ class BomService(BaseService):
         if re.search(r"\.(?:pdf|step|stp|iges|igs|dxf|dwg)$", lowered):
             return ""
         return text
+
+    def _current_project_version_label(self) -> str:
+        try:
+            project_id = int(self.session.project_id)
+        except Exception:
+            return ""
+        try:
+            with sqlite3.connect(DB_NAME) as conn:
+                row = conn.execute(
+                    "SELECT version_label FROM projects WHERE id=?",
+                    (project_id,),
+                ).fetchone()
+            return str(row[0] if row else "").strip().upper()
+        except Exception:
+            return ""
 
     def _assert_checked_out_for_change(self, part_id: int, action: str = "modify this item"):
         """Require a mutable revision and an owned (or administratively controlled) lock."""
@@ -279,6 +296,10 @@ class BomService(BaseService):
                     f"Item Number {part_number} already identifies another Item in this product."
                 )
         part_data["part_number"] = part_number
+        part_data["cad_revision"] = (
+            str(part_data.get("cad_revision") or "").strip().upper()
+            or self._current_project_version_label()
+        )
         part_data["drawing_number"] = self._clean_drawing_number(
             part_data.get("drawing_number")
         )
@@ -334,6 +355,7 @@ class BomService(BaseService):
             notes=part_data.get("notes"),
             pdf_path=part_data.get("pdf_path"),
             step_path=part_data.get("step_path"),
+            cad_revision=part_data.get("cad_revision"),
             status=part_data.get("status", "Design"),
             created=part_data.get("created"),
             modified=part_data.get("modified"),
@@ -435,6 +457,8 @@ class BomService(BaseService):
             part_data["drawing_number"] = self._clean_drawing_number(
                 part_data.get("drawing_number")
             )
+        if "cad_revision" in part_data:
+            part_data["cad_revision"] = str(part_data.get("cad_revision") or "").strip().upper()
         if "cad_control_mode" in part_data:
             new_control_mode = normalize_cad_control_mode(part_data.get("cad_control_mode"))
             if (
@@ -1924,6 +1948,9 @@ class BomService(BaseService):
         results = []
         category_map = self.bom_repo.get_categories_for_boms(part.id for part in all_parts)
         version_map = self.revision_repo.get_current_contexts(part.id for part in all_parts)
+        drw_revision_map = self.part_file_repo.active_pdf_revisions_for_parts(
+            part.id for part in all_parts
+        )
         try:
             binding_updates = self.revision_repo.get_parent_binding_update_counts(
                 int(self.session.project_id)
@@ -1936,6 +1963,7 @@ class BomService(BaseService):
             d["current_version"] = version.get("version_label") or d.get("revision")
             d["iteration_number"] = version.get("iteration_number")
             d["category_names"] = list(category_map.get(int(part.id), []))
+            d["drw_revision"] = drw_revision_map.get(int(part.id), "")
             d["binding_update_count"] = int(binding_updates.get(int(part.id), 0))
             d["ebom_behavior"] = "INHERIT"
             d["resolved_ebom_behavior"] = normalize_default_behavior(
@@ -2314,6 +2342,9 @@ class BomService(BaseService):
         parts_by_id = {int(part.id): part for part in parts}
         categories = self.bom_repo.get_categories_for_boms(part.id for part in parts)
         versions = self.revision_repo.get_current_contexts(part.id for part in parts)
+        drw_revision_map = self.part_file_repo.active_pdf_revisions_for_parts(
+            part.id for part in parts
+        )
         try:
             lock_owner = self.lock_repo.get_lock_owners_for_project(pid)
         except Exception:
@@ -2334,6 +2365,7 @@ class BomService(BaseService):
             path = f"{path_prefix_key}/{segment}" if path_prefix_key else segment
             node["children"] = []
             node["category_names"] = list(categories.get(int(part.id), []))
+            node["drw_revision"] = drw_revision_map.get(int(part.id), "")
             version = versions.get(int(part.id), {})
             node["current_version"] = version.get("version_label") or node.get("revision")
             node["iteration_number"] = version.get("iteration_number")
@@ -2411,6 +2443,9 @@ class BomService(BaseService):
         all_parts = {b.id: b for b in self.bom_repo.get_all(project_id)}
         version_map = self.revision_repo.get_current_contexts(all_parts.keys())
         category_map = self.bom_repo.get_categories_for_boms(all_parts.keys())
+        drw_revision_map = self.part_file_repo.active_pdf_revisions_for_parts(
+            all_parts.keys()
+        )
         try:
             lock_owner = self.lock_repo.get_lock_owners_for_project(int(project_id))
         except Exception:
@@ -2445,6 +2480,7 @@ class BomService(BaseService):
             node["iteration_number"] = version.get("iteration_number")
             node["binding_update_count"] = int(binding_updates.get(int(part_id), 0))
             node["categories"] = list(category_map.get(int(part_id), []))
+            node["drw_revision"] = drw_revision_map.get(int(part_id), "")
             node["children"] = []
 
             if node.get("locked"):
@@ -2489,6 +2525,9 @@ class BomService(BaseService):
         d["iteration_number"] = version_context.get("iteration_number")
         d["current_version"] = version_context.get("version_label") or str(d.get("revision") or "")
         d["revision_state"] = version_context.get("state") or d.get("lifecycle_state")
+        d["drw_revision"] = self.part_file_repo.active_pdf_revisions_for_parts(
+            [int(part_id)]
+        ).get(int(part_id), "")
         d["delivery_policy"] = delivery_policy_label(
             d.get("default_ebom_behavior")
         )
@@ -2675,6 +2714,10 @@ class BomService(BaseService):
             category_map = self.bom_repo.get_categories_for_boms(item_ids)
         except Exception:
             category_map = {}
+        try:
+            drw_revision_map = self.part_file_repo.active_pdf_revisions_for_parts(item_ids)
+        except Exception:
+            drw_revision_map = {}
         for row in nodes:
             item_id = int(row.get("bom_id") or row.get("id"))
             context = contexts.get(item_id) or {}
@@ -2693,6 +2736,7 @@ class BomService(BaseService):
             row["locked"] = bool(lock_owner)
             row["locked_by_username"] = lock_owner
             row["category_names"] = list(category_map.get(item_id, []))
+            row["drw_revision"] = drw_revision_map.get(item_id, "")
         return structure
 
     # -------------------------------
@@ -3728,6 +3772,9 @@ class BomService(BaseService):
         project_id = int(getattr(selected, "project_id", None) or self.session.project_id)
         parts = {int(part.id): part for part in self.bom_repo.get_all(project_id)}
         version_contexts = self.revision_repo.get_current_contexts(parts.keys())
+        drw_revision_map = self.part_file_repo.active_pdf_revisions_for_parts(
+            parts.keys()
+        )
         relations = self.children_repo.get_all_for_project(project_id)
         try:
             binding_status = self.revision_repo.get_project_binding_status(project_id)
@@ -3778,6 +3825,7 @@ class BomService(BaseService):
             version = version_contexts.get(int(node_id), {})
             node["current_version"] = version.get("version_label") or node.get("revision")
             node["current_iteration_id"] = version.get("current_iteration_id")
+            node["drw_revision"] = drw_revision_map.get(int(node_id), "")
             status = binding_status.get(int(usage_id)) if usage_id is not None else None
             if status:
                 node["bound_version"] = status.get("bound_version")

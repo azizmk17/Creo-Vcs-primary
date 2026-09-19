@@ -873,9 +873,28 @@ class ProjectRepository:
                 "checkout_workspace_name": None,
                 "checkout_workspace_machine_id": None,
             }
-            for row in rows:
+            has_drawing_owner = "drawing_owner_cad_document_id" in cols
+
+            def _is_drawing(row_data: dict) -> bool:
+                return str(row_data.get("category") or "").strip().upper() == "DRAWING"
+
+            def _copy_cad_document(row) -> None:
                 data = dict(row)
                 old_id = int(data["id"])
+                owner_override = None
+                if has_drawing_owner and _is_drawing(data):
+                    old_owner = data.get("drawing_owner_cad_document_id")
+                    if old_owner is None:
+                        raise ValueError(
+                            f"Drawing CAD Document {data.get('file_name') or old_id} "
+                            "has no owning PRT/ASM model."
+                        )
+                    owner_override = cad_id_map.get(int(old_owner))
+                    if owner_override is None:
+                        raise ValueError(
+                            f"Drawing CAD Document {data.get('file_name') or old_id} "
+                            "points to a model that is not part of this project version."
+                        )
                 overrides = {
                     "project_id": int(new_project_id),
                     "supplier_owner_item_id": (
@@ -886,31 +905,24 @@ class ProjectRepository:
                         bom_id_map.get(int(data["legacy_bom_id"]))
                         if data.get("legacy_bom_id") is not None else None
                     ),
-                    "drawing_owner_cad_document_id": None,
                     **checkout_reset,
                 }
+                if has_drawing_owner:
+                    overrides["drawing_owner_cad_document_id"] = (
+                        int(owner_override) if _is_drawing(data) else None
+                    )
                 new_id = self._insert_row_from_row(
                     conn, "cad_documents", cols, data,
                     overrides=overrides, id_col="id",
                 )
                 cad_id_map[old_id] = int(new_id)
 
-            if "drawing_owner_cad_document_id" in cols:
-                for row in rows:
-                    owner = row["drawing_owner_cad_document_id"]
-                    if owner is None:
-                        continue
-                    mapped_owner = cad_id_map.get(int(owner))
-                    mapped_doc = cad_id_map.get(int(row["id"]))
-                    if mapped_owner is not None and mapped_doc is not None:
-                        conn.execute(
-                            """
-                            UPDATE cad_documents
-                            SET drawing_owner_cad_document_id=?
-                            WHERE id=?
-                            """,
-                            (int(mapped_owner), int(mapped_doc)),
-                        )
+            model_rows = [row for row in rows if not _is_drawing(dict(row))]
+            drawing_rows = [row for row in rows if _is_drawing(dict(row))]
+            for row in model_rows:
+                _copy_cad_document(row)
+            for row in drawing_rows:
+                _copy_cad_document(row)
 
         if cad_id_map and "cad_document_iterations" in tables:
             cols = self._table_columns(conn, "cad_document_iterations")

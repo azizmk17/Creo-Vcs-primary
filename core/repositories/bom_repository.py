@@ -51,6 +51,8 @@ class BomRepository:
                 cols = [r[1] for r in conn.execute("PRAGMA table_info(bom)").fetchall()]
                 if "revision" not in cols:
                     conn.execute("ALTER TABLE bom ADD COLUMN revision TEXT DEFAULT 'A'")
+                if "cad_revision" not in cols:
+                    conn.execute("ALTER TABLE bom ADD COLUMN cad_revision TEXT DEFAULT ''")
                 if "lifecycle_state" not in cols:
                     conn.execute("ALTER TABLE bom ADD COLUMN lifecycle_state TEXT DEFAULT 'WIP'")
                 if "released_by" not in cols:
@@ -286,15 +288,18 @@ class BomRepository:
             cur.execute("""
                 INSERT INTO bom (type, name, part_number, drawing_number, aes_number,
                                 filename, drawing, base_file_name, base_drw_name, material,
-                                weight, notes, pdf_path, step_path, status, created, modified,
+                                weight, notes, pdf_path, step_path, revision, cad_revision,
+                                status, created, modified,
                                 project_id, classification, default_ebom_behavior,
                                 cad_requirement, drawing_requirement, represented_part_id,
                                 cad_control_mode, item_type, assembly_mode,
                                 procurement_source, item_view, default_unit)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 bom.type, bom.name, bom.part_number, bom.drawing_number, bom.aes_number,
-                bom.filename, bom.drawing, bom.base_file_name, bom.base_drw_name, bom.material, bom.weight, bom.notes, bom.pdf_path, bom.step_path, bom.status,
+                bom.filename, bom.drawing, bom.base_file_name, bom.base_drw_name,
+                bom.material, bom.weight, bom.notes, bom.pdf_path, bom.step_path,
+                bom.revision, bom.cad_revision, bom.status,
                 bom.created, bom.modified, bom.project_id,
                 normalize_classification(bom.classification),
                 normalize_default_behavior(bom.default_ebom_behavior),
@@ -911,14 +916,15 @@ class BomRepository:
                 UPDATE bom
                 SET type=?, name=?, part_number=?, drawing_number=?, aes_number=?,
                     filename=?, drawing=?, material=?, weight=?, notes=?, pdf_path=?, step_path=?,
-                    status=?, created=?, modified=?, classification=?,
+                    revision=?, cad_revision=?, status=?, created=?, modified=?, classification=?,
                     default_ebom_behavior=?, cad_requirement=?, drawing_requirement=?,
                     represented_part_id=?, cad_control_mode=?, item_type=?,
                     assembly_mode=?, procurement_source=?, item_view=?, default_unit=?
                 WHERE id=?
             """, (
                 bom.type, bom.name, bom.part_number, bom.drawing_number, bom.aes_number,
-                bom.filename, bom.drawing, bom.material, bom.weight, bom.notes, bom.pdf_path, bom.step_path, bom.status,
+                bom.filename, bom.drawing, bom.material, bom.weight, bom.notes,
+                bom.pdf_path, bom.step_path, bom.revision, bom.cad_revision, bom.status,
                 bom.created, bom.modified,
                 normalize_classification(bom.classification),
                 normalize_default_behavior(bom.default_ebom_behavior),

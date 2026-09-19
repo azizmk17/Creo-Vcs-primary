@@ -521,6 +521,8 @@ BOM_EXTRA_COLUMN_SPECS = [
     ("drawing_number", "Drawing Number", 120, False, ("drawing_number", "drawing")),
     ("filename", "Native File", 135, False, ("filename", "base_file_name")),
     ("base_drw_name", "Drawing File", 135, False, ("base_drw_name",)),
+    ("cad_revision", "CAD Rev", 72, True, ("cad_revision",)),
+    ("drw_revision", "DRW Rev", 72, True, ("drw_revision",)),
     ("item_type", "Item Type", 115, False, ("item_type",)),
     ("assembly_mode", "Assembly Mode", 105, False, ("assembly_mode",)),
     ("classification", "Classification", 105, False, ("classification",)),
@@ -8073,7 +8075,7 @@ class BomPage(QWidget):
                 str(value)
                 for value in (loaded or [])
                 if str(value) in {spec[0] for spec in BOM_EXTRA_COLUMN_SPECS}
-            }
+            } | {"cad_revision", "drw_revision"}
         except Exception:
             return self._default_visible_bom_column_keys()
 
@@ -8167,6 +8169,12 @@ class BomPage(QWidget):
             if value in (None, ""):
                 value = info.get("quantity")
             return "" if value in (None, "") else str(value)
+        return ""
+
+    def _extra_bom_column_text(self, item: QTreeWidgetItem, key: str) -> str:
+        for offset, (spec_key, _label, _width, _default, _aliases) in enumerate(BOM_EXTRA_COLUMN_SPECS):
+            if spec_key == key:
+                return item.text(BOM_COL_EXTRA_START + offset)
         return ""
 
     def _apply_extra_bom_columns(self, item: QTreeWidgetItem, info: dict) -> None:
@@ -8836,6 +8844,8 @@ class BomPage(QWidget):
             ("view", "View", ("item_view",)),
             ("unit", "Default Unit", ("default_unit",)),
             ("drawing", "DRW Number", ("drawing_number",)),
+            ("cad_revision", "CAD Rev", ("cad_revision",)),
+            ("drw_revision", "DRW Rev", ("drw_revision",)),
             ("type", "Type", ("type",)),
             ("revision", "Revision / Iteration", ("current_version", "revision")),
             ("state", "Lifecycle", ("status", "state", "lifecycle_state")),
@@ -17239,6 +17249,8 @@ class BomPage(QWidget):
                 "aes_number": item.data(0, BOM_TREE_AES_NUMBER_ROLE) or item.text(BOM_COL_AES),
                 "type": item.text(BOM_COL_TYPE),
                 "revision": item.text(BOM_COL_REV),
+                "cad_revision": self._extra_bom_column_text(item, "cad_revision"),
+                "drw_revision": self._extra_bom_column_text(item, "drw_revision"),
                 "status": item.text(BOM_COL_STATUS),
             }
         node = dict(node)
@@ -21282,6 +21294,8 @@ class BomPage(QWidget):
                 "aes_number": item.data(0, BOM_TREE_AES_NUMBER_ROLE) or "",
                 "type": item.text(BOM_COL_TYPE),
                 "revision": item.text(BOM_COL_REV),
+                "cad_revision": self._extra_bom_column_text(item, "cad_revision"),
+                "drw_revision": self._extra_bom_column_text(item, "drw_revision"),
                 "categories": ", ".join(item.data(0, BOM_TREE_CATEGORY_ROLE) or []),
                 "status": item.text(BOM_COL_STATUS),
                 "work_state": item.data(0, BOM_TREE_INWORK_ROLE) or "Checked In",
@@ -21305,7 +21319,8 @@ class BomPage(QWidget):
 
     def _export_visible_bom_csv(self, file_path: str, rows: list[dict]) -> None:
         fieldnames = [
-            "level", "part_number", "name", "aes_number", "type", "revision", "categories", "status",
+            "level", "part_number", "name", "aes_number", "type", "revision",
+            "cad_revision", "drw_revision", "categories", "status",
             "work_state", "pdf_status", "pdf_details", "step_status", "step_details",
             "integrity", "issues", "part_id", "details",
         ]
@@ -21331,6 +21346,8 @@ class BomPage(QWidget):
             ("aes_number", "AES Number"),
             ("type", "Type"),
             ("revision", "Revision"),
+            ("cad_revision", "CAD Rev"),
+            ("drw_revision", "DRW Rev"),
             ("categories", "Categories"),
             ("status", "Status"),
             ("work_state", "Work State"),
@@ -21382,9 +21399,9 @@ class BomPage(QWidget):
         ws.freeze_panes = "A6"
         ws.auto_filter.ref = f"A{header_row}:{get_column_letter(len(headers))}{max(header_row, header_row + len(rows))}"
         widths = {
-            "A": 8, "B": 32, "C": 16, "D": 12, "E": 12, "F": 28, "G": 14,
-            "H": 18, "I": 14, "J": 14, "K": 32, "L": 16, "M": 32, "N": 20,
-            "O": 18, "P": 10, "Q": 54,
+            "A": 8, "B": 32, "C": 16, "D": 12, "E": 12, "F": 28, "G": 12,
+            "H": 12, "I": 14, "J": 18, "K": 14, "L": 14, "M": 32, "N": 16,
+            "O": 32, "P": 20, "Q": 18, "R": 10, "S": 54,
         }
         for column, width in widths.items():
             ws.column_dimensions[column].width = width

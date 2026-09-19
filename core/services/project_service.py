@@ -15,19 +15,23 @@ def _is_dir_empty(path: str) -> bool:
         return True
 
 
-def _is_iteration_filename(filename: str) -> bool:
-    # e.g. part.prt.2, asm.asm.10, drw.drw.1
-    parts = filename.split(".")
-    return len(parts) >= 3 and parts[-1].isdigit()
-
-
-def _iteration_key_and_no(filename: str):
-    parts = filename.split(".")
-    if len(parts) < 3 or not parts[-1].isdigit():
+def _creo_base_and_iteration(filename: str):
+    """Return (base filename, iteration) for native Creo working files only."""
+    parts = str(filename or "").split(".")
+    if len(parts) < 2:
         return None, None
-    iter_no = int(parts[-1])
-    key = ".".join(parts[:-1])  # includes ext
-    return key, iter_no
+    iteration = None
+    if len(parts) >= 3 and parts[-1].isdigit():
+        iteration = int(parts[-1])
+        base_parts = parts[:-1]
+    else:
+        base_parts = parts
+    if len(base_parts) < 2:
+        return None, None
+    ext = base_parts[-1].lower()
+    if ext not in {"prt", "asm", "drw"}:
+        return None, None
+    return ".".join(base_parts), iteration
 
 
 _TRANSIENT_WORKING_DIRS = {
@@ -109,11 +113,13 @@ class ProjectService:
         return self.project_repo.get_project_by_root_and_label(root_project_id, version_label)
 
     def _purge_copy_working_directory(self, src_dir: str, dst_dir: str, progress_cb=None, cancel_cb=None):
-        """Copy only latest Creo iterations (e.g. part.prt.2) from src_dir into dst_dir.
+        """Copy only native Creo working files from src_dir into dst_dir.
 
         - Preserves relative directory structure
+        - Copies only .prt/.asm/.drw files, choosing the latest numbered iteration
         - Skips transient/internal folders: commits, PR folders, branches, vault,
           snapshots, baselines, exports, .nexus, __pycache__, .git
+        - Does not copy PDFs, STEP files, documents, or user-created non-CAD folders
         - Requires dst_dir to be empty (or non-existent)
         """
 
@@ -140,22 +146,22 @@ class ProjectService:
             if rel_root == ".":
                 rel_root = ""
 
-            latest = {}  # key -> (iter_no, filename)
-            passthrough = []
+            latest = {}  # base Creo filename -> (iteration rank, filename)
 
             for fn in files:
-                key, it = _iteration_key_and_no(fn)
-                if key is not None:
-                    prev = latest.get(key)
-                    if prev is None or it > prev[0]:
-                        latest[key] = (it, fn)
-                else:
-                    passthrough.append(fn)
+                key, it = _creo_base_and_iteration(fn)
+                if key is None:
+                    continue
+                rank = int(it) if it is not None else -1
+                prev = latest.get(key.casefold())
+                if prev is None or rank > prev[0]:
+                    latest[key.casefold()] = (rank, fn)
 
+            to_copy = [v[1] for v in latest.values()]
+            if not to_copy:
+                continue
             dst_subdir = os.path.join(dst_dir, rel_root)
             os.makedirs(dst_subdir, exist_ok=True)
-
-            to_copy = [v[1] for v in latest.values()] + passthrough
             for fn in to_copy:
                 if callable(cancel_cb) and cancel_cb():
                     raise RuntimeError("Cancelled")

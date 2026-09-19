@@ -113,6 +113,7 @@ def _migration_5(conn):
         _ensure_column(conn, "bom", "project_id", "project_id INTEGER")
         _ensure_column(conn, "bom", "locked", "locked INTEGER DEFAULT 0")
         _ensure_column(conn, "bom", "revision", "revision TEXT DEFAULT 'A'")
+        _ensure_column(conn, "bom", "cad_revision", "cad_revision TEXT DEFAULT ''")
         _ensure_column(conn, "bom", "lifecycle_state", "lifecycle_state TEXT DEFAULT 'WIP'")
         _ensure_column(conn, "bom", "released_by", "released_by INTEGER")
         _ensure_column(conn, "bom", "released_at", "released_at TEXT")
@@ -1617,6 +1618,7 @@ def _migration_32(conn):
     if "bom" not in tables:
         return
     _ensure_column(conn, "bom", "revision", "revision TEXT DEFAULT 'A'")
+    _ensure_column(conn, "bom", "cad_revision", "cad_revision TEXT DEFAULT ''")
     _ensure_column(conn, "bom", "current_iteration_id", "current_iteration_id INTEGER")
 
     conn.executescript(

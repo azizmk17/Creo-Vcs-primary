@@ -1,6 +1,6 @@
 import sqlite3
 import re
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 from config import DB_NAME
 from core.models.part_file_model import PartFile
@@ -199,6 +199,52 @@ class PartFileRepository:
                 (part_id,),
             ).fetchall()
             return [PartFile(**dict(r)) for r in rows]
+
+    def active_pdf_revisions_for_parts(self, part_ids: Iterable[int]) -> dict[int, str]:
+        ids = sorted({int(value) for value in (part_ids or []) if value is not None})
+        if not ids:
+            return {}
+        revisions: dict[int, str] = {}
+        with self.get_conn() as conn:
+            for start in range(0, len(ids), 800):
+                chunk = ids[start:start + 800]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT
+                        pf.part_id,
+                        pf.file_role,
+                        pf.file_type,
+                        v.version_no,
+                        v.id AS version_id,
+                        v.revision
+                    FROM part_files pf
+                    JOIN part_file_versions v
+                      ON v.id = pf.active_version_id
+                    WHERE pf.deleted_at IS NULL
+                      AND v.deleted_at IS NULL
+                      AND pf.part_id IN ({placeholders})
+                      AND TRIM(COALESCE(v.revision, '')) <> ''
+                      AND (
+                          UPPER(COALESCE(pf.file_type, '')) = 'PDF'
+                          OR LOWER(COALESCE(pf.file_role, '')) IN ('generated_pdf', 'exported_pdf')
+                      )
+                    ORDER BY
+                        pf.part_id,
+                        CASE
+                            WHEN LOWER(COALESCE(pf.file_role, '')) IN ('generated_pdf', 'exported_pdf') THEN 0
+                            ELSE 1
+                        END,
+                        v.version_no DESC,
+                        v.id DESC
+                    """,
+                    tuple(chunk),
+                ).fetchall()
+                for row in rows:
+                    part_id = int(row["part_id"])
+                    if part_id not in revisions:
+                        revisions[part_id] = str(row["revision"] or "").strip().upper()
+        return revisions
 
     def get_file_by_id(self, file_id: int) -> Optional[PartFile]:
         with self.get_conn() as conn:
