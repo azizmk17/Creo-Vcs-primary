@@ -500,6 +500,10 @@ class ProjectRepository:
                             (new_target_id, int(new_bom_id)),
                         )
 
+                self._duplicate_product_variants(
+                    conn, int(source_project_id), int(new_project_id), bom_id_map
+                )
+
                 # Duplicate BOM relations (only those between duplicated parts)
                 relation_id_map = {}
                 if bom_id_map:
@@ -1233,6 +1237,59 @@ class ProjectRepository:
             conn.execute(
                 f"INSERT OR IGNORE INTO issue_parts({','.join(names)}) VALUES({','.join('?' for _ in names)})",
                 values,
+            )
+
+    def _duplicate_product_variants(self, conn, source_project_id: int, new_project_id: int, bom_id_map):
+        """Copy product variant definitions and remap their assigned BOM item membership."""
+        tables = set(self._list_tables(conn))
+        if not bom_id_map or not {"product_variants", "product_variant_items"}.issubset(tables):
+            return
+        variant_cols = self._table_columns(conn, "product_variants")
+        item_cols = self._table_columns(conn, "product_variant_items")
+        variant_id_map = {}
+        rows = conn.execute(
+            "SELECT * FROM product_variants WHERE project_id=? ORDER BY sort_order, id",
+            (int(source_project_id),),
+        ).fetchall()
+        for row in rows:
+            data = dict(row)
+            old_variant_id = int(data["id"])
+            new_variant_id = self._insert_row_from_row(
+                conn,
+                "product_variants",
+                variant_cols,
+                data,
+                overrides={"project_id": int(new_project_id)},
+                id_col="id",
+            )
+            variant_id_map[old_variant_id] = int(new_variant_id)
+        if not variant_id_map:
+            return
+        placeholders = ",".join("?" for _ in variant_id_map)
+        memberships = conn.execute(
+            f"SELECT * FROM product_variant_items WHERE variant_id IN ({placeholders})",
+            tuple(variant_id_map.keys()),
+        ).fetchall()
+        for row in memberships:
+            data = dict(row)
+            old_bom_id = data.get("bom_id")
+            old_variant_id = data.get("variant_id")
+            if old_bom_id is None or old_variant_id is None:
+                continue
+            new_bom_id = bom_id_map.get(int(old_bom_id))
+            new_variant_id = variant_id_map.get(int(old_variant_id))
+            if new_bom_id is None or new_variant_id is None:
+                continue
+            self._insert_row_from_row(
+                conn,
+                "product_variant_items",
+                item_cols,
+                data,
+                overrides={
+                    "variant_id": int(new_variant_id),
+                    "bom_id": int(new_bom_id),
+                },
+                id_col="",
             )
 
     def _table_columns(self, conn, table_name):

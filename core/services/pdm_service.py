@@ -518,8 +518,13 @@ class PdmService:
                 predicates.append("lower(COALESCE(status,''))<>'deleted'")
             if "lifecycle_state" in columns:
                 predicates.append("lower(COALESCE(lifecycle_state,''))<>'deleted'")
+            order_expr = (
+                "COALESCE(sort_order,id),id"
+                if "sort_order" in columns else
+                "id"
+            )
             items = [dict(row) for row in conn.execute(
-                f"SELECT * FROM bom WHERE {' AND '.join(predicates)} ORDER BY id",
+                f"SELECT * FROM bom WHERE {' AND '.join(predicates)} ORDER BY {order_expr}",
                 (int(project_id),),
             ).fetchall()]
             usages = [dict(row) for row in conn.execute(

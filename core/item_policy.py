@@ -1,6 +1,7 @@
 """Windchill-style Item master attributes and normalization rules."""
 
 ITEM_TYPES = (
+    "PRODUCT",
     "MECHANICAL_PART",
     "SOFTWARE_PART",
     "PURCHASED_PART",
@@ -45,6 +46,13 @@ def normalize_default_unit(value) -> str:
 def item_type_defaults(item_type: str) -> dict:
     """Return authoring defaults without changing persisted legacy Items."""
     item_type = normalize_item_type(item_type)
+    if item_type == "PRODUCT":
+        return {
+            "procurement_source": "MAKE",
+            "cad_requirement": "NOT_REQUIRED",
+            "drawing_requirement": "NOT_REQUIRED",
+            "deliverable": True,
+        }
     if item_type == "SOFTWARE_PART":
         return {
             "procurement_source": "MAKE",

@@ -1947,6 +1947,7 @@ class BomService(BaseService):
             lock_owner = {}
         results = []
         category_map = self.bom_repo.get_categories_for_boms(part.id for part in all_parts)
+        variant_map = self.bom_repo.get_variant_names_for_boms(part.id for part in all_parts)
         version_map = self.revision_repo.get_current_contexts(part.id for part in all_parts)
         drw_revision_map = self.part_file_repo.active_pdf_revisions_for_parts(
             part.id for part in all_parts
@@ -1963,6 +1964,7 @@ class BomService(BaseService):
             d["current_version"] = version.get("version_label") or d.get("revision")
             d["iteration_number"] = version.get("iteration_number")
             d["category_names"] = list(category_map.get(int(part.id), []))
+            d["variant_names"] = list(variant_map.get(int(part.id), []))
             d["drw_revision"] = drw_revision_map.get(int(part.id), "")
             d["binding_update_count"] = int(binding_updates.get(int(part.id), 0))
             d["ebom_behavior"] = "INHERIT"
@@ -2009,6 +2011,55 @@ class BomService(BaseService):
         result = self.bom_repo.delete_category(int(self.session.project_id), int(category_id))
         self._tree_dirty.add(int(self.session.project_id))
         return result
+
+    # -------------------------------
+    # PRODUCT VARIANTS
+    # -------------------------------
+    def list_product_variants(self) -> List[Dict]:
+        if not self.session.project_id:
+            return []
+        return self.bom_repo.list_variants(int(self.session.project_id))
+
+    def create_product_variant(self, name: str, description: str = "") -> Dict:
+        if not self.session.project_id:
+            raise ValueError("Select a project before creating variants.")
+        return self.bom_repo.create_variant(
+            int(self.session.project_id), name, description, created_by=self.user_id
+        )
+
+    def update_product_variant(self, variant_id: int, *, name=None, description=None) -> Dict:
+        if not self.session.project_id:
+            raise ValueError("Select a project before editing variants.")
+        return self.bom_repo.update_variant(
+            int(self.session.project_id), int(variant_id), name=name, description=description
+        )
+
+    def delete_product_variant(self, variant_id: int) -> Dict:
+        if not self.session.project_id:
+            raise ValueError("Select a project before deleting variants.")
+        result = self.bom_repo.delete_variant(int(self.session.project_id), int(variant_id))
+        self._tree_dirty.add(int(self.session.project_id))
+        return result
+
+    def variants_for_part(self, part_id: int) -> List[str]:
+        return self.bom_repo.get_variant_names_for_bom(int(part_id))
+
+    def set_part_variants(self, part_id: int, variant_ids) -> List[str]:
+        if not self.session.project_id:
+            raise ValueError("Select a project before assigning variants.")
+        names = self.bom_repo.set_variants_for_bom(
+            int(part_id),
+            int(self.session.project_id),
+            variant_ids,
+            assigned_by=self.user_id,
+        )
+        self._tree_dirty.add(int(self.session.project_id))
+        return names
+
+    def variant_item_ids(self, variant_id: int) -> set[int]:
+        if not self.session.project_id or not variant_id:
+            return set()
+        return self.bom_repo.variant_item_ids(int(self.session.project_id), int(variant_id))
 
     def search_relation_parents(self, query: str = "") -> List[Dict]:
         if not self.session.project_id:
@@ -2159,6 +2210,141 @@ class BomService(BaseService):
                     pass
         self._tree_dirty.add(int(self.session.project_id))
         return result
+
+    def apply_child_relation_operation_to_targets(
+        self, target_parent_ids, selections, mode: str = "copy"
+    ) -> Dict:
+        """Copy selected EBOM occurrences under several target assemblies."""
+        if not self.session.project_id:
+            raise ValueError("Select a project before changing the BOM structure.")
+        action = str(mode or "copy").strip().lower()
+        if action != "copy":
+            raise ValueError("Multiple target assemblies support Copy only.")
+
+        targets = []
+        seen_targets = set()
+        for value in target_parent_ids or []:
+            target_id = int(value)
+            if target_id not in seen_targets:
+                seen_targets.add(target_id)
+                targets.append(target_id)
+        if not targets:
+            raise ValueError("Select at least one target assembly.")
+
+        normalized = []
+        seen_selections = set()
+        for selection in selections or []:
+            child_id = int(selection.get("child_id"))
+            source_value = selection.get("source_parent_id")
+            source_parent_id = int(source_value) if source_value is not None else None
+            key = (child_id, source_parent_id)
+            if key in seen_selections:
+                continue
+            seen_selections.add(key)
+            child = self.bom_repo.get_by_id(child_id)
+            if not child or int(child.project_id or 0) != int(self.session.project_id):
+                raise ValueError(f"Child item {child_id} was not found in the current project.")
+            normalized.append({"child_id": child_id, "source_parent_id": source_parent_id})
+        if not normalized:
+            raise ValueError("Select at least one child occurrence.")
+
+        for target_id in targets:
+            target = self.bom_repo.get_by_id(int(target_id))
+            if not target or int(target.project_id or 0) != int(self.session.project_id):
+                raise ValueError(f"Target assembly {target_id} was not found in the current project.")
+            if str(target.type or "").strip().lower() not in {"asm", "assembly"}:
+                raise ValueError(f"{target.name or target_id} is not an assembly.")
+            self._assert_checked_out_for_change(int(target_id), "change its structure")
+            for selection in normalized:
+                if int(selection["child_id"]) == int(target_id):
+                    raise ValueError("An assembly cannot be a child of itself.")
+
+        children_by_parent = defaultdict(list)
+        try:
+            with self.pdm_service.repo.get_conn() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT parent_item_id,child_item_id
+                    FROM item_usages
+                    WHERE project_id=?
+                    """,
+                    (int(self.session.project_id),),
+                ).fetchall()
+                for row in rows:
+                    children_by_parent[int(row["parent_item_id"])].append(
+                        int(row["child_item_id"])
+                    )
+                for selection in normalized:
+                    source_parent_id = selection.get("source_parent_id")
+                    if source_parent_id is None:
+                        continue
+                    source = conn.execute(
+                        """
+                        SELECT 1
+                        FROM item_usages
+                        WHERE project_id=? AND parent_item_id=? AND child_item_id=?
+                        """,
+                        (
+                            int(self.session.project_id),
+                            int(source_parent_id),
+                            int(selection["child_id"]),
+                        ),
+                    ).fetchone()
+                    if not source:
+                        raise ValueError(
+                            f"The selected source usage for item {selection['child_id']} no longer exists."
+                        )
+        except ValueError:
+            raise
+        except Exception:
+            for row in self.children_repo.get_structure_rows(int(self.session.project_id)):
+                children_by_parent[int(row["parent_id"])].append(int(row["child_id"]))
+
+        def contains_descendant(start_id: int, wanted_id: int) -> bool:
+            pending = list(children_by_parent.get(int(start_id), []))
+            visited = set()
+            while pending:
+                current = int(pending.pop())
+                if current == int(wanted_id):
+                    return True
+                if current in visited:
+                    continue
+                visited.add(current)
+                pending.extend(children_by_parent.get(current, []))
+            return False
+
+        for target_id in targets:
+            for selection in normalized:
+                if contains_descendant(int(selection["child_id"]), int(target_id)):
+                    child = self.bom_repo.get_by_id(int(selection["child_id"]))
+                    name = str(getattr(child, "name", "") or selection["child_id"])
+                    target = self.bom_repo.get_by_id(int(target_id))
+                    target_name = str(getattr(target, "name", "") or target_id)
+                    raise ValueError(
+                        f"Cannot place {name} under {target_name} because it would create a circular BOM structure."
+                    )
+
+        changed_children = set()
+        copied_targets = []
+        skipped = []
+        for target_id in targets:
+            result = self.pdm_service.repo.apply_item_usage_relations(
+                int(self.session.project_id), int(target_id), normalized, "copy"
+            )
+            copied_targets.append(int(target_id))
+            changed_children.update(int(value) for value in (result.get("child_ids") or []))
+            skipped.extend(result.get("skipped_child_ids") or [])
+            self.pdm_service.repo.capture_item_structure_iteration(
+                int(target_id), "MANUAL", created_by=self.user_id
+            )
+        self._tree_dirty.add(int(self.session.project_id))
+        return {
+            "mode": "copy",
+            "target_parent_ids": copied_targets,
+            "child_ids": sorted(changed_children),
+            "skipped_child_ids": skipped,
+            "operation_count": len(copied_targets) * len(normalized),
+        }
 
     # -------------------------------
     # GET BOM TREE
@@ -2341,6 +2527,7 @@ class BomService(BaseService):
         parts = self.bom_repo.get_many(pid, requested_ids)
         parts_by_id = {int(part.id): part for part in parts}
         categories = self.bom_repo.get_categories_for_boms(part.id for part in parts)
+        variant_map = self.bom_repo.get_variant_names_for_boms(part.id for part in parts)
         versions = self.revision_repo.get_current_contexts(part.id for part in parts)
         drw_revision_map = self.part_file_repo.active_pdf_revisions_for_parts(
             part.id for part in parts
@@ -2365,6 +2552,7 @@ class BomService(BaseService):
             path = f"{path_prefix_key}/{segment}" if path_prefix_key else segment
             node["children"] = []
             node["category_names"] = list(categories.get(int(part.id), []))
+            node["variant_names"] = list(variant_map.get(int(part.id), []))
             node["drw_revision"] = drw_revision_map.get(int(part.id), "")
             version = versions.get(int(part.id), {})
             node["current_version"] = version.get("version_label") or node.get("revision")
@@ -2443,6 +2631,7 @@ class BomService(BaseService):
         all_parts = {b.id: b for b in self.bom_repo.get_all(project_id)}
         version_map = self.revision_repo.get_current_contexts(all_parts.keys())
         category_map = self.bom_repo.get_categories_for_boms(all_parts.keys())
+        variant_map = self.bom_repo.get_variant_names_for_boms(all_parts.keys())
         drw_revision_map = self.part_file_repo.active_pdf_revisions_for_parts(
             all_parts.keys()
         )
@@ -2480,6 +2669,7 @@ class BomService(BaseService):
             node["iteration_number"] = version.get("iteration_number")
             node["binding_update_count"] = int(binding_updates.get(int(part_id), 0))
             node["categories"] = list(category_map.get(int(part_id), []))
+            node["variant_names"] = list(variant_map.get(int(part_id), []))
             node["drw_revision"] = drw_revision_map.get(int(part_id), "")
             node["children"] = []
 
@@ -2551,6 +2741,9 @@ class BomService(BaseService):
         category_names = self.bom_repo.get_categories_for_bom(int(part_id))
         d["category_names"] = list(category_names)
         d["categories"] = ", ".join(category_names)
+        variant_names = self.bom_repo.get_variant_names_for_bom(int(part_id))
+        d["variant_names"] = list(variant_names)
+        d["variants"] = ", ".join(variant_names)
         try:
             if d.get("locked") and self.session.project_id:
                 lock_owner = self.lock_repo.get_lock_owners_for_project(int(self.session.project_id))
@@ -2715,6 +2908,10 @@ class BomService(BaseService):
         except Exception:
             category_map = {}
         try:
+            variant_map = self.bom_repo.get_variant_names_for_boms(item_ids)
+        except Exception:
+            variant_map = {}
+        try:
             drw_revision_map = self.part_file_repo.active_pdf_revisions_for_parts(item_ids)
         except Exception:
             drw_revision_map = {}
@@ -2736,6 +2933,7 @@ class BomService(BaseService):
             row["locked"] = bool(lock_owner)
             row["locked_by_username"] = lock_owner
             row["category_names"] = list(category_map.get(item_id, []))
+            row["variant_names"] = list(variant_map.get(item_id, []))
             row["drw_revision"] = drw_revision_map.get(item_id, "")
         return structure
 
@@ -3639,6 +3837,30 @@ class BomService(BaseService):
     def ordered_pdm_item_usage_ids(self, parent_item_id: int) -> List[int]:
         return self.pdm_service.repo.ordered_item_usage_ids(int(parent_item_id))
 
+    def ordered_pdm_root_item_ids(self) -> List[int]:
+        if not self.session.project_id:
+            return []
+        return self.bom_repo.ordered_root_item_ids(int(self.session.project_id))
+
+    def reorder_pdm_root_items(self, ordered_item_ids) -> bool:
+        if not self.session.project_id:
+            raise ValueError("No project is selected.")
+        current = self.bom_repo.ordered_root_item_ids(int(self.session.project_id))
+        requested = [int(value) for value in ordered_item_ids or []]
+        if set(current) != set(requested):
+            raise ValueError("Reorder must keep the same top-level Items.")
+        result = self.bom_repo.set_root_item_order(
+            int(self.session.project_id), requested
+        )
+        self.emit_project_event(
+            "item.root_order_changed",
+            entity_type="PROJECT",
+            entity_id=int(self.session.project_id),
+            payload={"item_ids": requested},
+        )
+        self._tree_dirty.add(int(self.session.project_id))
+        return result
+
     def reorder_pdm_item_usages(self, parent_item_id: int, ordered_usage_ids) -> bool:
         self._assert_checked_out_for_change(
             int(parent_item_id), "reorder its Item Structure"
@@ -3772,6 +3994,7 @@ class BomService(BaseService):
         project_id = int(getattr(selected, "project_id", None) or self.session.project_id)
         parts = {int(part.id): part for part in self.bom_repo.get_all(project_id)}
         version_contexts = self.revision_repo.get_current_contexts(parts.keys())
+        variant_map = self.bom_repo.get_variant_names_for_boms(parts.keys())
         drw_revision_map = self.part_file_repo.active_pdf_revisions_for_parts(
             parts.keys()
         )
@@ -3825,6 +4048,7 @@ class BomService(BaseService):
             version = version_contexts.get(int(node_id), {})
             node["current_version"] = version.get("version_label") or node.get("revision")
             node["current_iteration_id"] = version.get("current_iteration_id")
+            node["variant_names"] = list(variant_map.get(int(node_id), []))
             node["drw_revision"] = drw_revision_map.get(int(node_id), "")
             status = binding_status.get(int(usage_id)) if usage_id is not None else None
             if status:

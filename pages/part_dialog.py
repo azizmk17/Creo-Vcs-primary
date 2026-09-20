@@ -39,6 +39,7 @@ class PartDialog(QDialog):
     """Enterprise Item master editor; CAD associations are managed in Item Structure."""
 
     ITEM_TYPE_LABELS = {
+        "PRODUCT": "Product / Variant",
         "MECHANICAL_PART": "Mechanical Part",
         "SOFTWARE_PART": "Software Part",
         "PURCHASED_PART": "Purchased Part",
@@ -95,7 +96,7 @@ class PartDialog(QDialog):
         self._represented_part_id = self.part_data.get("represented_part_id")
         self._loading = True
 
-        self.setWindowTitle("New Item" if not self.part_data else "Edit Attributes")
+        self.setWindowTitle("New Item" if not self.part_data.get("id") else "Edit Attributes")
         self.setModal(True)
         self.resize(760, 720)
         self.setMinimumSize(680, 620)
@@ -470,16 +471,23 @@ class PartDialog(QDialog):
         self._set_combo_data(
             self.delivery_input, "NORMAL" if defaults["deliverable"] else "EXCLUDE"
         )
+        if str(self.item_type_input.currentData() or "") == "PRODUCT":
+            self._set_combo_data(self.assembly_mode_input, "SEPARABLE")
+            self._set_combo_data(self.mechanical_type_input, "asm")
         self._sync_mechanical_type_enabled()
         self._sync_aes_requirement()
 
     def _sync_mechanical_type_enabled(self, _index: int = 0) -> None:
-        is_mechanical = str(self.item_type_input.currentData() or "") == "MECHANICAL_PART"
+        item_type = str(self.item_type_input.currentData() or "")
+        is_mechanical = item_type == "MECHANICAL_PART"
+        if item_type == "PRODUCT":
+            self._set_combo_data(self.assembly_mode_input, "SEPARABLE")
+            self._set_combo_data(self.mechanical_type_input, "asm")
         self.mechanical_type_input.setEnabled(is_mechanical)
         self.mechanical_type_input.setToolTip(
             "Mechanical object type stored in the BOM tree, e.g. prt or asm."
             if is_mechanical else
-            "Only Mechanical Parts expose a PRT/ASM-style BOM type."
+            "Product/Variant Items are assembly-style EBOM parents; other non-mechanical Items do not expose PRT/ASM type."
         )
 
     def _sync_mechanical_type_from_assembly(self, _index: int = 0) -> None:
@@ -599,6 +607,9 @@ class PartDialog(QDialog):
         mechanical_type = str(self.mechanical_type_input.currentData() or "").strip().lower()
         if item_type == "MECHANICAL_PART":
             bom_type = mechanical_type or ("asm" if assembly_mode != "COMPONENT" else "prt")
+        elif item_type == "PRODUCT":
+            bom_type = "asm"
+            assembly_mode = "SEPARABLE"
         else:
             bom_type = str(self.part_data.get("type") or "").strip().lower() or "item"
         classification = str(self.classification_input.currentData() or "PHYSICAL")

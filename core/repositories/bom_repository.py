@@ -101,6 +101,7 @@ class BomRepository:
                     "default_unit": (
                         "default_unit TEXT NOT NULL DEFAULT 'EA'"
                     ),
+                    "sort_order": "sort_order INTEGER NOT NULL DEFAULT 0",
                     "deleted_at": "deleted_at TEXT",
                     "deleted_by": "deleted_by INTEGER",
                     "delete_reason": "delete_reason TEXT",
@@ -285,6 +286,13 @@ class BomRepository:
     def insert(self, bom: Bom) -> int:
         with self.get_conn() as conn:
             cur = conn.cursor()
+            sort_order = int(getattr(bom, "sort_order", 0) or 0)
+            if sort_order <= 0 and bom.project_id is not None:
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(sort_order),0)+10 FROM bom WHERE project_id=?",
+                    (int(bom.project_id),),
+                ).fetchone()
+                sort_order = int(row[0] or 10)
             cur.execute("""
                 INSERT INTO bom (type, name, part_number, drawing_number, aes_number,
                                 filename, drawing, base_file_name, base_drw_name, material,
@@ -293,8 +301,8 @@ class BomRepository:
                                 project_id, classification, default_ebom_behavior,
                                 cad_requirement, drawing_requirement, represented_part_id,
                                 cad_control_mode, item_type, assembly_mode,
-                                procurement_source, item_view, default_unit)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                procurement_source, item_view, default_unit, sort_order)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 bom.type, bom.name, bom.part_number, bom.drawing_number, bom.aes_number,
                 bom.filename, bom.drawing, bom.base_file_name, bom.base_drw_name,
@@ -312,6 +320,7 @@ class BomRepository:
                 normalize_procurement_source(bom.procurement_source),
                 normalize_item_view(bom.item_view),
                 normalize_default_unit(bom.default_unit),
+                sort_order,
             ))
             return cur.lastrowid
 
@@ -697,10 +706,70 @@ class BomRepository:
         """Return the lightweight project membership used by the lazy BOM index."""
         with self.get_conn() as conn:
             rows = conn.execute(
-                "SELECT id FROM bom WHERE project_id=? AND deleted_at IS NULL ORDER BY id",
+                """
+                SELECT id FROM bom
+                WHERE project_id=? AND deleted_at IS NULL
+                ORDER BY COALESCE(sort_order,id),id
+                """,
                 (int(project_id),),
             ).fetchall()
             return [int(row["id"]) for row in rows]
+
+    def ordered_root_item_ids(self, project_id: int) -> List[int]:
+        """Return top-level Item ids in their persisted project root order."""
+        with self.get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT b.id
+                FROM bom b
+                WHERE b.project_id=?
+                  AND b.deleted_at IS NULL
+                  AND lower(COALESCE(b.status,''))<>'deleted'
+                  AND lower(COALESCE(b.lifecycle_state,''))<>'deleted'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM item_usages u
+                      JOIN bom p ON p.id=u.parent_item_id
+                      WHERE u.child_item_id=b.id
+                        AND u.project_id=b.project_id
+                        AND p.project_id=b.project_id
+                        AND p.deleted_at IS NULL
+                  )
+                ORDER BY COALESCE(b.sort_order,b.id),b.id
+                """,
+                (int(project_id),),
+            ).fetchall()
+            return [int(row["id"]) for row in rows]
+
+    def set_root_item_order(self, project_id: int, ordered_item_ids) -> bool:
+        ordered = []
+        seen = set()
+        for value in ordered_item_ids or []:
+            try:
+                item_id = int(value)
+            except Exception:
+                continue
+            if item_id in seen:
+                continue
+            ordered.append(item_id)
+            seen.add(item_id)
+        if not ordered:
+            return False
+        with self.get_conn() as conn:
+            existing = self.ordered_root_item_ids(int(project_id))
+            existing_set = set(existing)
+            final_order = [item_id for item_id in ordered if item_id in existing_set]
+            final_order.extend(item_id for item_id in existing if item_id not in set(final_order))
+            for index, item_id in enumerate(final_order):
+                conn.execute(
+                    """
+                    UPDATE bom
+                    SET sort_order=?, modified=datetime('now')
+                    WHERE id=? AND project_id=?
+                    """,
+                    ((index + 1) * 10, int(item_id), int(project_id)),
+                )
+            return True
 
     def get_many(self, project_id: int, bom_ids) -> List[Bom]:
         """Fetch full BOM rows only for the level currently being displayed."""
@@ -903,6 +972,338 @@ class BomRepository:
                 (int(category_id), int(project_id)),
             )
             return {"category": dict(category), "parts": [dict(row) for row in parts]}
+
+    @staticmethod
+    def _clean_variant_name(name: str) -> str:
+        value = " ".join(str(name or "").split())
+        if not value:
+            raise ValueError("Variant name is required.")
+        if len(value) > 100:
+            raise ValueError("Variant name must be 100 characters or fewer.")
+        return value
+
+    def _ensure_variant_tables(self, conn) -> None:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS product_variants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL COLLATE NOCASE,
+                description TEXT DEFAULT '',
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_by INTEGER,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(project_id, name)
+            );
+            CREATE TABLE IF NOT EXISTS product_variant_items (
+                variant_id INTEGER NOT NULL,
+                bom_id INTEGER NOT NULL,
+                assigned_by INTEGER,
+                assigned_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (variant_id, bom_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_product_variants_project
+                ON product_variants(project_id, sort_order, name, id);
+            CREATE INDEX IF NOT EXISTS idx_product_variant_items_bom
+                ON product_variant_items(bom_id);
+            """
+        )
+
+    def list_variants(self, project_id: int) -> List[dict]:
+        with self.get_conn() as conn:
+            self._ensure_variant_tables(conn)
+            if self._table_exists(conn, "item_usages"):
+                count_join = (
+                    "LEFT JOIN item_usages vu "
+                    "ON vu.parent_item_id=b.id AND vu.project_id=b.project_id"
+                )
+                count_expr = "COUNT(vu.child_item_id)"
+            elif self._table_exists(conn, "bom_children"):
+                count_join = "LEFT JOIN bom_children vu ON vu.parent_id=b.id"
+                count_expr = "COUNT(vu.child_id)"
+            else:
+                count_join = "LEFT JOIN product_variant_items vi ON vi.variant_id=b.id"
+                count_expr = "COUNT(vi.bom_id)"
+            rows = conn.execute(
+                f"""
+                SELECT b.id, b.project_id, b.name,
+                       COALESCE(b.notes, '') AS description,
+                       COALESCE(b.part_number, b.aes_number, '') AS number,
+                       b.part_number, b.aes_number, b.type, b.item_type,
+                       b.created AS created_at, b.modified AS updated_at,
+                       {count_expr} AS item_count
+                FROM bom b
+                {count_join}
+                WHERE b.project_id=?
+                  AND UPPER(COALESCE(b.item_type, ''))='PRODUCT'
+                  AND b.deleted_at IS NULL
+                  AND lower(COALESCE(b.status,''))<>'deleted'
+                  AND lower(COALESCE(b.lifecycle_state,''))<>'deleted'
+                GROUP BY b.id
+                ORDER BY lower(COALESCE(b.part_number, '')), lower(b.name), b.id
+                """,
+                (int(project_id),),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_variant(self, project_id: int, variant_id: int) -> dict:
+        with self.get_conn() as conn:
+            self._ensure_variant_tables(conn)
+            if self._table_exists(conn, "item_usages"):
+                count_join = (
+                    "LEFT JOIN item_usages vu "
+                    "ON vu.parent_item_id=b.id AND vu.project_id=b.project_id"
+                )
+                count_expr = "COUNT(vu.child_item_id)"
+            elif self._table_exists(conn, "bom_children"):
+                count_join = "LEFT JOIN bom_children vu ON vu.parent_id=b.id"
+                count_expr = "COUNT(vu.child_id)"
+            else:
+                count_join = "LEFT JOIN product_variant_items vi ON vi.variant_id=b.id"
+                count_expr = "COUNT(vi.bom_id)"
+            row = conn.execute(
+                f"""
+                SELECT b.id, b.project_id, b.name,
+                       COALESCE(b.notes, '') AS description,
+                       b.part_number, b.aes_number, b.type, b.item_type,
+                       b.created AS created_at, b.modified AS updated_at,
+                       {count_expr} AS item_count
+                FROM bom b
+                {count_join}
+                WHERE b.project_id=? AND b.id=?
+                  AND UPPER(COALESCE(b.item_type, ''))='PRODUCT'
+                  AND b.deleted_at IS NULL
+                GROUP BY b.id
+                """,
+                (int(project_id), int(variant_id)),
+            ).fetchone()
+            if not row:
+                raise ValueError("Product variant was not found in the current project.")
+            return dict(row)
+
+    def create_variant(self, project_id: int, name: str, description: str = "", created_by=None) -> dict:
+        raise ValueError("Create a Product / Variant Item from the item editor.")
+
+    def update_variant(self, project_id: int, variant_id: int, *, name=None, description=None) -> dict:
+        raise ValueError("Edit the Product / Variant Item attributes from the item editor.")
+
+    def delete_variant(self, project_id: int, variant_id: int) -> dict:
+        with self.get_conn() as conn:
+            self._ensure_variant_tables(conn)
+            variant = conn.execute(
+                """
+                SELECT *
+                FROM bom
+                WHERE id=? AND project_id=? AND UPPER(COALESCE(item_type,''))='PRODUCT'
+                """,
+                (int(variant_id), int(project_id)),
+            ).fetchone()
+            if not variant:
+                raise ValueError("Product variant was not found in the current project.")
+            parts = conn.execute(
+                """
+                SELECT b.id, b.name, b.part_number, b.aes_number, b.type
+                FROM product_variant_items vi
+                JOIN bom b ON b.id=vi.bom_id
+                WHERE vi.variant_id=? AND b.project_id=? AND b.deleted_at IS NULL
+                ORDER BY lower(COALESCE(b.part_number, '')), lower(b.name), b.id
+                """,
+                (int(variant_id), int(project_id)),
+            ).fetchall()
+            conn.execute("DELETE FROM product_variant_items WHERE variant_id=?", (int(variant_id),))
+            return {"variant": dict(variant), "parts": [dict(row) for row in parts]}
+
+    def get_variant_names_for_bom(self, bom_id: int) -> List[str]:
+        with self.get_conn() as conn:
+            self._ensure_variant_tables(conn)
+            if self._table_exists(conn, "item_usages"):
+                rows = conn.execute(
+                    """
+                    SELECT DISTINCT v.name
+                    FROM item_usages u
+                    JOIN bom v ON v.id=u.parent_item_id
+                    WHERE u.child_item_id=?
+                      AND UPPER(COALESCE(v.item_type, ''))='PRODUCT'
+                      AND v.deleted_at IS NULL
+                    ORDER BY lower(COALESCE(v.part_number, '')), lower(v.name), v.id
+                    """,
+                    (int(bom_id),),
+                ).fetchall()
+                return [str(row["name"]) for row in rows]
+            if self._table_exists(conn, "bom_children"):
+                rows = conn.execute(
+                    """
+                    SELECT DISTINCT v.name
+                    FROM bom_children u
+                    JOIN bom v ON v.id=u.parent_id
+                    WHERE u.child_id=?
+                      AND UPPER(COALESCE(v.item_type, ''))='PRODUCT'
+                      AND v.deleted_at IS NULL
+                    ORDER BY lower(COALESCE(v.part_number, '')), lower(v.name), v.id
+                    """,
+                    (int(bom_id),),
+                ).fetchall()
+                return [str(row["name"]) for row in rows]
+            rows = conn.execute(
+                """
+                SELECT v.name
+                FROM product_variant_items vi
+                JOIN bom v ON v.id=vi.variant_id
+                WHERE vi.bom_id=?
+                  AND UPPER(COALESCE(v.item_type, ''))='PRODUCT'
+                  AND v.deleted_at IS NULL
+                ORDER BY lower(COALESCE(v.part_number, '')), lower(v.name), v.id
+                """,
+                (int(bom_id),),
+            ).fetchall()
+            return [str(row["name"]) for row in rows]
+
+    def get_variant_names_for_boms(self, bom_ids) -> dict:
+        ids = sorted({int(bom_id) for bom_id in (bom_ids or []) if bom_id is not None})
+        if not ids:
+            return {}
+        fetched = []
+        with self.get_conn() as conn:
+            self._ensure_variant_tables(conn)
+            for offset in range(0, len(ids), 800):
+                chunk = ids[offset:offset + 800]
+                placeholders = ",".join("?" for _ in chunk)
+                if self._table_exists(conn, "item_usages"):
+                    fetched.extend(conn.execute(
+                        f"""
+                        SELECT DISTINCT u.child_item_id AS bom_id, v.name
+                        FROM item_usages u
+                        JOIN bom v ON v.id=u.parent_item_id
+                        WHERE u.child_item_id IN ({placeholders})
+                          AND UPPER(COALESCE(v.item_type, ''))='PRODUCT'
+                          AND v.deleted_at IS NULL
+                        ORDER BY lower(COALESCE(v.part_number, '')), lower(v.name), v.id
+                        """,
+                        chunk,
+                    ).fetchall())
+                    continue
+                if self._table_exists(conn, "bom_children"):
+                    fetched.extend(conn.execute(
+                        f"""
+                        SELECT DISTINCT u.child_id AS bom_id, v.name
+                        FROM bom_children u
+                        JOIN bom v ON v.id=u.parent_id
+                        WHERE u.child_id IN ({placeholders})
+                          AND UPPER(COALESCE(v.item_type, ''))='PRODUCT'
+                          AND v.deleted_at IS NULL
+                        ORDER BY lower(COALESCE(v.part_number, '')), lower(v.name), v.id
+                        """,
+                        chunk,
+                    ).fetchall())
+                    continue
+                fetched.extend(conn.execute(
+                    f"""
+                    SELECT vi.bom_id, v.name
+                    FROM product_variant_items vi
+                    JOIN bom v ON v.id=vi.variant_id
+                    WHERE vi.bom_id IN ({placeholders})
+                      AND UPPER(COALESCE(v.item_type, ''))='PRODUCT'
+                      AND v.deleted_at IS NULL
+                    ORDER BY lower(COALESCE(v.part_number, '')), lower(v.name), v.id
+                    """,
+                    chunk,
+                ).fetchall())
+        result = {bom_id: [] for bom_id in ids}
+        for row in fetched:
+            result.setdefault(int(row["bom_id"]), []).append(str(row["name"]))
+        return result
+
+    def set_variants_for_bom(self, bom_id: int, project_id: int, variant_ids, assigned_by=None) -> List[str]:
+        cleaned_ids = []
+        seen = set()
+        for raw_id in variant_ids or []:
+            try:
+                variant_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if variant_id not in seen:
+                seen.add(variant_id)
+                cleaned_ids.append(variant_id)
+        with self.get_conn() as conn:
+            self._ensure_variant_tables(conn)
+            part = conn.execute(
+                "SELECT id FROM bom WHERE id=? AND project_id=?",
+                (int(bom_id), int(project_id)),
+            ).fetchone()
+            if not part:
+                raise ValueError("BOM item was not found in the current project.")
+            if cleaned_ids:
+                placeholders = ",".join("?" for _ in cleaned_ids)
+                valid = {
+                    int(row["id"]) for row in conn.execute(
+                        f"""
+                        SELECT id
+                        FROM bom
+                        WHERE project_id=? AND id IN ({placeholders})
+                          AND UPPER(COALESCE(item_type, ''))='PRODUCT'
+                          AND deleted_at IS NULL
+                        """,
+                        [int(project_id), *cleaned_ids],
+                    ).fetchall()
+                }
+                if len(valid) != len(cleaned_ids):
+                    raise ValueError("One or more selected variants no longer exist.")
+            conn.execute("DELETE FROM product_variant_items WHERE bom_id=?", (int(bom_id),))
+            for variant_id in cleaned_ids:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO product_variant_items(variant_id, bom_id, assigned_by)
+                    VALUES(?,?,?)
+                    """,
+                    (int(variant_id), int(bom_id), assigned_by),
+                )
+        return self.get_variant_names_for_bom(int(bom_id))
+
+    def variant_item_ids(self, project_id: int, variant_id: int) -> set[int]:
+        with self.get_conn() as conn:
+            self._ensure_variant_tables(conn)
+            if self._table_exists(conn, "item_usages"):
+                rows = conn.execute(
+                    """
+                    SELECT u.child_item_id AS bom_id
+                    FROM item_usages u
+                    JOIN bom v ON v.id=u.parent_item_id
+                    JOIN bom b ON b.id=u.child_item_id
+                    WHERE v.project_id=? AND v.id=? AND b.project_id=? AND b.deleted_at IS NULL
+                      AND UPPER(COALESCE(v.item_type, ''))='PRODUCT'
+                      AND v.deleted_at IS NULL
+                    """,
+                    (int(project_id), int(variant_id), int(project_id)),
+                ).fetchall()
+                return {int(row["bom_id"]) for row in rows}
+            if self._table_exists(conn, "bom_children"):
+                rows = conn.execute(
+                    """
+                    SELECT u.child_id AS bom_id
+                    FROM bom_children u
+                    JOIN bom v ON v.id=u.parent_id
+                    JOIN bom b ON b.id=u.child_id
+                    WHERE v.project_id=? AND v.id=? AND b.project_id=? AND b.deleted_at IS NULL
+                      AND UPPER(COALESCE(v.item_type, ''))='PRODUCT'
+                      AND v.deleted_at IS NULL
+                    """,
+                    (int(project_id), int(variant_id), int(project_id)),
+                ).fetchall()
+                return {int(row["bom_id"]) for row in rows}
+            rows = conn.execute(
+                """
+                SELECT vi.bom_id
+                FROM product_variant_items vi
+                JOIN bom v ON v.id=vi.variant_id
+                JOIN bom b ON b.id=vi.bom_id
+                WHERE v.project_id=? AND v.id=? AND b.project_id=? AND b.deleted_at IS NULL
+                  AND UPPER(COALESCE(v.item_type, ''))='PRODUCT'
+                  AND v.deleted_at IS NULL
+                """,
+                (int(project_id), int(variant_id), int(project_id)),
+            ).fetchall()
+            return {int(row["bom_id"]) for row in rows}
 
     # -------------------------------
     # UPDATE

@@ -42,6 +42,7 @@ class Bom:
     procurement_source: str = "MAKE"
     item_view: str = "DESIGN"
     default_unit: str = "EA"
+    sort_order: int = 0
     deleted_at: Optional[str] = None
     deleted_by: Optional[int] = None
     delete_reason: Optional[str] = None

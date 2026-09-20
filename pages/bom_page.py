@@ -233,9 +233,6 @@ class BomTreeWidget(QTreeWidget):
 
         target_id = target.data(0, Qt.UserRole)
         target_parent = target.parent()
-        if target_parent is None:
-            event.ignore()
-            return
         engineering_parent = target_parent
         while engineering_parent is not None and engineering_parent.data(0, Qt.UserRole) is None:
             engineering_parent = engineering_parent.parent()
@@ -253,6 +250,9 @@ class BomTreeWidget(QTreeWidget):
         scope = str(self.property("pdmScope") or "").upper()
         selected_ids = []
         if scope == "CAD" or target.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+            if target_parent is None:
+                event.ignore()
+                return
             parent_cad_id = target_parent.data(0, PDM_CAD_DOCUMENT_ID_ROLE)
             target_member_id = target.data(0, PDM_CAD_MEMBER_ID_ROLE)
             if parent_cad_id is None or target_member_id is None:
@@ -270,22 +270,38 @@ class BomTreeWidget(QTreeWidget):
             target_id = int(target_member_id)
             target_parent_id = int(parent_cad_id)
         elif scope == "EBOM" or target.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_ITEM:
-            occurrence = target.data(0, BOM_TREE_OCCURRENCE_ROLE) or {}
-            target_usage_id = occurrence.get("usage_id")
-            if target_usage_id is None:
-                event.ignore()
-                return
-            for item in selected:
-                if item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+            if target_parent is None:
+                if target_id is None:
                     event.ignore()
                     return
-                usage_id = (item.data(0, BOM_TREE_OCCURRENCE_ROLE) or {}).get("usage_id")
-                if usage_id is None:
+                for item in selected:
+                    if item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+                        event.ignore()
+                        return
+                    item_id = item.data(0, Qt.UserRole)
+                    if item_id is None:
+                        event.ignore()
+                        return
+                    selected_ids.append(int(item_id))
+                target_id = int(target_id)
+                target_parent_id = 0
+            else:
+                occurrence = target.data(0, BOM_TREE_OCCURRENCE_ROLE) or {}
+                target_usage_id = occurrence.get("usage_id")
+                if target_usage_id is None:
                     event.ignore()
                     return
-                selected_ids.append(int(usage_id))
-            target_id = int(target_usage_id)
-            target_parent_id = int(target_parent_id)
+                for item in selected:
+                    if item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+                        event.ignore()
+                        return
+                    usage_id = (item.data(0, BOM_TREE_OCCURRENCE_ROLE) or {}).get("usage_id")
+                    if usage_id is None:
+                        event.ignore()
+                        return
+                    selected_ids.append(int(usage_id))
+                target_id = int(target_usage_id)
+                target_parent_id = int(target_parent_id)
         else:
             for item in selected:
                 try:
@@ -359,6 +375,8 @@ BOM_TREE_PROMOTION_ROLE = Qt.UserRole + 49
 BOM_TREE_ITEM_NUMBER_ROLE = Qt.UserRole + 50
 BOM_TREE_AES_NUMBER_ROLE = Qt.UserRole + 51
 BOM_TREE_FOLDER_SCOPE_ROLE = Qt.UserRole + 52
+BOM_TREE_VARIANT_ROLE = Qt.UserRole + 53
+BOM_TREE_PRODUCT_ROLE = Qt.UserRole + 54
 STRUCTURE_CURRENT_ITERATION_ROLE = Qt.UserRole + 60
 STRUCTURE_BOUND_ITERATION_ROLE = Qt.UserRole + 61
 STRUCTURE_LATEST_ITERATION_ROLE = Qt.UserRole + 62
@@ -523,6 +541,7 @@ BOM_EXTRA_COLUMN_SPECS = [
     ("base_drw_name", "Drawing File", 135, False, ("base_drw_name",)),
     ("cad_revision", "CAD Rev", 72, True, ("cad_revision",)),
     ("drw_revision", "DRW Rev", 72, True, ("drw_revision",)),
+    ("variants", "Variants", 140, True, ("variants", "variant_names")),
     ("item_type", "Item Type", 115, False, ("item_type",)),
     ("assembly_mode", "Assembly Mode", 105, False, ("assembly_mode",)),
     ("classification", "Classification", 105, False, ("classification",)),
@@ -556,6 +575,10 @@ _BOM_INWORK_COLOR = QColor("#BA7517")
 _BOM_INWORK_GAP_PX = 6
 _BOM_TREE_SEL_BG = "#e8eefc"
 _BOM_TREE_ROW_TEXT = "#111827"
+_BOM_PRODUCT_ROW_BG = "#9F2D2D"
+_BOM_PRODUCT_ROW_BG_SELECTED = "#842424"
+_BOM_PRODUCT_ROW_FG = "#FFFFFF"
+_BOM_PRODUCT_ROW_MUTED_FG = "#FFE2C6"
 
 _FILE_BADGE_STYLES = {
     "ok": {
@@ -756,6 +779,68 @@ def _files_delegate_pill_rects(option_rect: QRect, payload: dict) -> tuple[QRect
     return pdf_rect, step_rect
 
 
+def _is_product_tree_row(item: QTreeWidgetItem | None) -> bool:
+    try:
+        return bool(item and item.data(0, BOM_TREE_PRODUCT_ROLE))
+    except Exception:
+        return False
+
+
+def _apply_product_row_option(opt: QStyleOptionViewItem, item: QTreeWidgetItem | None) -> bool:
+    if not _is_product_tree_row(item):
+        return False
+    selected = bool(opt.state & QStyle.State_Selected)
+    bg = QColor(_BOM_PRODUCT_ROW_BG_SELECTED if selected else _BOM_PRODUCT_ROW_BG)
+    fg = QColor(_BOM_PRODUCT_ROW_FG)
+    opt.backgroundBrush = QBrush(bg)
+    for group in (QPalette.Active, QPalette.Inactive, QPalette.Disabled):
+        opt.palette.setColor(group, QPalette.Base, bg)
+        opt.palette.setColor(group, QPalette.AlternateBase, bg)
+        opt.palette.setColor(group, QPalette.Text, fg)
+        opt.palette.setColor(group, QPalette.WindowText, fg)
+        opt.palette.setColor(group, QPalette.Highlight, bg)
+        opt.palette.setColor(group, QPalette.HighlightedText, fg)
+    return True
+
+
+class _BomTreeProductRowDelegate(QStyledItemDelegate):
+    """Default cell painter with PRODUCT row color support."""
+
+    def __init__(self, tree: QTreeWidget, parent=None):
+        super().__init__(parent)
+        self._tree = tree
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index):
+        item = self._tree.itemFromIndex(index)
+        if item is None:
+            return super().paint(painter, option, index)
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        is_product = _apply_product_row_option(opt, item)
+        if not is_product:
+            return super().paint(painter, opt, index)
+
+        widget = opt.widget or self._tree
+        style = widget.style()
+        painter.save()
+        painter.fillRect(opt.rect, opt.backgroundBrush)
+        icon_rect = style.subElementRect(QStyle.SE_ItemViewItemDecoration, opt, widget)
+        if not opt.icon.isNull() and icon_rect.isValid():
+            opt.icon.paint(painter, icon_rect, opt.decorationAlignment)
+        text_rect = style.subElementRect(QStyle.SE_ItemViewItemText, opt, widget)
+        if text_rect.width() <= 0:
+            text_rect = opt.rect.adjusted(5, 0, -5, 0)
+        font = QFont(opt.font)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QColor(_BOM_PRODUCT_ROW_FG))
+        fm = QFontMetrics(font)
+        text = fm.elidedText(str(opt.text or ""), opt.textElideMode, max(8, text_rect.width()))
+        painter.drawText(text_rect, opt.displayAlignment or (Qt.AlignVCenter | Qt.AlignLeft), text)
+        painter.restore()
+        return
+
+
 class _BomTreeNameDelegate(QStyledItemDelegate):
     """Renders part name + optional inline 'In Work' label in column 0."""
 
@@ -773,6 +858,7 @@ class _BomTreeNameDelegate(QStyledItemDelegate):
 
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
+        is_product_row = _apply_product_row_option(opt, item)
         name = item.text(BOM_COL_NAME) or ""
         suffix = item.data(0, BOM_TREE_INWORK_ROLE) or ""
         issue_summary = item.data(0, BOM_TREE_ISSUE_ROLE) or {}
@@ -790,7 +876,13 @@ class _BomTreeNameDelegate(QStyledItemDelegate):
 
         opt.text = ""
         painter.save()
-        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
+        if is_product_row:
+            painter.fillRect(opt.rect, opt.backgroundBrush)
+            icon_rect = style.subElementRect(QStyle.SE_ItemViewItemDecoration, opt, widget)
+            if not opt.icon.isNull() and icon_rect.isValid():
+                opt.icon.paint(painter, icon_rect, opt.decorationAlignment)
+        else:
+            style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
         painter.restore()
 
         text_rect = style.subElementRect(QStyle.SE_ItemViewItemText, opt, widget)
@@ -798,7 +890,7 @@ class _BomTreeNameDelegate(QStyledItemDelegate):
             text_rect = opt.rect
 
         # Keep normal (dark) text on selection — do not use HighlightedText (often white on blue).
-        name_pen = QColor(_BOM_TREE_ROW_TEXT)
+        name_pen = QColor(_BOM_PRODUCT_ROW_FG if is_product_row else _BOM_TREE_ROW_TEXT)
 
         is_asm = bool(item.data(0, BOM_TREE_IS_ASSEMBLY_ROLE)) or any(
             item.child(index).data(0, PDM_OBJECT_KIND_ROLE) != PDM_OBJECT_CAD
@@ -884,7 +976,7 @@ class _BomTreeNameDelegate(QStyledItemDelegate):
                 max(0, text_rect.right() - (text_rect.left() + name_w + _BOM_INWORK_GAP_PX)),
                 text_rect.height(),
             )
-            painter.setPen(_BOM_INWORK_COLOR)
+            painter.setPen(QColor(_BOM_PRODUCT_ROW_MUTED_FG) if is_product_row else _BOM_INWORK_COLOR)
             painter.drawText(suf_rect, Qt.AlignVCenter | Qt.AlignLeft, suf_elided)
             name_w += _BOM_INWORK_GAP_PX + QFontMetrics(suf_font).horizontalAdvance(suf_elided)
         if issue_badges:
@@ -930,12 +1022,16 @@ class _BomTreeFilesDelegate(QStyledItemDelegate):
 
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
+        _apply_product_row_option(opt, item)
         opt.text = ""
         opt.icon = QIcon()
         widget = opt.widget or self._tree
         style = widget.style()
         painter.save()
-        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
+        if _is_product_tree_row(item):
+            painter.fillRect(opt.rect, opt.backgroundBrush)
+        else:
+            style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
         painter.restore()
 
         if item.data(0, BOM_TREE_FOLDER_ROLE):
@@ -1011,11 +1107,15 @@ class _BomTreeStatusDelegate(QStyledItemDelegate):
 
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
+        is_product_row = _apply_product_row_option(opt, item)
         opt.text = ""
         widget = opt.widget or self._tree
         style = widget.style()
         painter.save()
-        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
+        if is_product_row:
+            painter.fillRect(opt.rect, opt.backgroundBrush)
+        else:
+            style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
         painter.restore()
 
         if item.data(0, BOM_TREE_FOLDER_ROLE):
@@ -1025,7 +1125,7 @@ class _BomTreeStatusDelegate(QStyledItemDelegate):
         key = _status_badge_key(raw)
         if not key:
             painter.save()
-            painter.setPen(opt.palette.color(QPalette.Text))
+            painter.setPen(QColor(_BOM_PRODUCT_ROW_FG) if is_product_row else opt.palette.color(QPalette.Text))
             f = QFont(opt.font)
             f.setPixelSize(11)
             painter.setFont(f)
@@ -1087,11 +1187,15 @@ class _BomTreeIntegrityDelegate(QStyledItemDelegate):
 
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
+        is_product_row = _apply_product_row_option(opt, item)
         opt.text = ""
         widget = opt.widget or self._tree
         style = widget.style()
         painter.save()
-        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
+        if is_product_row:
+            painter.fillRect(opt.rect, opt.backgroundBrush)
+        else:
+            style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
         painter.restore()
 
         if item.data(0, BOM_TREE_FOLDER_ROLE):
@@ -1103,7 +1207,10 @@ class _BomTreeIntegrityDelegate(QStyledItemDelegate):
         payload = item.data(BOM_COL_INTEGRITY, BOM_TREE_INTEGRITY_ROLE) or {"state": "ok"}
         state = str(payload.get("state") or "ok")
         sym = "✓" if state == "ok" else "⚠"
-        col = QColor("#639922") if state == "ok" else QColor("#BA7517")
+        if is_product_row:
+            col = QColor(_BOM_PRODUCT_ROW_FG)
+        else:
+            col = QColor("#639922") if state == "ok" else QColor("#BA7517")
         f = QFont(opt.font)
         f.setPixelSize(14)
         painter.save()
@@ -2611,7 +2718,11 @@ class BomPage(QWidget):
         self._bom_advanced_filters = self._default_bom_advanced_filters()
         self._active_saved_filter_id = None
         self._active_saved_filter_name = ""
+        self._active_variant_id = None
+        self._active_variant_item_ids = None
         self._advanced_filter_dialog = None
+        self._product_variants_cache = []
+        self._loading_variant_selector = False
         self._bom_mode = "ebom"
         self._pdm_cad_roots = []
         self._pdm_cad_scope_path = []
@@ -2698,7 +2809,7 @@ class BomPage(QWidget):
                 self._load_pdm_cad_tree()
                 return
             if str(getattr(self, "_bom_mode", "")).lower() == "ebom":
-                self._load_pdm_ebom_tree()
+                self._load_released_ebom_tree()
                 return
         except Exception:
             pass
@@ -7366,6 +7477,305 @@ class BomPage(QWidget):
         self._refresh_loaded_part_branch(int(parent_id))
         self._refresh_part_in_tree(int(child["id"]))
 
+    def _refresh_variant_selector(self) -> None:
+        combo = getattr(self, "variant_selector", None)
+        if combo is None:
+            return
+        previous_id = getattr(self, "_active_variant_id", None)
+        try:
+            variants = self.bom_service.list_product_variants() or []
+        except Exception:
+            variants = []
+        self._product_variants_cache = list(variants)
+        self._loading_variant_selector = True
+        try:
+            combo.clear()
+            combo.addItem("All variants", None)
+            for variant in variants:
+                label = str(variant.get("name") or "")
+                count = int(variant.get("item_count") or 0)
+                combo.addItem(f"{label} ({count})", int(variant["id"]))
+            target_index = 0
+            if previous_id is not None:
+                for index in range(combo.count()):
+                    if combo.itemData(index) == int(previous_id):
+                        target_index = index
+                        break
+                else:
+                    self._active_variant_id = None
+            combo.setCurrentIndex(target_index)
+        finally:
+            self._loading_variant_selector = False
+
+    def _on_variant_filter_changed(self, _index: int = 0) -> None:
+        if getattr(self, "_loading_variant_selector", False):
+            return
+        combo = getattr(self, "variant_selector", None)
+        self._active_variant_id = combo.currentData() if combo is not None else None
+        self._active_variant_item_ids = None
+        if str(getattr(self, "_bom_mode", "cad")) == "ebom":
+            if self._active_variant_id:
+                self._open_product_variant_root(int(self._active_variant_id))
+            else:
+                self._clear_pdm_isolation()
+            self._refresh_bom_row_numbers()
+        self._update_advanced_filter_button_state()
+
+    def _find_ebom_payload_for_item_id(self, item_id: int) -> dict | None:
+        identity = ("ebom", int(item_id))
+        found_path = self._find_pdm_payload_path_to_identity(
+            list(getattr(self, "_pdm_ebom_roots", []) or []),
+            identity,
+            "ebom",
+        )
+        if found_path:
+            return dict(found_path[-1])
+        return None
+
+    def _open_product_variant_root(self, variant_id: int) -> None:
+        payload = self._find_ebom_payload_for_item_id(int(variant_id))
+        if payload is None:
+            try:
+                data = self.bom_service.get_released_ebom_project(int(self.session.project_id)) or {}
+                self._pdm_ebom_roots = list(data.get("roots") or [])
+            except Exception:
+                pass
+            payload = self._find_ebom_payload_for_item_id(int(variant_id))
+        if payload is None:
+            QMessageBox.warning(
+                self,
+                "Product Variants",
+                "The selected Product Item is not available in the current EBOM tree.",
+            )
+            return
+        entry = self._pdm_scope_entry_from_payload(payload, "ebom")
+        self._pdm_ebom_scope_path = [entry]
+        self._render_pdm_ebom_roots([payload])
+        tree = getattr(self, "_ebom_tree", None)
+        try:
+            if tree is not None and tree.topLevelItemCount():
+                root_item = tree.topLevelItem(0)
+                tree.setCurrentItem(root_item)
+                root_item.setSelected(True)
+                self.on_tree_item_clicked(root_item, BOM_COL_NAME)
+        except Exception:
+            pass
+
+    def _selected_bom_item_ids_for_variant_assignment(self) -> list[int]:
+        tree = self._current_pdm_tree() if str(getattr(self, "_bom_mode", "cad")) == "ebom" else self._current_tree_for_filtering()
+        ids = []
+        seen = set()
+        for item in list(tree.selectedItems() if tree is not None else []):
+            if (
+                item is None
+                or self._is_folder_tree_item(item)
+                or self._is_lazy_placeholder(item)
+                or item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD
+            ):
+                continue
+            try:
+                part_id = int(item.data(0, Qt.UserRole))
+            except Exception:
+                continue
+            if part_id not in seen:
+                seen.add(part_id)
+                ids.append(part_id)
+        if ids:
+            return ids
+        if getattr(self, "current_part_id", None):
+            return [int(self.current_part_id)]
+        return []
+
+    def assign_variants_to_selected_items(self) -> None:
+        tree = self._current_pdm_tree() if str(getattr(self, "_bom_mode", "cad")) == "ebom" else None
+        selected_rows = list(tree.selectedItems() if tree is not None else [])
+        selections = []
+        seen = set()
+        for row in selected_rows:
+            payload = self._pdm_ebom_relation_selection_for_item(row)
+            if payload is None:
+                continue
+            child_id = int(payload["child_id"])
+            source_parent_id = payload.get("source_parent_id")
+            key = (child_id, source_parent_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            selections.append(payload)
+        if not selections:
+            QMessageBox.information(self, "Product Variants", "Select one or more EBOM Items first.")
+            return
+        selections = self._resolve_relation_sources(selections, "copy")
+        if selections is None:
+            return
+        variants = self.bom_service.list_product_variants() or []
+        if not variants:
+            QMessageBox.information(self, "Product Variants", "Create a Product Item first.")
+            self.show_product_variants_manager()
+            variants = self.bom_service.list_product_variants() or []
+            if not variants:
+                return
+        child_ids = {int(row["child_id"]) for row in selections}
+        variants = [
+            row for row in variants
+            if int(row.get("id") or 0) not in child_ids
+        ]
+        if not variants:
+            QMessageBox.information(self, "Product Variants", "No target Product Items are available.")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Copy to Product Variants")
+        dialog.resize(420, 430)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(f"Copy {len(selections)} selected usage(s) to Product Item variants."))
+        list_widget = QListWidget()
+        for variant in variants:
+            item = QListWidgetItem(str(variant.get("name") or ""))
+            item.setData(Qt.UserRole, int(variant["id"]))
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+            list_widget.addItem(item)
+        layout.addWidget(list_widget, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        selected_variant_ids = [
+            int(list_widget.item(index).data(Qt.UserRole))
+            for index in range(list_widget.count())
+            if list_widget.item(index).checkState() == Qt.Checked
+        ]
+        if not selected_variant_ids:
+            QMessageBox.information(self, "Product Variants", "Select at least one Product Item variant.")
+            return
+        try:
+            result = self.bom_service.apply_child_relation_operation_to_targets(
+                selected_variant_ids,
+                selections,
+                "copy",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Product Variants", f"Could not copy to variants:\n{exc}")
+            return
+        affected = set(int(value) for value in (result.get("target_parent_ids") or []))
+        affected.update(int(value) for value in (result.get("child_ids") or []))
+        for item_id in sorted(affected):
+            self._refresh_pdm_ebom_structure_branch(int(item_id))
+        self._active_variant_item_ids = None
+        self._refresh_variant_selector()
+        self._refresh_ebom_filters()
+        if selections:
+            self.display_details(int(selections[0]["child_id"]))
+
+    def show_product_variants_manager(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Product Variants")
+        dialog.resize(560, 420)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("Product variants are Product Items. Create/edit them as Items, then assign components to them."))
+        list_widget = QListWidget()
+        layout.addWidget(list_widget, 1)
+        button_row = QHBoxLayout()
+        add_btn = QPushButton("New Product Item")
+        rename_btn = QPushButton("Edit Item")
+        delete_btn = QPushButton("Delete Item")
+        button_row.addWidget(add_btn)
+        button_row.addWidget(rename_btn)
+        button_row.addWidget(delete_btn)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
+        close_buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        close_buttons.rejected.connect(dialog.reject)
+        layout.addWidget(close_buttons)
+
+        def refresh(selected_id=None):
+            try:
+                rows = self.bom_service.list_product_variants() or []
+            except Exception as exc:
+                QMessageBox.critical(dialog, "Product Variants", f"Could not load variants:\n{exc}")
+                rows = []
+            list_widget.clear()
+            for row in rows:
+                item = QListWidgetItem(
+                    f"{row.get('name') or ''}    ({int(row.get('item_count') or 0)} item(s))"
+                )
+                item.setData(Qt.UserRole, dict(row))
+                list_widget.addItem(item)
+                if selected_id is not None and int(row["id"]) == int(selected_id):
+                    list_widget.setCurrentItem(item)
+
+        def current_variant():
+            item = list_widget.currentItem()
+            return item.data(Qt.UserRole) if item else None
+
+        def add_variant():
+            try:
+                item_dialog = PartDialog(
+                    self,
+                    {
+                        "item_type": "PRODUCT",
+                        "type": "asm",
+                        "assembly_mode": "SEPARABLE",
+                        "cad_requirement": "NOT_REQUIRED",
+                        "drawing_requirement": "NOT_REQUIRED",
+                        "default_ebom_behavior": "NORMAL",
+                    },
+                )
+                if item_dialog.exec_() != QDialog.Accepted:
+                    return
+                data = item_dialog.get_data()
+                if not data.get("name"):
+                    QMessageBox.warning(dialog, "Product Variants", "Name is required.")
+                    return
+                created_id = self.bom_service.add_part(data)
+                refresh(int(created_id))
+                self._refresh_variant_selector()
+                self._active_variant_item_ids = None
+            except Exception as exc:
+                QMessageBox.critical(dialog, "Product Variants", str(exc))
+
+        def rename_variant():
+            row = current_variant()
+            if not row:
+                return
+            try:
+                self.edit_part(int(row["id"]))
+                refresh(int(row["id"]))
+                self._refresh_variant_selector()
+                self._active_variant_item_ids = None
+                self._refresh_ebom_filters()
+            except Exception as exc:
+                QMessageBox.critical(dialog, "Product Variants", str(exc))
+
+        def delete_variant():
+            row = current_variant()
+            if not row:
+                return
+            count = int(row.get("item_count") or 0)
+            if QMessageBox.question(
+                dialog,
+                "Delete Product Item",
+                f"Delete Product Item '{row.get('name')}'?\n\nIt is assigned as a variant to {count} item(s).",
+            ) != QMessageBox.Yes:
+                return
+            try:
+                self.delete_part(int(row["id"]))
+                refresh()
+                self._active_variant_id = None
+                self._active_variant_item_ids = None
+                self._refresh_variant_selector()
+                self._refresh_ebom_filters()
+            except Exception as exc:
+                QMessageBox.critical(dialog, "Product Variants", str(exc))
+
+        add_btn.clicked.connect(add_variant)
+        rename_btn.clicked.connect(rename_variant)
+        delete_btn.clicked.connect(delete_variant)
+        refresh(getattr(self, "_active_variant_id", None))
+        dialog.exec_()
+
     def _refresh_ebom_filters(self) -> int:
         tree = getattr(self, "_ebom_tree", None)
         if tree is None:
@@ -8331,6 +8741,17 @@ class BomPage(QWidget):
         self.saved_filters_btn = QPushButton("Saved Filters")
         self.saved_filters_btn.setProperty("structureTool", True)
         self.saved_filters_btn.clicked.connect(self.show_saved_bom_filters_menu)
+        self.variant_selector = QComboBox()
+        self.variant_selector.setProperty("structureTool", True)
+        self.variant_selector.setMinimumWidth(160)
+        self.variant_selector.setToolTip("Open a Product Item variant as the EBOM root.")
+        self.variant_selector.currentIndexChanged.connect(self._on_variant_filter_changed)
+        self.assign_variant_btn = QPushButton("Copy to Variant")
+        self.assign_variant_btn.setProperty("structureTool", True)
+        self.assign_variant_btn.clicked.connect(self.assign_variants_to_selected_items)
+        self.manage_variants_btn = QPushButton("Variants")
+        self.manage_variants_btn.setProperty("structureTool", True)
+        self.manage_variants_btn.clicked.connect(self.show_product_variants_manager)
         self.clear_filter_btn = QPushButton("Clear")
         self.clear_filter_btn.setProperty("structureTool", True)
         self.clear_filter_btn.clicked.connect(self.clear_bom_tree_filter)
@@ -8341,6 +8762,9 @@ class BomPage(QWidget):
         self.bom_columns_btn.clicked.connect(self.show_bom_column_dialog)
         filter_row.addWidget(self.advanced_filter_btn)
         filter_row.addWidget(self.saved_filters_btn)
+        filter_row.addWidget(self.variant_selector)
+        filter_row.addWidget(self.assign_variant_btn)
+        filter_row.addWidget(self.manage_variants_btn)
         filter_row.addWidget(self.clear_filter_btn)
         filter_row.addWidget(self.bom_columns_btn)
         left_layout.addLayout(filter_row)
@@ -8707,6 +9131,10 @@ class BomPage(QWidget):
             except Exception:
                 pass
             _bom_tree_sel_palette(_tw)
+            try:
+                _tw.setItemDelegate(_BomTreeProductRowDelegate(_tw, _tw))
+            except Exception:
+                pass
 
         self.tree.setItemDelegateForColumn(BOM_COL_NAME, _BomTreeNameDelegate(self.tree, self.tree))
         self.tree.setItemDelegateForColumn(BOM_COL_FILES, _BomTreeFilesDelegate(self.tree, self.tree))
@@ -8846,6 +9274,7 @@ class BomPage(QWidget):
             ("drawing", "DRW Number", ("drawing_number",)),
             ("cad_revision", "CAD Rev", ("cad_revision",)),
             ("drw_revision", "DRW Rev", ("drw_revision",)),
+            ("variants", "Variants", ("variants", "variant_names")),
             ("type", "Type", ("type",)),
             ("revision", "Revision / Iteration", ("current_version", "revision")),
             ("state", "Lifecycle", ("status", "state", "lifecycle_state")),
@@ -11494,6 +11923,136 @@ class BomPage(QWidget):
             "Select the target EBOM assembly in the tree. You can search, filter, expand, or isolate first. Press Esc to cancel.",
         )
 
+    def _copy_pdm_ebom_usages_to_multiple_assemblies(
+        self, selected_items: list[QTreeWidgetItem]
+    ) -> None:
+        selections = []
+        for row in selected_items or []:
+            payload = self._pdm_ebom_relation_selection_for_item(row)
+            if payload is not None:
+                selections.append(payload)
+        if not selections:
+            return QMessageBox.warning(self, "Item Structure", "Select one or more EBOM Items.")
+        selections = self._resolve_relation_sources(selections, "copy")
+        if selections is None:
+            return
+        try:
+            assemblies = self.bom_service.search_relation_parents("") or []
+        except Exception as exc:
+            QMessageBox.critical(self, "Copy to Assemblies", f"Could not load assemblies:\n{exc}")
+            return
+        child_ids = {int(row["child_id"]) for row in selections}
+        assemblies = [
+            row for row in assemblies
+            if int(row.get("id") or 0) not in child_ids
+        ]
+        if not assemblies:
+            QMessageBox.information(self, "Copy to Assemblies", "No target assemblies are available.")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Copy to Multiple Assemblies")
+        dialog.resize(620, 560)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(
+            f"Copy {len(selections)} selected usage(s) to one or more target assemblies."
+        ))
+        search = QLineEdit()
+        search.setPlaceholderText("Search assemblies by item number, AES, or name...")
+        layout.addWidget(search)
+        list_widget = QListWidget()
+        layout.addWidget(list_widget, 1)
+        action_row = QHBoxLayout()
+        select_visible_btn = QPushButton("Select Visible")
+        clear_btn = QPushButton("Clear")
+        action_row.addWidget(select_visible_btn)
+        action_row.addWidget(clear_btn)
+        action_row.addStretch(1)
+        layout.addLayout(action_row)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        selected_target_ids = set()
+        loading_targets = {"active": False}
+
+        def label_for(row: dict) -> str:
+            number = str(row.get("part_number") or row.get("aes_number") or "").strip()
+            name = str(row.get("name") or "").strip()
+            item_type = str(row.get("type") or "").strip()
+            prefix = f"{number} - " if number else ""
+            suffix = f" [{item_type}]" if item_type else ""
+            return f"{prefix}{name or row.get('id')}{suffix}"
+
+        def populate() -> None:
+            query = str(search.text() or "").strip().lower()
+            loading_targets["active"] = True
+            list_widget.clear()
+            for row in assemblies:
+                label = label_for(row)
+                haystack = " ".join(
+                    str(row.get(key) or "")
+                    for key in ("part_number", "aes_number", "name", "type")
+                ).lower()
+                if query and query not in haystack:
+                    continue
+                item = QListWidgetItem(label)
+                target_id = int(row["id"])
+                item.setData(Qt.UserRole, target_id)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Checked if target_id in selected_target_ids else Qt.Unchecked)
+                list_widget.addItem(item)
+            loading_targets["active"] = False
+
+        def set_visible_checked(checked: bool) -> None:
+            state = Qt.Checked if checked else Qt.Unchecked
+            for index in range(list_widget.count()):
+                list_widget.item(index).setCheckState(state)
+
+        def remember_checked(item: QListWidgetItem) -> None:
+            if loading_targets["active"] or item is None:
+                return
+            target_id = int(item.data(Qt.UserRole))
+            if item.checkState() == Qt.Checked:
+                selected_target_ids.add(target_id)
+            else:
+                selected_target_ids.discard(target_id)
+
+        search.textChanged.connect(populate)
+        list_widget.itemChanged.connect(remember_checked)
+        select_visible_btn.clicked.connect(lambda _=False: set_visible_checked(True))
+        clear_btn.clicked.connect(lambda _=False: set_visible_checked(False))
+        populate()
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        target_ids = sorted(selected_target_ids)
+        if not target_ids:
+            QMessageBox.information(self, "Copy to Assemblies", "Select at least one target assembly.")
+            return
+        try:
+            result = self.bom_service.apply_child_relation_operation_to_targets(
+                target_ids, selections, "copy"
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Copy to Assemblies", str(exc))
+            return
+        affected = set(int(value) for value in (result.get("target_parent_ids") or []))
+        affected.update(int(value) for value in (result.get("child_ids") or []))
+        for item_id in sorted(affected):
+            self._refresh_pdm_ebom_structure_branch(int(item_id))
+        try:
+            self._refresh_ebom_filters()
+        except Exception:
+            pass
+        try:
+            self.window().statusBar().showMessage(
+                f"Copied {len(result.get('child_ids') or [])} item(s) to "
+                f"{len(result.get('target_parent_ids') or [])} assemblies.",
+                7000,
+            )
+        except Exception:
+            pass
+
     def _finish_pdm_ebom_structure_operation(
         self,
         target_parent_id: int,
@@ -11807,12 +12366,12 @@ class BomPage(QWidget):
         if not selected:
             raise ValueError("Select one or more sibling rows to reorder.")
         visual_parent = selected[0].parent()
-        if visual_parent is None:
-            raise ValueError("Top-level rows cannot be reordered here.")
         if any(item.parent() is not visual_parent for item in selected):
             raise ValueError("Reorder works only for rows under the same parent.")
 
         if scope == "CAD":
+            if visual_parent is None:
+                raise ValueError("Top-level CAD Documents cannot be reordered here.")
             parent_id = visual_parent.data(0, PDM_CAD_DOCUMENT_ID_ROLE)
             if parent_id is None:
                 raise ValueError("The parent CAD assembly was not found.")
@@ -11828,20 +12387,34 @@ class BomPage(QWidget):
                 int(value) for value in self.bom_service.ordered_pdm_cad_member_ids(int(parent_id))
             ]
         else:
-            parent_id = self._pdm_ebom_relation_parent_for_item(selected[0])
-            if parent_id is None:
-                raise ValueError("Top-level EBOM Items cannot be reordered here.")
-            selected_ids = []
-            for item in selected:
-                if item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
-                    raise ValueError("Associated CAD rows are not EBOM usage rows.")
-                usage_id = (item.data(0, BOM_TREE_OCCURRENCE_ROLE) or {}).get("usage_id")
-                if usage_id is None:
-                    raise ValueError("This EBOM row has no persisted usage to reorder.")
-                selected_ids.append(int(usage_id))
-            current_order = [
-                int(value) for value in self.bom_service.ordered_pdm_item_usage_ids(int(parent_id))
-            ]
+            if visual_parent is None:
+                parent_id = 0
+                selected_ids = []
+                for item in selected:
+                    if item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+                        raise ValueError("Associated CAD rows are not EBOM root rows.")
+                    item_id = item.data(0, Qt.UserRole)
+                    if item_id is None:
+                        raise ValueError("This EBOM root row has no Item id to reorder.")
+                    selected_ids.append(int(item_id))
+                current_order = [
+                    int(value) for value in self.bom_service.ordered_pdm_root_item_ids()
+                ]
+            else:
+                parent_id = self._pdm_ebom_relation_parent_for_item(selected[0])
+                if parent_id is None:
+                    raise ValueError("The parent EBOM Item was not found.")
+                selected_ids = []
+                for item in selected:
+                    if item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+                        raise ValueError("Associated CAD rows are not EBOM usage rows.")
+                    usage_id = (item.data(0, BOM_TREE_OCCURRENCE_ROLE) or {}).get("usage_id")
+                    if usage_id is None:
+                        raise ValueError("This EBOM row has no persisted usage to reorder.")
+                    selected_ids.append(int(usage_id))
+                current_order = [
+                    int(value) for value in self.bom_service.ordered_pdm_item_usage_ids(int(parent_id))
+                ]
 
         selected_set = set(selected_ids)
         selected_in_order = [value for value in current_order if value in selected_set]
@@ -11855,6 +12428,10 @@ class BomPage(QWidget):
             self.bom_service.reorder_pdm_cad_members(int(parent_id), ordered_ids)
             self._refresh_pdm_cad_structure_branch(int(parent_id))
             self._refresh_pdm_cad_filter()
+        elif int(parent_id) == 0:
+            self.bom_service.reorder_pdm_root_items(ordered_ids)
+            self._pdm_ebom_scope_path = []
+            self._load_released_ebom_tree()
         else:
             self.bom_service.reorder_pdm_item_usages(int(parent_id), ordered_ids)
             self._refresh_pdm_ebom_structure_branch(int(parent_id))
@@ -11919,11 +12496,18 @@ class BomPage(QWidget):
         scope = str(tree.property("pdmScope") or "").upper() if tree is not None else ""
         try:
             selected_set = {int(value) for value in selected_ids or []}
-            current_order = (
-                [int(value) for value in self.bom_service.ordered_pdm_cad_member_ids(int(target_parent_id))]
-                if scope == "CAD" else
-                [int(value) for value in self.bom_service.ordered_pdm_item_usage_ids(int(target_parent_id))]
-            )
+            if scope == "CAD":
+                current_order = [
+                    int(value) for value in self.bom_service.ordered_pdm_cad_member_ids(int(target_parent_id))
+                ]
+            elif int(target_parent_id) == 0:
+                current_order = [
+                    int(value) for value in self.bom_service.ordered_pdm_root_item_ids()
+                ]
+            else:
+                current_order = [
+                    int(value) for value in self.bom_service.ordered_pdm_item_usage_ids(int(target_parent_id))
+                ]
             if int(target_id) not in current_order or not selected_set.issubset(set(current_order)):
                 raise ValueError("Drag reorder works only between sibling rows under the same parent.")
             if int(target_id) in selected_set:
@@ -13271,6 +13855,14 @@ class BomPage(QWidget):
             lambda _checked=False, rows=list(selected_ebom_rows):
             self._apply_pdm_ebom_structure_operation(rows, "copy")
         )
+        copy_many_usage_action = structure_menu.addAction(
+            "Copy Selected Usage(s) To Multiple Assemblies..."
+        )
+        copy_many_usage_action.setEnabled(can_manage and bool(selected_ebom_rows))
+        copy_many_usage_action.triggered.connect(
+            lambda _checked=False, rows=list(selected_ebom_rows):
+            self._copy_pdm_ebom_usages_to_multiple_assemblies(rows)
+        )
         move_usage_action = structure_menu.addAction("Move Selected Usage(s) To...")
         move_usage_action.setEnabled(can_manage and bool(selected_ebom_rows))
         move_usage_action.triggered.connect(
@@ -13447,6 +14039,9 @@ class BomPage(QWidget):
 
         if self.perm.can("manage_parts"):
             menu.addAction(edit_action)
+            assign_variant_action = QAction("Copy to Product Variants...", self)
+            assign_variant_action.triggered.connect(self.assign_variants_to_selected_items)
+            menu.addAction(assign_variant_action)
             menu.addAction(delete_action)
             if str(item.text(BOM_COL_TYPE) or "").strip().lower() in {"asm", "assembly"}:
                 menu.addAction(add_child_action)
@@ -14395,6 +14990,15 @@ class BomPage(QWidget):
         self._bom_advanced_filters = self._default_bom_advanced_filters()
         self._active_saved_filter_id = None
         self._active_saved_filter_name = ""
+        self._active_variant_id = None
+        self._active_variant_item_ids = None
+        combo = getattr(self, "variant_selector", None)
+        if combo is not None:
+            previous_block = combo.blockSignals(True)
+            try:
+                combo.setCurrentIndex(0)
+            finally:
+                combo.blockSignals(previous_block)
         for tree in (
             getattr(self, "tree", None),
             getattr(self, "_search_tree", None),
@@ -14412,6 +15016,8 @@ class BomPage(QWidget):
             self._refresh_pdm_cad_filter()
             self._tree_stack.setCurrentWidget(self._cad_tree)
         elif getattr(self, "_bom_mode", "cad") == "ebom":
+            self._pdm_ebom_scope_path = []
+            self._render_pdm_ebom_roots(getattr(self, "_pdm_ebom_roots", []) or [])
             self._refresh_ebom_filters()
         elif was_flat_filter:
             try:
@@ -14425,7 +15031,8 @@ class BomPage(QWidget):
         self._update_advanced_filter_button_state(visible_count=None)
 
     def _update_advanced_filter_button_state(self, visible_count: int | None = None):
-        active = not self._is_default_bom_advanced_filter()
+        variant_active = bool(getattr(self, "_active_variant_id", None))
+        active = not self._is_default_bom_advanced_filter() or variant_active
         try:
             self.clear_filter_btn.setEnabled(active)
         except Exception:
@@ -16912,6 +17519,12 @@ class BomPage(QWidget):
             self._windchill_item_label(info)
             if is_ebom_item_row else str(info.get("name", "") or ""),
         )
+        is_product_variant = str(info.get("item_type") or "").strip().upper() == "PRODUCT"
+        item.setData(0, BOM_TREE_PRODUCT_ROLE, bool(is_product_variant))
+        if is_product_variant:
+            current_label = str(item.text(BOM_COL_NAME) or "")
+            if not current_label.startswith("PRO  "):
+                item.setText(BOM_COL_NAME, f"PRO  {current_label}")
         item.setData(0, BOM_TREE_INWORK_ROLE, locked_txt)
         has_lazy_metadata = "_has_children" in info
         has_structural_children = any(
@@ -16935,6 +17548,12 @@ class BomPage(QWidget):
         if isinstance(category_names, str):
             category_names = [category_names] if category_names.strip() else []
         item.setData(0, BOM_TREE_CATEGORY_ROLE, list(category_names or []))
+        variant_names = info.get("variant_names", info.get("variants", []))
+        if isinstance(variant_names, str):
+            variant_names = [
+                value.strip() for value in variant_names.split(",") if value.strip()
+            ]
+        item.setData(0, BOM_TREE_VARIANT_ROLE, list(variant_names or []))
         binding_update_count = int(info.get("binding_update_count") or 0)
         item.setData(0, BOM_TREE_BINDING_UPDATE_ROLE, binding_update_count)
         item.setData(0, BOM_TREE_POLICY_ROLE, {
@@ -16984,6 +17603,19 @@ class BomPage(QWidget):
         item.setText(BOM_COL_INTEGRITY, "")
         item.setData(0, Qt.UserRole, part_id)
         self._apply_extra_bom_columns(item, info)
+        column_count = item.treeWidget().columnCount() if item.treeWidget() is not None else BOM_TREE_COLUMN_COUNT
+        for column in range(column_count):
+            font = item.font(column)
+            font.setBold(bool(is_product_variant))
+            item.setFont(column, font)
+            item.setBackground(column, QBrush())
+            item.setForeground(column, QBrush())
+        if is_product_variant:
+            product_bg = QBrush(QColor("#9F2D2D"))
+            product_fg = QBrush(QColor("#FFFFFF"))
+            for column in range(column_count):
+                item.setBackground(column, product_bg)
+                item.setForeground(column, product_fg)
 
         try:
             if info.get("_defer_indicators"):
@@ -17030,6 +17662,8 @@ class BomPage(QWidget):
                 f"EBOM policy: {classification}; occurrence {occurrence_behavior}; "
                 f"effective {resolved_behavior}"
             )
+            if is_product_variant:
+                tips0.append("Product variant Item: use this as a configurable product/BOM option.")
             if str(info.get("cad_control_mode") or "CONTROLLED").upper() == "SUPPLIER_PACKAGE":
                 tips0.append(
                     "Supplier-managed CAD package: internal owned CAD dependencies are not BOM items and are excluded from individual integrity checks."
@@ -17251,6 +17885,8 @@ class BomPage(QWidget):
                 "revision": item.text(BOM_COL_REV),
                 "cad_revision": self._extra_bom_column_text(item, "cad_revision"),
                 "drw_revision": self._extra_bom_column_text(item, "drw_revision"),
+                "variants": self._extra_bom_column_text(item, "variants"),
+                "variant_names": list(item.data(0, BOM_TREE_VARIANT_ROLE) or []),
                 "status": item.text(BOM_COL_STATUS),
             }
         node = dict(node)
@@ -18947,9 +19583,11 @@ class BomPage(QWidget):
                 self.tree.clear()
             except Exception:
                 pass
+            self._refresh_variant_selector()
             self._set_tree_loading(False)
             self._mark_initial_tree_ready()
             return
+        self._refresh_variant_selector()
         try:
             self._issue_summary_cache = self.issue_service.part_summary()
             score = max(0, self.issue_service.health_score() - len(getattr(self, "missing_ids", set()) or set()))
@@ -20100,6 +20738,8 @@ class BomPage(QWidget):
         for key in keys:
             value = details.get(key)
             if value is not None and str(value).strip():
+                if isinstance(value, (list, tuple, set)):
+                    return ", ".join(str(item) for item in value if str(item).strip())
                 return str(value)
         return ""
 
@@ -21266,6 +21906,14 @@ class BomPage(QWidget):
             pass
         if search_query:
             rows.append(("Search mode", "Current search results"))
+        active_variant_id = getattr(self, "_active_variant_id", None)
+        if active_variant_id:
+            variant_name = ""
+            for variant in getattr(self, "_product_variants_cache", []) or []:
+                if int(variant.get("id") or 0) == int(active_variant_id):
+                    variant_name = str(variant.get("name") or "")
+                    break
+            rows.append(("Product variant", variant_name or str(active_variant_id)))
         return rows or [("Filter", "None - all visible BOM rows")]
 
     def _collect_visible_bom_export_rows(self) -> list[dict]:
@@ -21296,6 +21944,7 @@ class BomPage(QWidget):
                 "revision": item.text(BOM_COL_REV),
                 "cad_revision": self._extra_bom_column_text(item, "cad_revision"),
                 "drw_revision": self._extra_bom_column_text(item, "drw_revision"),
+                "variants": self._extra_bom_column_text(item, "variants"),
                 "categories": ", ".join(item.data(0, BOM_TREE_CATEGORY_ROLE) or []),
                 "status": item.text(BOM_COL_STATUS),
                 "work_state": item.data(0, BOM_TREE_INWORK_ROLE) or "Checked In",
@@ -21320,7 +21969,7 @@ class BomPage(QWidget):
     def _export_visible_bom_csv(self, file_path: str, rows: list[dict]) -> None:
         fieldnames = [
             "level", "part_number", "name", "aes_number", "type", "revision",
-            "cad_revision", "drw_revision", "categories", "status",
+            "cad_revision", "drw_revision", "variants", "categories", "status",
             "work_state", "pdf_status", "pdf_details", "step_status", "step_details",
             "integrity", "issues", "part_id", "details",
         ]
@@ -21348,6 +21997,7 @@ class BomPage(QWidget):
             ("revision", "Revision"),
             ("cad_revision", "CAD Rev"),
             ("drw_revision", "DRW Rev"),
+            ("variants", "Variants"),
             ("categories", "Categories"),
             ("status", "Status"),
             ("work_state", "Work State"),
@@ -21400,8 +22050,8 @@ class BomPage(QWidget):
         ws.auto_filter.ref = f"A{header_row}:{get_column_letter(len(headers))}{max(header_row, header_row + len(rows))}"
         widths = {
             "A": 8, "B": 32, "C": 16, "D": 12, "E": 12, "F": 28, "G": 12,
-            "H": 12, "I": 14, "J": 18, "K": 14, "L": 14, "M": 32, "N": 16,
-            "O": 32, "P": 20, "Q": 18, "R": 10, "S": 54,
+            "H": 12, "I": 22, "J": 14, "K": 18, "L": 14, "M": 14, "N": 32,
+            "O": 16, "P": 32, "Q": 20, "R": 18, "S": 10, "T": 54,
         }
         for column, width in widths.items():
             ws.column_dimensions[column].width = width

@@ -2408,8 +2408,8 @@ def _migration_35(conn):
             """
         ).fetchall()
         allowed_values = {
-            "item_type": ({
-                "MECHANICAL_PART", "SOFTWARE_PART", "PURCHASED_PART",
+                "item_type": ({
+                "PRODUCT", "MECHANICAL_PART", "SOFTWARE_PART", "PURCHASED_PART",
                 "REFERENCE_PART",
             }, "MECHANICAL_PART"),
             "assembly_mode": ({"COMPONENT", "SEPARABLE", "INSEPARABLE"}, "COMPONENT"),
@@ -3186,6 +3186,58 @@ def _migration_40(conn):
     _ensure_column(conn, "user_settings", "cli_enabled", "cli_enabled INTEGER DEFAULT 0")
 
 
+def _migration_41(conn):
+    """Add product variant membership for EBOM configuration management."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS product_variants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            name TEXT NOT NULL COLLATE NOCASE,
+            description TEXT DEFAULT '',
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_by INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(project_id, name),
+            FOREIGN KEY (project_id) REFERENCES projects(id),
+            FOREIGN KEY (created_by) REFERENCES users(id)
+        );
+        CREATE TABLE IF NOT EXISTS product_variant_items (
+            variant_id INTEGER NOT NULL,
+            bom_id INTEGER NOT NULL,
+            assigned_by INTEGER,
+            assigned_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (variant_id, bom_id),
+            FOREIGN KEY (variant_id) REFERENCES product_variants(id),
+            FOREIGN KEY (bom_id) REFERENCES bom(id),
+            FOREIGN KEY (assigned_by) REFERENCES users(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_product_variants_project
+            ON product_variants(project_id, sort_order, name, id);
+        CREATE INDEX IF NOT EXISTS idx_product_variant_items_bom
+            ON product_variant_items(bom_id);
+        """
+    )
+
+
+def _migration_42(conn):
+    """Persist project root Item order for drag/drop root reordering."""
+    cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(bom)").fetchall()}
+    if "sort_order" not in cols:
+        conn.execute("ALTER TABLE bom ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
+    conn.execute(
+        """
+        UPDATE bom
+        SET sort_order = id * 10
+        WHERE sort_order IS NULL OR sort_order = 0
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bom_project_root_order ON bom(project_id, sort_order, id)"
+    )
+
+
 MIGRATIONS = {
     1: """
     CREATE TABLE IF NOT EXISTS users (
@@ -3576,6 +3628,10 @@ WHERE r.name = 'designer' AND p.name = 'manage_issues';
     39: _migration_39,
 
     40: _migration_40,
+
+    41: _migration_41,
+
+    42: _migration_42,
 
 }
 
