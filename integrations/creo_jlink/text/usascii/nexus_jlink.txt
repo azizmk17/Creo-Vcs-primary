@@ -34,6 +34,22 @@ NexusStatusHelp
 Show Nexus lifecycle and checkout status for the current Creo model
 #
 #
+NexusWorkspaceStatus
+Workspace Status
+#
+#
+NexusWorkspaceStatusHelp
+Show local Creo files and active Nexus checkouts in the selected workspace
+#
+#
+NexusHistory
+CAD History
+#
+#
+NexusHistoryHelp
+Show the checkout and check-in history for the current CAD Document
+#
+#
 NexusCheckout
 Check Out
 #
@@ -56,5 +72,21 @@ Undo Check Out
 #
 NexusUndoHelp
 Undo the current user's checkout and retain the local file read-only
+#
+#
+NexusRevise
+Create CAD Revision
+#
+#
+NexusReviseHelp
+Create the next CAD revision after the current working copy is closed
+#
+#
+NexusRelease
+Release CAD Document
+#
+#
+NexusReleaseHelp
+Release the current checked-in CAD Document through the Nexus lifecycle
 #
 #

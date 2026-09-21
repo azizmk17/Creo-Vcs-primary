@@ -34,6 +34,9 @@ final class MiniJson {
 
     @SuppressWarnings("unchecked")
     public static List<Object> array(Object value) {
+        if (value == null) {
+            return new ArrayList<Object>();
+        }
         if (!(value instanceof List)) {
             throw new IllegalArgumentException("Expected a JSON array.");
         }
@@ -55,10 +58,17 @@ final class MiniJson {
 
     public static int integer(Map<String, Object> value, String key) {
         Object item = value == null ? null : value.get(key);
+        if (item == null) {
+            return 0;
+        }
         if (item instanceof Number) {
             return ((Number) item).intValue();
         }
-        return Integer.parseInt(String.valueOf(item));
+        String text = String.valueOf(item).trim();
+        if (text.length() == 0 || "null".equalsIgnoreCase(text)) {
+            return 0;
+        }
+        return Integer.parseInt(text);
     }
 
     private static void writeValue(StringBuilder output, Object value) {

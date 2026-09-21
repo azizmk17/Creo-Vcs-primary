@@ -102,12 +102,20 @@ class CreoBridgeController:
                 str(body.get("name") or ""), str(body.get("description") or "")
             )
             return {"workspace": workspace}
+        workspace_match = re.fullmatch(r"/api/v1/workspaces/([^/]+)/checkouts", path)
+        if method == "GET" and workspace_match:
+            return self.workspace_checkouts(workspace_match.group(1))
+        if method == "GET" and path == "/api/v1/cad":
+            return self.project_cad_documents()
         if method == "GET" and path == "/api/v1/cad/resolve":
             values = query.get("file_name") or []
             file_name = values[0] if values else ""
             return self.resolve_cad(file_name)
 
-        match = re.fullmatch(r"/api/v1/cad/(\d+)(?:/(retrieve|checkout|checkin|undo))?", path)
+        match = re.fullmatch(
+            r"/api/v1/cad/(\d+)(?:/(retrieve|checkout|checkin|undo|history|revise|release))?",
+            path,
+        )
         if match:
             cad_document_id = int(match.group(1))
             action = match.group(2)
@@ -121,6 +129,12 @@ class CreoBridgeController:
                 return self.checkin(cad_document_id, body)
             if method == "POST" and action == "undo":
                 return self.undo_checkout(cad_document_id, body)
+            if method == "GET" and action == "history":
+                return self.cad_history(cad_document_id)
+            if method == "POST" and action == "revise":
+                return self.revise(cad_document_id)
+            if method == "POST" and action == "release":
+                return self.release(cad_document_id)
 
         raise BridgeApiError(404, "route_not_found", "The bridge route was not found.")
 
@@ -229,6 +243,15 @@ class CreoBridgeController:
                 404,
                 "workspace_not_found",
                 "The selected CAD workspace is not available for the current user on this machine.",
+            )
+        workspace_machine = str(workspace.get("machine_id") or "").strip()
+        if workspace_machine and workspace_machine.casefold() != str(
+            service.machine_id
+        ).strip().casefold():
+            raise BridgeApiError(
+                409,
+                "workspace_machine_mismatch",
+                "The selected CAD workspace belongs to another machine.",
             )
         return service, workspace
 
@@ -424,6 +447,79 @@ class CreoBridgeController:
         _user_id, _project_id, _project, document = self._document(cad_document_id)
         return self._status_payload(document)
 
+    def cad_history(self, cad_document_id: int) -> dict:
+        """Return the append-only checkout history for a project CAD Document."""
+        _user_id, _project_id, _project, document = self._document(cad_document_id)
+        history = self._pdm_service().cad_checkout_history(int(cad_document_id))
+        return {
+            "cad": self._status_payload(document),
+            "history": [dict(row) for row in history or []],
+        }
+
+    def revise(self, cad_document_id: int) -> dict:
+        """Create the next CAD revision only when no working copy is active."""
+        with self._operation_lock:
+            self._require_commit_permission()
+            _user_id, _project_id, _project, document = self._document(cad_document_id)
+            if document.get("checked_out_by") is not None:
+                raise BridgeApiError(
+                    409,
+                    "checkout_active",
+                    "Check in or undo the active CAD checkout before creating a revision.",
+                )
+            result = self._bom_service().revise_pdm_cad_document(int(cad_document_id))
+            return {"revision": result, "cad": self.cad_status(cad_document_id)}
+
+    def release(self, cad_document_id: int) -> dict:
+        """Promote a checked-in CAD Document through the Nexus lifecycle."""
+        with self._operation_lock:
+            self._require_commit_permission()
+            _user_id, _project_id, _project, document = self._document(cad_document_id)
+            if document.get("checked_out_by") is not None:
+                raise BridgeApiError(
+                    409,
+                    "checkout_active",
+                    "Check in or undo the active CAD checkout before releasing it.",
+                )
+            result = self._bom_service().release_pdm_cad_document(int(cad_document_id))
+            return {"release": result, "cad": self.cad_status(cad_document_id)}
+
+    def project_cad_documents(self) -> dict:
+        _user_id, project_id, _project = self._require_project()
+        rows = self._pdm_service().list_cad_documents(
+            int(project_id),
+            include_related_drawings=True,
+            include_legacy_fallback=True,
+        )
+        documents = [self._status_payload(dict(row)) for row in rows or []]
+        documents.sort(
+            key=lambda row: (
+                str(row.get("category") or ""),
+                str(row.get("file_name") or "").casefold(),
+                int(row.get("id") or 0),
+            )
+        )
+        return {"cad_documents": documents}
+
+    def workspace_checkouts(self, workspace_id: str) -> dict:
+        user_id, project_id, _project = self._require_project()
+        workspace_service, workspace = self._workspace(workspace_id)
+        rows = self._pdm_service().repo.list_checked_out_cad_by_workspace(
+            str(workspace["id"])
+        )
+        documents = [
+            self._status_payload(dict(row))
+            for row in rows or []
+            if int(row.get("project_id") or 0) == int(project_id)
+        ]
+        return {
+            "workspace": workspace,
+            "cad_documents": documents,
+            "local_files": workspace_service.scan_workspace(
+                str(workspace["id"]), int(project_id), int(user_id)
+            ),
+        }
+
     def retrieve(self, cad_document_id: int, body: dict) -> dict:
         with self._operation_lock:
             user_id, _project_id, _project, document = self._document(cad_document_id)
@@ -558,11 +654,19 @@ class CreoBridgeController:
                 path for path in workspace_root.iterdir()
                 if path.is_file()
                 and workspace_service.logical_name(path.name).casefold() == logical
-                and _CAD_VERSION_RE.search(path.name)
+                and (
+                    _CAD_VERSION_RE.search(path.name)
+                    or re.search(r"\.(?:prt|asm|drw)$", path.name, re.IGNORECASE)
+                )
             ]
+
+            def creo_version(path: Path) -> int:
+                match = _CAD_VERSION_RE.search(path.name)
+                return int(match.group(1)) if match else 0
+
             candidates.sort(
                 key=lambda path: (
-                    int(_CAD_VERSION_RE.search(path.name).group(1)),
+                    creo_version(path),
                     path.name.casefold(),
                 ),
                 reverse=True,

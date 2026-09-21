@@ -34,6 +34,41 @@ class _JavaSmokeController:
     "The Creo integration Java 7 runtime is not installed.",
 )
 class CreoJLinkJavaClientTests(unittest.TestCase):
+    def test_mini_json_treats_optional_null_fields_as_empty_values(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_path = Path(temporary)
+            classes = temporary_path / "classes"
+            classes.mkdir()
+            sources = [
+                JLINK_ROOT / "src" / "MiniJson.java",
+                JLINK_ROOT / "test" / "MiniJsonOptionalSmoke.java",
+            ]
+            subprocess.run(
+                [
+                    str(JDK / "bin" / "javac.exe"),
+                    "-source",
+                    "1.7",
+                    "-target",
+                    "1.7",
+                    "-Xlint:all",
+                    "-d",
+                    str(classes),
+                    *(str(source) for source in sources),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            result = subprocess.run(
+                [str(JAVA), "-cp", str(classes), "MiniJsonOptionalSmoke"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+
+        self.assertIn("MINI_JSON_OPTIONAL_OK", result.stdout)
+
     def test_java_7_client_calls_authenticated_bridge_get_and_post(self):
         with tempfile.TemporaryDirectory() as temporary:
             temporary_path = Path(temporary)

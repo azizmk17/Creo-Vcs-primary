@@ -10,20 +10,40 @@ authority.
 
 - **Connect to Active Project** shows the Nexus user and selected product version.
 - **Select CAD Workspace** selects or creates a machine-local managed workspace.
-- **Retrieve** copies the controlled CAD file, related drawings, and recursive managed
-  assembly dependencies into that workspace. Dependencies remain read-only unless they
-  have their own checkout in the same user, workspace, and machine context.
+- **Retrieve** lists CAD Documents from the active Nexus product version, then copies
+  the selected controlled CAD file, related drawings, and recursive managed assembly
+  dependencies into the selected local CAD workspace. Dependencies remain read-only
+  unless they have their own checkout in the same user, workspace, and machine context.
 - **Status** shows revision, iteration, lifecycle, checkout owner, and editability.
+- **Workspace Status** shows every Creo model file in the selected workspace,
+  including unmapped local files, plus active Nexus checkouts.
+- **CAD History** shows the append-only checkout, check-in, and undo history for
+  the current CAD Document.
 - **Check Out** obtains the Nexus CAD/Item lock and opens the editable workspace copy.
-- **Check In** saves the model, creates the next managed CAD iteration, updates Nexus,
-  applies the existing coordinated Item lock policy, and makes retained files read-only.
+- **Check In** shows a workspace checklist that starts with every Creo file found in
+  the selected local CAD workspace, then marks checked-out CAD Documents and managed
+  models currently loaded in Creo, including loaded children/dependencies. The user
+  selects which eligible CAD Documents to check in, one shared comment is applied,
+  Nexus creates the next managed CAD iteration for each selected document, and
+  retained files become read-only.
 - **Undo Check Out** releases the coordinated checkout and keeps local files read-only.
+- **Create CAD Revision** creates the next CAD revision after the working copy is
+  checked in or undone.
+- **Release CAD Document** promotes a checked-in CAD Document through the Nexus
+  lifecycle. Released data must be revised before it can be edited again.
 
 Managed files that are not checked out by the current Nexus user in the assigned
 workspace are read-only. Command guards also block Save and Rename when checkout
 ownership cannot be verified. Backup/Save As remains available because it creates a
 separate copy without modifying the controlled source model. Unmanaged Creo work
 outside a Nexus workspace is not blocked.
+
+The integration follows a Windchill-style rule: the Nexus server owns identity,
+revision, lifecycle, permissions, checkout locks, Item coordination, and audit
+history; Creo owns the active model session and the local workspace copy. A local
+file is never accepted for check-in only because its name looks correct: it must be
+inside the selected machine-local workspace and match the active Nexus project and
+CAD Document identity.
 
 ## Installed paths
 
@@ -79,5 +99,7 @@ only if those products are installed elsewhere.
   product window is visible.
 - **Wrong project or unmanaged file:** select the product version in Nexus that owns
   the CAD Document, then use Status again.
+- **Retrieve list is empty:** select the product version in Nexus that owns the CAD
+  Documents, then use Retrieve again.
 - **File remains read-only:** check it out into the same CAD workspace from which it
   is opened. Files checked out by another user intentionally remain blocked.

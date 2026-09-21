@@ -32,7 +32,7 @@ class _CadRepo:
                 "file_name": "machine.asm",
                 "checked_out_by": 7,
                 "checkout_workspace_id": "workspace-one",
-                "checkout_workspace_machine_id": "test-machine",
+                "checkout_workspace_machine_id": "",
             },
             2: {
                 "id": 2,
@@ -46,6 +46,12 @@ class _CadRepo:
                 "file_name": "bracket.prt",
                 "checked_out_by": 8,
                 "checkout_workspace_id": "other-workspace",
+            },
+            4: {
+                "id": 4,
+                "project_id": 10,
+                "file_name": "other_project.prt",
+                "checked_out_by": None,
             },
         }
         self.members = {
@@ -61,12 +67,56 @@ class _CadRepo:
     def list_cad_members(self, parent_id):
         return list(self.members.get(int(parent_id), []))
 
+    def list_cad_documents(
+        self,
+        project_id,
+        *,
+        include_related_drawings=True,
+        include_legacy_fallback=True,
+    ):
+        return [
+            dict(row)
+            for row in self.documents.values()
+            if int(row.get("project_id") or 0) == int(project_id)
+        ]
+
+    def list_checked_out_cad_by_workspace(self, workspace_id):
+        return [
+            dict(row)
+            for row in self.documents.values()
+            if row.get("checked_out_by") is not None
+            and str(row.get("checkout_workspace_id") or "") == str(workspace_id)
+        ]
+
 
 class _WorkspaceService:
     machine_id = "test-machine"
 
     def __init__(self):
         self.calls = []
+
+    def get_workspace(self, workspace_id):
+        return {
+            "id": str(workspace_id),
+            "name": "Creo Workspace",
+            "path": "C:/workspace",
+            "available": True,
+        }
+
+    def scan_workspace(self, workspace_id, project_id, user_id):
+        return [{
+            "workspace_id": str(workspace_id),
+            "workspace_name": "Creo Workspace",
+            "cad_document_id": 1,
+            "project_id": int(project_id),
+            "logical_file_name": "machine.asm",
+            "filename": "machine.asm.7",
+            "path": "C:/workspace/machine.asm.7",
+            "modified": True,
+            "status": "READY",
+            "detail": "Modified and ready to stage.",
+            "selectable": True,
+        }]
 
     def materialize_cad_document_package(
         self,
@@ -167,12 +217,94 @@ class CreoBridgeControllerTests(unittest.TestCase):
         pdm = SimpleNamespace(repo=self.repo)
         self.controller = CreoBridgeController(
             session=SimpleNamespace(user_id=7, project_id=9),
-            project_service=SimpleNamespace(),
-            permission_repo=SimpleNamespace(),
+            project_service=SimpleNamespace(
+                get_project_by_id=lambda project_id: {
+                    "id": int(project_id),
+                    "name": "Machine",
+                }
+            ),
+            permission_repo=SimpleNamespace(
+                user_has_permission=lambda *_args: True,
+            ),
             bom_service_factory=lambda: SimpleNamespace(),
-            workspace_service_factory=lambda: SimpleNamespace(),
-            pdm_service_factory=lambda: pdm,
+            workspace_service_factory=lambda: _WorkspaceService(),
+            pdm_service_factory=lambda: SimpleNamespace(
+                repo=self.repo,
+                list_cad_documents=self.repo.list_cad_documents,
+            ),
         )
+
+    def test_project_cad_documents_lists_only_active_project(self):
+        result = self.controller.dispatch("GET", "/api/v1/cad", {}, {})
+
+        self.assertEqual(
+            [row["file_name"] for row in result["cad_documents"]],
+            ["bracket.prt", "frame.asm", "machine.asm"],
+        )
+        self.assertTrue(all(row["managed"] for row in result["cad_documents"]))
+        self.assertNotIn(
+            "other_project.prt",
+            [row["file_name"] for row in result["cad_documents"]],
+        )
+
+    def test_workspace_checkouts_lists_active_project_checkout_rows(self):
+        self.repo.documents[5] = {
+            "id": 5,
+            "project_id": 10,
+            "file_name": "foreign.asm",
+            "checked_out_by": 7,
+            "checkout_workspace_id": "workspace-one",
+            "checkout_workspace_machine_id": "test-machine",
+        }
+
+        result = self.controller.dispatch(
+            "GET", "/api/v1/workspaces/workspace-one/checkouts", {}, {}
+        )
+
+        self.assertEqual(
+            [row["file_name"] for row in result["cad_documents"]],
+            ["machine.asm"],
+        )
+        self.assertEqual(result["workspace"]["id"], "workspace-one")
+        self.assertTrue(result["cad_documents"][0]["can_checkin"])
+        self.assertEqual(
+            result["local_files"][0]["filename"],
+            "machine.asm.7",
+        )
+        self.assertTrue(result["local_files"][0]["selectable"])
+
+    def test_history_route_returns_append_only_checkout_events(self):
+        history = [{
+            "action": "CHECKIN",
+            "note": "Creo update",
+            "workspace_name": "Creo Workspace",
+        }]
+        self.controller._pdm_service_factory = lambda: SimpleNamespace(
+            repo=self.repo,
+            list_cad_documents=self.repo.list_cad_documents,
+            cad_checkout_history=lambda _cad_id: history,
+        )
+
+        result = self.controller.dispatch(
+            "GET", "/api/v1/cad/1/history", {}, {}
+        )
+
+        self.assertEqual(result["history"], history)
+        self.assertEqual(result["cad"]["id"], 1)
+
+    def test_revision_and_release_routes_use_the_pdm_service(self):
+        calls = []
+        self.controller._bom_service_factory = lambda: SimpleNamespace(
+            revise_pdm_cad_document=lambda cad_id: calls.append(("revise", cad_id)) or {"id": cad_id},
+            release_pdm_cad_document=lambda cad_id: calls.append(("release", cad_id)) or {"id": cad_id},
+        )
+
+        revised = self.controller.dispatch("POST", "/api/v1/cad/2/revise", {}, {})
+        released = self.controller.dispatch("POST", "/api/v1/cad/2/release", {}, {})
+
+        self.assertEqual(calls, [("revise", 2), ("release", 2)])
+        self.assertEqual(revised["revision"]["id"], 2)
+        self.assertEqual(released["release"]["id"], 2)
 
     def test_materializes_recursive_dependencies_read_only_unless_owned_here(self):
         workspace_service = _WorkspaceService()

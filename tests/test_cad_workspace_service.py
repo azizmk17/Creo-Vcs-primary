@@ -92,6 +92,18 @@ class CadWorkspaceServiceTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "READY")
         self.assertTrue(rows[0]["selectable"])
 
+    def test_unversioned_creo_file_is_visible_as_unmapped(self):
+        workspace = self.service.create_workspace("Unmapped local files")
+        path = Path(workspace["path"]) / "scratch.prt"
+        path.write_bytes(b"local-only")
+
+        rows = self.service.scan_workspace(workspace["id"], 1, 7)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["filename"], "scratch.prt")
+        self.assertEqual(rows[0]["status"], "UNMAPPED")
+        self.assertFalse(rows[0]["selectable"])
+
     def test_workspace_is_not_project_bound_but_blocks_flat_name_collision(self):
         workspace = self.service.create_workspace("Mixed project work")
         self.service.materialize_cad_document(workspace["id"], 11)

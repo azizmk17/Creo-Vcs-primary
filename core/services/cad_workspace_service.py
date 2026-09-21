@@ -28,6 +28,7 @@ from core.session_manager import SessionManager
 _MANIFEST_NAME = ".creovcs-workspace.json"
 _REGISTRY_NAME = "registry.json"
 _CREO_RE = re.compile(r"^(.*\.(?:prt|asm|drw))\.(\d+)$", re.IGNORECASE)
+_CREO_UNVERSIONED_RE = re.compile(r"^(.*\.(?:prt|asm|drw))$", re.IGNORECASE)
 
 
 def _utc_now() -> str:
@@ -532,6 +533,15 @@ class CadWorkspaceService:
             if match:
                 grouped.setdefault(match.group(1).casefold(), []).append(
                     (int(match.group(2)), child)
+                )
+                continue
+            # A user can place an ordinary Creo file in the managed directory
+            # before Nexus has materialized a numbered iteration. Keep it
+            # visible as UNMAPPED so it cannot disappear from the check-in view.
+            unversioned = _CREO_UNVERSIONED_RE.match(child.name)
+            if unversioned:
+                grouped.setdefault(unversioned.group(1).casefold(), []).append(
+                    (0, child)
                 )
 
         entries_by_logical = {

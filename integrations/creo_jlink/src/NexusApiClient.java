@@ -30,13 +30,38 @@ public class NexusApiClient {
         return MiniJson.object(request("POST", "/workspaces", body).get("workspace"));
     }
 
+    public List<Object> listWorkspaceCheckouts(String workspaceId) throws Exception {
+        return MiniJson.array(listWorkspaceState(workspaceId).get("cad_documents"));
+    }
+
+    public Map<String, Object> listWorkspaceState(String workspaceId) throws Exception {
+        String encoded = URLEncoder.encode(workspaceId == null ? "" : workspaceId, "UTF-8");
+        return request("GET", "/workspaces/" + encoded + "/checkouts", null);
+    }
+
     public Map<String, Object> resolveCad(String fileName) throws Exception {
         String encoded = URLEncoder.encode(fileName, "UTF-8");
         return MiniJson.object(request("GET", "/cad/resolve?file_name=" + encoded, null).get("cad"));
     }
 
+    public List<Object> listCadDocuments() throws Exception {
+        return MiniJson.array(request("GET", "/cad", null).get("cad_documents"));
+    }
+
     public Map<String, Object> cadStatus(int cadId) throws Exception {
         return MiniJson.object(request("GET", "/cad/" + cadId, null).get("cad"));
+    }
+
+    public Map<String, Object> cadHistory(int cadId) throws Exception {
+        return request("GET", "/cad/" + cadId + "/history", null);
+    }
+
+    public Map<String, Object> revise(int cadId) throws Exception {
+        return request("POST", "/cad/" + cadId + "/revise", new LinkedHashMap<String, Object>());
+    }
+
+    public Map<String, Object> release(int cadId) throws Exception {
+        return request("POST", "/cad/" + cadId + "/release", new LinkedHashMap<String, Object>());
     }
 
     public Map<String, Object> retrieve(int cadId, String workspaceId) throws Exception {

@@ -79,6 +79,12 @@ public class NexusJLink {
         addCommand("NexusPDM.Status", "NexusStatus", "NexusStatusHelp", new CommandAction() {
             public void run() throws Exception { showStatus(); }
         });
+        addCommand("NexusPDM.WorkspaceStatus", "NexusWorkspaceStatus", "NexusWorkspaceStatusHelp", new CommandAction() {
+            public void run() throws Exception { showWorkspaceStatus(); }
+        });
+        addCommand("NexusPDM.History", "NexusHistory", "NexusHistoryHelp", new CommandAction() {
+            public void run() throws Exception { showHistory(); }
+        });
         addCommand("NexusPDM.Checkout", "NexusCheckout", "NexusCheckoutHelp", new CommandAction() {
             public void run() throws Exception { checkout(); }
         });
@@ -87,6 +93,12 @@ public class NexusJLink {
         });
         addCommand("NexusPDM.Undo", "NexusUndo", "NexusUndoHelp", new CommandAction() {
             public void run() throws Exception { undoCheckout(); }
+        });
+        addCommand("NexusPDM.Revise", "NexusRevise", "NexusReviseHelp", new CommandAction() {
+            public void run() throws Exception { reviseCurrent(); }
+        });
+        addCommand("NexusPDM.Release", "NexusRelease", "NexusReleaseHelp", new CommandAction() {
+            public void run() throws Exception { releaseCurrent(); }
         });
     }
 
@@ -183,14 +195,10 @@ public class NexusJLink {
 
     private static void retrieve() throws Exception {
         Map<String, Object> workspace = requireWorkspace();
-        String fileName = NexusDialogs.input(
-            "Managed Creo filename (for example housing.prt or machine.asm):",
-            "Retrieve from Nexus"
-        );
-        if (fileName == null || fileName.trim().length() == 0) {
+        Map<String, Object> status = chooseProjectCadDocument("Retrieve from Nexus");
+        if (status == null) {
             return;
         }
-        Map<String, Object> status = api.resolveCad(fileName.trim());
         requireManaged(status);
         Map<String, Object> result = api.retrieve(
             MiniJson.integer(status, "id"), MiniJson.text(workspace, "id")
@@ -202,6 +210,43 @@ public class NexusJLink {
             MiniJson.text(refreshed, "file_name") + " was retrieved " + mode + ".",
             "Nexus Retrieve"
         );
+    }
+
+    private static Map<String, Object> chooseProjectCadDocument(String title) throws Exception {
+        List<Object> raw;
+        try {
+            raw = api.listCadDocuments();
+        } catch (NexusApiException error) {
+            if ("route_not_found".equals(error.getCode())) {
+                throw new IllegalStateException(
+                    "The running Nexus bridge does not include the CAD Document list route yet.\n\n"
+                        + "Close and restart the Nexus desktop app, then reconnect Creo to the project."
+                );
+            }
+            throw error;
+        }
+        List<CadChoice> choices = new ArrayList<CadChoice>();
+        for (Object item : raw) {
+            Map<String, Object> cad = MiniJson.object(item);
+            if (MiniJson.bool(cad, "managed")) {
+                choices.add(new CadChoice(cad));
+            }
+        }
+        if (choices.isEmpty()) {
+            throw new IllegalStateException(
+                "The active Nexus project has no managed CAD Documents to retrieve."
+            );
+        }
+        Object selected = NexusDialogs.choose(
+            "Select a CAD Document from the active Nexus project:",
+            title,
+            choices.toArray(),
+            choices.get(0)
+        );
+        if (!(selected instanceof CadChoice)) {
+            return null;
+        }
+        return ((CadChoice) selected).cad;
     }
 
     private static void showStatus() throws Exception {
@@ -218,6 +263,100 @@ public class NexusJLink {
                 + "\nWorkspace: " + MiniJson.text(status, "checkout_workspace_name")
                 + "\nEditable here: " + (MiniJson.bool(status, "can_modify") ? "Yes" : "No"),
             "Nexus CAD Status"
+        );
+    }
+
+    private static void showWorkspaceStatus() throws Exception {
+        Map<String, Object> workspace = requireWorkspace();
+        Map<String, Object> state = loadWorkspaceState(MiniJson.text(workspace, "id"));
+        List<Object> localFiles = MiniJson.array(state.get("local_files"));
+        List<Object> checkouts = MiniJson.array(state.get("cad_documents"));
+        List<String> lines = new ArrayList<String>();
+        lines.add("Workspace: " + MiniJson.text(workspace, "name"));
+        lines.add("Path: " + MiniJson.text(workspace, "path"));
+        lines.add("Local Creo files: " + localFiles.size());
+        lines.add("Active Nexus checkouts: " + checkouts.size());
+        lines.add("");
+        for (Object raw : localFiles) {
+            Map<String, Object> file = MiniJson.object(raw);
+            lines.add(MiniJson.text(file, "filename") + " - "
+                + MiniJson.text(file, "status") + " - "
+                + MiniJson.text(file, "detail"));
+        }
+        NexusDialogs.info(joinList(lines, "\n"), "Nexus Workspace Status");
+    }
+
+    private static void showHistory() throws Exception {
+        Map<String, Object> status = resolveCurrentModel();
+        Map<String, Object> result = api.cadHistory(MiniJson.integer(status, "id"));
+        List<Object> history = MiniJson.array(result.get("history"));
+        List<String> lines = new ArrayList<String>();
+        lines.add("CAD: " + MiniJson.text(status, "file_name"));
+        lines.add("Current revision: " + MiniJson.text(status, "revision") + "."
+            + MiniJson.integer(status, "iteration"));
+        lines.add("");
+        for (Object raw : history) {
+            Map<String, Object> entry = MiniJson.object(raw);
+            String action = MiniJson.text(entry, "action");
+            String timestamp = MiniJson.text(entry, "created_at");
+            String user = MiniJson.text(entry, "username");
+            if (user.length() == 0) user = MiniJson.text(entry, "user_id");
+            String note = MiniJson.text(entry, "note");
+            String workspaceName = MiniJson.text(entry, "workspace_name");
+            String line = timestamp + "  " + action;
+            if (user.length() > 0) line += "  by " + user;
+            if (workspaceName.length() > 0) line += "  [" + workspaceName + "]";
+            if (note.length() > 0) line += "\n  " + note;
+            lines.add(line);
+        }
+        if (history.isEmpty()) lines.add("No checkout history is recorded.");
+        NexusDialogs.info(joinList(lines, "\n"), "Nexus CAD History");
+    }
+
+    private static void reviseCurrent() throws Exception {
+        Map<String, Object> status = resolveCurrentModel();
+        if (MiniJson.bool(status, "can_modify")) {
+            throw new IllegalStateException(
+                "Undo or check in the active checkout before creating a new CAD revision."
+            );
+        }
+        boolean confirmed = NexusDialogs.confirm(
+            "Create the next CAD revision for " + MiniJson.text(status, "file_name") + "?",
+            "Nexus CAD Revision",
+            JOptionPane.QUESTION_MESSAGE
+        );
+        if (!confirmed) return;
+        Map<String, Object> result = api.revise(MiniJson.integer(status, "id"));
+        Map<String, Object> revised = MiniJson.object(result.get("cad"));
+        NexusDialogs.info(
+            "New CAD revision created: " + MiniJson.text(revised, "revision") + "."
+                + MiniJson.integer(revised, "iteration")
+                + "\nCheck it out before editing.",
+            "Nexus CAD Revision"
+        );
+    }
+
+    private static void releaseCurrent() throws Exception {
+        Map<String, Object> status = resolveCurrentModel();
+        if (MiniJson.text(status, "checkout_state").length() > 0
+            && !"CHECKED_IN".equals(MiniJson.text(status, "checkout_state"))) {
+            throw new IllegalStateException(
+                "Check in or undo the active checkout before releasing this CAD Document."
+            );
+        }
+        boolean confirmed = NexusDialogs.confirm(
+            "Release " + MiniJson.text(status, "file_name") + " at revision "
+                + MiniJson.text(status, "revision") + "." + MiniJson.integer(status, "iteration") + "?",
+            "Nexus Release CAD",
+            JOptionPane.QUESTION_MESSAGE
+        );
+        if (!confirmed) return;
+        Map<String, Object> result = api.release(MiniJson.integer(status, "id"));
+        Map<String, Object> released = MiniJson.object(result.get("cad"));
+        NexusDialogs.info(
+            "CAD Document released at revision " + MiniJson.text(released, "revision")
+                + "." + MiniJson.integer(released, "iteration") + ".",
+            "Nexus Release CAD"
         );
     }
 
@@ -310,36 +449,205 @@ public class NexusJLink {
     }
 
     private static void checkin() throws Exception {
-        Model current = requireCurrentModel();
-        Map<String, Object> status = api.resolveCad(current.GetFileName());
-        requireManaged(status);
-        if (!MiniJson.bool(status, "can_checkin")) {
-            throw new IllegalStateException(
-                MiniJson.text(status, "read_only_reason").length() == 0
-                    ? "This CAD Document is not checked out here."
-                    : MiniJson.text(status, "read_only_reason")
+        Map<String, Object> workspace = requireWorkspace();
+        List<CheckinChoice> choices = checkinChoices(workspace);
+        if (choices.isEmpty()) {
+            NexusDialogs.info(
+                "No managed CAD Documents are available for check-in in this workspace.",
+                "Nexus Check In"
+            );
+            return;
+        }
+        Object[] labels = new Object[choices.size()];
+        boolean[] selected = new boolean[choices.size()];
+        for (int index = 0; index < choices.size(); index++) {
+            CheckinChoice choice = choices.get(index);
+            labels[index] = choice;
+            selected[index] = choice.defaultSelected();
+        }
+        NexusDialogs.ChecklistResult selection = NexusDialogs.checklist(
+            "Select the CAD Documents to check in from this workspace:",
+            "Nexus Check In",
+            labels,
+            selected,
+            "Check-in comment:"
+        );
+        if (selection == null) return;
+        String note = selection.note.trim();
+        if (note.length() == 0) return;
+        if (selection.selectedIndexes.length == 0) {
+            NexusDialogs.info("No CAD Documents were selected.", "Nexus Check In");
+            return;
+        }
+
+        List<String> checkedIn = new ArrayList<String>();
+        for (int index = 0; index < selection.selectedIndexes.length; index++) {
+            CheckinChoice choice = choices.get(selection.selectedIndexes[index]);
+            if (!MiniJson.bool(choice.status, "can_checkin")) {
+                String reason = MiniJson.text(choice.status, "read_only_reason");
+                throw new IllegalStateException(
+                    choice.fileName() + " cannot be checked in."
+                        + (reason.length() == 0 ? "" : "\n" + reason)
+                );
+            }
+            if (choice.loaded != null && choice.loaded.model.GetIsModified()) {
+                choice.loaded.model.Save();
+            }
+            Map<String, Object> result = api.checkin(
+                MiniJson.integer(choice.status, "id"),
+                MiniJson.text(choice.status, "checkout_workspace_id"),
+                "",
+                note
+            );
+            Map<String, Object> refreshed = MiniJson.object(result.get("cad"));
+            checkedIn.add(
+                MiniJson.text(refreshed, "file_name")
+                    + " Rev " + MiniJson.text(refreshed, "revision")
+                    + "." + MiniJson.text(refreshed, "iteration")
             );
         }
-        String note = NexusDialogs.input(
-            "Check-in comment:", "Nexus Check In"
-        );
-        if (note == null || note.trim().length() == 0) return;
-        if (current.GetIsModified()) {
-            current.Save();
-        }
-        Map<String, Object> result = api.checkin(
-            MiniJson.integer(status, "id"),
-            MiniJson.text(status, "checkout_workspace_id"),
-            "",
-            note.trim()
-        );
-        Map<String, Object> refreshed = MiniJson.object(result.get("cad"));
         NexusDialogs.info(
-            "Check-in completed.\nCAD revision: " + MiniJson.text(refreshed, "revision")
-                + "." + MiniJson.text(refreshed, "iteration")
-                + "\nThe local file is now read-only.",
+            "Check-in completed:\n" + joinList(checkedIn, "\n")
+                + "\n\nThe checked-in local files are now read-only.",
             "Nexus Check In"
         );
+    }
+
+    private static List<CheckinChoice> checkinChoices(Map<String, Object> workspace)
+        throws Exception {
+        List<CheckinChoice> choices = new ArrayList<CheckinChoice>();
+        Map<Integer, CheckinChoice> byId = new LinkedHashMap<Integer, CheckinChoice>();
+        Map<String, Object> workspaceState = loadWorkspaceState(MiniJson.text(workspace, "id"));
+        List<Object> localRows = MiniJson.array(workspaceState.get("local_files"));
+        for (Object item : localRows) {
+            Map<String, Object> local = MiniJson.object(item);
+            int cadId = MiniJson.integer(local, "cad_document_id");
+            Map<String, Object> status = MiniJson.object(item);
+            if (cadId > 0) {
+                try {
+                    status = api.cadStatus(cadId);
+                } catch (Exception ignored) {
+                    status = new LinkedHashMap<String, Object>();
+                }
+            }
+            CheckinChoice choice = new CheckinChoice(status);
+            choice.localFile = local;
+            choices.add(choice);
+            if (cadId > 0) {
+                byId.put(Integer.valueOf(cadId), choice);
+            }
+        }
+
+        List<Object> workspaceRows = MiniJson.array(workspaceState.get("cad_documents"));
+        for (Object item : workspaceRows) {
+            Map<String, Object> status = MiniJson.object(item);
+            if (!MiniJson.bool(status, "managed")) continue;
+            Integer id = Integer.valueOf(MiniJson.integer(status, "id"));
+            CheckinChoice choice = byId.get(id);
+            if (choice == null) {
+                choice = new CheckinChoice(status);
+                choices.add(choice);
+                byId.put(id, choice);
+            } else {
+                choice.status = status;
+            }
+            choice.workspaceCheckout = true;
+        }
+
+        Map<String, LoadedModelInfo> loaded = loadedCreoModels();
+        for (LoadedModelInfo info : loaded.values()) {
+            Map<String, Object> status;
+            try {
+                status = api.resolveCad(info.model.GetFileName());
+            } catch (Exception ignored) {
+                continue;
+            }
+            if (!MiniJson.bool(status, "managed")) continue;
+            Integer id = Integer.valueOf(MiniJson.integer(status, "id"));
+            CheckinChoice choice = byId.get(id);
+            if (choice == null) {
+                choice = new CheckinChoice(status);
+                choices.add(choice);
+                byId.put(id, choice);
+            } else {
+                choice.status = status;
+            }
+            choice.loaded = info;
+        }
+        return choices;
+    }
+
+    private static Map<String, Object> loadWorkspaceState(String workspaceId)
+        throws Exception {
+        try {
+            return api.listWorkspaceState(workspaceId);
+        } catch (NexusApiException error) {
+            if ("route_not_found".equals(error.getCode())) {
+                throw new IllegalStateException(
+                    "The running Nexus bridge does not include workspace status yet.\n\n"
+                        + "Close and restart the Nexus desktop app, then reconnect Creo to the project."
+                );
+            }
+            throw error;
+        }
+    }
+
+    private static Map<String, LoadedModelInfo> loadedCreoModels() {
+        Map<String, LoadedModelInfo> loaded = new LinkedHashMap<String, LoadedModelInfo>();
+        Model current = null;
+        try {
+            current = session.GetCurrentModel();
+        } catch (Throwable ignored) {
+        }
+        if (current == null) {
+            return loaded;
+        }
+        walkLoadedModels(loaded, current, "current", new LinkedHashSet<String>());
+        return loaded;
+    }
+
+    private static void walkLoadedModels(
+        Map<String, LoadedModelInfo> loaded,
+        Model model,
+        String source,
+        Set<String> visiting
+    ) {
+        if (model == null) return;
+        String key = "";
+        try { key = logicalCreoFileName(model.GetFileName()).toLowerCase(); }
+        catch (Throwable ignored) { }
+        if (key.length() == 0 || !visiting.add(key)) return;
+        addLoadedModel(loaded, model, source);
+        try {
+            Dependencies dependencies = model.ListDependencies();
+            if (dependencies != null) {
+                for (int index = 0; index < dependencies.getarraysize(); index++) {
+                    Dependency dependency = dependencies.get(index);
+                    if (dependency == null || dependency.GetDepModel() == null) continue;
+                    Model child = session.GetModelFromDescr(dependency.GetDepModel());
+                    if (child != null) {
+                        walkLoadedModels(loaded, child, "loaded child", visiting);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            visiting.remove(key);
+        }
+    }
+
+    private static void addLoadedModel(
+        Map<String, LoadedModelInfo> loaded,
+        Model model,
+        String source
+    ) {
+        try {
+            String key = logicalCreoFileName(model.GetFileName()).toLowerCase();
+            if (key.length() > 0 && !loaded.containsKey(key)) {
+                loaded.put(key, new LoadedModelInfo(model, source));
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     private static void undoCheckout() throws Exception {
@@ -396,15 +704,9 @@ public class NexusJLink {
         if (root.GetIsModified()) {
             modified.add(root.GetFileName());
         }
-        Dependencies dependencies = root.ListDependencies();
-        if (dependencies != null) {
-            for (int index = 0; index < dependencies.getarraysize(); index++) {
-                Dependency dependency = dependencies.get(index);
-                if (dependency == null || dependency.GetDepModel() == null) continue;
-                Model loaded = session.GetModelFromDescr(dependency.GetDepModel());
-                if (loaded != null && loaded.GetIsModified()) {
-                    modified.add(loaded.GetFileName());
-                }
+        for (LoadedModelInfo loaded : loadedCreoModels().values()) {
+            if (loaded.model != root && loaded.modified()) {
+                modified.add(loaded.model.GetFileName());
             }
         }
         if (!modified.isEmpty()) {
@@ -416,6 +718,15 @@ public class NexusJLink {
     }
 
     private static String join(Set<String> values, String separator) {
+        StringBuilder result = new StringBuilder();
+        for (String value : values) {
+            if (result.length() > 0) result.append(separator);
+            result.append(value);
+        }
+        return result.toString();
+    }
+
+    private static String joinList(List<String> values, String separator) {
         StringBuilder result = new StringBuilder();
         for (String value : values) {
             if (result.length() > 0) result.append(separator);
@@ -526,6 +837,120 @@ public class NexusJLink {
             String name = MiniJson.text(workspace, "name");
             String path = MiniJson.text(workspace, "path");
             return name + (path.length() == 0 ? "" : "  [" + path + "]");
+        }
+    }
+
+    private static final class CadChoice {
+        private final Map<String, Object> cad;
+
+        private CadChoice(Map<String, Object> cad) {
+            this.cad = cad;
+        }
+
+        public String toString() {
+            String fileName = MiniJson.text(cad, "file_name");
+            String number = MiniJson.text(cad, "number");
+            String revision = MiniJson.text(cad, "revision");
+            String iteration = String.valueOf(MiniJson.integer(cad, "iteration"));
+            String category = MiniJson.text(cad, "category");
+            String state = MiniJson.text(cad, "checkout_state");
+            String label = fileName.length() > 0 ? fileName : number;
+            if (number.length() > 0 && !number.equals(label)) {
+                label = label + " - " + number;
+            }
+            if (revision.length() > 0 || iteration.length() > 0) {
+                label = label + "  Rev " + revision + "." + iteration;
+            }
+            if (category.length() > 0) {
+                label = label + "  [" + category + "]";
+            }
+            if (state.length() > 0) {
+                label = label + "  " + state;
+            }
+            return label;
+        }
+    }
+
+    private static final class LoadedModelInfo {
+        private final Model model;
+        private final String source;
+
+        private LoadedModelInfo(Model model, String source) {
+            this.model = model;
+            this.source = source;
+        }
+
+        private boolean modified() {
+            try {
+                return model.GetIsModified();
+            } catch (Throwable ignored) {
+                return false;
+            }
+        }
+    }
+
+    private static final class CheckinChoice {
+        private Map<String, Object> status;
+        private Map<String, Object> localFile;
+        private boolean workspaceCheckout;
+        private LoadedModelInfo loaded;
+
+        private CheckinChoice(Map<String, Object> status) {
+            this.status = status;
+        }
+
+        private String fileName() {
+            String name = MiniJson.text(status, "file_name");
+            if (name.length() == 0 && localFile != null) {
+                name = MiniJson.text(localFile, "logical_file_name");
+            }
+            if (name.length() == 0 && localFile != null) {
+                name = MiniJson.text(localFile, "filename");
+            }
+            return name;
+        }
+
+        private boolean defaultSelected() {
+            return MiniJson.bool(status, "can_checkin")
+                && (
+                    (loaded != null && ("current".equals(loaded.source) || loaded.modified()))
+                    || (localFile != null && MiniJson.bool(localFile, "selectable"))
+                );
+        }
+
+        public String toString() {
+            String label = fileName();
+            if (label.length() == 0) {
+                label = MiniJson.text(status, "number");
+            }
+            String revision = MiniJson.text(status, "revision");
+            int iteration = MiniJson.integer(status, "iteration");
+            if (revision.length() > 0 || iteration > 0) {
+                label = label + "  Rev " + revision + "." + iteration;
+            }
+            List<String> tags = new ArrayList<String>();
+            if (localFile != null) tags.add("local workspace");
+            if (workspaceCheckout) tags.add("workspace checkout");
+            if (loaded != null) {
+                tags.add(loaded.source);
+                if (loaded.modified()) tags.add("modified");
+            } else {
+                tags.add("not loaded");
+            }
+            if (localFile != null) {
+                String statusText = MiniJson.text(localFile, "status");
+                if (statusText.length() > 0) tags.add(statusText);
+            }
+            if (!MiniJson.bool(status, "can_checkin")) tags.add("read-only");
+            label = label + "  [" + joinList(tags, ", ") + "]";
+            String reason = MiniJson.text(status, "read_only_reason");
+            if (reason.length() == 0 && localFile != null) {
+                reason = MiniJson.text(localFile, "detail");
+            }
+            if (!MiniJson.bool(status, "can_checkin") && reason.length() > 0) {
+                label = label + " - " + reason;
+            }
+            return label;
         }
     }
 }

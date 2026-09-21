@@ -1,7 +1,17 @@
 import java.awt.Component;
+import java.awt.BorderLayout;
+import java.awt.GridLayout;
+import java.util.ArrayList;
+import java.util.List;
+import javax.swing.BorderFactory;
+import javax.swing.Box;
+import javax.swing.BoxLayout;
+import javax.swing.JCheckBox;
 import javax.swing.JComboBox;
 import javax.swing.JDialog;
 import javax.swing.JOptionPane;
+import javax.swing.JPanel;
+import javax.swing.JScrollPane;
 import javax.swing.JTextField;
 import javax.swing.SwingUtilities;
 
@@ -85,6 +95,65 @@ public final class NexusDialogs {
         return choices.getSelectedItem();
     }
 
+    public static ChecklistResult checklist(
+        String message,
+        String title,
+        Object[] values,
+        boolean[] checked,
+        String noteLabel
+    ) {
+        final JCheckBox[] boxes = new JCheckBox[values.length];
+        JPanel list = new JPanel();
+        list.setLayout(new BoxLayout(list, BoxLayout.Y_AXIS));
+        for (int index = 0; index < values.length; index++) {
+            boxes[index] = new JCheckBox(String.valueOf(values[index]));
+            boxes[index].setSelected(checked != null && index < checked.length && checked[index]);
+            boxes[index].setAlignmentX(Component.LEFT_ALIGNMENT);
+            list.add(boxes[index]);
+        }
+        JScrollPane scroll = new JScrollPane(list);
+        scroll.setBorder(BorderFactory.createEtchedBorder());
+        scroll.setPreferredSize(new java.awt.Dimension(760, 260));
+
+        final JTextField note = new JTextField(54);
+        JPanel notePanel = new JPanel(new GridLayout(2, 1, 0, 4));
+        notePanel.add(new javax.swing.JLabel(noteLabel));
+        notePanel.add(note);
+
+        JPanel panel = new JPanel(new BorderLayout(0, 8));
+        panel.add(new javax.swing.JLabel(message), BorderLayout.NORTH);
+        panel.add(scroll, BorderLayout.CENTER);
+        Box bottom = Box.createVerticalBox();
+        bottom.add(notePanel);
+        panel.add(bottom, BorderLayout.SOUTH);
+
+        JOptionPane pane = new JOptionPane(
+            panel,
+            JOptionPane.QUESTION_MESSAGE,
+            JOptionPane.OK_CANCEL_OPTION
+        );
+        Object value = show(pane, title, new Runnable() {
+            public void run() {
+                note.requestFocusInWindow();
+            }
+        });
+        if (!(value instanceof Integer)
+            || ((Integer) value).intValue() != JOptionPane.OK_OPTION) {
+            return null;
+        }
+        List<Integer> selected = new ArrayList<Integer>();
+        for (int index = 0; index < boxes.length; index++) {
+            if (boxes[index].isSelected()) {
+                selected.add(Integer.valueOf(index));
+            }
+        }
+        int[] indexes = new int[selected.size()];
+        for (int index = 0; index < selected.size(); index++) {
+            indexes[index] = selected.get(index).intValue();
+        }
+        return new ChecklistResult(indexes, note.getText());
+    }
+
     private static void showMessage(String message, String title, int messageType) {
         JOptionPane pane = new JOptionPane(
             message,
@@ -146,5 +215,15 @@ public final class NexusDialogs {
         Object value = pane.getValue();
         dialog.dispose();
         return value;
+    }
+
+    public static final class ChecklistResult {
+        public final int[] selectedIndexes;
+        public final String note;
+
+        private ChecklistResult(int[] selectedIndexes, String note) {
+            this.selectedIndexes = selectedIndexes;
+            this.note = note == null ? "" : note;
+        }
     }
 }
