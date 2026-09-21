@@ -353,10 +353,12 @@ class BomGUI(QMainWindow):
         self.project_event_repo = ProjectEventRepository()
         self._sync_last_event_id = 0
         self._sync_poll_in_progress = False
+        self.creo_bridge = None
 
         self._project_combo_initializing = False
         self._projects_for_user = []
         self._ensure_valid_current_project()
+        self._start_creo_bridge()
 
         # Persistent application shell
         self._configure_status_bar()
@@ -364,6 +366,31 @@ class BomGUI(QMainWindow):
 
         self._build_ui(startup_progress=startup_progress)
         self._start_project_event_sync()
+
+    def _start_creo_bridge(self):
+        if str(os.environ.get("NEXUS_CREO_BRIDGE_DISABLED", "")).lower() in {
+            "1", "true", "yes", "on",
+        }:
+            return
+        try:
+            from core.integrations.creo_bridge import NexusCreoBridge
+
+            self.creo_bridge = NexusCreoBridge()
+            descriptor = self.creo_bridge.start()
+            print(f"[creo-bridge] listening on {descriptor['api_url']}")
+        except Exception as exc:
+            self.creo_bridge = None
+            print(f"[creo-bridge] warning: {exc}")
+
+    def closeEvent(self, event):
+        bridge = getattr(self, "creo_bridge", None)
+        if bridge is not None:
+            try:
+                bridge.stop()
+            except Exception:
+                pass
+            self.creo_bridge = None
+        super().closeEvent(event)
 
     def _configure_status_bar(self):
         status = self.statusBar()

@@ -1,0 +1,7 @@
+classes/
+dist/
+test-classes/
+std.out
+traceback.log
+trail.txt.*
+*.log

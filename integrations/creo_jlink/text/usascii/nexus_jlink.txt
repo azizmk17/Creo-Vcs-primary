@@ -1,0 +1,60 @@
+NexusPDM
+&Nexus PDM
+#
+#
+NexusConnect
+Connect to Active Project
+#
+#
+NexusConnectHelp
+Show the active Nexus user, product version, and CAD workspace
+#
+#
+NexusWorkspace
+Select CAD Workspace
+#
+#
+NexusWorkspaceHelp
+Select or create the local Nexus CAD workspace used by Creo
+#
+#
+NexusRetrieve
+Retrieve
+#
+#
+NexusRetrieveHelp
+Retrieve a managed CAD Document from the active Nexus product version
+#
+#
+NexusStatus
+Status
+#
+#
+NexusStatusHelp
+Show Nexus lifecycle and checkout status for the current Creo model
+#
+#
+NexusCheckout
+Check Out
+#
+#
+NexusCheckoutHelp
+Check out the current CAD Document into the selected Nexus workspace
+#
+#
+NexusCheckin
+Check In
+#
+#
+NexusCheckinHelp
+Save and check in the current CAD Document to Nexus
+#
+#
+NexusUndo
+Undo Check Out
+#
+#
+NexusUndoHelp
+Undo the current user's checkout and retain the local file read-only
+#
+#

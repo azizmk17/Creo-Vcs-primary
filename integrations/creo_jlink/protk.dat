@@ -1,0 +1,10 @@
+name                NexusPDM
+startup             java
+java_app_class      NexusJLink
+java_app_classpath  C:\Users\mkazi\git_20260511\Creo-Vcs-primary\integrations\creo_jlink\classes
+java_app_start      start
+java_app_stop       stop
+allow_stop          true
+delay_start         false
+text_dir            C:\Users\mkazi\git_20260511\Creo-Vcs-primary\integrations\creo_jlink\text
+end

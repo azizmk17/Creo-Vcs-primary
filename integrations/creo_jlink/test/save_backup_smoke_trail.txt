@@ -1,0 +1,7 @@
+!trail file version No. 1800
+!Nexus J-Link save and backup smoke test.
+~ Command `ProCmdModelNew`
+~ Update `new` `InputPanel1` `nexus_jlink_save_smoke`
+~ Activate `new` `OK`
+~ Command `ProCmdModelSave`
+~ Command `ProCmdModelBackup`

@@ -1,0 +1,83 @@
+# Nexus PDM for Creo 3.0
+
+This synchronous J-Link application connects Creo Parametric 3.0 M020 to the
+currently running Nexus desktop application. The Java code never opens the
+Nexus database. It uses an authenticated localhost API, so the existing Nexus
+permission, lifecycle, checkout, Item, CAD Document, and audit rules remain the
+authority.
+
+## Current commands
+
+- **Connect to Active Project** shows the Nexus user and selected product version.
+- **Select CAD Workspace** selects or creates a machine-local managed workspace.
+- **Retrieve** copies the controlled CAD file, related drawings, and recursive managed
+  assembly dependencies into that workspace. Dependencies remain read-only unless they
+  have their own checkout in the same user, workspace, and machine context.
+- **Status** shows revision, iteration, lifecycle, checkout owner, and editability.
+- **Check Out** obtains the Nexus CAD/Item lock and opens the editable workspace copy.
+- **Check In** saves the model, creates the next managed CAD iteration, updates Nexus,
+  applies the existing coordinated Item lock policy, and makes retained files read-only.
+- **Undo Check Out** releases the coordinated checkout and keeps local files read-only.
+
+Managed files that are not checked out by the current Nexus user in the assigned
+workspace are read-only. Command guards also block Save and Rename when checkout
+ownership cannot be verified. Backup/Save As remains available because it creates a
+separate copy without modifying the controlled source model. Unmanaged Creo work
+outside a Nexus workspace is not blocked.
+
+## Installed paths
+
+- JDK: `C:\Program Files\Java\jdk1.7.0_80`
+- Runtime: `C:\Program Files\Java\jre7`
+- J-Link API: `C:\Program Files\PTC\Creo 3.0\M020\Common Files\text\java\pfc.jar`
+- Creo launcher: `C:\Program Files\PTC\Creo 3.0\M020\Parametric\bin\parametric.bat`
+
+No Creo Object TOOLKIT Java installation or license is used.
+
+## Build and run
+
+1. Close every existing Creo session.
+2. Start Nexus normally.
+3. Sign in and select the required product and version in Nexus.
+4. Run `compile.bat` once, or whenever Java source changes.
+5. Run `run_creo.bat`.
+6. In Creo, open **Applications > Nexus PDM > Connect to Active Project**.
+7. Select a CAD workspace before Retrieve or Check Out.
+
+`build_and_run.bat` combines steps 4 and 5.
+
+The Nexus bridge descriptor is generated for the signed-in Windows account at:
+
+```text
+%LOCALAPPDATA%\CreoVCS\bridge.json
+```
+
+It contains a random per-process token and a `127.0.0.1` API address. The file is
+removed when Nexus exits normally. The token is never stored in `protk.dat` or
+the Java build.
+
+## Moving this directory
+
+`protk.dat` contains absolute paths because that is the most reliable registration
+method for this Creo release. If the repository moves, update these two entries:
+
+```text
+java_app_classpath  <new-directory>\classes
+text_dir            <new-directory>\text
+```
+
+Update the Java and Creo paths in `compile.bat`, `run_creo.bat`, and `config.pro`
+only if those products are installed elsewhere.
+
+## Troubleshooting
+
+- **Application is not registered:** start Creo with `run_creo.bat`; do not attach
+  to an already running Creo process.
+- **Startup failed:** run `compile.bat`, verify `protk.dat` paths, and inspect
+  `std.out` plus the newest `trail.txt.*` in this directory.
+- **Nexus bridge is not running:** keep Nexus open, sign in, and wait until its main
+  product window is visible.
+- **Wrong project or unmanaged file:** select the product version in Nexus that owns
+  the CAD Document, then use Status again.
+- **File remains read-only:** check it out into the same CAD workspace from which it
+  is opened. Files checked out by another user intentionally remain blocked.

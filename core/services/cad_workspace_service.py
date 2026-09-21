@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import socket
+import stat
 import tempfile
 import uuid
 from datetime import datetime, timezone
@@ -71,6 +72,23 @@ class CadWorkspaceService:
             for block in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(block)
         return digest.hexdigest()
+
+    @staticmethod
+    def _set_path_editable(path: Path, editable: bool) -> None:
+        """Apply the workspace write policy without changing file contents."""
+        current_mode = path.stat().st_mode
+        if editable:
+            os.chmod(path, current_mode | stat.S_IWRITE)
+        else:
+            os.chmod(
+                path,
+                current_mode & ~stat.S_IWRITE & ~stat.S_IWGRP & ~stat.S_IWOTH,
+            )
+
+    @staticmethod
+    def _remove_readonly_and_retry(operation, path, _error) -> None:
+        os.chmod(path, os.stat(path).st_mode | stat.S_IWRITE)
+        operation(path)
 
     @staticmethod
     def _read_json(path: Path, default):
@@ -334,6 +352,7 @@ class CadWorkspaceService:
         *,
         preserve_existing: bool = False,
         source_path: str | os.PathLike | None = None,
+        editable: bool = True,
     ) -> dict:
         workspace = self.get_workspace(workspace_id)
         if not workspace or not workspace.get("available"):
@@ -388,6 +407,7 @@ class CadWorkspaceService:
                 )
         else:
             shutil.copy2(source, destination)
+        self._set_path_editable(destination, bool(editable))
 
         entry = {
             "cad_document_id": int(cad_document_id),
@@ -399,7 +419,7 @@ class CadWorkspaceService:
             "baseline_cad_iteration": int(document.get("iteration") or 0),
             "checkout_user_id": int(document["checked_out_by"])
             if document.get("checked_out_by") is not None else None,
-            "editable": True,
+            "editable": bool(editable),
             # When checkout is started from the staging dialog, the source is
             # already the user's workspace file.  The local file should remain
             # stageable immediately after checkout even if it equals the newly
@@ -425,6 +445,7 @@ class CadWorkspaceService:
         preserve_existing: bool = False,
         source_path: str | os.PathLike | None = None,
         include_related_drawings: bool = True,
+        editable: bool = True,
     ) -> list[dict]:
         """Materialize a model CAD Document and its related DRW documents."""
         primary = self.materialize_cad_document(
@@ -432,6 +453,7 @@ class CadWorkspaceService:
             int(cad_document_id),
             preserve_existing=preserve_existing,
             source_path=source_path,
+            editable=editable,
         )
         materialized = [primary]
         if not include_related_drawings:
@@ -445,9 +467,32 @@ class CadWorkspaceService:
                     workspace_id,
                     int(drawing["id"]),
                     preserve_existing=True,
+                    editable=editable,
                 )
             )
         return materialized
+
+    def set_document_files_editable(
+        self, workspace_id: str, cad_document_id: int, editable: bool
+    ) -> list[str]:
+        """Change write access for every local Creo iteration of one document."""
+        manifest = self.load_manifest(str(workspace_id))
+        entry = (manifest.get("entries") or {}).get(str(int(cad_document_id)))
+        if not entry:
+            return []
+        logical_key = str(entry.get("logical_file_name") or "").casefold()
+        changed = []
+        for child in self.workspace_path(str(workspace_id)).iterdir():
+            if (
+                child.is_file()
+                and _CREO_RE.match(child.name)
+                and self.logical_name(child.name).casefold() == logical_key
+            ):
+                self._set_path_editable(child, bool(editable))
+                changed.append(str(child))
+        entry["editable"] = bool(editable)
+        self._save_manifest(str(workspace_id), manifest)
+        return changed
 
     def release_cad_document(self, workspace_id: str | None, cad_document_id: int) -> None:
         if not workspace_id:
@@ -456,7 +501,21 @@ class CadWorkspaceService:
             manifest = self.load_manifest(str(workspace_id))
         except ValueError:
             return
-        if manifest.setdefault("entries", {}).pop(str(int(cad_document_id)), None) is not None:
+        entries = manifest.setdefault("entries", {})
+        entry = entries.get(str(int(cad_document_id)))
+        if entry is not None:
+            logical_key = str(entry.get("logical_file_name") or "").casefold()
+            try:
+                for child in self.workspace_path(str(workspace_id)).iterdir():
+                    if (
+                        child.is_file()
+                        and _CREO_RE.match(child.name)
+                        and self.logical_name(child.name).casefold() == logical_key
+                    ):
+                        self._set_path_editable(child, False)
+            except OSError:
+                pass
+            entries.pop(str(int(cad_document_id)), None)
             self._save_manifest(str(workspace_id), manifest)
 
     def scan_workspace(self, workspace_id: str, project_id: int, user_id: int) -> list[dict]:
@@ -557,7 +616,7 @@ class CadWorkspaceService:
         marker = self.load_manifest(workspace_id)
         if str(marker.get("workspace_id") or "").lower() != str(workspace_id).lower():
             raise ValueError("Refusing to delete a workspace with an invalid marker.")
-        shutil.rmtree(resolved)
+        shutil.rmtree(resolved, onerror=self._remove_readonly_and_retry)
         registry = self._registry()
         registry["workspaces"] = [
             row for row in registry.get("workspaces") or []

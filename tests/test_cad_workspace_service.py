@@ -1,4 +1,5 @@
 import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -96,6 +97,23 @@ class CadWorkspaceServiceTests(unittest.TestCase):
         self.service.materialize_cad_document(workspace["id"], 11)
         with self.assertRaisesRegex(ValueError, "another CAD Document"):
             self.service.materialize_cad_document(workspace["id"], 22)
+
+    def test_retrieved_file_is_read_only_until_made_editable(self):
+        workspace = self.service.create_workspace("Read-only review")
+        copied = self.service.materialize_cad_document(
+            workspace["id"], 11, editable=False
+        )
+        copied_path = Path(copied["path"])
+        self.assertFalse(bool(copied_path.stat().st_mode & stat.S_IWRITE))
+
+        changed = self.service.set_document_files_editable(
+            workspace["id"], 11, True
+        )
+        self.assertEqual(changed, [str(copied_path)])
+        self.assertTrue(bool(copied_path.stat().st_mode & stat.S_IWRITE))
+
+        self.service.release_cad_document(workspace["id"], 11)
+        self.assertFalse(bool(copied_path.stat().st_mode & stat.S_IWRITE))
 
     def test_delete_blocks_active_checkout_and_then_requires_force_for_files(self):
         workspace = self.service.create_workspace("Delete guard")
