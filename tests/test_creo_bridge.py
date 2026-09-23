@@ -94,8 +94,12 @@ class _WorkspaceService:
 
     def __init__(self):
         self.calls = []
+        self.intents = {}
+        self.missing_workspaces = set()
 
     def get_workspace(self, workspace_id):
+        if str(workspace_id).lower() in self.missing_workspaces:
+            return None
         return {
             "id": str(workspace_id),
             "name": "Creo Workspace",
@@ -118,12 +122,26 @@ class _WorkspaceService:
             "selectable": True,
         }]
 
+    def get_edit_intent(self, workspace_id, document_id):
+        return self.intents.get((str(workspace_id), int(document_id)))
+
+    def set_edit_intent(self, workspace_id, document_id, user_id, reason=""):
+        intent = {
+            "enabled": True,
+            "cad_document_id": int(document_id),
+            "user_id": int(user_id),
+            "reason": str(reason),
+        }
+        self.intents[(str(workspace_id), int(document_id))] = intent
+        return intent
+
     def materialize_cad_document_package(
         self,
         workspace_id,
         document_id,
         *,
         preserve_existing,
+        preserve_local_changes=False,
         include_related_drawings,
         editable,
     ):
@@ -214,6 +232,7 @@ class CreoBridgeTransportTests(unittest.TestCase):
 class CreoBridgeControllerTests(unittest.TestCase):
     def setUp(self):
         self.repo = _CadRepo()
+        self.workspace_service = _WorkspaceService()
         pdm = SimpleNamespace(repo=self.repo)
         self.controller = CreoBridgeController(
             session=SimpleNamespace(user_id=7, project_id=9),
@@ -227,7 +246,7 @@ class CreoBridgeControllerTests(unittest.TestCase):
                 user_has_permission=lambda *_args: True,
             ),
             bom_service_factory=lambda: SimpleNamespace(),
-            workspace_service_factory=lambda: _WorkspaceService(),
+            workspace_service_factory=lambda: self.workspace_service,
             pdm_service_factory=lambda: SimpleNamespace(
                 repo=self.repo,
                 list_cad_documents=self.repo.list_cad_documents,
@@ -291,6 +310,37 @@ class CreoBridgeControllerTests(unittest.TestCase):
 
         self.assertEqual(result["history"], history)
         self.assertEqual(result["cad"]["id"], 1)
+
+    def test_edit_intent_route_records_local_only_permission(self):
+        result = self.controller.dispatch(
+            "POST",
+            "/api/v1/cad/2/intent",
+            {},
+            {"workspace_id": "workspace-one", "reason": "Review locally"},
+        )
+
+        self.assertTrue(result["intent"]["enabled"])
+        self.assertEqual(result["intent"]["cad_document_id"], 2)
+        self.assertTrue(result["cad"]["local_edit_intent"])
+        self.assertEqual(result["cad"]["workspace_path"], "C:/workspace")
+        self.assertTrue(result["cad"]["server_save_blocked"])
+
+    def test_retrieve_auto_recovers_owned_checkout_when_old_workspace_was_deleted(self):
+        self.workspace_service.missing_workspaces.add("workspace-one")
+
+        def undo(cad_id, _note):
+            self.repo.documents[int(cad_id)]["checked_out_by"] = None
+            self.repo.documents[int(cad_id)]["checkout_workspace_id"] = None
+            return {"id": int(cad_id)}
+
+        self.controller._bom_service_factory = lambda: SimpleNamespace(
+            undo_checkout_pdm_cad_document=undo,
+        )
+
+        result = self.controller.retrieve(1, {"workspace_id": "workspace-two"})
+
+        self.assertEqual(result["root_path"], "C:/workspace/1")
+        self.assertIsNone(result["cad"]["checked_out_by"])
 
     def test_revision_and_release_routes_use_the_pdm_service(self):
         calls = []

@@ -29,6 +29,7 @@ from core.repositories.permission_repository import PermissionRepository
 from core.repositories.signature_repository import SignatureRepository
 from core.services.bom_service import BomService
 from core.services.cad_workspace_service import CadWorkspaceService
+from core.services.commit_service import CommitService
 from core.services.pdm_service import PdmService
 from core.services.project_service import ProjectService
 from core.session_manager import SessionManager
@@ -65,6 +66,7 @@ class CreoBridgeController:
         bom_service_factory=None,
         workspace_service_factory=None,
         pdm_service_factory=None,
+        commit_service_factory=None,
     ) -> None:
         self.session = session or SessionManager()
         self.project_service = project_service or ProjectService()
@@ -74,6 +76,7 @@ class CreoBridgeController:
             workspace_service_factory or CadWorkspaceService
         )
         self._pdm_service_factory = pdm_service_factory or PdmService
+        self._commit_service_factory = commit_service_factory or CommitService
         self._operation_lock = threading.RLock()
 
     @staticmethod
@@ -107,13 +110,17 @@ class CreoBridgeController:
             return self.workspace_checkouts(workspace_match.group(1))
         if method == "GET" and path == "/api/v1/cad":
             return self.project_cad_documents()
+        if method == "POST" and path == "/api/v1/checkin/plan":
+            return self.checkin_plan(body)
         if method == "GET" and path == "/api/v1/cad/resolve":
             values = query.get("file_name") or []
             file_name = values[0] if values else ""
-            return self.resolve_cad(file_name)
+            workspace_values = query.get("workspace_id") or []
+            workspace_id = workspace_values[0] if workspace_values else ""
+            return self.resolve_cad(file_name, workspace_id)
 
         match = re.fullmatch(
-            r"/api/v1/cad/(\d+)(?:/(retrieve|checkout|checkin|undo|history|revise|release))?",
+            r"/api/v1/cad/(\d+)(?:/(retrieve|checkout|checkin|undo|recover|history|revise|release|intent))?",
             path,
         )
         if match:
@@ -129,12 +136,16 @@ class CreoBridgeController:
                 return self.checkin(cad_document_id, body)
             if method == "POST" and action == "undo":
                 return self.undo_checkout(cad_document_id, body)
+            if method == "POST" and action == "recover":
+                return self.recover_checkout(cad_document_id, body)
             if method == "GET" and action == "history":
                 return self.cad_history(cad_document_id)
             if method == "POST" and action == "revise":
                 return self.revise(cad_document_id)
             if method == "POST" and action == "release":
                 return self.release(cad_document_id)
+            if method == "POST" and action == "intent":
+                return self.edit_intent(cad_document_id, body)
 
         raise BridgeApiError(404, "route_not_found", "The bridge route was not found.")
 
@@ -146,6 +157,9 @@ class CreoBridgeController:
 
     def _bom_service(self) -> BomService:
         return self._bom_service_factory()
+
+    def _commit_service(self) -> CommitService:
+        return self._commit_service_factory()
 
     def _require_session(self) -> int:
         user_id = getattr(self.session, "user_id", None)
@@ -255,7 +269,51 @@ class CreoBridgeController:
             )
         return service, workspace
 
-    def _status_payload(self, document: dict) -> dict:
+    def _checkout_workspace_record(self, document: dict):
+        """Return the service and registry row for a document's checkout workspace."""
+        workspace_id = str(document.get("checkout_workspace_id") or "").strip().lower()
+        service = self._workspace_service()
+        if not workspace_id:
+            return service, None
+        try:
+            return service, service.get_workspace(workspace_id)
+        except Exception:
+            # A malformed or removed legacy workspace identifier is stale state,
+            # not a reason to make the CAD document permanently uncheckable.
+            return service, None
+
+    def _has_stale_owned_checkout(self, document: dict, user_id: int) -> bool:
+        """Detect an owner's checkout whose managed workspace no longer exists."""
+        owner = document.get("checked_out_by")
+        if owner is None or int(owner) != int(user_id):
+            return False
+        _service, workspace = self._checkout_workspace_record(document)
+        return not workspace or not workspace.get("available")
+
+    def _recover_stale_owned_checkout(
+        self, document: dict, user_id: int, *, note: str
+    ) -> bool:
+        """Release only a current user's checkout stranded by a missing workspace."""
+        if not self._has_stale_owned_checkout(document, user_id):
+            return False
+        self._bom_service().undo_checkout_pdm_cad_document(
+            int(document["id"]), note
+        )
+        return True
+
+    @staticmethod
+    def _workspace_conflict_message(document: dict) -> str:
+        workspace_name = str(document.get("checkout_workspace_name") or "").strip()
+        workspace_id = str(document.get("checkout_workspace_id") or "").strip()
+        label = workspace_name or workspace_id or "an unmanaged workspace"
+        return (
+            "This CAD Document is checked out by you in another workspace "
+            f"({label}). Undo the CAD checkout in that workspace before using it here."
+        )
+
+    def _status_payload(
+        self, document: dict, *, local_workspace_id: str | None = None
+    ) -> dict:
         user_id = self._require_session()
         owner = document.get("checked_out_by")
         owner_id = int(owner) if owner is not None else None
@@ -265,11 +323,33 @@ class CreoBridgeController:
         ).strip()
         local_machine = socket.gethostname().strip() or "unknown-machine"
         workspace = None
+        edit_intent = None
+        intent_workspace_id = str(local_workspace_id or workspace_id).strip().lower()
+        intent_workspace = None
         if workspace_id:
             try:
-                workspace = self._workspace_service().get_workspace(workspace_id)
+                workspace_service = self._workspace_service()
+                workspace = workspace_service.get_workspace(workspace_id)
+                if workspace and hasattr(workspace_service, "get_edit_intent"):
+                    edit_intent = workspace_service.get_edit_intent(
+                        workspace_id, int(document["id"])
+                    )
             except Exception:
                 workspace = None
+        if intent_workspace_id:
+            try:
+                intent_service = self._workspace_service()
+                intent_workspace = intent_service.get_workspace(intent_workspace_id)
+                if intent_workspace and hasattr(intent_service, "get_edit_intent"):
+                    edit_intent = intent_service.get_edit_intent(
+                        intent_workspace_id, int(document["id"])
+                    )
+            except Exception:
+                intent_workspace = None
+        checkout_workspace_available = bool(workspace and workspace.get("available"))
+        checkout_recovery_available = bool(
+            owner_id == user_id and not checkout_workspace_available
+        )
         owned_here = bool(
             owner_id == user_id
             and workspace_id
@@ -320,7 +400,16 @@ class CreoBridgeController:
                 document.get("checkout_workspace_name") or ""
             ),
             "checkout_workspace_machine_id": workspace_machine or None,
-            "workspace_path": str((workspace or {}).get("path") or "") or None,
+            "checkout_workspace_available": checkout_workspace_available,
+            "checkout_recovery_available": checkout_recovery_available,
+            "workspace_path": str(
+                (workspace or intent_workspace or {}).get("path") or ""
+            ) or None,
+            "local_edit_intent": bool(edit_intent),
+            "local_edit_intent_at": (
+                str((edit_intent or {}).get("created_at") or "") or None
+            ),
+            "server_save_blocked": bool(edit_intent and not owned_here),
             "can_checkout": bool(
                 can_commit and owner_id is None and lifecycle not in {"RELEASED", "OBSOLETE"}
             ),
@@ -383,6 +472,7 @@ class CreoBridgeController:
         *,
         include_related_drawings: bool,
         include_dependencies: bool,
+        preserve_local_changes: bool = False,
     ) -> tuple[list[dict], list[int]]:
         """Copy a root model and its controlled dependency closure safely."""
         pdm = self._pdm_service()
@@ -421,6 +511,10 @@ class CreoBridgeController:
                 workspace["id"],
                 document_id,
                 preserve_existing=False,
+                preserve_local_changes=(
+                    bool(preserve_local_changes)
+                    and document_id == int(root_cad_document_id)
+                ),
                 include_related_drawings=include_related_drawings,
                 editable=editable,
             )
@@ -431,7 +525,7 @@ class CreoBridgeController:
                     materialized_ids.add(copied_id)
         return materialized, dependency_ids
 
-    def resolve_cad(self, file_name: str) -> dict:
+    def resolve_cad(self, file_name: str, workspace_id: str = "") -> dict:
         _user_id, project_id, _project = self._require_project()
         clean_name = CadWorkspaceService.logical_name(str(file_name or ""))
         if not clean_name:
@@ -441,7 +535,11 @@ class CreoBridgeController:
         )
         if not document:
             return {"cad": {"managed": False, "file_name": clean_name}}
-        return {"cad": self._status_payload(dict(document))}
+        return {
+            "cad": self._status_payload(
+                dict(document), local_workspace_id=str(workspace_id or "").strip()
+            )
+        }
 
     def cad_status(self, cad_document_id: int) -> dict:
         _user_id, _project_id, _project, document = self._document(cad_document_id)
@@ -529,11 +627,16 @@ class CreoBridgeController:
                 document, user_id, workspace, workspace_service
             )
             if owner is not None and int(owner) == user_id and not checked_out_here:
-                raise BridgeApiError(
-                    409,
-                    "workspace_conflict",
-                    "This CAD Document is checked out by you in another workspace.",
-                )
+                if not self._recover_stale_owned_checkout(
+                    document,
+                    user_id,
+                    note="Recovered stale checkout before Creo retrieve",
+                ):
+                    raise BridgeApiError(
+                        409,
+                        "workspace_conflict",
+                        self._workspace_conflict_message(document),
+                    )
             files, dependency_ids = self._materialize_cad_package(
                 workspace_service,
                 workspace,
@@ -555,6 +658,11 @@ class CreoBridgeController:
             _user_id, _project_id, _project = self._require_commit_permission()
             _uid, _pid, _project_row, document = self._document(cad_document_id)
             workspace_service, workspace = self._workspace(body.get("workspace_id"))
+            self._recover_stale_owned_checkout(
+                document,
+                int(_user_id),
+                note="Recovered stale checkout before Creo checkout",
+            )
             bom_service = self._bom_service()
             revision_candidates = [document]
             if str(document.get("category") or "").upper() != "DRAWING":
@@ -598,6 +706,7 @@ class CreoBridgeController:
                         str(body.get("released_item_revision_code") or "").strip() or None
                     ),
                     released_item_revision_codes=revision_codes,
+                    explicit_item_checkout=True,
                     **descriptor,
                 )
                 checked_out = True
@@ -608,6 +717,7 @@ class CreoBridgeController:
                     int(_user_id),
                     include_related_drawings=bool(body.get("include_drawings", True)),
                     include_dependencies=bool(body.get("include_dependencies", True)),
+                    preserve_local_changes=bool(body.get("preserve_local_changes", False)),
                 )
             except Exception:
                 if checked_out:
@@ -685,7 +795,7 @@ class CreoBridgeController:
 
     def checkin(self, cad_document_id: int, body: dict) -> dict:
         with self._operation_lock:
-            user_id, _project_id, _project = self._require_commit_permission()
+            user_id, _project_id, project = self._require_commit_permission()
             _uid, _pid, _project_row, document = self._document(cad_document_id)
             if document.get("checked_out_by") is None or int(document["checked_out_by"]) != user_id:
                 raise BridgeApiError(
@@ -711,20 +821,100 @@ class CreoBridgeController:
                 document,
                 str(body.get("path") or "").strip(),
             )
-            match = _CAD_VERSION_RE.search(source.name)
-            creo_version = int(match.group(1)) if match else None
-            result = self._bom_service().checkin_pdm_cad_document(
-                int(cad_document_id),
-                str(source),
-                note,
-                source_file_name=source.name,
-                creo_file_version=creo_version,
+            working_directory = str(project.get("working_directory") or "").strip()
+            if not working_directory:
+                raise BridgeApiError(
+                    409,
+                    "project_directory_required",
+                    "The active Nexus project has no working directory.",
+                )
+            commit_service = self._commit_service()
+            user = commit_service.user_service.get_user_by_id(int(user_id))
+            designer = str(getattr(user, "username", "") or "").strip()
+            if not designer:
+                raise BridgeApiError(404, "user_not_found", "The Nexus user was not found.")
+            target_commit_id = str(body.get("target_commit_id") or "").strip()
+            duplicate_action = str(body.get("duplicate_action") or "error").strip().lower()
+            title = datetime.now().strftime("Creo check-in %Y-%m-%d %H%M%S")
+            try:
+                result = commit_service.commit_file(
+                    os.path.join(working_directory, "commits"),
+                    [str(source)],
+                    designer,
+                    note,
+                    title,
+                    workspace_expectations=[{
+                        "path": str(source),
+                        "workspace_id": str(workspace["id"]),
+                        "cad_document_id": int(cad_document_id),
+                    }],
+                    target_commit_id=target_commit_id or None,
+                    duplicate_action=duplicate_action,
+                )
+            except ValueError as exc:
+                message = str(exc)
+                if "Choose Replace or Skip" in message:
+                    raise BridgeApiError(409, "pending_file_conflict", message)
+                raise
+            commit_service.emit_project_event(
+                "commit.staged_from_creo",
+                entity_type="COMMIT",
+                entity_id=result.get("commit_id"),
+                actor_user_id=0,
+                payload={
+                    "commit_id": result.get("commit_id"),
+                    "item_ids": result.get("affected_part_ids") or [],
+                    "cad_document_ids": result.get("affected_cad_document_ids") or [],
+                    "status": "Pending",
+                    "source": "CREO_JLINK",
+                },
             )
             return {
-                "checkin": result,
+                "checkin": {
+                    "staged": True,
+                    "finalized": False,
+                    "message": "The CAD file is staged in a Pending commit.",
+                },
+                "pending_commit": result,
                 "source_path": str(source),
                 "cad": self.cad_status(cad_document_id),
             }
+
+    def checkin_plan(self, body: dict) -> dict:
+        """Describe pending-group and duplicate choices before a Creo batch."""
+        user_id, project_id, _project = self._require_commit_permission()
+        commit_service = self._commit_service()
+        conflicts = []
+        seen = set()
+        for value in body.get("cad_document_ids") or []:
+            try:
+                cad_document_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if cad_document_id in seen:
+                continue
+            seen.add(cad_document_id)
+            _uid, _pid, _row, document = self._document(cad_document_id)
+            clean_name = commit_service._clean_creo_file_name(
+                str(document.get("file_name") or "")
+            )
+            pending = commit_service.commit_repository.get_pending_commit_by_base_filename(
+                clean_name, int(project_id)
+            )
+            if pending:
+                pending_user_id = int(getattr(pending, "designer", 0) or 0)
+                conflicts.append({
+                    "cad_document_id": cad_document_id,
+                    "file_name": clean_name,
+                    "commit_id": str(getattr(pending, "commit_id", "") or ""),
+                    "title": str(getattr(pending, "title", "") or ""),
+                    "replace_allowed": pending_user_id == int(user_id),
+                    "owner": str(getattr(pending, "username", "") or ""),
+                })
+        return {
+            "pending_commits": commit_service.pending_commit_choices(int(user_id)),
+            "conflicts": conflicts,
+        }
 
     def undo_checkout(self, cad_document_id: int, body: dict) -> dict:
         with self._operation_lock:
@@ -745,6 +935,81 @@ class CreoBridgeController:
                 "undo": result,
                 "cad": self.cad_status(cad_document_id),
                 "local_files_retained": True,
+            }
+
+    def recover_checkout(self, cad_document_id: int, body: dict) -> dict:
+        """Recover an owner checkout after its managed workspace was deleted."""
+        with self._operation_lock:
+            user_id, _project_id, _project = self._require_commit_permission()
+            _uid, _pid, _project_row, document = self._document(cad_document_id)
+            owner = document.get("checked_out_by")
+            if owner is None or int(owner) != user_id:
+                raise BridgeApiError(
+                    409,
+                    "not_checkout_owner",
+                    "Only the user who owns this CAD checkout can recover it.",
+                )
+            if not self._has_stale_owned_checkout(document, user_id):
+                raise BridgeApiError(
+                    409,
+                    "workspace_still_available",
+                    self._workspace_conflict_message(document),
+                )
+            result = self._bom_service().undo_checkout_pdm_cad_document(
+                int(cad_document_id),
+                str(body.get("note") or "Recovered checkout after workspace deletion").strip(),
+            )
+            return {
+                "recovery": result,
+                "cad": self.cad_status(cad_document_id),
+                "local_files_retained": False,
+            }
+
+    def edit_intent(self, cad_document_id: int, body: dict) -> dict:
+        """Make the local copy editable without granting a server checkout."""
+        with self._operation_lock:
+            user_id, _project_id, _project = self._require_commit_permission()
+            _uid, _pid, _project_row, document = self._document(cad_document_id)
+            workspace_service, workspace = self._workspace(body.get("workspace_id"))
+            if self._checked_out_in_workspace(
+                document, user_id, workspace, workspace_service
+            ):
+                return {
+                    "intent": {
+                        "enabled": False,
+                        "reason": "CAD Document is already checked out by this user.",
+                    },
+                    "cad": self._status_payload(
+                        document, local_workspace_id=str(workspace["id"])
+                    ),
+                }
+            if (
+                document.get("checked_out_by") is not None
+                and int(document["checked_out_by"]) == user_id
+            ):
+                if self._recover_stale_owned_checkout(
+                    document,
+                    user_id,
+                    note="Recovered stale checkout before local edit intent",
+                ):
+                    _uid, _pid, _project_row, document = self._document(cad_document_id)
+                else:
+                    raise BridgeApiError(
+                        409,
+                        "workspace_conflict",
+                        self._workspace_conflict_message(document),
+                    )
+            intent = workspace_service.set_edit_intent(
+                workspace["id"],
+                int(cad_document_id),
+                int(user_id),
+                str(body.get("reason") or "User chose to continue locally."),
+            )
+            return {
+                "intent": intent,
+                "cad": self._status_payload(
+                    document, local_workspace_id=str(workspace["id"])
+                ),
             }
 
 

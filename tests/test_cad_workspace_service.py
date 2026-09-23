@@ -127,6 +127,29 @@ class CadWorkspaceServiceTests(unittest.TestCase):
         self.service.release_cad_document(workspace["id"], 11)
         self.assertFalse(bool(copied_path.stat().st_mode & stat.S_IWRITE))
 
+    def test_local_edit_intent_preserves_changes_when_checkout_adopts_them(self):
+        workspace = self.service.create_workspace("Local intent")
+        copied = self.service.materialize_cad_document(workspace["id"], 11, editable=False)
+        copied_path = Path(copied["path"])
+        intent = self.service.set_edit_intent(
+            workspace["id"], 11, 7, "Continue locally"
+        )
+        copied_path.write_bytes(b"local-edit")
+        adopted = self.service.materialize_cad_document(
+            workspace["id"],
+            11,
+            preserve_local_changes=True,
+            editable=True,
+        )
+
+        self.assertTrue(intent["enabled"])
+        self.assertIsNone(self.service.get_edit_intent(workspace["id"], 11))
+        self.assertEqual(Path(adopted["path"]).read_bytes(), b"local-edit")
+        self.assertTrue(adopted["stage_ready_after_checkout"])
+        self.assertTrue(bool(Path(adopted["path"]).stat().st_mode & stat.S_IWRITE))
+        rows = self.service.scan_workspace(workspace["id"], 1, 7)
+        self.assertTrue(rows[0]["modified"])
+
     def test_delete_blocks_active_checkout_and_then_requires_force_for_files(self):
         workspace = self.service.create_workspace("Delete guard")
         self.repo.documents[11]["checkout_workspace_id"] = workspace["id"]

@@ -3208,6 +3208,7 @@ class BomService(BaseService):
         workspace_name: str | None = None,
         workspace_machine_id: str | None = None,
         checkout_item_ids: list[int] | tuple[int, ...] | None = None,
+        explicit_item_checkout: bool = False,
     ) -> Dict:
         """Check out CAD and coordinate every affected Item working copy."""
         cad_document_id = int(cad_document_id)
@@ -3287,10 +3288,20 @@ class BomService(BaseService):
             else:
                 self.revision_repo.assert_mutable(int(associated_item_id))
 
-        auto_item_checkout_ids = []
+        created_item_checkout_ids = []
+        promoted_item_checkout_ids = []
         try:
             for associated_item_id in associated_item_ids:
-                if self.lock_repo.get_by_part(int(associated_item_id)):
+                existing_lock = self.lock_repo.get_by_part(int(associated_item_id))
+                if existing_lock:
+                    if (
+                        explicit_item_checkout
+                        and str(getattr(existing_lock, "checkout_origin", "ITEM") or "ITEM").upper() == "CAD"
+                    ):
+                        self.lock_repo.set_checkout_origin(
+                            int(associated_item_id), "ITEM"
+                        )
+                        promoted_item_checkout_ids.append(int(associated_item_id))
                     continue
                 revision_code = effective_revision_codes.get(
                     int(associated_item_id), ""
@@ -3300,9 +3311,9 @@ class BomService(BaseService):
                     as_user_id=actor_id,
                     released_revision_code=revision_code or None,
                     exact_item=True,
-                    checkout_origin="CAD",
+                    checkout_origin=("ITEM" if explicit_item_checkout else "CAD"),
                 )
-                auto_item_checkout_ids.append(int(associated_item_id))
+                created_item_checkout_ids.append(int(associated_item_id))
             result = self.pdm_service.checkout_cad_document(
                 cad_document_id,
                 actor_id,
@@ -3348,12 +3359,19 @@ class BomService(BaseService):
                     )
             except Exception:
                 pass
-            for associated_item_id in reversed(auto_item_checkout_ids):
+            for associated_item_id in reversed(created_item_checkout_ids):
                 try:
                     self.undo_checkout(
                         int(associated_item_id),
                         as_user_id=actor_id,
                         exact_item=True,
+                    )
+                except Exception:
+                    pass
+            for associated_item_id in reversed(promoted_item_checkout_ids):
+                try:
+                    self.lock_repo.set_checkout_origin(
+                        int(associated_item_id), "CAD"
                     )
                 except Exception:
                     pass
@@ -3382,8 +3400,19 @@ class BomService(BaseService):
                 recorded_item_ids[0] if recorded_item_ids else None
             ),
             "related_drawing_checkout_ids": related_drawing_ids,
-            "item_checkout_auto_created": bool(auto_item_checkout_ids),
-            "item_checkout_auto_created_ids": auto_item_checkout_ids,
+            "item_checkout_auto_created": bool(
+                created_item_checkout_ids and not explicit_item_checkout
+            ),
+            "item_checkout_auto_created_ids": (
+                created_item_checkout_ids if not explicit_item_checkout else []
+            ),
+            "item_checkout_explicit": bool(
+                explicit_item_checkout and associated_item_ids
+            ),
+            "item_checkout_explicit_ids": (
+                sorted(set(int(value) for value in associated_item_ids))
+                if explicit_item_checkout else []
+            ),
         }
 
     def checkin_pdm_cad_document(

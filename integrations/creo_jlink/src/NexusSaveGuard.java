@@ -22,6 +22,9 @@ public class NexusSaveGuard extends DefaultUICommandBracketListener {
 
     public void OnBeforeCommand() throws jxthrowable {
         Model model = session.GetCurrentModel();
+        if (model == null) {
+            model = session.GetActiveModel();
+        }
         if (model != null) {
             enforce(model);
         }
@@ -39,13 +42,14 @@ public class NexusSaveGuard extends DefaultUICommandBracketListener {
         boolean block = false;
         String reason = "";
         try {
-            Map<String, Object> status = api.resolveCad(fileName);
+            Map<String, Object> status = NexusJLink.resolveCadForModel(model);
             if (!MiniJson.bool(status, "managed")) {
                 if (isTrackedWorkspaceFile(model, fileName)) {
                     block = true;
                     reason = "The file belongs to a Nexus workspace, but the active Nexus project does not match it.";
                 }
-            } else if (!MiniJson.bool(status, "can_modify")) {
+            } else if (!MiniJson.bool(status, "can_modify")
+                && !MiniJson.bool(status, "local_edit_intent")) {
                 block = true;
                 reason = MiniJson.text(status, "read_only_reason");
                 String owner = MiniJson.text(status, "checked_out_by_username");
@@ -55,6 +59,9 @@ public class NexusSaveGuard extends DefaultUICommandBracketListener {
             } else if (!modelIsInsideWorkspace(model, MiniJson.text(status, "workspace_path"))) {
                 block = true;
                 reason = "Open the checked-out copy from its assigned Nexus CAD workspace before editing.";
+            } else if (MiniJson.bool(status, "local_edit_intent")) {
+                // Local intent permits a local Save; server check-in remains blocked.
+                return;
             }
         } catch (Exception error) {
             if (isTrackedWorkspaceFile(model, fileName)) {

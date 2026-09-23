@@ -409,16 +409,138 @@ class CommitRepository:
     def get_pending_commit_by_base_filename(self, base_file_name: str, project_id: int) -> Commit:
         with self.get_conn() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT * FROM commits WHERE base_file_name=? AND status='Pending' AND project_id=?", (base_file_name,project_id,))
+            cur.execute(
+                "SELECT * FROM commits WHERE lower(base_file_name)=lower(?) AND status='Pending' AND project_id=?",
+                (base_file_name, project_id),
+            )
             row = cur.fetchone()
             if row:
                 return self._row_to_commit(row)
             return None
+
+    def get_pending_rows_by_base_filename(
+        self, base_file_name: str, project_id: int
+    ) -> list[dict]:
+        """Return every Item-history row for one file in a pending commit."""
+        with self.get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT c.*, u.username AS designer_name
+                FROM commits c
+                LEFT JOIN users u ON u.id=c.designer
+                WHERE lower(c.base_file_name)=lower(?)
+                  AND c.status='Pending' AND c.project_id=?
+                ORDER BY c.id
+                """,
+                (str(base_file_name), int(project_id)),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def delete_pending_rows_by_base_filename(
+        self,
+        base_file_name: str,
+        project_id: int,
+        *,
+        exclude_row_ids=None,
+    ) -> list[dict]:
+        """Delete replaced pending rows while preserving newly inserted rows."""
+        excluded = {
+            int(value) for value in (exclude_row_ids or []) if value is not None
+        }
+        with self.get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT c.*, u.username AS designer_name
+                FROM commits c
+                LEFT JOIN users u ON u.id=c.designer
+                WHERE lower(c.base_file_name)=lower(?)
+                  AND c.status='Pending' AND c.project_id=?
+                ORDER BY c.id
+                """,
+                (str(base_file_name), int(project_id)),
+            ).fetchall()
+            removed = [dict(row) for row in rows if int(row["id"]) not in excluded]
+            if removed:
+                placeholders = ",".join("?" for _ in removed)
+                removed_ids = tuple(int(row["id"]) for row in removed)
+                # Traceability rows reference the physical commit row. Remove
+                # children first so the next foreign-key-enabled repository
+                # transaction does not encounter orphaned links.
+                for sql in (
+                    f"DELETE FROM commit_step_diffs WHERE commit_id IN ({placeholders})",
+                    f"DELETE FROM commit_file_links WHERE commit_row_id IN ({placeholders})",
+                ):
+                    try:
+                        conn.execute(sql, removed_ids)
+                    except sqlite3.OperationalError:
+                        pass
+                conn.execute(
+                    f"DELETE FROM commits WHERE id IN ({placeholders})",
+                    removed_ids,
+                )
+                for commit_id in sorted({str(row["commit_id"]) for row in removed}):
+                    still_used = conn.execute(
+                        "SELECT 1 FROM commits WHERE commit_id=? AND project_id=? LIMIT 1",
+                        (commit_id, int(project_id)),
+                    ).fetchone()
+                    if still_used:
+                        continue
+                    try:
+                        conn.execute(
+                            "DELETE FROM issue_commit_links WHERE commit_id=?",
+                            (commit_id,),
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        conn.execute(
+                            """
+                            DELETE FROM commit_file_links
+                            WHERE commit_group_id IN (
+                                SELECT id FROM commit_groups
+                                WHERE commit_id=? AND project_id=?
+                            )
+                            """,
+                            (commit_id, int(project_id)),
+                        )
+                        conn.execute(
+                            "DELETE FROM commit_groups WHERE commit_id=? AND project_id=?",
+                            (commit_id, int(project_id)),
+                        )
+                    except Exception:
+                        pass
+                conn.commit()
+            return removed
+
+    def hard_delete_rows(self, row_ids) -> int:
+        normalized = sorted({int(value) for value in (row_ids or []) if value is not None})
+        if not normalized:
+            return 0
+        with self.get_conn() as conn:
+            placeholders = ",".join("?" for _ in normalized)
+            params = tuple(normalized)
+            for sql in (
+                f"DELETE FROM commit_step_diffs WHERE commit_id IN ({placeholders})",
+                f"DELETE FROM commit_file_links WHERE commit_row_id IN ({placeholders})",
+            ):
+                try:
+                    conn.execute(sql, params)
+                except sqlite3.OperationalError:
+                    pass
+            cur = conn.execute(
+                f"DELETE FROM commits WHERE id IN ({placeholders})",
+                params,
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)
     
     def is_duplicate_commit(self, base_file_name: str, project_id: int) -> bool:
         with self.get_conn() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM commits WHERE base_file_name=? AND status='Pending' AND project_id=?", (base_file_name,project_id,))
+            cur.execute(
+                "SELECT COUNT(*) FROM commits WHERE lower(base_file_name)=lower(?) AND status='Pending' AND project_id=?",
+                (base_file_name, project_id),
+            )
             count = cur.fetchone()[0]
             return count > 0
         
@@ -585,6 +707,7 @@ class CommitRepository:
             cur = conn.cursor()
             for sql, params in (
                 ("DELETE FROM issue_commit_links WHERE commit_id = ?", (str(commit_id),)),
+                ("DELETE FROM commit_step_diffs WHERE commit_id IN (SELECT id FROM commits WHERE commit_id = ? AND project_id = ?)", (str(commit_id), int(project_id))),
                 ("DELETE FROM commit_file_links WHERE commit_group_id IN (SELECT id FROM commit_groups WHERE commit_id = ? AND project_id = ?)", (str(commit_id), int(project_id))),
                 ("DELETE FROM commit_groups WHERE commit_id = ? AND project_id = ?", (str(commit_id), int(project_id))),
             ):

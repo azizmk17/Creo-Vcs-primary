@@ -40,8 +40,16 @@ public class NexusApiClient {
     }
 
     public Map<String, Object> resolveCad(String fileName) throws Exception {
-        String encoded = URLEncoder.encode(fileName, "UTF-8");
-        return MiniJson.object(request("GET", "/cad/resolve?file_name=" + encoded, null).get("cad"));
+        return resolveCad(fileName, null);
+    }
+
+    public Map<String, Object> resolveCad(String fileName, String workspaceId) throws Exception {
+        String encoded = URLEncoder.encode(fileName == null ? "" : fileName, "UTF-8");
+        String path = "/cad/resolve?file_name=" + encoded;
+        if (workspaceId != null && workspaceId.trim().length() > 0) {
+            path += "&workspace_id=" + URLEncoder.encode(workspaceId, "UTF-8");
+        }
+        return MiniJson.object(request("GET", path, null).get("cad"));
     }
 
     public List<Object> listCadDocuments() throws Exception {
@@ -76,27 +84,51 @@ public class NexusApiClient {
         int cadId,
         String workspaceId,
         boolean reviseReleased,
-        String releasedItemRevision
+        String releasedItemRevision,
+        boolean preserveLocalChanges
     ) throws Exception {
         Map<String, Object> body = new LinkedHashMap<String, Object>();
         body.put("workspace_id", workspaceId);
         body.put("include_drawings", Boolean.TRUE);
         body.put("include_dependencies", Boolean.TRUE);
         body.put("revise_released", Boolean.valueOf(reviseReleased));
+        body.put("preserve_local_changes", Boolean.valueOf(preserveLocalChanges));
         if (releasedItemRevision != null && releasedItemRevision.trim().length() > 0) {
             body.put("released_item_revision_code", releasedItemRevision.trim());
         }
         return request("POST", "/cad/" + cadId + "/checkout", body);
     }
 
+    public Map<String, Object> setEditIntent(
+        int cadId, String workspaceId, String reason
+    ) throws Exception {
+        Map<String, Object> body = new LinkedHashMap<String, Object>();
+        body.put("workspace_id", workspaceId);
+        body.put("reason", reason == null ? "" : reason);
+        return request("POST", "/cad/" + cadId + "/intent", body);
+    }
+
     public Map<String, Object> checkin(
-        int cadId, String workspaceId, String path, String note
+        int cadId,
+        String workspaceId,
+        String path,
+        String note,
+        String targetCommitId,
+        String duplicateAction
     ) throws Exception {
         Map<String, Object> body = new LinkedHashMap<String, Object>();
         body.put("workspace_id", workspaceId);
         body.put("path", path == null ? "" : path);
         body.put("note", note);
+        body.put("target_commit_id", targetCommitId == null ? "" : targetCommitId);
+        body.put("duplicate_action", duplicateAction == null ? "error" : duplicateAction);
         return request("POST", "/cad/" + cadId + "/checkin", body);
+    }
+
+    public Map<String, Object> checkinPlan(List<Integer> cadDocumentIds) throws Exception {
+        Map<String, Object> body = new LinkedHashMap<String, Object>();
+        body.put("cad_document_ids", cadDocumentIds);
+        return request("POST", "/checkin/plan", body);
     }
 
     public Map<String, Object> undoCheckout(int cadId, String note) throws Exception {

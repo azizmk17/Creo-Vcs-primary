@@ -19,18 +19,43 @@ authority.
   including unmapped local files, plus active Nexus checkouts.
 - **CAD History** shows the append-only checkout, check-in, and undo history for
   the current CAD Document.
-- **Check Out** obtains the Nexus CAD/Item lock and opens the editable workspace copy.
+- **Check Out** obtains the Nexus CAD lock plus an explicit checkout for every
+  associated Item, then opens the editable workspace copy. The Item checkout is
+  visible and independently owned by the current user rather than being a hidden
+  CAD-only reservation.
 - **Check In** shows a workspace checklist that starts with every Creo file found in
   the selected local CAD workspace, then marks checked-out CAD Documents and managed
   models currently loaded in Creo, including loaded children/dependencies. The user
-  selects which eligible CAD Documents to check in, one shared comment is applied,
-  Nexus creates the next managed CAD iteration for each selected document, and
-  retained files become read-only.
+  selects which eligible CAD Documents to stage and one shared comment is applied.
+  If the user already owns a Pending commit, Creo asks whether to add the files to
+  that group or create a new one. If a model is already pending, Creo asks whether
+  to replace that pending copy or skip it. The selected files then appear in the
+  Commit page's Pending section. CAD and associated Item checkouts remain active
+  until the Pending commit is approved and merged; merge creates the managed CAD
+  iteration and closes the coordinated checkouts.
 - **Undo Check Out** releases the coordinated checkout and keeps local files read-only.
 - **Create CAD Revision** creates the next CAD revision after the working copy is
   checked in or undone.
 - **Release CAD Document** promotes a checked-in CAD Document through the Nexus
   lifecycle. Released data must be revised before it can be edited again.
+
+Before a managed read-only model is changed, the J-Link guard runs at the Creo
+command boundary. It covers feature edit/redefine/delete/suppress/resume and
+dimension-edit commands. The conflict dialog offers:
+
+- **Check Out Now**: obtains the Nexus lock before the Creo command continues.
+- **Continue Locally**: records local edit intent, makes only the workspace copy
+  writable, and allows local Save while keeping Nexus check-in blocked.
+- **Cancel**: cancels the Creo edit command.
+
+Creo 3.0 can report a loaded child as modified after some feature-edit button
+workflows have already started. The integration also checks loaded models after
+guarded commands; an unauthorized modified child immediately raises the same
+conflict workflow and keeps Nexus Save/check-in blocked.
+
+When local edit intent is later checked out, Nexus preserves the local bytes and
+uses the controlled server file as the comparison baseline, preventing silent
+overwrites of local work.
 
 Managed files that are not checked out by the current Nexus user in the assigned
 workspace are read-only. Command guards also block Save and Rename when checkout
@@ -103,3 +128,7 @@ only if those products are installed elsewhere.
   Documents, then use Retrieve again.
 - **File remains read-only:** check it out into the same CAD workspace from which it
   is opened. Files checked out by another user intentionally remain blocked.
+- **An edit command is not intercepted:** Creo identifies commands by internal
+  command IDs. Enable `auxapp_popup_menu_info yes`, reproduce the edit once, and
+  inspect the newest trail file if a custom Creo command must be added to the
+  guard list in `NexusJLink.java`.

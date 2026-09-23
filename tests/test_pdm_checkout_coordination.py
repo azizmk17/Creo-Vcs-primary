@@ -144,6 +144,17 @@ class PdmCheckoutCoordinationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "associated CAD working copies"):
             self.service.checkin_item_data(1, "metadata")
 
+    def test_cad_checkout_can_create_an_explicit_associated_item_checkout(self):
+        result = self.service.checkout_pdm_cad_document(
+            int(self.owner_cad["id"]), explicit_item_checkout=True
+        )
+
+        item_lock = self.service.lock_repo.get_by_part(1)
+        self.assertEqual((item_lock.user_id, item_lock.checkout_origin), (1, "ITEM"))
+        self.assertTrue(result["item_checkout_explicit"])
+        self.assertEqual(result["item_checkout_explicit_ids"], [1])
+        self.assertFalse(result["item_checkout_auto_created"])
+
     def test_unassociated_cad_checkout_does_not_lock_an_item(self):
         cad_id = self.repo.create_cad_document(
             7, "FREE-CAD", "Free CAD", "free.prt"

@@ -455,14 +455,35 @@ class CommitService(BaseService):
         jira_url: str | None = None,
         engineering_attachments=None,
         workspace_expectations=None,
+        target_commit_id: str | None = None,
+        duplicate_action: str = "error",
     ):
-
-        commit_id = f"commit_{uuid.uuid4().hex[:8]}"
-
         designer_user = self.user_service.get_user_by_username(designer)
         if not designer_user:
             raise ValueError("Unknown designer user")
         designer_id = designer_user.id
+
+        target_rows = []
+        requested_commit_id = str(target_commit_id or "").strip()
+        if requested_commit_id:
+            target_rows = self.commit_repository.get_rows_by_commit_id(
+                requested_commit_id, int(self.session.project_id)
+            )
+            if not target_rows:
+                raise ValueError("The selected pending commit no longer exists.")
+            first_target = target_rows[0]
+            if any(str(row.get("status") or "").lower() != "pending" for row in target_rows):
+                raise ValueError("Only a Pending commit can receive additional Creo files.")
+            if int(first_target.get("designer") or 0) != int(designer_id):
+                raise ValueError("Files can only be added to your own pending commit.")
+            commit_id = requested_commit_id
+            title = str(first_target.get("title") or title).strip()
+        else:
+            commit_id = f"commit_{uuid.uuid4().hex[:8]}"
+
+        duplicate_action = str(duplicate_action or "error").strip().lower()
+        if duplicate_action not in {"error", "replace", "skip"}:
+            raise ValueError("Invalid pending-file conflict action.")
 
         if not uncommitted_parts:
             raise ValueError("No files staged for commit.")
@@ -470,6 +491,7 @@ class CommitService(BaseService):
         user_dir = os.path.join(commit_dir, designer)
         commit_user_dir = os.path.join(user_dir, f"{title}_{commit_id}")
         commit_plan = []
+        skipped_files = []
         expected_by_path = {
             os.path.normcase(os.path.abspath(str(item.get("path") or ""))): dict(item)
             for item in (workspace_expectations or [])
@@ -506,7 +528,20 @@ class CommitService(BaseService):
             creo_file_version = get_version_number(filename)
             print(f"Base file name: {base_f_name}, Extension: {file_extension}")
             if self.commit_repository.is_duplicate_commit(base_f_name, self.session.project_id):
-                raise ValueError(f"Commit already exists for {base_f_name}. Use --force to overwrite.")
+                pending_rows = self.commit_repository.get_pending_rows_by_base_filename(
+                    base_f_name, int(self.session.project_id)
+                )
+                if any(int(row.get("designer") or 0) != int(designer_id) for row in pending_rows):
+                    raise ValueError(
+                        f"Pending commit for {base_f_name} belongs to another user and cannot be replaced."
+                    )
+                if duplicate_action == "skip":
+                    skipped_files.append(filename)
+                    continue
+                if duplicate_action != "replace":
+                    raise ValueError(
+                        f"Pending commit already contains {base_f_name}. Choose Replace or Skip."
+                    )
 
             part_type = "Drw" if category == "DRAWING" else "Cad"
             cad_document = self.pdm_service.repo.get_cad_document_by_file(
@@ -599,6 +634,17 @@ class CommitService(BaseService):
                 "creo_file_version": creo_file_version,
             })
 
+        if not commit_plan:
+            return {
+                "commit_id": requested_commit_id or None,
+                "title": title if requested_commit_id else "",
+                "appended": bool(requested_commit_id),
+                "staged_files": [],
+                "skipped_files": skipped_files,
+                "affected_part_ids": [],
+                "affected_cad_document_ids": [],
+            }
+
         delayed_attachments = self._normalize_engineering_attachments(engineering_attachments)
         step_attachment_by_part = {}
         if bool(step_compare_enabled):
@@ -616,6 +662,7 @@ class CommitService(BaseService):
                 step_attachment_by_part[part_id] = attachment
 
         inserted_any = False
+        inserted_row_ids = []
         try:
             ensure_dir_exists(commit_user_dir)
 
@@ -733,7 +780,7 @@ class CommitService(BaseService):
                     signature = self.signature_repo.add_signature(
                         "commit", designer_id, message
                     )
-                    self.commit_repository.insert(
+                    inserted_row_ids.append(self.commit_repository.insert(
                         history_part_id,
                         item["part_type"],
                         item["filename"],
@@ -760,8 +807,50 @@ class CommitService(BaseService):
                         ),
                         cad_document_id=item.get("cad_document_id"),
                         creo_file_version=item.get("creo_file_version"),
-                    )
+                    ))
                     inserted_any = True
+
+            replaced_rows = []
+            if duplicate_action == "replace":
+                for base_file_name in sorted({item["base_f_name"] for item in commit_plan}):
+                    replaced_rows.extend(
+                        self.commit_repository.delete_pending_rows_by_base_filename(
+                            base_file_name,
+                            int(self.session.project_id),
+                            exclude_row_ids=inserted_row_ids,
+                        )
+                    )
+
+                retained_paths = {
+                    os.path.normcase(os.path.abspath(item["dest_path"]))
+                    for item in commit_plan
+                }
+                for old_row in replaced_rows:
+                    old_dir = os.path.join(
+                        commit_dir,
+                        str(old_row.get("designer_name") or designer),
+                        f"{old_row.get('title') or ''}_{old_row.get('commit_id') or ''}",
+                    )
+                    old_path = os.path.join(old_dir, str(old_row.get("filename") or ""))
+                    if (
+                        os.path.normcase(os.path.abspath(old_path)) not in retained_paths
+                        and safe_exists(old_path)
+                    ):
+                        try:
+                            os.remove(old_path)
+                        except OSError:
+                            pass
+                    try:
+                        old_commit_id = str(old_row.get("commit_id") or "")
+                        old_commit_rows = self.commit_repository.get_rows_by_commit_id(
+                            old_commit_id, int(self.session.project_id)
+                        )
+                        if safe_isdir(old_dir) and not old_commit_rows:
+                            safe_rmtree(old_dir)
+                        elif safe_isdir(old_dir) and not os.listdir(old_dir):
+                            os.rmdir(old_dir)
+                    except OSError:
+                        pass
 
             self.traceability_service.repo.backfill_commit_groups()
             if resolved_issue_ids:
@@ -775,7 +864,12 @@ class CommitService(BaseService):
                     for issue_id in resolved_issue_ids:
                         self.traceability_service.link_jira(issue_id, jira_key or "", jira_url or "")
         except Exception as e:
-            if inserted_any:
+            if inserted_any and requested_commit_id:
+                try:
+                    self.commit_repository.hard_delete_rows(inserted_row_ids)
+                except Exception:
+                    pass
+            elif inserted_any:
                 try:
                     self.commit_repository.hard_delete_by_commit_id(commit_id, self.session.project_id)
                 except Exception:
@@ -813,9 +907,40 @@ class CommitService(BaseService):
         )
         return {
             "commit_id": commit_id,
+            "title": title,
+            "appended": bool(requested_commit_id),
+            "staged_files": [item["filename"] for item in commit_plan],
+            "skipped_files": skipped_files,
             "affected_part_ids": affected_part_ids,
             "affected_cad_document_ids": affected_cad_ids,
         }
+
+    def pending_commit_choices(self, user_id: int | None = None) -> list[dict]:
+        """Return the current user's persisted Pending commit groups."""
+        actor_id = int(user_id if user_id is not None else self.user_id)
+        rows = self.commit_repository.get_by_status(
+            "Pending", int(self.session.project_id)
+        )
+        grouped = {}
+        for row in rows:
+            if int(getattr(row, "designer", 0) or 0) != actor_id:
+                continue
+            commit_id = str(getattr(row, "commit_id", "") or "")
+            group = grouped.setdefault(commit_id, {
+                "commit_id": commit_id,
+                "title": str(getattr(row, "title", "") or ""),
+                "message": str(getattr(row, "message", "") or ""),
+                "committed_at": str(getattr(row, "committed_at", "") or ""),
+                "files": [],
+            })
+            filename = str(getattr(row, "filename", "") or "")
+            if filename and filename not in group["files"]:
+                group["files"].append(filename)
+        return sorted(
+            grouped.values(),
+            key=lambda row: row.get("committed_at") or "",
+            reverse=True,
+        )
 
 
     def get_commit_history (self):

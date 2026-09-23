@@ -763,13 +763,17 @@ class PdmRepository:
         if version_match:
             clean_file = version_match.group(1)
         with self.get_conn() as conn:
-            return self._dict(conn.execute(
+            record = self._dict(conn.execute(
                 """
                 SELECT * FROM cad_documents
                 WHERE project_id=? AND lower(file_name)=lower(?)
                 """,
                 (int(project_id), clean_file),
             ).fetchone())
+            if not record:
+                return None
+            self._add_checkout_usernames(conn, [record])
+            return record
 
     def get_cad_document_by_legacy_item(self, item_id: int) -> Optional[dict]:
         with self.get_conn() as conn:

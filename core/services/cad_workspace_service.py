@@ -352,6 +352,7 @@ class CadWorkspaceService:
         cad_document_id: int,
         *,
         preserve_existing: bool = False,
+        preserve_local_changes: bool = False,
         source_path: str | os.PathLike | None = None,
         editable: bool = True,
     ) -> dict:
@@ -387,7 +388,22 @@ class CadWorkspaceService:
                 f"{logical}. Review that workspace or choose another one."
             )
 
-        if source_path:
+        preserve_local_file = bool(
+            preserve_local_changes and existing_entry and existing
+        )
+        if preserve_local_file:
+            # Keep the user's local edit while retaining the controlled source
+            # as the new checkout baseline for later change detection.
+            source = self.resolve_controlled_source(document)
+            destination = max(
+                existing,
+                key=lambda candidate: (
+                    int(_CREO_RE.match(candidate.name).group(2))
+                    if _CREO_RE.match(candidate.name) else 0,
+                    candidate.name.casefold(),
+                ),
+            ).resolve()
+        elif source_path:
             source = Path(source_path).expanduser().resolve()
         elif preserve_existing and existing:
             def _version_key(candidate: Path) -> tuple[int, str]:
@@ -400,9 +416,14 @@ class CadWorkspaceService:
         if not source.is_file():
             raise ValueError("The controlled CAD source file does not exist.")
         baseline_hash = self._sha256(source)
-        destination = path / source.name
+        if not preserve_local_file:
+            destination = path / source.name
         if destination.exists():
-            if self._sha256(destination) != baseline_hash and not preserve_existing:
+            if (
+                self._sha256(destination) != baseline_hash
+                and not preserve_existing
+                and not preserve_local_file
+            ):
                 raise ValueError(
                     f"{destination.name} already exists with different content in the workspace."
                 )
@@ -425,7 +446,7 @@ class CadWorkspaceService:
             # already the user's workspace file.  The local file should remain
             # stageable immediately after checkout even if it equals the newly
             # recorded baseline hash.
-            "stage_ready_after_checkout": bool(source_path),
+            "stage_ready_after_checkout": bool(source_path or preserve_local_file),
             "materialized_at": _utc_now(),
         }
         manifest.setdefault("entries", {})[str(int(cad_document_id))] = entry
@@ -444,6 +465,7 @@ class CadWorkspaceService:
         cad_document_id: int,
         *,
         preserve_existing: bool = False,
+        preserve_local_changes: bool = False,
         source_path: str | os.PathLike | None = None,
         include_related_drawings: bool = True,
         editable: bool = True,
@@ -453,6 +475,7 @@ class CadWorkspaceService:
             workspace_id,
             int(cad_document_id),
             preserve_existing=preserve_existing,
+            preserve_local_changes=preserve_local_changes,
             source_path=source_path,
             editable=editable,
         )
@@ -494,6 +517,55 @@ class CadWorkspaceService:
         entry["editable"] = bool(editable)
         self._save_manifest(str(workspace_id), manifest)
         return changed
+
+    def set_edit_intent(
+        self,
+        workspace_id: str,
+        cad_document_id: int,
+        user_id: int,
+        reason: str = "",
+    ) -> dict:
+        """Make a local workspace copy editable without granting server checkout."""
+        manifest = self.load_manifest(str(workspace_id))
+        key = str(int(cad_document_id))
+        entry = (manifest.get("entries") or {}).get(key)
+        if not entry:
+            raise ValueError(
+                "The CAD Document is not materialized in the selected Nexus workspace."
+            )
+        intent = {
+            "enabled": True,
+            "user_id": int(user_id),
+            "reason": str(reason or "").strip(),
+            "created_at": _utc_now(),
+        }
+        entry["edit_intent"] = intent
+        entry["editable"] = True
+        logical_key = str(entry.get("logical_file_name") or "").casefold()
+        changed = []
+        try:
+            for child in self.workspace_path(str(workspace_id)).iterdir():
+                if (
+                    child.is_file()
+                    and self.logical_name(child.name).casefold() == logical_key
+                    and (_CREO_RE.match(child.name) or _CREO_UNVERSIONED_RE.match(child.name))
+                ):
+                    self._set_path_editable(child, True)
+                    changed.append(str(child))
+        except OSError as exc:
+            raise ValueError(f"Could not make the local CAD copy editable: {exc}")
+        manifest["entries"][key] = entry
+        self._save_manifest(str(workspace_id), manifest)
+        return {**intent, "cad_document_id": int(cad_document_id), "files": changed}
+
+    def get_edit_intent(self, workspace_id: str, cad_document_id: int) -> dict | None:
+        try:
+            manifest = self.load_manifest(str(workspace_id), required=False)
+        except ValueError:
+            return None
+        entry = (manifest.get("entries") or {}).get(str(int(cad_document_id)))
+        intent = (entry or {}).get("edit_intent") if entry else None
+        return dict(intent) if isinstance(intent, dict) and intent.get("enabled") else None
 
     def release_cad_document(self, workspace_id: str | None, cad_document_id: int) -> None:
         if not workspace_id:
@@ -582,6 +654,11 @@ class CadWorkspaceService:
                     status, detail = "UNCHANGED", "The latest local content matches the checkout baseline."
                 else:
                     status, detail, selectable = "READY", "Modified and ready to stage.", True
+                if entry.get("edit_intent") and owner is not None and int(owner) != int(user_id):
+                    detail = (
+                        "Local edit intent is active; Nexus server check-in remains blocked "
+                        "until this CAD Document is checked out by you."
+                    )
             rows.append({
                 "workspace_id": workspace_id,
                 "workspace_name": workspace["name"],
@@ -597,6 +674,8 @@ class CadWorkspaceService:
                 "status": status,
                 "detail": detail,
                 "selectable": selectable,
+                "edit_intent": bool(entry.get("edit_intent")),
+                "server_save_blocked": bool(entry.get("edit_intent")),
             })
         return rows
 

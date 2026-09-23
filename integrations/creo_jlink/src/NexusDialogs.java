@@ -51,6 +51,42 @@ public final class NexusDialogs {
             && ((Integer) value).intValue() == JOptionPane.YES_OPTION;
     }
 
+    /** Return 0 for checkout, 1 for local intent, and -1 for cancel. */
+    public static int editChoice(String message, String title) {
+        Object[] options = new Object[] {
+            "Check Out Now", "Continue Locally", "Cancel"
+        };
+        JOptionPane pane = new JOptionPane(
+            message,
+            JOptionPane.WARNING_MESSAGE,
+            JOptionPane.DEFAULT_OPTION,
+            null,
+            options,
+            options[0]
+        );
+        Object value = show(pane, title);
+        if (value == options[0] || (value != null && options[0].equals(value))) return 0;
+        if (value == options[1] || (value != null && options[1].equals(value))) return 1;
+        return -1;
+    }
+
+    /** Return 0 for replace, 1 for skip, and -1 for cancel. */
+    public static int replaceChoice(String message, String title) {
+        Object[] options = new Object[] {"Replace", "Skip", "Cancel"};
+        JOptionPane pane = new JOptionPane(
+            message,
+            JOptionPane.WARNING_MESSAGE,
+            JOptionPane.DEFAULT_OPTION,
+            null,
+            options,
+            options[0]
+        );
+        Object value = show(pane, title);
+        if (value == options[0] || (value != null && options[0].equals(value))) return 0;
+        if (value == options[1] || (value != null && options[1].equals(value))) return 1;
+        return -1;
+    }
+
     public static String input(String message, String title) {
         final JTextField field = new JTextField(34);
         JOptionPane pane = new JOptionPane(
