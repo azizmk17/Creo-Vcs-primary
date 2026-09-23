@@ -96,6 +96,8 @@ class _WorkspaceService:
         self.calls = []
         self.intents = {}
         self.missing_workspaces = set()
+        self.manifest_entries = {}
+        self.local_rows = None
 
     def get_workspace(self, workspace_id):
         if str(workspace_id).lower() in self.missing_workspaces:
@@ -108,6 +110,8 @@ class _WorkspaceService:
         }
 
     def scan_workspace(self, workspace_id, project_id, user_id):
+        if self.local_rows is not None:
+            return list(self.local_rows)
         return [{
             "workspace_id": str(workspace_id),
             "workspace_name": "Creo Workspace",
@@ -121,6 +125,15 @@ class _WorkspaceService:
             "detail": "Modified and ready to stage.",
             "selectable": True,
         }]
+
+    def load_manifest(self, workspace_id, required=True):
+        return {
+            "workspace_id": str(workspace_id),
+            "entries": {
+                str(key): dict(value)
+                for key, value in self.manifest_entries.items()
+            },
+        }
 
     def get_edit_intent(self, workspace_id, document_id):
         return self.intents.get((str(workspace_id), int(document_id)))
@@ -324,6 +337,162 @@ class CreoBridgeControllerTests(unittest.TestCase):
         self.assertTrue(result["cad"]["local_edit_intent"])
         self.assertEqual(result["cad"]["workspace_path"], "C:/workspace")
         self.assertTrue(result["cad"]["server_save_blocked"])
+
+    def test_other_users_checkout_offers_continue_locally_but_blocks_checkin(self):
+        status = self.controller.cad_status(3)
+
+        self.assertFalse(status["can_checkin"])
+        self.assertEqual(status["edit_conflicts"][0]["code"], "CHECKED_OUT_BY_OTHER")
+        self.assertIn(
+            "CONTINUE_LOCALLY",
+            [row["code"] for row in status["edit_conflicts"][0]["actions"]],
+        )
+
+    def test_local_intent_does_not_require_commit_permission(self):
+        self.controller.permission_repo = SimpleNamespace(
+            user_has_permission=lambda *_args: False,
+        )
+
+        result = self.controller.edit_intent(
+            2, {"workspace_id": "workspace-one", "reason": "Local experiment"}
+        )
+
+        self.assertTrue(result["intent"]["enabled"])
+        self.assertFalse(result["cad"]["can_checkin"])
+        self.assertTrue(result["cad"]["server_save_blocked"])
+
+    def test_checkin_preflight_collects_modified_checked_out_dependency(self):
+        self.repo.documents[2].update({
+            "checked_out_by": 7,
+            "checkout_workspace_id": "workspace-one",
+            "checkout_workspace_machine_id": "test-machine",
+        })
+        self.workspace_service.manifest_entries = {
+            1: {"baseline_cad_revision": "", "baseline_cad_iteration": 0},
+            2: {"baseline_cad_revision": "", "baseline_cad_iteration": 0},
+            3: {"baseline_cad_revision": "", "baseline_cad_iteration": 0},
+        }
+        self.workspace_service.local_rows = [{
+            "cad_document_id": 1,
+            "modified": True,
+        }, {
+            "cad_document_id": 2,
+            "modified": True,
+        }]
+
+        conflicts = self.controller._checkin_preflight_conflicts(
+            [1],
+            self.workspace_service,
+            self.workspace_service.get_workspace("workspace-one"),
+            7,
+            9,
+        )
+
+        dependency_conflict = next(
+            row for row in conflicts
+            if row["code"] == "MODIFIED_DEPENDENCY_NOT_SELECTED"
+        )
+        self.assertEqual(dependency_conflict["related_cad_document_ids"], [2])
+        self.assertEqual(
+            dependency_conflict["default_action"], "ADD_REQUIRED_OBJECTS"
+        )
+
+    def test_checkin_preflight_blocks_out_of_date_workspace_baseline(self):
+        self.repo.documents[1].update({"revision": "B", "iteration": 2})
+        self.workspace_service.manifest_entries = {
+            1: {"baseline_cad_revision": "A", "baseline_cad_iteration": 1},
+        }
+        self.workspace_service.local_rows = [{
+            "cad_document_id": 1,
+            "modified": True,
+        }]
+
+        conflicts = self.controller._checkin_preflight_conflicts(
+            [1],
+            self.workspace_service,
+            self.workspace_service.get_workspace("workspace-one"),
+            7,
+            9,
+        )
+
+        self.assertEqual(conflicts[0]["code"], "OUT_OF_DATE")
+        self.assertEqual(conflicts[0]["severity"], "BLOCKING")
+
+    def test_drawing_checkin_requires_related_model_in_selected_batch(self):
+        self.repo.documents[1].update({
+            "category": "ASSEMBLY",
+            "checkout_workspace_machine_id": "",
+        })
+        self.repo.documents[5] = {
+            "id": 5,
+            "project_id": 9,
+            "file_name": "machine.drw",
+            "category": "DRAWING",
+            "drawing_owner_cad_document_id": 1,
+            "checked_out_by": 7,
+            "checkout_workspace_id": "workspace-one",
+            "checkout_workspace_machine_id": "",
+        }
+        self.workspace_service.manifest_entries = {
+            1: {"baseline_cad_revision": "", "baseline_cad_iteration": 0},
+            5: {"baseline_cad_revision": "", "baseline_cad_iteration": 0},
+        }
+        self.workspace_service.local_rows = [
+            {"cad_document_id": 1, "modified": True},
+            {"cad_document_id": 5, "modified": True},
+        ]
+        workspace = self.workspace_service.get_workspace("workspace-one")
+
+        conflicts = self.controller._checkin_preflight_conflicts(
+            [5], self.workspace_service, workspace, 7, 9
+        )
+
+        drawing_conflict = next(
+            row for row in conflicts
+            if row["code"] == "DRAWING_MODEL_NOT_SELECTED"
+        )
+        self.assertEqual(drawing_conflict["related_cad_document_ids"], [1])
+        self.assertEqual(drawing_conflict["default_action"], "ADD_REQUIRED_OBJECTS")
+        self.assertEqual(
+            drawing_conflict["actions"][0]["label"], "Add Related Model"
+        )
+
+        complete_conflicts = self.controller._checkin_preflight_conflicts(
+            [5, 1], self.workspace_service, workspace, 7, 9
+        )
+        self.assertNotIn(
+            "DRAWING_MODEL_NOT_SELECTED",
+            [row["code"] for row in complete_conflicts],
+        )
+
+    def test_drawing_checkin_endpoint_revalidates_batch_and_workspace(self):
+        self.repo.documents[1].update({
+            "category": "ASSEMBLY",
+            "checkout_workspace_machine_id": "",
+        })
+        drawing = {
+            "id": 5,
+            "project_id": 9,
+            "file_name": "machine.drw",
+            "category": "DRAWING",
+            "drawing_owner_cad_document_id": 1,
+        }
+        workspace = self.workspace_service.get_workspace("workspace-one")
+
+        with self.assertRaises(BridgeApiError) as caught:
+            self.controller._require_drawing_model_in_checkin_batch(
+                drawing, {"batch_cad_document_ids": [5]}, 7,
+                workspace, self.workspace_service,
+            )
+
+        self.assertEqual(caught.exception.code, "drawing_model_required")
+        self.assertEqual(
+            self.controller._require_drawing_model_in_checkin_batch(
+                drawing, {"batch_cad_document_ids": [1, 5]}, 7,
+                workspace, self.workspace_service,
+            ),
+            1,
+        )
 
     def test_retrieve_auto_recovers_owned_checkout_when_old_workspace_was_deleted(self):
         self.workspace_service.missing_workspaces.add("workspace-one")

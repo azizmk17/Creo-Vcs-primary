@@ -631,8 +631,45 @@ class CommitService(BaseService):
                 "part_id": part_id,
                 "part_ids": part_ids,
                 "cad_document_id": int(cad_document["id"]),
+                "drawing_owner_cad_document_id": (
+                    int(cad_document["drawing_owner_cad_document_id"])
+                    if cad_document.get("drawing_owner_cad_document_id") is not None
+                    else None
+                ),
                 "creo_file_version": creo_file_version,
             })
+
+        planned_cad_ids = {
+            int(row["cad_document_id"])
+            for row in commit_plan
+            if row.get("cad_document_id") is not None
+        }
+        for row in commit_plan:
+            owner_id = row.get("drawing_owner_cad_document_id")
+            if owner_id is None or int(owner_id) in planned_cad_ids:
+                continue
+            owner_document = self.pdm_service.repo.get_cad_document(int(owner_id))
+            owner_file_name = self._clean_creo_file_name(
+                str((owner_document or {}).get("file_name") or "")
+            )
+            owner_is_in_target = False
+            if requested_commit_id and owner_file_name:
+                pending_rows = self.commit_repository.get_pending_rows_by_base_filename(
+                    owner_file_name, int(self.session.project_id)
+                )
+                owner_is_in_target = any(
+                    str(pending.get("commit_id") or "") == str(requested_commit_id)
+                    for pending in pending_rows
+                )
+            if not owner_is_in_target:
+                drawing_label = str(row.get("base_f_name") or row.get("filename") or "drawing")
+                model_label = owner_file_name or self._cad_document_label(
+                    owner_document, "related model"
+                )
+                raise ValueError(
+                    f"Commit blocked: drawing {drawing_label} cannot be checked in "
+                    f"without its related model {model_label} in the same Pending commit."
+                )
 
         if not commit_plan:
             return {

@@ -1267,32 +1267,64 @@ class AdminPage(QWidget):
         current_name = str(project.get("name") or "")
         current_wd = str(project.get("working_directory") or "")
         current_desc = str(project.get("description") or "")
+        current_version = str(project.get("version_label") or "")
+        is_readonly = int(project.get("is_readonly") or 0) == 1
 
-        if int(project.get("is_readonly") or 0) == 1:
-            return QMessageBox.warning(self, "Read-only", "This project is read-only and cannot be edited.")
+        name = current_name
+        wd = current_wd
+        desc = current_desc
+        if not is_readonly:
+            name, ok = QInputDialog.getText(
+                self, "Edit Project", "Project name:", text=current_name
+            )
+            if not (ok and name and name.strip()):
+                return
 
-        name, ok = QInputDialog.getText(self, "Edit Project", "Project name:", text=current_name)
-        if not (ok and name and name.strip()):
-            return
+            wd = QFileDialog.getExistingDirectory(
+                self,
+                "Select Working Directory",
+                directory=(current_wd if current_wd else ""),
+            )
+            if not wd:
+                return
 
-        wd = QFileDialog.getExistingDirectory(
+            desc, ok2 = QInputDialog.getMultiLineText(
+                self,
+                "Edit Description",
+                "Project description:",
+                text=current_desc,
+            )
+            if not ok2:
+                return
+
+        version_label, version_ok = QInputDialog.getText(
             self,
-            "Select Working Directory",
-            directory=(current_wd if current_wd else ""),
+            "Project Version",
+            "Version label:",
+            text=current_version,
         )
-        if not wd:
-            return
-
-        desc, ok2 = QInputDialog.getMultiLineText(self, "Edit Description", "Project description:", text=current_desc)
-        if not ok2:
+        if not version_ok:
             return
 
         try:
-            self.project_service.update_project(int(pid), name.strip(), wd, desc)
+            self.project_service.update_project(
+                int(pid),
+                name.strip(),
+                wd,
+                desc,
+                version_label=version_label,
+                allow_readonly_version_change=True,
+            )
         except Exception as e:
             return QMessageBox.warning(self, "Failed", str(e))
 
-        QMessageBox.information(self, "Updated", "Project updated.")
+        QMessageBox.information(
+            self,
+            "Updated",
+            "Project configuration updated."
+            if not is_readonly
+            else "Project version label updated.",
+        )
         self.load_projects()
         self.refresh_stats()
 

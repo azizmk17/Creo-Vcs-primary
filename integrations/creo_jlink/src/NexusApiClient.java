@@ -114,7 +114,8 @@ public class NexusApiClient {
         String path,
         String note,
         String targetCommitId,
-        String duplicateAction
+        String duplicateAction,
+        List<Integer> batchCadDocumentIds
     ) throws Exception {
         Map<String, Object> body = new LinkedHashMap<String, Object>();
         body.put("workspace_id", workspaceId);
@@ -122,12 +123,16 @@ public class NexusApiClient {
         body.put("note", note);
         body.put("target_commit_id", targetCommitId == null ? "" : targetCommitId);
         body.put("duplicate_action", duplicateAction == null ? "error" : duplicateAction);
+        body.put("batch_cad_document_ids", batchCadDocumentIds);
         return request("POST", "/cad/" + cadId + "/checkin", body);
     }
 
-    public Map<String, Object> checkinPlan(List<Integer> cadDocumentIds) throws Exception {
+    public Map<String, Object> checkinPlan(
+        List<Integer> cadDocumentIds, String workspaceId
+    ) throws Exception {
         Map<String, Object> body = new LinkedHashMap<String, Object>();
         body.put("cad_document_ids", cadDocumentIds);
+        body.put("workspace_id", workspaceId == null ? "" : workspaceId);
         return request("POST", "/checkin/plan", body);
     }
 

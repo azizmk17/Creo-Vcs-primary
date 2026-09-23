@@ -27,6 +27,17 @@ def _int_to_alpha(n: int) -> str:
         n //= 26
     return "".join(reversed(out))
 
+
+def _normalize_project_version_label(label: str) -> str:
+    value = str(label or "").strip()
+    if not value:
+        raise ValueError("Project version is required")
+    if len(value) > 128:
+        raise ValueError("Project version must be 128 characters or fewer")
+    if not value.isprintable():
+        raise ValueError("Project version cannot contain control characters")
+    return value
+
 class ProjectRepository:
     def __init__(self, db_name=DB_NAME):
         self.db_name = db_name
@@ -238,7 +249,15 @@ class ProjectRepository:
             conn.commit()
             return cur.rowcount > 0
 
-    def update_project(self, project_id: int, name: str, working_directory: str, description: str = "") -> bool:
+    def update_project(
+        self,
+        project_id: int,
+        name: str,
+        working_directory: str,
+        description: str = "",
+        version_label: str | None = None,
+        allow_readonly_version_change: bool = False,
+    ) -> bool:
         """Update editable project fields. Returns True if a row was updated."""
 
         if not project_id:
@@ -252,19 +271,79 @@ class ProjectRepository:
 
         with self.get_conn() as conn:
             cols = set(self._table_columns(conn, "projects"))
+            row = conn.execute(
+                "SELECT * FROM projects WHERE id = ?", (int(project_id),)
+            ).fetchone()
+            if not row:
+                raise ValueError("Project not found")
+            current = dict(row)
+            readonly = bool(int(current.get("is_readonly") or 0))
+            metadata_changed = any((
+                name != str(current.get("name") or ""),
+                working_directory != str(current.get("working_directory") or ""),
+                description != str(current.get("description") or ""),
+            ))
+            if readonly and metadata_changed:
+                raise ValueError("This project is read-only; only its version label can be changed")
+            if readonly and version_label is not None and not allow_readonly_version_change:
+                raise ValueError("This project is read-only")
 
-            # If the schema supports readonly, refuse edits.
-            if "is_readonly" in cols:
-                row = conn.execute("SELECT is_readonly FROM projects WHERE id = ?", (int(project_id),)).fetchone()
-                if row and int(dict(row).get("is_readonly") or 0) == 1:
-                    raise ValueError("This project is read-only")
+            new_version = None
+            old_version = str(current.get("version_label") or "").strip()
+            if version_label is not None and "version_label" in cols:
+                new_version = _normalize_project_version_label(version_label)
+                root_id = int(current.get("root_project_id") or current.get("id"))
+                duplicate = conn.execute(
+                    """
+                    SELECT id FROM projects
+                    WHERE root_project_id=? AND id<>?
+                      AND LOWER(TRIM(version_label))=LOWER(TRIM(?))
+                    LIMIT 1
+                    """,
+                    (root_id, int(project_id), new_version),
+                ).fetchone()
+                if duplicate:
+                    raise ValueError(
+                        f'Project version "{new_version}" already exists for this product'
+                    )
 
-            cur = conn.execute(
-                "UPDATE projects SET name = ?, description = ?, working_directory = ? WHERE id = ?",
-                (name, description, working_directory, int(project_id)),
-            )
+            if metadata_changed:
+                conn.execute(
+                    "UPDATE projects SET name=?, description=?, working_directory=? WHERE id=?",
+                    (name, description, working_directory, int(project_id)),
+                )
+            if new_version is not None and new_version != old_version:
+                conn.execute(
+                    "UPDATE projects SET version_label=? WHERE id=?",
+                    (new_version, int(project_id)),
+                )
+                tables = set(self._list_tables(conn))
+                if "part_file_versions" in tables:
+                    file_cols = set(self._table_columns(conn, "part_file_versions"))
+                    if {"root_project_id", "project_version_label"}.issubset(file_cols):
+                        conn.execute(
+                            """
+                            UPDATE part_file_versions
+                            SET project_version_label=?
+                            WHERE root_project_id=?
+                              AND LOWER(TRIM(project_version_label))=LOWER(TRIM(?))
+                            """,
+                            (new_version, root_id, old_version),
+                        )
+                if "assembly_configurations" in tables:
+                    config_cols = set(self._table_columns(conn, "assembly_configurations"))
+                    if {"project_id", "source_project_version"}.issubset(config_cols):
+                        conn.execute(
+                            """
+                            UPDATE assembly_configurations
+                            SET source_project_version=?
+                            WHERE project_id=?
+                              AND LOWER(TRIM(source_project_version))=LOWER(TRIM(?))
+                            """,
+                            (new_version, int(project_id), old_version),
+                        )
             conn.commit()
-            return cur.rowcount > 0
+            return bool(metadata_changed or new_version is not None)
 
     def _next_project_version_label(self, conn, root_project_id: int) -> str:
         rows = conn.execute(
@@ -323,7 +402,7 @@ class ProjectRepository:
                 explicit_name = bool(new_project_name and str(new_project_name).strip())
                 explicit_desc = description is not None
 
-                existing_labels: set[str] = set()
+                existing_labels: dict[str, str] = {}
                 if supports_versioning:
                     rows = conn.execute(
                         "SELECT version_label FROM projects WHERE root_project_id = ?",
@@ -334,19 +413,22 @@ class ProjectRepository:
                             lbl = r[0]
                         except Exception:
                             lbl = None
-                        lbl = (lbl or "").strip().upper()
+                        lbl = (lbl or "").strip()
                         if lbl:
-                            existing_labels.add(lbl)
+                            existing_labels[lbl.casefold()] = lbl
 
                 def _label_is_valid(lbl: str) -> bool:
-                    s = (lbl or "").strip().upper()
-                    return bool(s) and s.isalpha()
+                    try:
+                        _normalize_project_version_label(lbl)
+                        return True
+                    except ValueError:
+                        return False
 
                 def _next_free_label(start_n: int) -> str:
                     n = max(1, int(start_n))
                     while True:
                         cand = _int_to_alpha(n)
-                        if cand not in existing_labels:
+                        if cand.casefold() not in existing_labels:
                             return cand
                         n += 1
 
@@ -354,20 +436,23 @@ class ProjectRepository:
                 if not supports_versioning:
                     version_label = "A"
                 else:
-                    if version_label is None or not str(version_label).strip():
+                    explicit_version_label = bool(
+                        version_label is not None and str(version_label).strip()
+                    )
+                    if not explicit_version_label:
                         max_n = 0
-                        for lbl in existing_labels:
+                        for lbl in existing_labels.values():
                             max_n = max(max_n, _alpha_to_int(lbl))
                         version_label = _next_free_label(max_n + 1)
                     else:
-                        candidate = str(version_label).strip().upper()
-                        if not _label_is_valid(candidate):
-                            raise ValueError("Version label must be alphabetic (A..Z..AA..)")
-                        n0 = _alpha_to_int(candidate)
-                        version_label = candidate if candidate not in existing_labels else _next_free_label(n0)
+                        version_label = _normalize_project_version_label(version_label)
+                        if version_label.casefold() in existing_labels:
+                            raise ValueError(
+                                f'Project version "{version_label}" already exists for this product'
+                            )
 
                 if not _label_is_valid(version_label):
-                    raise ValueError("Version label must be alphabetic (A..Z..AA..)")
+                    version_label = _normalize_project_version_label(version_label)
 
                 insert_cols = set(self._table_columns(conn, "projects"))
 
@@ -409,13 +494,17 @@ class ProjectRepository:
                             )
                         new_project_id = cur.lastrowid
                         if supports_versioning:
-                            existing_labels.add(version_label)
+                            existing_labels[version_label.casefold()] = version_label
                         break
                     except sqlite3.IntegrityError as e:
                         last_err = e
                         msg = str(e)
                         # If version label is taken, pick next label and retry.
                         if supports_versioning and ("projects.root_project_id" in msg and "projects.version_label" in msg):
+                            if explicit_version_label:
+                                raise ValueError(
+                                    f'Project version "{version_label}" already exists for this product'
+                                )
                             n = _alpha_to_int(version_label)
                             version_label = _next_free_label(n + 1)
                             continue

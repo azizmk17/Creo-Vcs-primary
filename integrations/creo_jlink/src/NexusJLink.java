@@ -8,15 +8,19 @@ import java.util.Set;
 import javax.swing.JOptionPane;
 
 import com.ptc.cipjava.jxthrowable;
+import com.ptc.pfc.pfcBase.ActionListener;
 import com.ptc.pfc.pfcCommand.DefaultUICommandActionListener;
 import com.ptc.pfc.pfcCommand.UICommand;
 import com.ptc.pfc.pfcCommand.UICommandBracketListener;
+import com.ptc.pfc.pfcExceptions.XCancelProEAction;
 import com.ptc.pfc.pfcGlobal.pfcGlobal;
 import com.ptc.pfc.pfcModel.Dependencies;
 import com.ptc.pfc.pfcModel.Dependency;
 import com.ptc.pfc.pfcModel.Model;
 import com.ptc.pfc.pfcModel.ModelDescriptor;
 import com.ptc.pfc.pfcModel.pfcModel;
+import com.ptc.pfc.pfcObject.Child;
+import com.ptc.pfc.pfcObject.Parent;
 import com.ptc.pfc.pfcSession.Session;
 import com.ptc.pfc.pfcWindow.Window;
 
@@ -25,6 +29,8 @@ public class NexusJLink {
     private static NexusApiClient api;
     private static final List<CommandGuardRegistration> commandGuards =
         new ArrayList<CommandGuardRegistration>();
+    private static final List<ActionListener> mutationGuards =
+        new ArrayList<ActionListener>();
     private static final Set<String> registeredGuardNames =
         new LinkedHashSet<String>();
     private static final Set<String> unauthorizedModificationAlerts =
@@ -35,6 +41,7 @@ public class NexusJLink {
         try {
             session = pfcGlobal.GetProESession();
             api = new NexusApiClient();
+            installMutationGuards();
             installCommandGuards();
             installMenu();
             System.out.println("Nexus PDM J-Link started.");
@@ -51,6 +58,13 @@ public class NexusJLink {
             }
         }
         commandGuards.clear();
+        for (ActionListener listener : mutationGuards) {
+            try {
+                session.RemoveActionListener(listener);
+            } catch (Throwable ignored) {
+            }
+        }
+        mutationGuards.clear();
         registeredGuardNames.clear();
         unauthorizedModificationAlerts.clear();
         selectedWorkspace = null;
@@ -76,9 +90,12 @@ public class NexusJLink {
             // Creo 3.0 commands captured from the actual ribbon/tree workflows.
             "ProCmdDynEdit",
             "ProCmdEditValueDim",
+            "mod_dim_emb",
+            "mod_partdim_emb",
             "ProCmdL05Edit",
             "ProCmdL05Edit@PopupMenuTree",
             "ProCmdL05EditFeat",
+            "ProCmdEditNoAutoRegen@PopupMenuTree",
             "ProCmdRedefine",
             "ProCmdRedefine@PopupMenuTree",
             "ProCmdEditProperties",
@@ -96,12 +113,118 @@ public class NexusJLink {
             "ProCmdFtMirror",
             "ProCmdFtShell",
             "ProCmdFtRib",
+            "ProCmdDatumAxis",
+            "ProCmdDatumCsys",
+            "ProCmdDatumPlane",
+            "ProCmdDatumPointGeneral",
+            "ProCmdDatumSketCurve",
+            "ProCmdSketDimension",
+            "ProCmdEditChainSpline",
+            "ProCmdEditCorner",
+            "ProCmdEditDelSeg",
+            "ProCmdEditMirror",
+            "ProCmdEditTransRotScale",
             "ProCmdCompAssem",
+            "ProCmdCompEditPlacement",
+            "ProCmdCompConstr",
+            "ProCmdCompRedefine",
+            "ProCmdCompPackage",
+            "ProCmdCompReplace",
+            "ProCmdCompDelete",
             "ProCmdSuppressFeat",
+            "ProCmdSuppress@PopupMenuTree",
+            "ProCmdResume@PopupMenuTree",
+            "ProCmdDelete@PopupMenuTree",
+            "ProCmdEditPaste",
+            "ProCmdModelParams",
+            "ProCmdParamEdit",
+            "ProCmdRelations",
+            // Drawing dimensions, notes, symbols, views, and sheet edits.
+            "ProCmdDwgCrStdNewRefDim",
+            "ProCmdDtlInsFreeNote",
+            "ProCmdDwgCreate3DDatum",
+            "ProCmdDwgCreateBallon",
+            "ProCmdDwgCreateSurfFin",
+            "ProCmdDwgCrGtolMakeTarg",
+            "ProCmdDwgCrGtolSpecTol",
+            "ProCmdDwgCrSnapLine",
+            "ProCmdDwgCrSymInstCust",
+            "ProCmdDwgDraftGroup",
+            "ProCmdDwgViewAux",
+            "ProCmdDwgViewDet",
+            "ProCmdDwgViewGen",
+            "ProCmdDwgViewProj",
+            "ProCmdDwgCrStdDim",
+            "ProCmdDwgCreateDim",
+            "ProCmdDwgModDim",
+            "ProCmdDwgMoveDim",
+            "ProCmdDwgCreateNote",
+            "ProCmdDwgEditNote",
+            "ProCmdDwgModNote",
+            "ProCmdDwgCreateSymbol",
+            "ProCmdDwgEditSymbol",
+            "ProCmdDwgCrGeneralView",
+            "ProCmdDwgViewProperties",
+            "ProCmdDwgMoveView",
+            "ProCmdDwgDeleteView",
+            "ProCmdDwgDelete",
+            "ProCmdDwgEditValue",
+            "ProCmdDwgParams",
+            "ProCmdDwgFormat",
+            "ProCmdDwgSheetSetup",
+            "ProCmdCreateNote",
+            "ProCmdEditNote",
+            "ProCmdAnnotationEdit",
+            "PH.L.PIM_Addpb.l0",
+            "PH.pop_constr_offset",
+            "psh_delete1",
             "ProCmdRegenPart"
         };
         for (String commandName : editCommands) {
             addEditCommandGuard(commandName);
+        }
+    }
+
+    private static void installMutationGuards() throws jxthrowable {
+        if (!mutationGuards.isEmpty()) return;
+        ActionListener[] listeners = new ActionListener[] {
+            new NexusModelMutationGuard(),
+            new NexusFeatureMutationGuard(),
+            new NexusSolidMutationGuard(),
+            new NexusSessionMutationGuard()
+        };
+        for (int index = 0; index < listeners.length; index++) {
+            try {
+                session.AddActionListener(listeners[index]);
+                mutationGuards.add(listeners[index]);
+            } catch (Throwable error) {
+                System.out.println(
+                    "Nexus PDM mutation guard unavailable: "
+                        + listeners[index].getClass().getName() + " - " + error
+                );
+            }
+        }
+        System.out.println(
+            "Nexus PDM session-wide mutation guards registered: "
+                + mutationGuards.size()
+        );
+    }
+
+    static void refreshCommandProtection() {
+        if (session == null || api == null) return;
+        try {
+            installCommandGuards();
+        } catch (Throwable error) {
+            System.out.println("Nexus PDM command protection refresh failed: " + error);
+        }
+    }
+
+    static void refreshEditProtection() {
+        refreshCommandProtection();
+        try {
+            checkForUnauthorizedModifications();
+        } catch (Throwable error) {
+            System.out.println("Nexus PDM modification scan failed: " + error);
         }
     }
 
@@ -445,45 +568,70 @@ public class NexusJLink {
         );
     }
 
-    /** Called immediately before Creo starts a feature, dimension, or delete edit. */
-    static boolean allowModelEdit() throws Exception {
-        Model current = currentOrActiveModel();
-        if (current == null || api == null) return true;
-        Map<String, Object> status = resolveCadForModel(current);
-        if (!MiniJson.bool(status, "managed")
-            || MiniJson.bool(status, "can_modify")
-            || MiniJson.bool(status, "local_edit_intent")) {
-            return true;
+    private static NexusDialogs.ConflictItem conflictItem(Map<String, Object> conflict) {
+        List<Object> rawActions = MiniJson.array(conflict.get("actions"));
+        String[] actionCodes = new String[rawActions.size()];
+        String[] actionLabels = new String[rawActions.size()];
+        for (int index = 0; index < rawActions.size(); index++) {
+            Map<String, Object> action = MiniJson.object(rawActions.get(index));
+            actionCodes[index] = MiniJson.text(action, "code");
+            actionLabels[index] = MiniJson.text(action, "label");
         }
-
-        String owner = MiniJson.text(status, "checked_out_by_username");
-        if (owner.length() == 0 && "CHECKED_OUT_BY_OTHER".equals(
-            MiniJson.text(status, "checkout_state")
-        )) {
-            owner = "another Nexus user";
+        List<String> context = new ArrayList<String>();
+        String owner = MiniJson.text(conflict, "owner");
+        String workspace = MiniJson.text(conflict, "workspace");
+        String revision = MiniJson.text(conflict, "revision");
+        int iteration = MiniJson.integer(conflict, "iteration");
+        if (owner.length() > 0) context.add("Owner: " + owner);
+        if (workspace.length() > 0) context.add("Workspace: " + workspace);
+        if (revision.length() > 0 || iteration > 0) {
+            context.add("Revision: " + revision + "." + iteration);
         }
-        String ownerLine = owner.length() == 0 ? "" : "\nOwner: " + owner;
-        int decision = NexusDialogs.editChoice(
-            "This CAD Document is read-only in Nexus." + ownerLine
-                + "\n\nCheck Out Now: obtain the Nexus lock and continue the edit."
-                + "\nContinue Locally: allow local editing, but server check-in remains blocked.",
-            "Nexus Edit Conflict"
+        return new NexusDialogs.ConflictItem(
+            MiniJson.text(conflict, "id"),
+            MiniJson.text(conflict, "object"),
+            MiniJson.text(conflict, "description"),
+            MiniJson.text(conflict, "name"),
+            joinList(context, " | "),
+            MiniJson.text(conflict, "severity"),
+            actionCodes,
+            actionLabels,
+            MiniJson.text(conflict, "default_action")
         );
-        if (decision == 0) {
-            Map<String, Object> workspace = requireWorkspace();
-            boolean retained = checkoutCurrentModel(status, current, workspace, false, false);
-            if (!retained) {
-                NexusDialogs.info(
-                    "The checked-out workspace copy is now open. Retry the edit command on that model.",
-                    "Nexus Edit Conflict"
-                );
-            }
-            return retained;
+    }
+
+    private static NexusDialogs.ConflictResult showConflicts(
+        List<Object> conflicts, String title
+    ) {
+        NexusDialogs.ConflictItem[] items =
+            new NexusDialogs.ConflictItem[conflicts.size()];
+        for (int index = 0; index < conflicts.size(); index++) {
+            items[index] = conflictItem(MiniJson.object(conflicts.get(index)));
         }
-        if (decision == 1) {
+        return NexusDialogs.conflicts(title, items);
+    }
+
+    private static String chooseEditConflictAction(
+        Map<String, Object> status, String title
+    ) {
+        List<Object> conflicts = MiniJson.array(status.get("edit_conflicts"));
+        if (conflicts.isEmpty()) return "CANCEL";
+        NexusDialogs.ConflictResult resolution = showConflicts(conflicts, title);
+        if (resolution == null) return "CANCEL";
+        Map<String, Object> conflict = MiniJson.object(conflicts.get(0));
+        return resolution.actionFor(MiniJson.text(conflict, "id"));
+    }
+
+    private static boolean applyEditConflictAction(
+        String action,
+        Map<String, Object> status,
+        Model model,
+        boolean preserveLocalChanges
+    ) throws Exception {
+        if ("CONTINUE_LOCALLY".equals(action)) {
             Map<String, Object> workspace = requireWorkspace();
             if (!modelMatchesWorkspace(
-                current,
+                model,
                 MiniJson.text(workspace, "path"),
                 MiniJson.text(status, "file_name")
             )) {
@@ -494,16 +642,92 @@ public class NexusJLink {
             api.setEditIntent(
                 MiniJson.integer(status, "id"),
                 MiniJson.text(workspace, "id"),
-                "User chose to continue locally."
+                preserveLocalChanges
+                    ? "Creo detected a local modification before checkout."
+                    : "User chose to continue locally."
             );
             return true;
         }
+        if ("CHECKOUT_NOW".equals(action) || "REVISE_AND_CHECKOUT".equals(action)) {
+            Map<String, Object> workspace = requireWorkspace();
+            boolean retained = checkoutCurrentModel(
+                status,
+                model,
+                workspace,
+                preserveLocalChanges,
+                false,
+                "REVISE_AND_CHECKOUT".equals(action)
+            );
+            return retained;
+        }
         return false;
+    }
+
+    /** Called immediately before Creo starts a feature, dimension, or delete edit. */
+    static boolean allowModelEdit() throws Exception {
+        Model current = currentOrActiveModel();
+        return resolveModelConflict(current, false);
+    }
+
+    static void requireModelEdit(Model model, String operation) throws jxthrowable {
+        try {
+            boolean preserveLocalChanges = false;
+            try {
+                preserveLocalChanges = model != null && model.GetIsModified();
+            } catch (Throwable ignored) {
+            }
+            if (resolveModelConflict(model, preserveLocalChanges)) return;
+            XCancelProEAction.Throw();
+        } catch (jxthrowable error) {
+            throw error;
+        } catch (Throwable error) {
+            String detail = error.getMessage() == null
+                ? String.valueOf(error)
+                : error.getMessage();
+            NexusDialogs.error(
+                "Nexus could not authorize " + operation + ".\n\n" + detail,
+                "Nexus Edit Conflict"
+            );
+            XCancelProEAction.Throw();
+        }
+    }
+
+    static Model modelForChild(Child child) {
+        if (child == null) return currentOrActiveModel();
+        try {
+            Parent parent = child.GetDBParent();
+            for (int depth = 0; parent != null && depth < 12; depth++) {
+                if (parent instanceof Model) return (Model) parent;
+                if (!(parent instanceof Child)) break;
+                parent = ((Child) parent).GetDBParent();
+            }
+        } catch (Throwable ignored) {
+        }
+        return currentOrActiveModel();
+    }
+
+    static boolean resolveModelConflict(Model model, boolean preserveLocalChanges)
+        throws Exception {
+        if (model == null || api == null) return true;
+        Map<String, Object> status = resolveCadForModel(model);
+        if (!MiniJson.bool(status, "managed")
+            || MiniJson.bool(status, "can_modify")
+            || MiniJson.bool(status, "local_edit_intent")) {
+            return true;
+        }
+        return applyEditConflictAction(
+            chooseEditConflictAction(status, "Conflicts"),
+            status,
+            model,
+            preserveLocalChanges
+        );
     }
 
     /** Catch feature-edit paths that Creo reports as modified only after the command runs. */
     static void checkForUnauthorizedModifications() throws Exception {
         if (api == null) return;
+        List<EditConflictCandidate> candidates = new ArrayList<EditConflictCandidate>();
+        List<Object> conflicts = new ArrayList<Object>();
         for (LoadedModelInfo info : loadedCreoModels().values()) {
             String key = logicalCreoFileName(safeFileName(info.model)).toLowerCase();
             if (key.length() == 0) continue;
@@ -523,64 +747,43 @@ public class NexusJLink {
                 || unauthorizedModificationAlerts.contains(key)) {
                 continue;
             }
+            List<Object> modelConflicts = MiniJson.array(status.get("edit_conflicts"));
+            if (modelConflicts.isEmpty()) continue;
+            Map<String, Object> conflict = MiniJson.object(modelConflicts.get(0));
             unauthorizedModificationAlerts.add(key);
+            candidates.add(new EditConflictCandidate(
+                key,
+                info.model,
+                status,
+                MiniJson.text(conflict, "id")
+            ));
+            conflicts.add(conflict);
+        }
+        if (candidates.isEmpty()) return;
+        NexusDialogs.ConflictResult resolution = showConflicts(conflicts, "Conflicts");
+        for (EditConflictCandidate candidate : candidates) {
+            String action = resolution == null
+                ? "CANCEL"
+                : resolution.actionFor(candidate.conflictId);
             try {
-                handleDetectedUnauthorizedModification(status, info.model);
+                boolean resolved = applyEditConflictAction(
+                    action, candidate.status, candidate.model, true
+                );
+                if (!resolved) {
+                    NexusDialogs.warning(
+                        "Nexus Save and check-in remain blocked for "
+                            + safeFileName(candidate.model)
+                            + ". Undo the local change, obtain the checkout, or choose "
+                            + "Continue Locally from Conflict Management.",
+                        "Nexus Modification Blocked"
+                    );
+                }
             } catch (Throwable error) {
-                unauthorizedModificationAlerts.remove(key);
+                unauthorizedModificationAlerts.remove(candidate.key);
                 if (error instanceof Exception) throw (Exception) error;
                 throw new IllegalStateException(error.getMessage(), error);
             }
         }
-    }
-
-    private static void handleDetectedUnauthorizedModification(
-        Map<String, Object> status, Model model
-    ) throws Exception {
-        String owner = MiniJson.text(status, "checked_out_by_username");
-        if (owner.length() == 0 && "CHECKED_OUT_BY_OTHER".equals(
-            MiniJson.text(status, "checkout_state")
-        )) {
-            owner = "another Nexus user";
-        }
-        String ownerLine = owner.length() == 0 ? "" : "\nOwner: " + owner;
-        int decision = NexusDialogs.editChoice(
-            "Creo marked this managed CAD Document as modified, but Nexus does not "
-                + "allow this workspace to modify it." + ownerLine
-                + "\n\nCheck Out Now: keep the local change and obtain the Nexus lock."
-                + "\nContinue Locally: keep the local change, but block server Save/check-in."
-                + "\nCancel: leave the model read-only to Nexus.",
-            "Nexus Modification Conflict"
-        );
-        if (decision == 0) {
-            Map<String, Object> workspace = requireWorkspace();
-            checkoutCurrentModel(status, model, workspace, true, false);
-            return;
-        }
-        if (decision == 1) {
-            Map<String, Object> workspace = requireWorkspace();
-            if (!modelMatchesWorkspace(
-                model,
-                MiniJson.text(workspace, "path"),
-                MiniJson.text(status, "file_name")
-            )) {
-                throw new IllegalStateException(
-                    "Open the CAD Document from its selected Nexus workspace before continuing locally."
-                );
-            }
-            api.setEditIntent(
-                MiniJson.integer(status, "id"),
-                MiniJson.text(workspace, "id"),
-                "Creo detected a local modification before checkout."
-            );
-            return;
-        }
-        NexusDialogs.warning(
-            "Nexus detected a modification to a CAD Document that is not checked out.\n\n"
-                + "Nexus Save and check-in are blocked. Undo the Creo change or check out "
-                + "the CAD Document before continuing.",
-            "Nexus Modification Blocked"
-        );
     }
 
     private static void checkout() throws Exception {
@@ -620,10 +823,16 @@ public class NexusJLink {
             return;
         }
         if ("CHECKED_OUT_BY_OTHER".equals(MiniJson.text(status, "checkout_state"))) {
-            throw new IllegalStateException(
-                "This CAD Document is checked out by "
-                    + MiniJson.text(status, "checked_out_by_username") + "."
-            );
+            String action = chooseEditConflictAction(status, "Conflicts");
+            if ("CONTINUE_LOCALLY".equals(action)) {
+                applyEditConflictAction(action, status, current, false);
+                NexusDialogs.info(
+                    "Local edit intent is active. Nexus check-in remains blocked until "
+                        + "you obtain the checkout.",
+                    "Nexus Conflict Management"
+                );
+            }
+            return;
         }
         boolean preserveLocalChanges = MiniJson.bool(status, "local_edit_intent");
         if (preserveLocalChanges) {
@@ -637,12 +846,17 @@ public class NexusJLink {
         ensureReloadIsSafe(current, workspace, preserveLocalChanges);
         boolean reviseReleased = false;
         if ("RELEASED".equals(MiniJson.text(status, "lifecycle_state"))) {
-            boolean confirmed = NexusDialogs.confirm(
-                "This CAD Document is Released. Create its next CAD revision and check it out?",
-                "Nexus Check Out",
-                JOptionPane.QUESTION_MESSAGE
-            );
-            if (!confirmed) return;
+            String action = chooseEditConflictAction(status, "Conflicts");
+            if ("CONTINUE_LOCALLY".equals(action)) {
+                applyEditConflictAction(action, status, current, false);
+                NexusDialogs.info(
+                    "Local edit intent is active. Nexus check-in remains blocked until "
+                        + "the released CAD Document is revised and checked out.",
+                    "Nexus Conflict Management"
+                );
+                return;
+            }
+            if (!"REVISE_AND_CHECKOUT".equals(action)) return;
             reviseReleased = true;
         }
 
@@ -700,7 +914,8 @@ public class NexusJLink {
         Model current,
         Map<String, Object> workspace,
         boolean preserveLocalChanges,
-        boolean notify
+        boolean notify,
+        boolean reviseReleasedConfirmed
     ) throws Exception {
         if ("CHECKED_OUT_BY_OTHER".equals(MiniJson.text(status, "checkout_state"))) {
             throw new IllegalStateException(
@@ -710,8 +925,20 @@ public class NexusJLink {
                         : MiniJson.text(status, "checked_out_by_username")) + "."
             );
         }
-        boolean reviseReleased = false;
-        if ("RELEASED".equals(MiniJson.text(status, "lifecycle_state"))) {
+        boolean retained = modelMatchesWorkspace(
+            current,
+            MiniJson.text(workspace, "path"),
+            MiniJson.text(status, "file_name")
+        );
+        if (!retained) {
+            throw new IllegalStateException(
+                "Conflict Management will not replace or close the active Creo model. "
+                    + "Open its managed copy from the selected Nexus workspace, then retry."
+            );
+        }
+        boolean reviseReleased = reviseReleasedConfirmed;
+        if ("RELEASED".equals(MiniJson.text(status, "lifecycle_state"))
+            && !reviseReleased) {
             boolean confirmed = NexusDialogs.confirm(
                 "This CAD Document is Released. Create its next CAD revision and check it out?",
                 "Nexus Check Out",
@@ -756,24 +983,15 @@ public class NexusJLink {
                 throw error;
             }
         }
-        boolean retained = modelMatchesWorkspace(
-            current,
-            MiniJson.text(workspace, "path"),
-            MiniJson.text(status, "file_name")
-        );
-        if (retained) {
-            activateModel(current);
-        } else {
-            eraseForReload(current);
-            displayManagedResult(result);
-        }
+        // Conflict resolution must never erase, retrieve, display, activate, or
+        // switch models. The original Creo command continues in the same window.
         if (notify) {
             NexusDialogs.info(
                 "CAD checkout completed. The managed workspace copy is now editable.",
                 "Nexus Check Out"
             );
         }
-        return retained;
+        return true;
     }
 
     private static void checkin() throws Exception {
@@ -790,11 +1008,12 @@ public class NexusJLink {
         boolean[] selected = new boolean[choices.size()];
         for (int index = 0; index < choices.size(); index++) {
             CheckinChoice choice = choices.get(index);
-            labels[index] = choice;
+            labels[index] = choice.checklistItem();
             selected[index] = choice.defaultSelected();
         }
         NexusDialogs.ChecklistResult selection = NexusDialogs.checklist(
-            "Select the CAD Documents to check in from this workspace:",
+            "Workspace: " + MiniJson.text(workspace, "name")
+                + "    Select CAD Documents to check in:",
             "Nexus Check In",
             labels,
             selected,
@@ -808,12 +1027,97 @@ public class NexusJLink {
             return;
         }
 
-        List<Integer> selectedCadIds = new ArrayList<Integer>();
+        Map<Integer, CheckinChoice> allChoices =
+            new LinkedHashMap<Integer, CheckinChoice>();
+        for (CheckinChoice choice : choices) {
+            int cadId = MiniJson.integer(choice.status, "id");
+            if (cadId > 0) allChoices.put(Integer.valueOf(cadId), choice);
+        }
+        Map<Integer, CheckinChoice> selectedChoices =
+            new LinkedHashMap<Integer, CheckinChoice>();
         for (int index = 0; index < selection.selectedIndexes.length; index++) {
             CheckinChoice choice = choices.get(selection.selectedIndexes[index]);
-            selectedCadIds.add(Integer.valueOf(MiniJson.integer(choice.status, "id")));
+            int cadId = MiniJson.integer(choice.status, "id");
+            if (cadId > 0) selectedChoices.put(Integer.valueOf(cadId), choice);
         }
-        Map<String, Object> plan = api.checkinPlan(selectedCadIds);
+        Map<Integer, String> duplicateActions = new LinkedHashMap<Integer, String>();
+        Map<String, String> resolvedConflictActions =
+            new LinkedHashMap<String, String>();
+        List<String> skipped = new ArrayList<String>();
+        Map<String, Object> plan = new LinkedHashMap<String, Object>();
+        for (int pass = 0; pass < 8; pass++) {
+            List<Integer> selectedCadIds =
+                new ArrayList<Integer>(selectedChoices.keySet());
+            plan = api.checkinPlan(selectedCadIds, MiniJson.text(workspace, "id"));
+            List<Object> planConflicts = MiniJson.array(plan.get("pdm_conflicts"));
+            List<Object> unresolved = new ArrayList<Object>();
+            for (Object value : planConflicts) {
+                Map<String, Object> conflict = MiniJson.object(value);
+                if (!resolvedConflictActions.containsKey(MiniJson.text(conflict, "id"))) {
+                    unresolved.add(conflict);
+                }
+            }
+            if (unresolved.isEmpty()) break;
+            NexusDialogs.ConflictResult resolution = showConflicts(unresolved, "Conflicts");
+            if (resolution == null) return;
+            boolean selectionChanged = false;
+            for (Object value : unresolved) {
+                Map<String, Object> conflict = MiniJson.object(value);
+                String conflictId = MiniJson.text(conflict, "id");
+                String action = resolution.actionFor(conflictId);
+                resolvedConflictActions.put(conflictId, action);
+                int cadId = MiniJson.integer(conflict, "cad_document_id");
+                CheckinChoice choice = selectedChoices.get(Integer.valueOf(cadId));
+                if ("CANCEL".equals(action) || action.length() == 0) return;
+                if ("SKIP_OBJECT".equals(action)) {
+                    selectedChoices.remove(Integer.valueOf(cadId));
+                    resolvedConflictActions.clear();
+                    selectionChanged = true;
+                    if (choice != null && !skipped.contains(choice.fileName())) {
+                        skipped.add(choice.fileName());
+                    }
+                    continue;
+                }
+                if ("REPLACE_PENDING".equals(action)) {
+                    duplicateActions.put(Integer.valueOf(cadId), "replace");
+                    continue;
+                }
+                if ("ADD_REQUIRED_OBJECTS".equals(action)) {
+                    for (Object related : MiniJson.array(
+                        conflict.get("related_cad_document_ids")
+                    )) {
+                        int relatedId = jsonInteger(related);
+                        CheckinChoice relatedChoice = allChoices.get(
+                            Integer.valueOf(relatedId)
+                        );
+                        if (relatedChoice == null
+                            || !MiniJson.bool(relatedChoice.status, "can_checkin")) {
+                            throw new IllegalStateException(
+                                "A required modified dependency is not eligible for check-in: "
+                                    + relatedId
+                            );
+                        }
+                        if (!selectedChoices.containsKey(Integer.valueOf(relatedId))) {
+                            selectedChoices.put(Integer.valueOf(relatedId), relatedChoice);
+                            selectionChanged = true;
+                        }
+                    }
+                    continue;
+                }
+                throw new IllegalStateException(
+                    "Unsupported check-in conflict action: " + action
+                );
+            }
+            if (!selectionChanged) break;
+        }
+        if (selectedChoices.isEmpty()) {
+            NexusDialogs.info(
+                "No CAD Documents remain selected after conflict resolution.",
+                "Nexus Check In"
+            );
+            return;
+        }
+
         List<Object> pendingCommits = MiniJson.array(plan.get("pending_commits"));
         String targetCommitId = "";
         if (!pendingCommits.isEmpty()) {
@@ -842,19 +1146,16 @@ public class NexusJLink {
             }
         }
 
-        Map<Integer, Map<String, Object>> conflicts =
-            new LinkedHashMap<Integer, Map<String, Object>>();
-        for (Object value : MiniJson.array(plan.get("conflicts"))) {
-            Map<String, Object> conflict = MiniJson.object(value);
-            conflicts.put(
-                Integer.valueOf(MiniJson.integer(conflict, "cad_document_id")), conflict
-            );
+        List<CheckinChoice> stagingChoices = new ArrayList<CheckinChoice>();
+        for (CheckinChoice choice : selectedChoices.values()) {
+            if (!isDrawingChoice(choice)) stagingChoices.add(choice);
         }
-
+        for (CheckinChoice choice : selectedChoices.values()) {
+            if (isDrawingChoice(choice)) stagingChoices.add(choice);
+        }
+        List<Integer> checkinBatch = new ArrayList<Integer>(selectedChoices.keySet());
         List<String> staged = new ArrayList<String>();
-        List<String> skipped = new ArrayList<String>();
-        for (int index = 0; index < selection.selectedIndexes.length; index++) {
-            CheckinChoice choice = choices.get(selection.selectedIndexes[index]);
+        for (CheckinChoice choice : stagingChoices) {
             if (!MiniJson.bool(choice.status, "can_checkin")) {
                 String reason = MiniJson.text(choice.status, "read_only_reason");
                 throw new IllegalStateException(
@@ -863,33 +1164,9 @@ public class NexusJLink {
                 );
             }
             int cadId = MiniJson.integer(choice.status, "id");
-            String duplicateAction = "error";
-            Map<String, Object> conflict = conflicts.get(Integer.valueOf(cadId));
-            if (conflict != null) {
-                if (!MiniJson.bool(conflict, "replace_allowed")) {
-                    boolean skip = NexusDialogs.confirm(
-                        choice.fileName() + " is already pending for another Nexus user."
-                            + "\n\nSkip this model and continue with the batch?",
-                        "Nexus Pending File",
-                        JOptionPane.WARNING_MESSAGE
-                    );
-                    if (!skip) return;
-                    skipped.add(choice.fileName());
-                    continue;
-                }
-                int action = NexusDialogs.replaceChoice(
-                    choice.fileName() + " is already in Pending commit \""
-                        + MiniJson.text(conflict, "title") + "\".\n\n"
-                        + "Replace its pending copy or skip this model?",
-                    "Nexus Pending File"
-                );
-                if (action < 0) return;
-                if (action == 1) {
-                    skipped.add(choice.fileName());
-                    continue;
-                }
-                duplicateAction = "replace";
-            }
+            String duplicateAction = duplicateActions.containsKey(Integer.valueOf(cadId))
+                ? duplicateActions.get(Integer.valueOf(cadId))
+                : "error";
             if (choice.loaded != null && choice.loaded.model.GetIsModified()) {
                 choice.loaded.model.Save();
             }
@@ -899,7 +1176,8 @@ public class NexusJLink {
                 "",
                 note,
                 targetCommitId,
-                duplicateAction
+                duplicateAction,
+                checkinBatch
             );
             Map<String, Object> pending = MiniJson.object(result.get("pending_commit"));
             if (targetCommitId.length() == 0) {
@@ -923,6 +1201,12 @@ public class NexusJLink {
                 + "\n\nThe CAD and associated Item checkouts remain active until approval and merge.",
             "Nexus Check In"
         );
+    }
+
+    private static boolean isDrawingChoice(CheckinChoice choice) {
+        String category = MiniJson.text(choice.status, "category");
+        return "DRAWING".equalsIgnoreCase(category)
+            || choice.fileName().toLowerCase().endsWith(".drw");
     }
 
     private static List<CheckinChoice> checkinChoices(Map<String, Object> workspace)
@@ -1178,6 +1462,13 @@ public class NexusJLink {
         catch (Throwable ignored) { return ""; }
     }
 
+    private static int jsonInteger(Object value) {
+        if (value instanceof Number) return ((Number) value).intValue();
+        String text = value == null ? "" : String.valueOf(value).trim();
+        if (text.length() == 0 || "null".equalsIgnoreCase(text)) return 0;
+        return Integer.parseInt(text);
+    }
+
     private static String join(Set<String> values, String separator) {
         StringBuilder result = new StringBuilder();
         for (String value : values) {
@@ -1399,6 +1690,25 @@ public class NexusJLink {
         }
     }
 
+    private static final class EditConflictCandidate {
+        private final String key;
+        private final Model model;
+        private final Map<String, Object> status;
+        private final String conflictId;
+
+        private EditConflictCandidate(
+            String key,
+            Model model,
+            Map<String, Object> status,
+            String conflictId
+        ) {
+            this.key = key;
+            this.model = model;
+            this.status = status;
+            this.conflictId = conflictId;
+        }
+    }
+
     private static final class CheckinChoice {
         private Map<String, Object> status;
         private Map<String, Object> localFile;
@@ -1426,6 +1736,63 @@ public class NexusJLink {
                     (loaded != null && ("current".equals(loaded.source) || loaded.modified()))
                     || (localFile != null && MiniJson.bool(localFile, "selectable"))
                 );
+        }
+
+        private boolean modified() {
+            if (loaded != null && loaded.modified()) return true;
+            if (localFile == null) return false;
+            if (MiniJson.bool(localFile, "modified")) return true;
+            String localStatus = MiniJson.text(localFile, "status").toLowerCase();
+            return localStatus.indexOf("modified") >= 0
+                || localStatus.indexOf("changed") >= 0;
+        }
+
+        private NexusDialogs.ChecklistItem checklistItem() {
+            String name = fileName();
+            if (name.length() == 0) name = MiniJson.text(status, "number");
+            String revision = MiniJson.text(status, "revision");
+            int iteration = MiniJson.integer(status, "iteration");
+            String primary = name;
+            if (revision.length() > 0 || iteration > 0) {
+                primary += "    Rev " + revision + "." + iteration;
+            }
+
+            boolean selectable = MiniJson.bool(status, "can_checkin");
+            boolean changed = modified();
+            String state = !selectable
+                ? NexusDialogs.ChecklistItem.BLOCKED
+                : changed
+                    ? NexusDialogs.ChecklistItem.MODIFIED
+                    : NexusDialogs.ChecklistItem.READY;
+            List<String> context = new ArrayList<String>();
+            if (loaded != null) {
+                context.add("current".equals(loaded.source) ? "Current model" : "Loaded child");
+            } else {
+                context.add("Not loaded");
+            }
+            if (workspaceCheckout) context.add("Workspace checkout");
+            else if (localFile != null) context.add("Workspace file");
+
+            String reason = MiniJson.text(status, "read_only_reason");
+            if (reason.length() == 0 && localFile != null) {
+                reason = MiniJson.text(localFile, "detail");
+            }
+            String description = !selectable
+                ? reason.length() > 0 ? reason : "This CAD Document cannot be checked in."
+                : changed
+                    ? "The CAD Document has local modifications and is ready to check in."
+                    : "The checked-out CAD Document is ready to check in.";
+            String visibleDescription = description.length() > 92
+                ? description.substring(0, 89) + "..."
+                : description;
+            return new NexusDialogs.ChecklistItem(
+                primary,
+                visibleDescription,
+                state,
+                selectable,
+                description,
+                joinList(context, " | ")
+            );
         }
 
         public String toString() {

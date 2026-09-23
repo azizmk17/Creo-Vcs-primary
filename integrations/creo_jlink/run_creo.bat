@@ -5,6 +5,7 @@ set "JAVA_EXE=C:\PROGRA~1\Java\jre7\bin\java.exe"
 set "PFC_JAR=C:\Program Files\PTC\Creo 3.0\M020\Common Files\text\java\pfc.jar"
 set "CREO_LAUNCHER=C:\Program Files\PTC\Creo 3.0\M020\Parametric\bin\parametric.bat"
 set "BRIDGE_FILE=%LOCALAPPDATA%\CreoVCS\bridge.json"
+set "PTC_WF_ROOT=%LOCALAPPDATA%\CreoVCS\ptc-wf-root"
 
 if not exist "%JAVA_EXE%" (
     echo ERROR: Java 7 was not found at:
@@ -38,6 +39,8 @@ if not exist "%BRIDGE_FILE%" (
     echo Start Nexus, sign in, and select a product version before using the Nexus PDM menu.
     echo.
 )
+
+if not exist "%PTC_WF_ROOT%" mkdir "%PTC_WF_ROOT%"
 
 set "PRO_JAVA_COMMAND=%JAVA_EXE%"
 set "CLASSPATH=%~dp0classes;%PFC_JAR%"

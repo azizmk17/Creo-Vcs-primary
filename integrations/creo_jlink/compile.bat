@@ -31,6 +31,10 @@ echo Compiling Nexus PDM J-Link with Java 7...
     "%SOURCE%\NexusApiClient.java" ^
     "%SOURCE%\NexusSaveGuard.java" ^
     "%SOURCE%\NexusEditGuard.java" ^
+    "%SOURCE%\NexusModelMutationGuard.java" ^
+    "%SOURCE%\NexusFeatureMutationGuard.java" ^
+    "%SOURCE%\NexusSolidMutationGuard.java" ^
+    "%SOURCE%\NexusSessionMutationGuard.java" ^
     "%SOURCE%\NexusJLink.java"
 
 if errorlevel 1 (

@@ -102,8 +102,23 @@ class ProjectService:
     def delete_project(self, project_id: int) -> bool:
         return self.project_repo.delete_project(int(project_id))
 
-    def update_project(self, project_id: int, name: str, working_directory: str, description: str = "") -> bool:
-        return self.project_repo.update_project(int(project_id), name, working_directory, description)
+    def update_project(
+        self,
+        project_id: int,
+        name: str,
+        working_directory: str,
+        description: str = "",
+        version_label: str | None = None,
+        allow_readonly_version_change: bool = False,
+    ) -> bool:
+        return self.project_repo.update_project(
+            int(project_id),
+            name,
+            working_directory,
+            description,
+            version_label=version_label,
+            allow_readonly_version_change=allow_readonly_version_change,
+        )
 
     def duplicate_project(self, source_project_id: int, new_project_name: str, user_id: int) -> int:
         # Delegate to repository method

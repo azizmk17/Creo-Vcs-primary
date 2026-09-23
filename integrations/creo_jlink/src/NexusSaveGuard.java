@@ -40,6 +40,7 @@ public class NexusSaveGuard extends DefaultUICommandBracketListener {
         }
 
         boolean block = false;
+        boolean conflictHandled = false;
         String reason = "";
         try {
             Map<String, Object> status = NexusJLink.resolveCadForModel(model);
@@ -50,18 +51,28 @@ public class NexusSaveGuard extends DefaultUICommandBracketListener {
                 }
             } else if (!MiniJson.bool(status, "can_modify")
                 && !MiniJson.bool(status, "local_edit_intent")) {
-                block = true;
-                reason = MiniJson.text(status, "read_only_reason");
-                String owner = MiniJson.text(status, "checked_out_by_username");
-                if (owner.length() > 0 && "CHECKED_OUT_BY_OTHER".equals(MiniJson.text(status, "checkout_state"))) {
-                    reason = "Checked out by " + owner + ".";
+                if ("save".equals(action)) {
+                    conflictHandled = true;
+                    block = !NexusJLink.resolveModelConflict(model, true);
+                    reason = "The Save operation was canceled in Conflict Management.";
+                } else {
+                    block = true;
+                    reason = MiniJson.text(status, "read_only_reason");
+                    String owner = MiniJson.text(status, "checked_out_by_username");
+                    if (owner.length() > 0 && "CHECKED_OUT_BY_OTHER".equals(MiniJson.text(status, "checkout_state"))) {
+                        reason = "Checked out by " + owner + ".";
+                    }
                 }
             } else if (!modelIsInsideWorkspace(model, MiniJson.text(status, "workspace_path"))) {
                 block = true;
                 reason = "Open the checked-out copy from its assigned Nexus CAD workspace before editing.";
             } else if (MiniJson.bool(status, "local_edit_intent")) {
-                // Local intent permits a local Save; server check-in remains blocked.
-                return;
+                if ("save".equals(action)) {
+                    // Local intent permits local Save only; server check-in remains blocked.
+                    return;
+                }
+                block = true;
+                reason = "Local edit intent does not allow renaming a managed CAD Document.";
             }
         } catch (Exception error) {
             if (isTrackedWorkspaceFile(model, fileName)) {
@@ -71,10 +82,12 @@ public class NexusSaveGuard extends DefaultUICommandBracketListener {
         }
 
         if (block) {
-            NexusDialogs.warningLater(
-                "Nexus blocked the " + action + " operation for " + fileName + ".\n\n" + reason,
-                "Nexus PDM"
-            );
+            if (!conflictHandled) {
+                NexusDialogs.warningLater(
+                    "Nexus blocked the " + action + " operation for " + fileName + ".\n\n" + reason,
+                    "Nexus PDM"
+                );
+            }
             XCancelProEAction.Throw();
         }
     }

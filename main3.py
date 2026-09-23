@@ -1000,7 +1000,11 @@ class BomGUI(QMainWindow):
             QMessageBox.warning(self, "Error", "No project selected!")
             return
 
-        version_label, ok = QInputDialog.getText(self, "New Version", "Version label (leave empty for auto: A..Z..AA..):")
+        version_label, ok = QInputDialog.getText(
+            self,
+            "New Version",
+            "Version label (custom text allowed; leave empty for automatic A, B, ...):",
+        )
         if not ok:
             return
 

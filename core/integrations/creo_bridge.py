@@ -378,7 +378,7 @@ class CreoBridgeController:
             reason = "The checkout belongs to another workspace or machine."
         elif not can_commit:
             reason = "The current Nexus user no longer has permission to modify CAD."
-        return {
+        payload = {
             "managed": True,
             "id": int(document["id"]),
             "project_id": int(document.get("project_id") or 0),
@@ -417,6 +417,401 @@ class CreoBridgeController:
             "can_checkin": bool(can_commit and owned_here),
             "read_only_reason": reason,
         }
+        payload["edit_conflicts"] = self._edit_conflicts(payload)
+        return payload
+
+    @staticmethod
+    def _conflict_action(code: str, label: str) -> dict:
+        return {"code": str(code), "label": str(label)}
+
+    def _cad_conflict(
+        self,
+        document: dict,
+        *,
+        code: str,
+        description: str,
+        actions: list[dict],
+        default_action: str,
+        severity: str = "OVERRIDABLE",
+        related_cad_document_ids=None,
+    ) -> dict:
+        cad_id = int(document.get("id") or 0)
+        file_name = str(document.get("file_name") or "").strip()
+        number = str(document.get("number") or "").strip()
+        return {
+            "id": f"{str(code).lower()}:{cad_id}",
+            "code": str(code),
+            "cad_document_id": cad_id,
+            "object": file_name or number or str(cad_id),
+            "name": str(document.get("name") or "").strip(),
+            "number": number,
+            "file_name": file_name,
+            "revision": str(document.get("revision") or ""),
+            "iteration": int(document.get("iteration") or 0),
+            "description": str(description),
+            "severity": str(severity),
+            "overridable": str(severity).upper() == "OVERRIDABLE",
+            "actions": list(actions or []),
+            "default_action": str(default_action or "CANCEL"),
+            "owner": str(document.get("checked_out_by_username") or ""),
+            "workspace": str(document.get("checkout_workspace_name") or ""),
+            "related_cad_document_ids": [
+                int(value) for value in (related_cad_document_ids or [])
+            ],
+        }
+
+    def _edit_conflicts(self, status: dict) -> list[dict]:
+        if status.get("can_modify") or status.get("local_edit_intent"):
+            return []
+        readonly = self._conflict_action("MAKE_READ_ONLY", "Make Read-only")
+        cancel = self._conflict_action("CANCEL", "Cancel")
+        continue_local = self._conflict_action(
+            "CONTINUE_LOCALLY", "Continue Locally"
+        )
+        checkout_state = str(status.get("checkout_state") or "")
+        lifecycle = str(status.get("lifecycle_state") or "WIP").upper()
+        if checkout_state == "CHECKED_OUT_BY_OTHER":
+            owner = str(status.get("checked_out_by_username") or "another Nexus user")
+            return [self._cad_conflict(
+                status,
+                code="CHECKED_OUT_BY_OTHER",
+                description=(
+                    f"The object is checked out by {owner}. Local changes can be kept, "
+                    "but Nexus check-in remains blocked until you obtain the checkout."
+                ),
+                actions=[continue_local, readonly, cancel],
+                default_action="MAKE_READ_ONLY",
+            )]
+        if checkout_state == "CHECKED_OUT_BY_ME":
+            return [self._cad_conflict(
+                status,
+                code="OTHER_WORKSPACE",
+                description=(
+                    "The object is checked out by you in another workspace or machine. "
+                    "Open the owning workspace before making managed changes."
+                ),
+                actions=[readonly, cancel],
+                default_action="MAKE_READ_ONLY",
+                severity="BLOCKING",
+            )]
+        if lifecycle == "RELEASED":
+            return [self._cad_conflict(
+                status,
+                code="REVISION_REQUIRED",
+                description=(
+                    "The object is released and read-only. Create a new revision and "
+                    "check it out before making managed changes."
+                ),
+                actions=[
+                    self._conflict_action(
+                        "REVISE_AND_CHECKOUT", "Revise and Check Out Now"
+                    ),
+                    continue_local,
+                    readonly,
+                    cancel,
+                ],
+                default_action="REVISE_AND_CHECKOUT",
+            )]
+        if lifecycle == "OBSOLETE":
+            return [self._cad_conflict(
+                status,
+                code="OBSOLETE_OBJECT",
+                description=(
+                    "The object is obsolete. It cannot be checked out or checked in, "
+                    "but a local-only modification may be kept."
+                ),
+                actions=[continue_local, readonly, cancel],
+                default_action="MAKE_READ_ONLY",
+            )]
+        if not status.get("can_checkout"):
+            return [self._cad_conflict(
+                status,
+                code="MODIFY_PERMISSION_REQUIRED",
+                description=(
+                    "The current Nexus user cannot check out this object. A local-only "
+                    "change may be kept, but Nexus check-in remains blocked."
+                ),
+                actions=[continue_local, readonly, cancel],
+                default_action="MAKE_READ_ONLY",
+            )]
+        return [self._cad_conflict(
+            status,
+            code="NOT_CHECKED_OUT",
+            description="The object is read-only because it is not checked out.",
+            actions=[
+                self._conflict_action("CHECKOUT_NOW", "Check Out Now"),
+                continue_local,
+                readonly,
+                cancel,
+            ],
+            default_action="CHECKOUT_NOW",
+        )]
+
+    @staticmethod
+    def _workspace_manifest_entries(workspace_service, workspace_id: str) -> dict:
+        loader = getattr(workspace_service, "load_manifest", None)
+        if not callable(loader):
+            return {}
+        try:
+            manifest = loader(str(workspace_id), required=False) or {}
+        except (TypeError, ValueError):
+            try:
+                manifest = loader(str(workspace_id)) or {}
+            except Exception:
+                return {}
+        return {
+            int(key): dict(value or {})
+            for key, value in (manifest.get("entries") or {}).items()
+            if str(key).isdigit()
+        }
+
+    @staticmethod
+    def _drawing_model_id(document: dict) -> int | None:
+        if str(document.get("category") or "").upper() != "DRAWING":
+            return None
+        value = document.get("drawing_owner_cad_document_id")
+        try:
+            model_id = int(value)
+        except (TypeError, ValueError):
+            return None
+        return model_id if model_id > 0 else None
+
+    def _require_drawing_model_in_checkin_batch(
+        self,
+        document: dict,
+        body: dict,
+        user_id: int,
+        workspace: dict,
+        workspace_service,
+    ) -> int | None:
+        if str(document.get("category") or "").upper() != "DRAWING":
+            return None
+        model_id = self._drawing_model_id(document)
+        if model_id is None:
+            raise BridgeApiError(
+                409,
+                "drawing_model_not_bound",
+                "The drawing cannot be checked in because it is not bound to a PRT or ASM CAD Document.",
+            )
+        batch_ids = set()
+        for value in body.get("batch_cad_document_ids") or []:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0:
+                batch_ids.add(parsed)
+        if model_id not in batch_ids:
+            raise BridgeApiError(
+                409,
+                "drawing_model_required",
+                "A drawing cannot be checked in without its related PRT or ASM in the same check-in batch.",
+                {"related_cad_document_id": model_id},
+            )
+        model = self._pdm_service().repo.get_cad_document(model_id) or {}
+        if not model or not self._checked_out_in_workspace(
+            model, int(user_id), workspace, workspace_service
+        ):
+            raise BridgeApiError(
+                409,
+                "drawing_model_not_checkin_eligible",
+                "The drawing's related model must be checked out by you in the same workspace.",
+                {"related_cad_document_id": model_id},
+            )
+        return model_id
+
+    def _checkin_preflight_conflicts(
+        self,
+        cad_document_ids,
+        workspace_service,
+        workspace: dict,
+        user_id: int,
+        project_id: int,
+    ) -> list[dict]:
+        selected_ids = set()
+        for value in cad_document_ids or []:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0:
+                selected_ids.add(parsed)
+        workspace_id = str(workspace.get("id") or "")
+        entries = self._workspace_manifest_entries(workspace_service, workspace_id)
+        try:
+            local_rows = workspace_service.scan_workspace(
+                workspace_id, int(project_id), int(user_id)
+            )
+        except Exception:
+            local_rows = []
+        local_by_id = {
+            int(row.get("cad_document_id")): dict(row)
+            for row in local_rows or []
+            if row.get("cad_document_id") is not None
+        }
+        conflicts = []
+        skip = self._conflict_action("SKIP_OBJECT", "Skip Object")
+        cancel = self._conflict_action("CANCEL", "Cancel")
+        for cad_id in sorted(selected_ids):
+            document = self._pdm_service().repo.get_cad_document(int(cad_id)) or {}
+            if not document:
+                continue
+            status = self._status_payload(document, local_workspace_id=workspace_id)
+            if not status.get("can_checkin"):
+                conflicts.append(self._cad_conflict(
+                    status,
+                    code="CHECKIN_NOT_ALLOWED",
+                    description=(
+                        str(status.get("read_only_reason") or "")
+                        or "This object cannot be checked in from the selected workspace."
+                    ),
+                    actions=[skip, cancel],
+                    default_action="CANCEL",
+                    severity="BLOCKING",
+                ))
+                continue
+            entry = entries.get(cad_id) or {}
+            if not entry or cad_id not in local_by_id:
+                conflicts.append(self._cad_conflict(
+                    status,
+                    code="WORKSPACE_CONTENT_MISSING",
+                    description=(
+                        "The managed workspace entry or its local Creo content is missing. "
+                        "Retrieve the CAD Document into this workspace before check-in."
+                    ),
+                    actions=[skip, cancel],
+                    default_action="CANCEL",
+                    severity="BLOCKING",
+                ))
+                continue
+            baseline_revision = str(entry.get("baseline_cad_revision") or "")
+            baseline_iteration = int(entry.get("baseline_cad_iteration") or 0)
+            if entry and (
+                baseline_revision != str(document.get("revision") or "")
+                or baseline_iteration != int(document.get("iteration") or 0)
+            ):
+                conflicts.append(self._cad_conflict(
+                    status,
+                    code="OUT_OF_DATE",
+                    description=(
+                        "The server revision or iteration is newer than the workspace "
+                        "baseline. Update the managed copy before check-in."
+                    ),
+                    actions=[skip, cancel],
+                    default_action="CANCEL",
+                    severity="BLOCKING",
+                ))
+                continue
+            if str(document.get("category") or "").upper() == "DRAWING":
+                drawing_model_id = self._drawing_model_id(document)
+                if drawing_model_id is None:
+                    conflicts.append(self._cad_conflict(
+                        status,
+                        code="DRAWING_MODEL_NOT_BOUND",
+                        description=(
+                            "The drawing is not bound to a PRT or ASM CAD Document. "
+                            "Bind the related model before check-in."
+                        ),
+                        actions=[skip, cancel],
+                        default_action="CANCEL",
+                        severity="BLOCKING",
+                    ))
+                    continue
+                if drawing_model_id not in selected_ids:
+                    model = self._pdm_service().repo.get_cad_document(
+                        drawing_model_id
+                    ) or {}
+                    model_status = (
+                        self._status_payload(model, local_workspace_id=workspace_id)
+                        if model else {}
+                    )
+                    can_add_model = bool(
+                        drawing_model_id in entries
+                        and drawing_model_id in local_by_id
+                        and model_status.get("can_checkin")
+                    )
+                    actions = [skip, cancel]
+                    default_action = "CANCEL"
+                    severity = "BLOCKING"
+                    description = (
+                        "This drawing cannot be checked in without its related PRT or "
+                        "ASM in the same check-in batch."
+                    )
+                    if can_add_model:
+                        actions.insert(0, self._conflict_action(
+                            "ADD_REQUIRED_OBJECTS", "Add Related Model"
+                        ))
+                        default_action = "ADD_REQUIRED_OBJECTS"
+                        severity = "OVERRIDABLE"
+                    else:
+                        description += (
+                            " Retrieve and check out the related model in this workspace first."
+                        )
+                    conflicts.append(self._cad_conflict(
+                        status,
+                        code="DRAWING_MODEL_NOT_SELECTED",
+                        description=description,
+                        actions=actions,
+                        default_action=default_action,
+                        severity=severity,
+                        related_cad_document_ids=[drawing_model_id],
+                    ))
+                    continue
+            dependency_ids = list(self._cad_dependency_ids(cad_id))
+            drawing_owner_id = self._drawing_model_id(document)
+            if drawing_owner_id is not None:
+                dependency_ids.append(drawing_owner_id)
+            missing = sorted({
+                int(dependency_id)
+                for dependency_id in dependency_ids
+                if int(dependency_id) not in entries
+            })
+            if missing:
+                conflicts.append(self._cad_conflict(
+                    status,
+                    code="MISSING_REQUIRED_DEPENDENCY",
+                    description=(
+                        "One or more required CAD dependencies are missing from this "
+                        "workspace. Retrieve the complete managed structure before check-in."
+                    ),
+                    actions=[skip, cancel],
+                    default_action="CANCEL",
+                    severity="BLOCKING",
+                    related_cad_document_ids=missing,
+                ))
+                continue
+            modified_not_selected = []
+            for dependency_id in dependency_ids:
+                dependency_id = int(dependency_id)
+                row = local_by_id.get(dependency_id) or {}
+                dependency = self._pdm_service().repo.get_cad_document(dependency_id) or {}
+                if (
+                    dependency_id not in selected_ids
+                    and bool(row.get("modified"))
+                    and self._checked_out_in_workspace(
+                        dependency, int(user_id), workspace, workspace_service
+                    )
+                ):
+                    modified_not_selected.append(dependency_id)
+            if modified_not_selected:
+                conflicts.append(self._cad_conflict(
+                    status,
+                    code="MODIFIED_DEPENDENCY_NOT_SELECTED",
+                    description=(
+                        "Modified checked-out dependencies are not selected. Add them to "
+                        "the check-in set or skip this parent object."
+                    ),
+                    actions=[
+                        self._conflict_action(
+                            "ADD_REQUIRED_OBJECTS", "Add Required Objects"
+                        ),
+                        skip,
+                        cancel,
+                    ],
+                    default_action="ADD_REQUIRED_OBJECTS",
+                    related_cad_document_ids=modified_not_selected,
+                ))
+        return conflicts
 
     @staticmethod
     def _checked_out_in_workspace(
@@ -812,6 +1207,29 @@ class CreoBridgeController:
                     "workspace_conflict",
                     "The check-in request does not match the checkout workspace.",
                 )
+            self._require_drawing_model_in_checkin_batch(
+                document,
+                body,
+                int(user_id),
+                workspace,
+                workspace_service,
+            )
+            manifest_entries = self._workspace_manifest_entries(
+                workspace_service, str(workspace["id"])
+            )
+            manifest_entry = manifest_entries.get(int(cad_document_id)) or {}
+            if manifest_entry and (
+                str(manifest_entry.get("baseline_cad_revision") or "")
+                != str(document.get("revision") or "")
+                or int(manifest_entry.get("baseline_cad_iteration") or 0)
+                != int(document.get("iteration") or 0)
+            ):
+                raise BridgeApiError(
+                    409,
+                    "out_of_date",
+                    "The server CAD version is newer than this workspace baseline. "
+                    "Update the managed copy before check-in.",
+                )
             note = str(body.get("note") or "").strip()
             if not note:
                 raise BridgeApiError(400, "note_required", "A check-in comment is required.")
@@ -884,13 +1302,31 @@ class CreoBridgeController:
         """Describe pending-group and duplicate choices before a Creo batch."""
         user_id, project_id, _project = self._require_commit_permission()
         commit_service = self._commit_service()
-        conflicts = []
-        seen = set()
+        requested_ids = []
         for value in body.get("cad_document_ids") or []:
             try:
                 cad_document_id = int(value)
             except (TypeError, ValueError):
                 continue
+            if cad_document_id > 0 and cad_document_id not in requested_ids:
+                requested_ids.append(cad_document_id)
+        workspace_id = str(body.get("workspace_id") or "").strip()
+        if not workspace_id and requested_ids:
+            document = self._pdm_service().repo.get_cad_document(requested_ids[0]) or {}
+            workspace_id = str(document.get("checkout_workspace_id") or "").strip()
+        pdm_conflicts = []
+        if workspace_id:
+            workspace_service, workspace = self._workspace(workspace_id)
+            pdm_conflicts = self._checkin_preflight_conflicts(
+                requested_ids,
+                workspace_service,
+                workspace,
+                int(user_id),
+                int(project_id),
+            )
+        conflicts = []
+        seen = set()
+        for cad_document_id in requested_ids:
             if cad_document_id in seen:
                 continue
             seen.add(cad_document_id)
@@ -903,17 +1339,50 @@ class CreoBridgeController:
             )
             if pending:
                 pending_user_id = int(getattr(pending, "designer", 0) or 0)
-                conflicts.append({
+                pending_conflict = {
                     "cad_document_id": cad_document_id,
                     "file_name": clean_name,
                     "commit_id": str(getattr(pending, "commit_id", "") or ""),
                     "title": str(getattr(pending, "title", "") or ""),
                     "replace_allowed": pending_user_id == int(user_id),
                     "owner": str(getattr(pending, "username", "") or ""),
-                })
+                }
+                conflicts.append(pending_conflict)
+                pending_actions = [
+                    self._conflict_action("SKIP_OBJECT", "Skip Object"),
+                    self._conflict_action("CANCEL", "Cancel"),
+                ]
+                default_action = "SKIP_OBJECT"
+                if pending_conflict["replace_allowed"]:
+                    pending_actions.insert(
+                        0,
+                        self._conflict_action(
+                            "REPLACE_PENDING", "Replace Pending Copy"
+                        ),
+                    )
+                    default_action = "REPLACE_PENDING"
+                document = self._pdm_service().repo.get_cad_document(cad_document_id) or {}
+                pdm_conflicts.append(self._cad_conflict(
+                    document,
+                    code="PENDING_FILE_CONFLICT",
+                    description=(
+                        f'{clean_name} is already in Pending commit "'
+                        f'{pending_conflict["title"]}".'
+                    ),
+                    actions=pending_actions,
+                    default_action=default_action,
+                ))
         return {
             "pending_commits": commit_service.pending_commit_choices(int(user_id)),
             "conflicts": conflicts,
+            "pdm_conflicts": pdm_conflicts,
+            "event": {
+                "type": "CHECKIN_PREFLIGHT",
+                "status": "CONFLICTS" if pdm_conflicts else "READY",
+                "workspace_id": workspace_id or None,
+                "affected_cad_document_ids": requested_ids,
+                "created_at": _utc_now(),
+            },
         }
 
     def undo_checkout(self, cad_document_id: int, body: dict) -> dict:
@@ -968,7 +1437,7 @@ class CreoBridgeController:
     def edit_intent(self, cad_document_id: int, body: dict) -> dict:
         """Make the local copy editable without granting a server checkout."""
         with self._operation_lock:
-            user_id, _project_id, _project = self._require_commit_permission()
+            user_id, _project_id, _project = self._require_project()
             _uid, _pid, _project_row, document = self._document(cad_document_id)
             workspace_service, workspace = self._workspace(body.get("workspace_id"))
             if self._checked_out_in_workspace(

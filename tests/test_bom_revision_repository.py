@@ -282,6 +282,80 @@ class BomRevisionRepositoryTests(unittest.TestCase):
         self.assertEqual(status["child_bom_id"], by_aes["P01"])
         self.assertEqual(status["bound_version"], "A.2")
 
+    def test_project_version_accepts_and_preserves_custom_label(self):
+        repository = ProjectRepository(self.db_path)
+
+        new_project_id = repository.create_project_version(
+            source_project_id=10,
+            user_id=7,
+            new_working_directory="C:/custom-target",
+            version_label="2026-R1 / Prototype",
+        )
+
+        created = repository.get_project_by_id(int(new_project_id))
+        self.assertEqual(created["version_label"], "2026-R1 / Prototype")
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            repository.create_project_version(
+                source_project_id=10,
+                user_id=7,
+                new_working_directory="C:/duplicate-target",
+                version_label="2026-r1 / prototype",
+            )
+
+    def test_admin_version_rename_updates_managed_file_references(self):
+        repository = ProjectRepository(self.db_path)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS part_file_versions (
+                    id INTEGER PRIMARY KEY,
+                    root_project_id INTEGER,
+                    project_version_label TEXT
+                );
+                CREATE TABLE IF NOT EXISTS assembly_configurations (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER,
+                    source_project_version TEXT
+                );
+                INSERT INTO part_file_versions(
+                    id,root_project_id,project_version_label
+                ) VALUES(900,10,'A');
+                INSERT INTO assembly_configurations(
+                    id,project_id,source_project_version
+                ) VALUES(901,10,'A');
+                UPDATE projects SET is_readonly=1 WHERE id=10;
+                """
+            )
+
+        repository.update_project(
+            10,
+            "Demo",
+            "C:/source",
+            "Source",
+            version_label="Release 1.0",
+            allow_readonly_version_change=True,
+        )
+
+        with sqlite3.connect(self.db_path) as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT version_label FROM projects WHERE id=10"
+                ).fetchone()[0],
+                "Release 1.0",
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT project_version_label FROM part_file_versions WHERE id=900"
+                ).fetchone()[0],
+                "Release 1.0",
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT source_project_version FROM assembly_configurations WHERE id=901"
+                ).fetchone()[0],
+                "Release 1.0",
+            )
+
     def test_project_version_copy_remaps_pdm_cad_layer_and_preserves_document_paths(self):
         with sqlite3.connect(self.db_path) as conn:
             conn.executescript(
