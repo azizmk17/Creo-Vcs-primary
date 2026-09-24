@@ -144,10 +144,45 @@ class CadWorkspaceService:
 
     def get_workspace(self, workspace_id: str) -> dict | None:
         key = str(workspace_id or "").strip().lower()
-        for row in self.list_workspaces():
-            if row["id"] == key:
-                return row
+        if not re.fullmatch(r"[0-9a-f]{32}", key):
+            return None
+        registry = self._registry()
+        for raw in registry.get("workspaces") or []:
+            row = dict(raw or {})
+            if str(row.get("id") or "").strip().lower() != key:
+                continue
+            owner_user_id = row.get("owner_user_id")
+            if (
+                owner_user_id is not None
+                and self.session.user_id is not None
+                and int(owner_user_id) != int(self.session.user_id)
+            ):
+                return None
+            path = self.workspace_path(key)
+            row.update({
+                "id": key,
+                "path": str(path),
+                "available": path.is_dir(),
+            })
+            return row
         return None
+
+    @staticmethod
+    def _path_signature(path: Path) -> tuple[int, int] | None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        modified_ns = getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))
+        return int(modified_ns), int(stat.st_size)
+
+    def metadata_signature(self, workspace_id: str) -> tuple:
+        """Cheap freshness token without parsing the registry or manifest JSON."""
+        key = str(workspace_id or "").strip().lower()
+        manifest = None
+        if re.fullmatch(r"[0-9a-f]{32}", key):
+            manifest = self._path_signature(self._manifest_path(key))
+        return self._path_signature(self.registry_path), manifest
 
     def list_workspaces(self) -> list[dict]:
         registry = self._registry()

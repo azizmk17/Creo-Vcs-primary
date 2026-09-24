@@ -8,6 +8,7 @@ centralized in Nexus.
 
 from __future__ import annotations
 
+import copy
 import hmac
 import json
 import logging
@@ -17,11 +18,13 @@ import secrets
 import socket
 import tempfile
 import threading
+import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from config import DB_NAME
 from core.repositories.bom_children_repository import BomChildrenRepository
 from core.repositories.bom_repository import BomRepository
 from core.repositories.lock_repository import LockRepository
@@ -37,6 +40,9 @@ from core.session_manager import SessionManager
 
 API_VERSION = 1
 MAX_REQUEST_BYTES = 1024 * 1024
+STATUS_CACHE_MAX_AGE_SECONDS = max(
+    1.0, float(os.environ.get("NEXUS_CREO_STATUS_CACHE_SECONDS", "30"))
+)
 _CAD_VERSION_RE = re.compile(r"\.(?:prt|asm|drw)\.(\d+)$", re.IGNORECASE)
 logger = logging.getLogger(__name__)
 
@@ -78,6 +84,11 @@ class CreoBridgeController:
         self._pdm_service_factory = pdm_service_factory or PdmService
         self._commit_service_factory = commit_service_factory or CommitService
         self._operation_lock = threading.RLock()
+        self._service_lock = threading.RLock()
+        self._workspace_service_instance = None
+        self._pdm_service_instance = None
+        self._status_cache_lock = threading.RLock()
+        self._status_cache = {}
 
     @staticmethod
     def _build_bom_service() -> BomService:
@@ -91,7 +102,15 @@ class CreoBridgeController:
     def dispatch(self, method: str, path: str, query: dict, body: dict):
         method = str(method or "").upper()
         path = "/" + str(path or "").strip("/")
+        if method == "GET":
+            return self._dispatch(method, path, query, body)
+        self._clear_status_cache()
+        try:
+            return self._dispatch(method, path, query, body)
+        finally:
+            self._clear_status_cache()
 
+    def _dispatch(self, method: str, path: str, query: dict, body: dict):
         if method == "GET" and path == "/api/v1/context":
             return self.context()
         if method == "GET" and path == "/api/v1/projects":
@@ -150,10 +169,47 @@ class CreoBridgeController:
         raise BridgeApiError(404, "route_not_found", "The bridge route was not found.")
 
     def _workspace_service(self) -> CadWorkspaceService:
-        return self._workspace_service_factory()
+        with self._service_lock:
+            if self._workspace_service_instance is None:
+                self._workspace_service_instance = self._workspace_service_factory()
+            return self._workspace_service_instance
 
     def _pdm_service(self) -> PdmService:
-        return self._pdm_service_factory()
+        with self._service_lock:
+            if self._pdm_service_instance is None:
+                self._pdm_service_instance = self._pdm_service_factory()
+            return self._pdm_service_instance
+
+    def _clear_status_cache(self) -> None:
+        with self._status_cache_lock:
+            self._status_cache.clear()
+
+    @staticmethod
+    def _path_signature(path) -> tuple[int, int] | None:
+        try:
+            stat = Path(os.fspath(path)).stat()
+        except (OSError, TypeError, ValueError):
+            return None
+        modified_ns = getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))
+        return int(modified_ns), int(stat.st_size)
+
+    def _status_source_signature(self, workspace_id: str) -> tuple:
+        repo = getattr(self._pdm_service(), "repo", None)
+        signature_provider = getattr(repo, "status_cache_signature", None)
+        if callable(signature_provider):
+            database = signature_provider()
+        else:
+            database_path = getattr(repo, "db_name", DB_NAME)
+            database = self._path_signature(database_path)
+        workspace = None
+        service = self._workspace_service()
+        signature = getattr(service, "metadata_signature", None)
+        if workspace_id and callable(signature):
+            try:
+                workspace = signature(workspace_id)
+            except (OSError, TypeError, ValueError):
+                workspace = None
+        return database, workspace
 
     def _bom_service(self) -> BomService:
         return self._bom_service_factory()
@@ -326,22 +382,21 @@ class CreoBridgeController:
         edit_intent = None
         intent_workspace_id = str(local_workspace_id or workspace_id).strip().lower()
         intent_workspace = None
+        workspace_service = self._workspace_service()
         if workspace_id:
             try:
-                workspace_service = self._workspace_service()
                 workspace = workspace_service.get_workspace(workspace_id)
-                if workspace and hasattr(workspace_service, "get_edit_intent"):
-                    edit_intent = workspace_service.get_edit_intent(
-                        workspace_id, int(document["id"])
-                    )
             except Exception:
                 workspace = None
         if intent_workspace_id:
             try:
-                intent_service = self._workspace_service()
-                intent_workspace = intent_service.get_workspace(intent_workspace_id)
-                if intent_workspace and hasattr(intent_service, "get_edit_intent"):
-                    edit_intent = intent_service.get_edit_intent(
+                intent_workspace = (
+                    workspace
+                    if intent_workspace_id == workspace_id
+                    else workspace_service.get_workspace(intent_workspace_id)
+                )
+                if intent_workspace and hasattr(workspace_service, "get_edit_intent"):
+                    edit_intent = workspace_service.get_edit_intent(
                         intent_workspace_id, int(document["id"])
                     )
             except Exception:
@@ -921,20 +976,61 @@ class CreoBridgeController:
         return materialized, dependency_ids
 
     def resolve_cad(self, file_name: str, workspace_id: str = "") -> dict:
-        _user_id, project_id, _project = self._require_project()
+        user_id = self._require_session()
+        project_id = getattr(self.session, "project_id", None)
+        if project_id is None:
+            raise BridgeApiError(
+                409,
+                "project_required",
+                "Select a product and version in Nexus before using Creo.",
+            )
+        project_id = int(project_id)
         clean_name = CadWorkspaceService.logical_name(str(file_name or ""))
         if not clean_name:
             raise BridgeApiError(400, "file_name_required", "A Creo file name is required.")
-        document = self._pdm_service().repo.get_cad_document_by_file(
-            project_id, clean_name
+        clean_workspace_id = str(workspace_id or "").strip().lower()
+        cache_key = (
+            int(user_id),
+            project_id,
+            clean_workspace_id,
+            clean_name.casefold(),
         )
-        if not document:
-            return {"cad": {"managed": False, "file_name": clean_name}}
-        return {
-            "cad": self._status_payload(
-                dict(document), local_workspace_id=str(workspace_id or "").strip()
+        signature = self._status_source_signature(clean_workspace_id)
+        now = time.monotonic()
+        with self._status_cache_lock:
+            cached = self._status_cache.get(cache_key)
+            if (
+                cached
+                and cached["signature"] == signature
+                and now - float(cached["created_at"]) <= STATUS_CACHE_MAX_AGE_SECONDS
+            ):
+                return copy.deepcopy(cached["payload"])
+
+        def load_payload() -> dict:
+            self._require_project()
+            document = self._pdm_service().repo.get_cad_document_by_file(
+                project_id, clean_name
             )
-        }
+            if not document:
+                return {"cad": {"managed": False, "file_name": clean_name}}
+            return {"cad": self._status_payload(
+                dict(document), local_workspace_id=clean_workspace_id
+            )}
+
+        payload = load_payload()
+        final_signature = self._status_source_signature(clean_workspace_id)
+        if final_signature != signature:
+            signature = final_signature
+            payload = load_payload()
+            final_signature = self._status_source_signature(clean_workspace_id)
+        if final_signature == signature:
+            with self._status_cache_lock:
+                self._status_cache[cache_key] = {
+                    "created_at": time.monotonic(),
+                    "signature": final_signature,
+                    "payload": copy.deepcopy(payload),
+                }
+        return payload
 
     def cad_status(self, cad_document_id: int) -> dict:
         _user_id, _project_id, _project, document = self._document(cad_document_id)

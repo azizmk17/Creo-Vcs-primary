@@ -25,6 +25,8 @@ class _Controller:
 
 class _CadRepo:
     def __init__(self):
+        self.resolve_calls = 0
+        self.cache_version = 1
         self.documents = {
             1: {
                 "id": 1,
@@ -64,6 +66,20 @@ class _CadRepo:
         row = self.documents.get(int(document_id))
         return dict(row) if row else None
 
+    def get_cad_document_by_file(self, project_id, file_name):
+        self.resolve_calls += 1
+        logical = str(file_name or "").casefold()
+        for row in self.documents.values():
+            if (
+                int(row.get("project_id") or 0) == int(project_id)
+                and str(row.get("file_name") or "").casefold() == logical
+            ):
+                return dict(row)
+        return None
+
+    def status_cache_signature(self):
+        return self.cache_version
+
     def list_cad_members(self, parent_id):
         return list(self.members.get(int(parent_id), []))
 
@@ -94,6 +110,7 @@ class _WorkspaceService:
 
     def __init__(self):
         self.calls = []
+        self.metadata_version = 1
         self.intents = {}
         self.missing_workspaces = set()
         self.manifest_entries = {}
@@ -108,6 +125,9 @@ class _WorkspaceService:
             "path": "C:/workspace",
             "available": True,
         }
+
+    def metadata_signature(self, _workspace_id):
+        return self.metadata_version
 
     def scan_workspace(self, workspace_id, project_id, user_id):
         if self.local_rows is not None:
@@ -278,6 +298,44 @@ class CreoBridgeControllerTests(unittest.TestCase):
             "other_project.prt",
             [row["file_name"] for row in result["cad_documents"]],
         )
+
+    def test_resolve_uses_cache_until_database_or_workspace_metadata_changes(self):
+        query = {
+            "file_name": ["machine.asm"],
+            "workspace_id": ["workspace-one"],
+        }
+
+        first = self.controller.dispatch("GET", "/api/v1/cad/resolve", query, {})
+        second = self.controller.dispatch("GET", "/api/v1/cad/resolve", query, {})
+        self.assertEqual(first, second)
+        self.assertEqual(self.repo.resolve_calls, 1)
+
+        self.workspace_service.metadata_version += 1
+        self.controller.dispatch("GET", "/api/v1/cad/resolve", query, {})
+        self.assertEqual(self.repo.resolve_calls, 2)
+
+        self.repo.cache_version += 1
+        self.controller.dispatch("GET", "/api/v1/cad/resolve", query, {})
+        self.assertEqual(self.repo.resolve_calls, 3)
+
+    def test_edit_intent_mutation_invalidates_cached_status(self):
+        query = {
+            "file_name": ["frame.asm"],
+            "workspace_id": ["workspace-one"],
+        }
+        before = self.controller.dispatch("GET", "/api/v1/cad/resolve", query, {})
+        self.assertFalse(before["cad"]["local_edit_intent"])
+
+        self.controller.dispatch(
+            "POST",
+            "/api/v1/cad/2/intent",
+            {},
+            {"workspace_id": "workspace-one", "reason": "Local draft"},
+        )
+        after = self.controller.dispatch("GET", "/api/v1/cad/resolve", query, {})
+
+        self.assertTrue(after["cad"]["local_edit_intent"])
+        self.assertEqual(self.repo.resolve_calls, 2)
 
     def test_workspace_checkouts_lists_active_project_checkout_rows(self):
         self.repo.documents[5] = {

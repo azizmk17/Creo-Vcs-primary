@@ -35,6 +35,8 @@ public class NexusJLink {
         new LinkedHashSet<String>();
     private static final Set<String> unauthorizedModificationAlerts =
         new LinkedHashSet<String>();
+    private static final Set<String> localDraftModels =
+        new LinkedHashSet<String>();
     private static Map<String, Object> selectedWorkspace;
 
     public static void start() {
@@ -67,6 +69,7 @@ public class NexusJLink {
         mutationGuards.clear();
         registeredGuardNames.clear();
         unauthorizedModificationAlerts.clear();
+        localDraftModels.clear();
         selectedWorkspace = null;
         api = null;
         session = null;
@@ -177,8 +180,7 @@ public class NexusJLink {
             "ProCmdAnnotationEdit",
             "PH.L.PIM_Addpb.l0",
             "PH.pop_constr_offset",
-            "psh_delete1",
-            "ProCmdRegenPart"
+            "psh_delete1"
         };
         for (String commandName : editCommands) {
             addEditCommandGuard(commandName);
@@ -354,6 +356,9 @@ public class NexusJLink {
     private static Map<String, Object> chooseWorkspace() throws Exception {
         requireContext();
         installCommandGuards();
+        String previousWorkspaceId = selectedWorkspace == null
+            ? ""
+            : MiniJson.text(selectedWorkspace, "id");
         List<Object> raw = api.listWorkspaces();
         List<WorkspaceChoice> choices = new ArrayList<WorkspaceChoice>();
         for (Object item : raw) {
@@ -380,6 +385,9 @@ public class NexusJLink {
             selectedWorkspace = api.createWorkspace(name.trim());
         } else {
             selectedWorkspace = choice.workspace;
+        }
+        if (!previousWorkspaceId.equalsIgnoreCase(MiniJson.text(selectedWorkspace, "id"))) {
+            localDraftModels.clear();
         }
         session.ChangeDirectory(MiniJson.text(selectedWorkspace, "path"));
         NexusDialogs.info(
@@ -646,6 +654,7 @@ public class NexusJLink {
                     ? "Creo detected a local modification before checkout."
                     : "User chose to continue locally."
             );
+            markLocalDraft(model);
             return true;
         }
         if ("CHECKOUT_NOW".equals(action) || "REVISE_AND_CHECKOUT".equals(action)) {
@@ -709,10 +718,20 @@ public class NexusJLink {
     static boolean resolveModelConflict(Model model, boolean preserveLocalChanges)
         throws Exception {
         if (model == null || api == null) return true;
+        if (isLocalDraftModel(model)) return true;
         Map<String, Object> status = resolveCadForModel(model);
         if (!MiniJson.bool(status, "managed")
-            || MiniJson.bool(status, "can_modify")
-            || MiniJson.bool(status, "local_edit_intent")) {
+            || MiniJson.bool(status, "can_modify")) {
+            return true;
+        }
+        if (MiniJson.bool(status, "local_edit_intent")
+            && selectedWorkspace != null
+            && modelMatchesWorkspace(
+                model,
+                MiniJson.text(selectedWorkspace, "path"),
+                MiniJson.text(status, "file_name")
+            )) {
+            markLocalDraft(model);
             return true;
         }
         return applyEditConflictAction(
@@ -731,6 +750,7 @@ public class NexusJLink {
         for (LoadedModelInfo info : loadedCreoModels().values()) {
             String key = logicalCreoFileName(safeFileName(info.model)).toLowerCase();
             if (key.length() == 0) continue;
+            if (isLocalDraftModel(info.model)) continue;
             if (!info.modified()) {
                 unauthorizedModificationAlerts.remove(key);
                 continue;
@@ -743,8 +763,17 @@ public class NexusJLink {
             }
             if (!MiniJson.bool(status, "managed")
                 || MiniJson.bool(status, "can_modify")
-                || MiniJson.bool(status, "local_edit_intent")
                 || unauthorizedModificationAlerts.contains(key)) {
+                continue;
+            }
+            if (MiniJson.bool(status, "local_edit_intent")
+                && selectedWorkspace != null
+                && modelMatchesWorkspace(
+                    info.model,
+                    MiniJson.text(selectedWorkspace, "path"),
+                    MiniJson.text(status, "file_name")
+                )) {
+                markLocalDraft(info.model);
                 continue;
             }
             List<Object> modelConflicts = MiniJson.array(status.get("edit_conflicts"));
@@ -898,6 +927,7 @@ public class NexusJLink {
         }
 
         if (currentIsWorkspaceModel) {
+            localDraftModels.remove(localDraftKey(current));
             activateModel(current);
         } else {
             eraseForReload(current);
@@ -983,6 +1013,7 @@ public class NexusJLink {
                 throw error;
             }
         }
+        localDraftModels.remove(localDraftKey(current));
         // Conflict resolution must never erase, retrieve, display, activate, or
         // switch models. The original Creo command continues in the same window.
         if (notify) {
@@ -1502,7 +1533,13 @@ public class NexusJLink {
         if (workspacePath.length() == 0 || rootPath.length() == 0) {
             throw new IllegalStateException("Nexus did not return a managed Creo file path.");
         }
+        String previousWorkspaceId = selectedWorkspace == null
+            ? ""
+            : MiniJson.text(selectedWorkspace, "id");
         selectedWorkspace = workspace;
+        if (!previousWorkspaceId.equalsIgnoreCase(MiniJson.text(workspace, "id"))) {
+            localDraftModels.clear();
+        }
         session.ChangeDirectory(workspacePath);
         String logicalFileName = logicalCreoFileName(new File(rootPath).getName());
         ModelDescriptor descriptor = pfcModel.ModelDescriptor_CreateFromFileName(
@@ -1528,6 +1565,12 @@ public class NexusJLink {
                         + ". Erase that model, then retrieve it again from Nexus."
                 );
             }
+        }
+        Map<String, Object> status = MiniJson.object(result.get("cad"));
+        if (MiniJson.bool(status, "local_edit_intent")) {
+            markLocalDraft(model);
+        } else {
+            localDraftModels.remove(localDraftKey(model));
         }
         activateModel(model);
         return model;
@@ -1582,6 +1625,29 @@ public class NexusJLink {
     private static String logicalCreoFileName(String fileName) {
         String name = fileName == null ? "" : new File(fileName).getName();
         return name.replaceFirst("(?i)\\.(prt|asm|drw)\\.\\d+$", ".$1");
+    }
+
+    private static String localDraftKey(Model model) {
+        if (model == null || selectedWorkspace == null) return "";
+        String workspaceId = MiniJson.text(selectedWorkspace, "id").toLowerCase();
+        String fileName = logicalCreoFileName(safeFileName(model)).toLowerCase();
+        if (workspaceId.length() == 0 || fileName.length() == 0) return "";
+        return workspaceId + "|" + fileName;
+    }
+
+    static boolean isLocalDraftModel(Model model) {
+        String key = localDraftKey(model);
+        if (key.length() == 0 || !localDraftModels.contains(key)) return false;
+        return modelMatchesWorkspace(
+            model,
+            MiniJson.text(selectedWorkspace, "path"),
+            safeFileName(model)
+        );
+    }
+
+    private static void markLocalDraft(Model model) {
+        String key = localDraftKey(model);
+        if (key.length() > 0) localDraftModels.add(key);
     }
 
     private static void showError(Throwable error) {

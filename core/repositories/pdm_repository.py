@@ -766,7 +766,7 @@ class PdmRepository:
             record = self._dict(conn.execute(
                 """
                 SELECT * FROM cad_documents
-                WHERE project_id=? AND lower(file_name)=lower(?)
+                WHERE project_id=? AND file_name=? COLLATE NOCASE
                 """,
                 (int(project_id), clean_file),
             ).fetchone())

@@ -56,6 +56,8 @@ state, it offers:
 - **Continue Locally**: records local edit intent, makes only the workspace copy
   writable, and allows local Save while keeping Nexus check-in blocked. This remains
   available when another user owns the checkout; it never transfers or bypasses that lock.
+  Creo classifies the model as a local draft for the rest of the workspace session, so
+  later edits and local Saves do not repeat the conflict or database status check.
 - **Revise and Check Out Now**: creates the next revision for released CAD and obtains
   the coordinated CAD and Item checkout.
 - **Make Read-only**: cancels the attempted managed modification.
@@ -87,6 +89,11 @@ Conflict Management never erases, retrieves, displays, closes, activates, or swi
 a Creo model. **Check Out Now** updates the Nexus checkout while retaining the exact
 model and window. **Cancel** and **Make Read-only** cancel only the attempted command.
 Display and window lifecycle callbacks rebind command guards but never open conflicts.
+
+CAD status reads use a local bridge cache keyed by user, project, workspace, and file.
+The cache is invalidated immediately by bridge mutations and whenever the shared database,
+workspace registry, or selected workspace manifest signature changes. A periodic refresh
+is retained as a fallback for network filesystems that delay metadata notifications.
 
 When local edit intent is later checked out, Nexus preserves the local bytes and
 uses the controlled server file as the comparison baseline, preventing silent

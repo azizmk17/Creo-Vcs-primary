@@ -3,7 +3,7 @@ import com.ptc.pfc.pfcFeature.Feature;
 import com.ptc.pfc.pfcSolid.DefaultSolidActionListener;
 import com.ptc.pfc.pfcSolid.Solid;
 
-/** Guards structural mutations that create or regenerate solid features. */
+/** Guards structural mutations that create, delete, or convert solid features. */
 public class NexusSolidMutationGuard extends DefaultSolidActionListener {
     public void OnBeforeFeatureCreate(Solid solid, int featureType)
         throws jxthrowable {
