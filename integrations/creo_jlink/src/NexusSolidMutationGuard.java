@@ -16,11 +16,11 @@ public class NexusSolidMutationGuard extends DefaultSolidActionListener {
 
     public void OnAfterFeatureCreate(Solid solid, Feature feature)
         throws jxthrowable {
-        NexusJLink.refreshEditProtection();
+        NexusJLink.refreshCommandProtection();
     }
 
     public void OnAfterFeatureDelete(Solid solid, int featureId)
         throws jxthrowable {
-        NexusJLink.refreshEditProtection();
+        NexusJLink.refreshCommandProtection();
     }
 }

@@ -63,11 +63,10 @@ state, it offers:
 - **Make Read-only**: cancels the attempted managed modification.
 - **Cancel**: cancels the Creo edit command.
 
-Creo 3.0 can report a loaded child as modified after some feature-edit button
-workflows have already started. The integration also checks loaded models after
-guarded commands; an unauthorized modified child immediately raises the same
-conflict workflow and keeps Nexus check-in blocked. Save uses the same Conflict
-Management window; Continue Locally permits Save but never Rename.
+Creo maintenance releases can mark a model modified while it is being retrieved,
+displayed, or automatically regenerated. That flag alone never opens Conflict
+Management. Save uses the same Conflict Management window; Continue Locally permits
+Save but never Rename.
 
 Edit protection uses three coordinated layers:
 
@@ -76,10 +75,8 @@ Edit protection uses three coordinated layers:
 - Session-wide model, feature, and solid listeners stop feature creation/redefinition,
   component-constraint changes, model or feature parameter changes, deletion,
   suppression, and unit conversion.
-- Post-command and post-event scanning catches a model that Creo marks modified only
-  after an operation has started. This fallback opens Conflict Management and keeps
-  Save and Nexus check-in blocked until the user checks out, continues locally, or
-  undoes the unauthorized change.
+- Post-command and post-event callbacks only refresh mode-specific command guards.
+  They never infer a user edit from Creo's generic modified flag.
 
 Mode-specific Creo commands are rebound after model display and window changes, so
 drawing and assembly commands that do not exist during J-Link startup are protected

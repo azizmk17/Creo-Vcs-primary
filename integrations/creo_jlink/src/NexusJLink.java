@@ -33,8 +33,6 @@ public class NexusJLink {
         new ArrayList<ActionListener>();
     private static final Set<String> registeredGuardNames =
         new LinkedHashSet<String>();
-    private static final Set<String> unauthorizedModificationAlerts =
-        new LinkedHashSet<String>();
     private static final Set<String> localDraftModels =
         new LinkedHashSet<String>();
     private static Map<String, Object> selectedWorkspace;
@@ -68,7 +66,6 @@ public class NexusJLink {
         }
         mutationGuards.clear();
         registeredGuardNames.clear();
-        unauthorizedModificationAlerts.clear();
         localDraftModels.clear();
         selectedWorkspace = null;
         api = null;
@@ -218,15 +215,6 @@ public class NexusJLink {
             installCommandGuards();
         } catch (Throwable error) {
             System.out.println("Nexus PDM command protection refresh failed: " + error);
-        }
-    }
-
-    static void refreshEditProtection() {
-        refreshCommandProtection();
-        try {
-            checkForUnauthorizedModifications();
-        } catch (Throwable error) {
-            System.out.println("Nexus PDM modification scan failed: " + error);
         }
     }
 
@@ -740,79 +728,6 @@ public class NexusJLink {
             model,
             preserveLocalChanges
         );
-    }
-
-    /** Catch feature-edit paths that Creo reports as modified only after the command runs. */
-    static void checkForUnauthorizedModifications() throws Exception {
-        if (api == null) return;
-        List<EditConflictCandidate> candidates = new ArrayList<EditConflictCandidate>();
-        List<Object> conflicts = new ArrayList<Object>();
-        for (LoadedModelInfo info : loadedCreoModels().values()) {
-            String key = logicalCreoFileName(safeFileName(info.model)).toLowerCase();
-            if (key.length() == 0) continue;
-            if (isLocalDraftModel(info.model)) continue;
-            if (!info.modified()) {
-                unauthorizedModificationAlerts.remove(key);
-                continue;
-            }
-            Map<String, Object> status;
-            try {
-                status = resolveCadForModel(info.model);
-            } catch (Exception ignored) {
-                continue;
-            }
-            if (!MiniJson.bool(status, "managed")
-                || MiniJson.bool(status, "can_modify")
-                || unauthorizedModificationAlerts.contains(key)) {
-                continue;
-            }
-            if (MiniJson.bool(status, "local_edit_intent")
-                && selectedWorkspace != null
-                && modelMatchesWorkspace(
-                    info.model,
-                    MiniJson.text(selectedWorkspace, "path"),
-                    MiniJson.text(status, "file_name")
-                )) {
-                markLocalDraft(info.model);
-                continue;
-            }
-            List<Object> modelConflicts = MiniJson.array(status.get("edit_conflicts"));
-            if (modelConflicts.isEmpty()) continue;
-            Map<String, Object> conflict = MiniJson.object(modelConflicts.get(0));
-            unauthorizedModificationAlerts.add(key);
-            candidates.add(new EditConflictCandidate(
-                key,
-                info.model,
-                status,
-                MiniJson.text(conflict, "id")
-            ));
-            conflicts.add(conflict);
-        }
-        if (candidates.isEmpty()) return;
-        NexusDialogs.ConflictResult resolution = showConflicts(conflicts, "Conflicts");
-        for (EditConflictCandidate candidate : candidates) {
-            String action = resolution == null
-                ? "CANCEL"
-                : resolution.actionFor(candidate.conflictId);
-            try {
-                boolean resolved = applyEditConflictAction(
-                    action, candidate.status, candidate.model, true
-                );
-                if (!resolved) {
-                    NexusDialogs.warning(
-                        "Nexus Save and check-in remain blocked for "
-                            + safeFileName(candidate.model)
-                            + ". Undo the local change, obtain the checkout, or choose "
-                            + "Continue Locally from Conflict Management.",
-                        "Nexus Modification Blocked"
-                    );
-                }
-            } catch (Throwable error) {
-                unauthorizedModificationAlerts.remove(candidate.key);
-                if (error instanceof Exception) throw (Exception) error;
-                throw new IllegalStateException(error.getMessage(), error);
-            }
-        }
     }
 
     private static void checkout() throws Exception {
@@ -1753,25 +1668,6 @@ public class NexusJLink {
             } catch (Throwable ignored) {
                 return false;
             }
-        }
-    }
-
-    private static final class EditConflictCandidate {
-        private final String key;
-        private final Model model;
-        private final Map<String, Object> status;
-        private final String conflictId;
-
-        private EditConflictCandidate(
-            String key,
-            Model model,
-            Map<String, Object> status,
-            String conflictId
-        ) {
-            this.key = key;
-            this.model = model;
-            this.status = status;
-            this.conflictId = conflictId;
         }
     }
 

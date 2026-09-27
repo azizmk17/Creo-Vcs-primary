@@ -43,12 +43,12 @@ public class NexusFeatureMutationGuard extends DefaultFeatureActionListener {
     }
 
     public void OnAfterSuppress(Feature feature) throws jxthrowable {
-        NexusJLink.refreshEditProtection();
+        NexusJLink.refreshCommandProtection();
     }
 
     public void OnAfterCopy(
         Feature source, Feature target, FeatureCopyType type
     ) throws jxthrowable {
-        NexusJLink.refreshEditProtection();
+        NexusJLink.refreshCommandProtection();
     }
 }

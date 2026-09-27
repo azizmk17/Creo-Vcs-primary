@@ -21,13 +21,6 @@ public class NexusEditGuard extends DefaultUICommandBracketListener {
     }
 
     public void OnAfterCommand() throws jxthrowable {
-        try {
-            NexusJLink.checkForUnauthorizedModifications();
-        } catch (Throwable error) {
-            NexusDialogs.error(
-                error.getMessage() == null ? String.valueOf(error) : error.getMessage(),
-                "Nexus Modification Conflict"
-            );
-        }
+        NexusJLink.refreshCommandProtection();
     }
 }
