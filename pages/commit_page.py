@@ -3239,6 +3239,14 @@ class CommitPage(QWidget):
                 pass
             raise
 
+    def _reconcile_workspace_cad(self, row: dict, workspace: dict) -> dict:
+        cad_document_id = row.get("cad_document_id")
+        if cad_document_id is None:
+            raise ValueError("This file is not mapped to a managed CAD Document.")
+        return self.cad_workspace_service.reconcile_cad_document(
+            str(workspace["id"]), int(cad_document_id)
+        )
+
     def add_files_from_workspace(self):
         if not self.session.project_id or self.session.user_id is None:
             QMessageBox.warning(self, "CAD Workspace", "Select a project and sign in first.")
@@ -3250,6 +3258,7 @@ class CommitPage(QWidget):
             int(checkout_user_id),
             self,
             checkout_callback=self._checkout_workspace_cad,
+            reconcile_callback=self._reconcile_workspace_cad,
         )
         if dialog.exec_() != QDialog.Accepted:
             return
@@ -3269,6 +3278,9 @@ class CommitPage(QWidget):
                 "workspace_id": row["workspace_id"],
                 "cad_document_id": row.get("cad_document_id"),
                 "expected_sha256": row.get("candidate_sha256"),
+                "baseline_sha256": row.get("baseline_sha256"),
+                "baseline_cad_revision": row.get("baseline_cad_revision"),
+                "baseline_cad_iteration": row.get("baseline_cad_iteration"),
             })
 
     def _validate_workspace_staging(self) -> None:
@@ -3472,6 +3484,9 @@ class CommitPage(QWidget):
                 "sha256": staged.get("expected_sha256"),
                 "workspace_id": staged.get("workspace_id"),
                 "cad_document_id": staged.get("cad_document_id"),
+                "baseline_sha256": staged.get("baseline_sha256"),
+                "baseline_cad_revision": staged.get("baseline_cad_revision"),
+                "baseline_cad_iteration": staged.get("baseline_cad_iteration"),
             }
             for staged in self.uncommitted_parts
             if staged.get("workspace_id")

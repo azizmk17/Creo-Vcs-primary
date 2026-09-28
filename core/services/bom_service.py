@@ -633,13 +633,19 @@ class BomService(BaseService):
         """Return one Item for PDM workflows or the legacy shared-file family."""
         return [part] if exact_item else self._parts_sharing_base_file(part)
 
-    def checked_out_cad_for_item(self, item_id: int) -> List[Dict]:
-        return self.pdm_service.list_checked_out_cad_for_item(int(item_id))
+    def checked_out_cad_for_item(self, item_id: int, *, connection=None) -> List[Dict]:
+        return self.pdm_service.list_checked_out_cad_for_item(
+            int(item_id), connection=connection
+        )
 
-    def _assert_no_active_cad_checkouts(self, item_ids, action: str) -> None:
+    def _assert_no_active_cad_checkouts(
+        self, item_ids, action: str, *, connection=None
+    ) -> None:
         active = []
         for item_id in sorted({int(value) for value in (item_ids or [])}):
-            active.extend(self.checked_out_cad_for_item(item_id))
+            active.extend(self.checked_out_cad_for_item(
+                item_id, connection=connection
+            ))
         if not active:
             return
         labels = ", ".join(
@@ -752,7 +758,9 @@ class BomService(BaseService):
         )
         checkin_log_ids = {}
         for related in related_parts:
-            self.revision_repo.assert_checkout_mutable(int(related.id))
+            self.revision_repo.assert_checkout_mutable(
+                int(related.id), connection=connection
+            )
         locked_by_part = {
             int(p.id): self.lock_repo.get_by_part(int(p.id))
             for p in related_parts
@@ -820,6 +828,7 @@ class BomService(BaseService):
         released_revision_code: str | None = None,
         exact_item: bool = False,
         checkout_origin: str = "ITEM",
+        connection=None,
     ):
         part = self.bom_repo.get_by_id(part_id)
         if not part:
@@ -831,7 +840,7 @@ class BomService(BaseService):
         contexts = {}
         for related in related_parts:
             related_id = int(related.id)
-            context = self.revision_repo.get_current_context(related_id)
+            context = self.revision_repo.get_current_context(related_id, connection=connection)
             contexts[related_id] = context
             state = str(context.get("state") or "").strip().lower()
             if state == "released":
@@ -852,10 +861,10 @@ class BomService(BaseService):
                         )
                 else:
                     self.revision_repo.validate_released_checkout(
-                        related_id, target_revision
+                        related_id, target_revision, connection=connection
                     )
             else:
-                self.revision_repo.assert_mutable(related_id)
+                self.revision_repo.assert_checkout_mutable(related_id, connection=connection)
         actor_user_id = int(self.session.user_id) if self.session.user_id is not None else None
         if not actor_user_id:
             raise PermissionError("You must be logged in")
@@ -868,7 +877,7 @@ class BomService(BaseService):
             effective_user_id = int(actor_user_id)
 
         existing_locks = [
-            self.lock_repo.get_by_part(int(p.id))
+            self.lock_repo.get_by_part(int(p.id), conn=connection)
             for p in related_parts
             if getattr(p, "id", None) is not None
         ]
@@ -880,8 +889,8 @@ class BomService(BaseService):
             if int(lock.user_id) != int(effective_user_id):
                 raise ValueError("This Item is checked out by another user.")
             if origin == "ITEM":
-                self.lock_repo.upgrade_to_item_checkout(
-                    int(part.id), int(effective_user_id)
+                self.lock_repo.set_checkout_origin(
+                    int(part.id), "ITEM", conn=connection
                 )
                 self.emit_project_event(
                     "item.checkout",
@@ -889,6 +898,7 @@ class BomService(BaseService):
                     entity_id=int(part.id),
                     payload={"item_ids": [int(part.id)], "origin": origin},
                     actor_user_id=effective_user_id,
+                    conn=connection,
                 )
             return True
 
@@ -905,6 +915,7 @@ class BomService(BaseService):
                     if released_checkout else
                     ("Checked out shared CAD family part" if len(related_parts) > 1 else "Checked out part")
                 ),
+                conn=connection,
             )
             success = self.lock_repo.checkout(
                 related_id,
@@ -912,18 +923,21 @@ class BomService(BaseService):
                 signature,
                 object_iteration_id=contexts[related_id].get("current_iteration_id"),
                 checkout_origin=origin,
+                conn=connection,
             )
             if not success:
                 raise ValueError("Failed to check out part")
-            self.bom_repo.checkout_bom(related_id)
+            self.bom_repo.checkout_bom(related_id, conn=connection)
             if released_checkout:
                 if not str(
                     contexts[related_id].get("pending_revision_code") or ""
                 ).strip():
                     self.revision_repo.prepare_released_checkout(
-                        related_id, str(released_revision_code)
+                        related_id, str(released_revision_code), connection=connection
                     )
-            self.revision_repo.initialize_checkout(related_id, effective_user_id)
+            self.revision_repo.initialize_checkout(
+                related_id, effective_user_id, connection=connection
+            )
         affected = [int(related.id) for related in related_parts]
         self.emit_project_event(
             "item.checkout",
@@ -931,6 +945,7 @@ class BomService(BaseService):
             entity_id=int(part.id),
             payload={"item_ids": affected, "origin": origin},
             actor_user_id=effective_user_id,
+            conn=connection,
         )
         self._tree_dirty.add(int(self.session.project_id))
         return True
@@ -997,6 +1012,9 @@ class BomService(BaseService):
         note: str = "",
         source_commit_id: str | None = None,
         exact_item: bool = False,
+        *,
+        connection=None,
+        signature_key_prefix: str | None = None,
     ):
         if not source_commit_id:
             raise ValueError("A commit reference is required to check in an item.")
@@ -1005,13 +1023,16 @@ class BomService(BaseService):
             raise ValueError("Part not found")
         related_parts = self._checkout_scope(part, exact_item=bool(exact_item))
         self._assert_no_active_cad_checkouts(
-            [related.id for related in related_parts], "check in the Item"
+            [related.id for related in related_parts], "check in the Item",
+            connection=connection,
         )
         checkin_log_ids = {}
         for related in related_parts:
-            self.revision_repo.assert_checkout_mutable(int(related.id))
+            self.revision_repo.assert_checkout_mutable(
+                int(related.id), connection=connection
+            )
         locked_by_part = {
-            int(p.id): self.lock_repo.get_by_part(int(p.id))
+            int(p.id): self.lock_repo.get_by_part(int(p.id), conn=connection)
             for p in related_parts
             if getattr(p, "id", None) is not None
         }
@@ -1021,7 +1042,7 @@ class BomService(BaseService):
         for related in related_parts:
             related_id = int(related.id)
             if not locked_by_part.get(related_id):
-                self.bom_repo.checkin_bom(related_id)
+                self.bom_repo.checkin_bom(related_id, conn=connection)
                 continue
             signature = self.signature_repo.add_signature(
                 "checkin",
@@ -1029,21 +1050,31 @@ class BomService(BaseService):
                 note=str(note or "").strip() or (
                     "Checked in shared CAD family part" if len(related_parts) > 1 else "Checked in part"
                 ),
+                idempotency_key=(
+                    f"{signature_key_prefix}:{related_id}"
+                    if signature_key_prefix else None
+                ),
+                conn=connection,
             )
-            log_id = self.lock_repo.checkin(related_id, user_id, signature)
+            log_id = self.lock_repo.checkin(
+                related_id, user_id, signature, conn=connection
+            )
             if not log_id:
                 raise ValueError("Failed to check in part")
             checkin_log_ids[related_id] = int(log_id)
-            self.bom_repo.checkin_bom(related_id)
+            self.bom_repo.checkin_bom(related_id, conn=connection)
         for related in related_parts:
             related_id = int(related.id)
             context = self.revision_repo.record_checkin(
-                related_id, int(user_id), note=note, source_commit_id=source_commit_id
+                related_id, int(user_id), note=note, source_commit_id=source_commit_id,
+                connection=connection,
             )
             log_id = checkin_log_ids.get(related_id)
             iteration_id = context.get("current_iteration_id")
             if log_id and iteration_id is not None:
-                self.lock_repo.set_log_object_iteration(log_id, int(iteration_id))
+                self.lock_repo.set_log_object_iteration(
+                    log_id, int(iteration_id), conn=connection
+                )
         self._tree_dirty.add(int(self.session.project_id))
         return True
 
@@ -1088,6 +1119,9 @@ class BomService(BaseService):
         active_ids = [part_id for part_id, lock in locks.items() if lock]
         if int(part_id) not in active_ids:
             raise ValueError("The selected item is not checked out.")
+        self._assert_no_active_cad_checkouts(
+            active_ids, "check in the Item"
+        )
 
         actor = int(self.user_id) if self.user_id is not None else None
         if actor is None:
@@ -1201,6 +1235,10 @@ class BomService(BaseService):
         active_cad = []
         for related in related_parts:
             active_cad.extend(self.checked_out_cad_for_item(int(related.id)))
+        self._assert_no_active_cad_checkouts(
+            [int(related.id) for related in related_parts],
+            "undo the Item checkout",
+        )
         locks = {
             int(related.id): self.lock_repo.get_by_part(int(related.id))
             for related in related_parts
@@ -2998,12 +3036,6 @@ class BomService(BaseService):
             raise ValueError("The CAD Document was not found.")
         owner = document.get("checked_out_by")
         if owner is None:
-            for item_id in self.pdm_service.checkout_target_item_ids(
-                int(cad_document_id)
-            ):
-                item_lock = self.lock_repo.get_by_part(int(item_id))
-                if item_lock and int(item_lock.user_id) == int(self.user_id):
-                    return document
             raise ValueError(
                 f"Check out the CAD assembly or its related Item before you {action}."
             )
@@ -3251,7 +3283,7 @@ class BomService(BaseService):
             item_lock = self.lock_repo.get_by_part(int(associated_item_id))
             if item_lock and int(item_lock.user_id) != actor_id:
                 raise ValueError(
-                    f"Associated Item {associated_item_id} is checked out by another user. "
+                    f"The associated Item {associated_item_id} is checked out by another user. "
                     "The CAD Document was not checked out."
                 )
             if item_lock:
@@ -3273,7 +3305,7 @@ class BomService(BaseService):
                 if not target_revision:
                     raise ValueError(
                         f"Associated Item {context.get('version_label') or associated_item_id} "
-                        "is Released. Provide its next Item revision before checking out the shared CAD Document."
+                        "is Released. Enter the revision to create before checking out the shared CAD Document."
                     )
                 if pending_revision and pending_revision.casefold() != target_revision.casefold():
                     raise ValueError(
@@ -3290,38 +3322,45 @@ class BomService(BaseService):
 
         created_item_checkout_ids = []
         promoted_item_checkout_ids = []
-        try:
+        related_drawing_ids = []
+        with self.pdm_service.repo.get_conn() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             for associated_item_id in associated_item_ids:
-                existing_lock = self.lock_repo.get_by_part(int(associated_item_id))
+                existing_lock = self.lock_repo.get_by_part(
+                    int(associated_item_id), conn=connection
+                )
                 if existing_lock:
-                    if (
-                        explicit_item_checkout
-                        and str(getattr(existing_lock, "checkout_origin", "ITEM") or "ITEM").upper() == "CAD"
-                    ):
+                    if int(existing_lock.user_id) != actor_id:
+                        raise ValueError(
+                        f"The associated Item {associated_item_id} is checked out by another user."
+                        )
+                    if explicit_item_checkout and str(
+                        getattr(existing_lock, "checkout_origin", "ITEM") or "ITEM"
+                    ).upper() == "CAD":
                         self.lock_repo.set_checkout_origin(
-                            int(associated_item_id), "ITEM"
+                            int(associated_item_id), "ITEM", conn=connection
                         )
                         promoted_item_checkout_ids.append(int(associated_item_id))
                     continue
-                revision_code = effective_revision_codes.get(
-                    int(associated_item_id), ""
-                )
+                revision_code = effective_revision_codes.get(int(associated_item_id), "")
                 self.checkout_part(
                     int(associated_item_id),
                     as_user_id=actor_id,
                     released_revision_code=revision_code or None,
                     exact_item=True,
                     checkout_origin=("ITEM" if explicit_item_checkout else "CAD"),
+                    connection=connection,
                 )
                 created_item_checkout_ids.append(int(associated_item_id))
+
             result = self.pdm_service.checkout_cad_document(
                 cad_document_id,
                 actor_id,
                 workspace_id=workspace_id,
                 workspace_name=workspace_name,
                 workspace_machine_id=workspace_machine_id,
+                connection=connection,
             )
-            related_drawing_ids = []
             if str(document.get("category") or "").upper() != "DRAWING":
                 for drawing in self.pdm_service.repo.list_related_drawings(cad_document_id) or []:
                     drawing_id = int(drawing["id"])
@@ -3342,57 +3381,25 @@ class BomService(BaseService):
                         workspace_id=workspace_id,
                         workspace_name=workspace_name,
                         workspace_machine_id=workspace_machine_id,
+                        connection=connection,
                     )
                     related_drawing_ids.append(drawing_id)
-        except Exception:
-            for drawing_id in reversed(locals().get("related_drawing_ids", [])):
-                try:
-                    self.pdm_service.undo_checkout_cad_document(
-                        int(drawing_id), actor_id, "Parent CAD checkout failed"
-                    )
-                except Exception:
-                    pass
-            try:
-                if "result" in locals():
-                    self.pdm_service.undo_checkout_cad_document(
-                        cad_document_id, actor_id, "Related drawing checkout failed"
-                    )
-            except Exception:
-                pass
-            for associated_item_id in reversed(created_item_checkout_ids):
-                try:
-                    self.undo_checkout(
-                        int(associated_item_id),
-                        as_user_id=actor_id,
-                        exact_item=True,
-                    )
-                except Exception:
-                    pass
-            for associated_item_id in reversed(promoted_item_checkout_ids):
-                try:
-                    self.lock_repo.set_checkout_origin(
-                        int(associated_item_id), "CAD"
-                    )
-                except Exception:
-                    pass
-            raise
 
-        recorded_item_ids = self.pdm_service.cad_checkout_item_ids(
-            cad_document_id
-        )
+            self.emit_project_event(
+                "cad.checkout",
+                entity_type="CAD_DOCUMENT",
+                entity_id=int(cad_document_id),
+                payload={
+                    "cad_document_ids": sorted(set([int(cad_document_id), *related_drawing_ids])),
+                    "item_ids": sorted(set(int(value) for value in associated_item_ids)),
+                },
+                actor_user_id=actor_id,
+                conn=connection,
+            )
+
+        recorded_item_ids = self.pdm_service.cad_checkout_item_ids(cad_document_id)
         if not recorded_item_ids:
             recorded_item_ids = list(associated_item_ids)
-        cad_ids = [int(cad_document_id), *related_drawing_ids]
-        self.emit_project_event(
-            "cad.checkout",
-            entity_type="CAD_DOCUMENT",
-            entity_id=int(cad_document_id),
-            payload={
-                "cad_document_ids": sorted(set(cad_ids)),
-                "item_ids": sorted(set(int(value) for value in recorded_item_ids)),
-            },
-            actor_user_id=actor_id,
-        )
         return {
             **result,
             "associated_item_ids": recorded_item_ids,
@@ -3523,6 +3530,12 @@ class BomService(BaseService):
         document = self.pdm_service.repo.get_cad_document(cad_document_id)
         if not document:
             raise ValueError("The CAD Document was not found.")
+        checkout_item_ids = set(
+            int(value) for value in (
+                self.pdm_service.cad_checkout_item_ids(cad_document_id)
+                or ([document["checkout_item_id"]] if document.get("checkout_item_id") is not None else [])
+            )
+        )
         related_drawing_ids = []
         if str(document.get("category") or "").upper() != "DRAWING":
             for drawing in self.pdm_service.repo.list_related_drawings(cad_document_id) or []:
@@ -3530,15 +3543,27 @@ class BomService(BaseService):
                     continue
                 if int(drawing.get("checked_out_by")) != actor_id:
                     continue
+                drawing_item_ids = self.pdm_service.cad_checkout_item_ids(
+                    int(drawing["id"])
+                )
                 try:
                     self.pdm_service.undo_checkout_cad_document(
                         int(drawing["id"]), actor_id, note or "Parent CAD checkout undone"
                     )
                     related_drawing_ids.append(int(drawing["id"]))
+                    checkout_item_ids.update(int(value) for value in drawing_item_ids)
                 except Exception:
                     pass
         result = self.pdm_service.undo_checkout_cad_document(
             cad_document_id, actor_id, note
+        )
+        checkout_item_ids.update(
+            int(value) for value in (
+                result.get("checkout_item_ids") or result.get("associated_item_ids") or []
+            )
+        )
+        item_release = self._release_auto_item_checkouts_after_cad(
+            checkout_item_ids, actor_id
         )
         try:
             from core.services.cad_workspace_service import CadWorkspaceService
@@ -3565,8 +3590,8 @@ class BomService(BaseService):
         )
         return {
             **result,
+            **item_release,
             "related_drawing_checkout_ids": related_drawing_ids,
-            "item_checkout": "RETAINED_BY_RULE",
         }
 
     def revise_pdm_cad_document(self, cad_document_id: int) -> Dict:

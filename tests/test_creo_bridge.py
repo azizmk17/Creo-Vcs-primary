@@ -363,6 +363,93 @@ class CreoBridgeControllerTests(unittest.TestCase):
         )
         self.assertTrue(result["local_files"][0]["selectable"])
 
+    def test_register_new_native_model_creates_checkout_and_workspace_entry(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        workspace_root = Path(temporary.name) / "new-cad-workspace"
+        workspace_root.mkdir()
+        source = workspace_root / "new_bracket.prt.4"
+        source.write_bytes(b"#UGC:2 PART\nfixture")
+        self.workspace_service.get_workspace = lambda _workspace_id: {
+            "id": "workspace-one",
+            "name": "Creo Workspace",
+            "path": str(workspace_root),
+            "machine_id": "test-machine",
+            "available": True,
+        }
+        self.workspace_service.logical_name = lambda name: (
+            str(name).rsplit(".prt.", 1)[0] + ".prt"
+            if ".prt." in str(name).lower() else str(name)
+        )
+        self.workspace_service.scan_workspace = lambda *_args: [{
+            "cad_document_id": None,
+            "logical_file_name": "new_bracket.prt",
+            "filename": source.name,
+            "path": str(source),
+            "status": "UNMAPPED",
+        }]
+        self.workspace_service.checkout_descriptor = lambda _workspace_id: {
+            "workspace_id": "workspace-one",
+            "workspace_name": "Creo Workspace",
+            "workspace_machine_id": "test-machine",
+        }
+        self.workspace_service.materialize_cad_document = lambda *_args, **_kwargs: {
+            "cad_document_id": 17,
+            "path": str(source),
+        }
+        calls = []
+
+        def create_cad_document(project_id, **values):
+            calls.append(("create", project_id, values))
+            self.repo.documents[17] = {
+                "id": 17,
+                "project_id": project_id,
+                "file_name": values["file_name"],
+                "number": values["number"],
+                "name": values["name"],
+                "category": values["category"],
+                "revision": "A",
+                "iteration": 1,
+                "checked_out_by": 7,
+                "checkout_workspace_id": "workspace-one",
+            }
+            return 17
+
+        self.repo.get_cad_document_by_file = lambda _project_id, _name: None
+        self.repo.get_cad_document = lambda cad_id: dict(self.repo.documents.get(int(cad_id)) or {})
+        pdm_service = SimpleNamespace(
+            repo=self.repo,
+            create_cad_document=create_cad_document,
+            delete_cad_document=lambda cad_id: calls.append(("delete", cad_id)),
+        )
+        bom_service = SimpleNamespace(
+            checkout_pdm_cad_document=lambda cad_id, **kwargs: calls.append(("checkout", cad_id, kwargs)),
+            undo_checkout_pdm_cad_document=lambda *args: calls.append(("undo",) + args),
+        )
+        self.controller._pdm_service_factory = lambda: pdm_service
+        self.controller._bom_service_factory = lambda: bom_service
+        self.controller._status_payload = lambda document, **_kwargs: {
+            "id": int(document["id"]),
+            "file_name": document["file_name"],
+            "can_checkin": True,
+        }
+
+        result = self.controller.dispatch(
+            "POST",
+            "/api/v1/cad/register-new",
+            {},
+            {
+                "workspace_id": "workspace-one",
+                "files": [{"filename": source.name, "path": str(source)}],
+            },
+        )
+
+        self.assertEqual(result["registered"][0]["cad"]["id"], 17)
+        self.assertEqual(result["registered"][0]["local_file"]["cad_document_id"], 17)
+        self.assertEqual(calls[0][0], "create")
+        self.assertEqual(calls[1][0], "checkout")
+        self.assertEqual(calls[1][1], 17)
+
     def test_history_route_returns_append_only_checkout_events(self):
         history = [{
             "action": "CHECKIN",

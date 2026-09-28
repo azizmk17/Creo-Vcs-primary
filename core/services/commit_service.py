@@ -22,6 +22,7 @@ from core.services.issue_service import IssueService
 from core.services.traceability_service import TraceabilityService
 from core.services.part_file_service import PartFileService
 from core.services.pdm_service import PdmService
+from core.services.commit_snapshot_service import CommitSnapshotService
 
 from utils import (
     is_creo_file,
@@ -47,6 +48,7 @@ class CommitService(BaseService):
         self.traceability_service = TraceabilityService()
         self.part_file_service = PartFileService()
         self.pdm_service = PdmService()
+        self.snapshot_service = CommitSnapshotService(self.commit_repository.db_name)
 
         self.session = SessionManager()
 
@@ -587,6 +589,37 @@ class CommitService(BaseService):
                         f"Commit blocked: {filename} is no longer checked out in the "
                         "workspace from which it was staged."
                     )
+                baseline_revision = workspace_expected.get("baseline_cad_revision")
+                baseline_iteration = workspace_expected.get("baseline_cad_iteration")
+                if baseline_revision is not None and str(baseline_revision) != str(
+                    cad_document.get("revision") or ""
+                ):
+                    raise ValueError(
+                        f"Commit blocked: {filename} was retrieved from CAD revision "
+                        f"{baseline_revision}, but the current approved revision is "
+                        f"{cad_document.get('revision') or 'unknown'}. Retrieve the latest copy."
+                    )
+                if baseline_iteration is not None and int(baseline_iteration) != int(
+                    cad_document.get("iteration") or 0
+                ):
+                    raise ValueError(
+                        f"Commit blocked: {filename} was retrieved from CAD iteration "
+                        f"{baseline_iteration}, but the current approved iteration is "
+                        f"{cad_document.get('iteration') or 'unknown'}. Retrieve the latest copy."
+                    )
+                expected_baseline_hash = str(
+                    workspace_expected.get("baseline_sha256") or ""
+                ).strip().casefold()
+                current_iteration = self.pdm_service.repo.get_current_cad_iteration(
+                    int(cad_document["id"])
+                ) or {}
+                approved_hash = str(current_iteration.get("sha256") or "").strip().casefold()
+                if expected_baseline_hash:
+                    if approved_hash and approved_hash != expected_baseline_hash:
+                        raise ValueError(
+                            f"Commit blocked: the approved bytes for {filename} no longer "
+                            "match the retrieved workspace baseline. Retrieve the latest copy."
+                        )
 
             document_category = str(cad_document.get("category") or "").upper()
             if category == "DRAWING" and document_category != "DRAWING":
@@ -637,6 +670,18 @@ class CommitService(BaseService):
                     else None
                 ),
                 "creo_file_version": creo_file_version,
+                "baseline": {
+                    "revision": str(
+                        (workspace_expected or {}).get("baseline_cad_revision")
+                        or cad_document.get("revision") or ""
+                    ),
+                    "iteration": int(
+                        (workspace_expected or {}).get("baseline_cad_iteration")
+                        or cad_document.get("iteration") or 0
+                    ),
+                    "sha256": approved_hash or None,
+                    "workspace_sha256": expected_baseline_hash or None,
+                },
             })
 
         planned_cad_ids = {
@@ -700,11 +745,29 @@ class CommitService(BaseService):
 
         inserted_any = False
         inserted_row_ids = []
+        destination_backups = {}
         try:
             ensure_dir_exists(commit_user_dir)
 
             # Phase 2: copy/process all files. No DB rows are visible until every staged file succeeds.
             for item in commit_plan:
+                if safe_exists(item["dest_path"]):
+                    fd, backup = tempfile.mkstemp(
+                        prefix=".nexus-pending-backup-", dir=commit_user_dir
+                    )
+                    os.close(fd)
+                    destination_backups[item["dest_path"]] = (True, backup)
+                    try:
+                        shutil.copy2(item["dest_path"], backup)
+                    except Exception:
+                        try:
+                            os.remove(backup)
+                        except OSError:
+                            pass
+                        destination_backups[item["dest_path"]] = (True, None)
+                        raise
+                else:
+                    destination_backups[item["dest_path"]] = (False, None)
                 safe_copy2(item["filepath"], item["dest_path"])
                 print(f"Committed {item['filename']} for approval.")
                 print(f"File copied to {item['dest_path']}")
@@ -847,8 +910,32 @@ class CommitService(BaseService):
                     ))
                     inserted_any = True
 
-            replaced_rows = []
+            self.traceability_service.repo.backfill_commit_groups()
+            baselines = {
+                int(item["cad_document_id"]): item["baseline"]
+                for item in commit_plan
+                if item.get("cad_document_id") is not None
+            }
+            self.snapshot_service.seal_pending_commit(
+                commit_dir,
+                int(self.session.project_id),
+                commit_id,
+                int(self.user_id),
+                baseline_by_cad_id=baselines,
+            )
+            if resolved_issue_ids:
+                self.issue_service.link_to_commit_with_relation(
+                    resolved_issue_ids,
+                    commit_id,
+                    relation_type=resolved_issue_relation_type,
+                    note=message,
+                )
+                if (jira_key or jira_url):
+                    for issue_id in resolved_issue_ids:
+                        self.traceability_service.link_jira(issue_id, jira_key or "", jira_url or "")
+
             if duplicate_action == "replace":
+                replaced_rows = []
                 for base_file_name in sorted({item["base_f_name"] for item in commit_plan}):
                     replaced_rows.extend(
                         self.commit_repository.delete_pending_rows_by_base_filename(
@@ -857,7 +944,6 @@ class CommitService(BaseService):
                             exclude_row_ids=inserted_row_ids,
                         )
                     )
-
                 retained_paths = {
                     os.path.normcase(os.path.abspath(item["dest_path"]))
                     for item in commit_plan
@@ -889,17 +975,12 @@ class CommitService(BaseService):
                     except OSError:
                         pass
 
-            self.traceability_service.repo.backfill_commit_groups()
-            if resolved_issue_ids:
-                self.issue_service.link_to_commit_with_relation(
-                    resolved_issue_ids,
-                    commit_id,
-                    relation_type=resolved_issue_relation_type,
-                    note=message,
-                )
-                if (jira_key or jira_url):
-                    for issue_id in resolved_issue_ids:
-                        self.traceability_service.link_jira(issue_id, jira_key or "", jira_url or "")
+            for _existed, backup in destination_backups.values():
+                if backup and safe_exists(backup):
+                    try:
+                        os.remove(backup)
+                    except OSError:
+                        pass
         except Exception as e:
             if inserted_any and requested_commit_id:
                 try:
@@ -911,11 +992,20 @@ class CommitService(BaseService):
                     self.commit_repository.hard_delete_by_commit_id(commit_id, self.session.project_id)
                 except Exception:
                     pass
-            try:
-                if safe_isdir(commit_user_dir):
-                    safe_rmtree(commit_user_dir)
-            except Exception:
-                pass
+            for destination, (existed, backup) in destination_backups.items():
+                try:
+                    if backup and safe_exists(backup):
+                        os.replace(backup, destination)
+                    elif not existed and safe_exists(destination):
+                        os.remove(destination)
+                except OSError:
+                    pass
+            if not requested_commit_id:
+                try:
+                    if safe_isdir(commit_user_dir):
+                        safe_rmtree(commit_user_dir)
+                except Exception:
+                    pass
             msg = str(e)
             if msg.startswith(("cad404:", "drw404:", "cad_register_required:", "Error:", "Commit blocked:", "STEP compare failed")):
                 raise ValueError(msg)

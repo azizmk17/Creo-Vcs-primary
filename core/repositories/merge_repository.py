@@ -2,6 +2,7 @@ from core.models.merge_model import Merge
 from datetime import datetime
 from config import DB_NAME
 import sqlite3
+from contextlib import nullcontext
 
 class MergeRepository:
     def __init__(self, db_name=DB_NAME):
@@ -52,19 +53,25 @@ class MergeRepository:
                 return self._row_to_merge(row)
             return None
         
-    def get_commit_ids_by_commitid(self, commit_id: str) -> list[Merge]:
+    def get_commit_ids_by_commitid(
+        self, commit_id: str, project_id: int | None = None, *, include_approved=False
+    ) -> list[Merge]:
         with self.get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("""
+            status_clause = "c.status IN ('Validated','Approved')" if include_approved else "c.status='Validated'"
+            project_clause = " AND c.project_id=?" if project_id is not None else ""
+            params = [str(commit_id)]
+            if project_id is not None:
+                params.append(int(project_id))
+            rows = conn.execute(f"""
                 SELECT c.id, c.type, c.part_id, c.cad_document_id, c.creo_file_version, c.status,
                        c.filename, c.title, c.commit_id, c.project_id,
                        u.username AS designer_username
                 FROM commits c
                 JOIN users u ON u.id = c.designer
-                WHERE c.status = 'Validated' AND c.commit_id=?
-            """, (commit_id,))
-            rows = cur.fetchall()
-            return [self._row_to_merge(r) for r in rows]
+                WHERE {status_clause} AND c.commit_id=? {project_clause}
+                ORDER BY c.id
+            """, tuple(params)).fetchall()
+            return [self._row_to_merge(row) for row in rows]
             
 
     def _row_to_merge(self, row: sqlite3.Row) -> Merge:
@@ -84,10 +91,25 @@ class MergeRepository:
         filtered = {k: data.get(k) for k in keys}
         return Merge(**filtered)
     
-    def merge_commit(self, id, merge_user_id, merge_id,  message, approved_version, pr_path):
-        """Set status=Approved and attach merge message for given part IDs."""
-        with self.get_conn() as conn:
-            cur = conn.cursor()
+    def merge_commit(self, id, merge_user_id, merge_id, message, approved_version, pr_path, *, conn=None):
+        """Set status=Approved, treating an identical retry as successful."""
+        context = self.get_conn() if conn is None else nullcontext(conn)
+        with context as active_conn:
+            cur = active_conn.cursor()
+            current = cur.execute(
+                "SELECT status,merge_id,approved_version,pr_path FROM commits WHERE id=?",
+                (int(id),),
+            ).fetchone()
+            if not current:
+                raise ValueError(f"Commit row {id} no longer exists.")
+            if str(current["status"] or "").casefold() == "approved":
+                if (str(current["merge_id"] or "") == str(merge_id)
+                        and str(current["approved_version"] or "") == str(approved_version)
+                        and str(current["pr_path"] or "") == str(pr_path)):
+                    return True
+                raise ValueError(f"Commit row {id} was approved by a different operation.")
+            if str(current["status"] or "").casefold() != "validated":
+                raise ValueError(f"Commit row {id} is no longer awaiting approval.")
             cur.execute("""
                 UPDATE commits
                 SET status = 'Approved',
@@ -101,7 +123,7 @@ class MergeRepository:
                 WHERE id = ?
                 AND status = 'Validated'
             """, (merge_user_id, merge_id, message, approved_version, pr_path, id))
-            conn.commit()
+            return cur.rowcount == 1
 
     
 

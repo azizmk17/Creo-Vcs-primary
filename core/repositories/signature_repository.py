@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import nullcontext
 from typing import List, Optional
 from core.models.signature_model import Signature
 from config import DB_NAME
@@ -16,7 +17,7 @@ class SignatureRepository:
     # -------------------------------
     # CREATE / INSERT
     # -------------------------------
-    def add_signature(self, action, user_id, note=None) -> int:
+    def add_signature(self, action, user_id, note=None, *, idempotency_key=None, conn=None) -> int:
         """
         Add a new signature and return the inserted ID
         
@@ -29,15 +30,30 @@ class SignatureRepository:
             int: The ID of the newly inserted signature, or -1 if failed
         """
         try:
-            with self.get_conn() as conn:
-                cur = conn.cursor()
-                cur.execute("""
-                    INSERT INTO signature (action, user_id, note, timestamp)
-                    VALUES (?, ?, ?, ?)
-                """, (
-                    action, user_id, note, sqlite3.datetime.datetime.now().isoformat()
-                ))
-                return cur.lastrowid  
+            context = self.get_conn() if conn is None else nullcontext(conn)
+            with context as active_conn:
+                cur = active_conn.cursor()
+                timestamp = sqlite3.datetime.datetime.now().isoformat()
+                if idempotency_key:
+                    cur.execute("""
+                        INSERT INTO signature(
+                            action,user_id,note,timestamp,idempotency_key
+                        ) VALUES(?,?,?,?,?)
+                        ON CONFLICT(idempotency_key)
+                        WHERE idempotency_key IS NOT NULL DO NOTHING
+                    """, (action, user_id, note, timestamp, str(idempotency_key)))
+                    if cur.rowcount == 0:
+                        row = active_conn.execute(
+                            "SELECT id FROM signature WHERE idempotency_key=?",
+                            (str(idempotency_key),),
+                        ).fetchone()
+                        return int(row[0]) if row else -1
+                else:
+                    cur.execute("""
+                        INSERT INTO signature (action, user_id, note, timestamp)
+                        VALUES (?, ?, ?, ?)
+                    """, (action, user_id, note, timestamp))
+                return cur.lastrowid
         except sqlite3.Error as e:
             print(f"Database error: {e}")
             return -1

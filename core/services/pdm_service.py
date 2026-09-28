@@ -245,6 +245,8 @@ class PdmService:
         root = self.repo.get_cad_document(int(root_cad_document_id))
         if not root:
             raise PdmBuildError("The root CAD Document was not found.")
+        from core.services.cad_structure_sync_service import CadStructureSyncService
+        CadStructureSyncService(self.db_name).assert_current(int(root_cad_document_id))
         project_id = int(root["project_id"])
         summary = {
             "created": 0, "updated": 0, "removed": 0,
@@ -887,6 +889,7 @@ class PdmService:
         workspace_id: str | None = None,
         workspace_name: str | None = None,
         workspace_machine_id: str | None = None,
+        connection=None,
     ) -> dict:
         return self.repo.checkout_cad_document(
             int(cad_document_id),
@@ -894,6 +897,7 @@ class PdmService:
             workspace_id=workspace_id,
             workspace_name=workspace_name,
             workspace_machine_id=workspace_machine_id,
+            connection=connection,
         )
 
     def checkout_target_item_ids(self, cad_document_id: int) -> list[int]:
@@ -937,8 +941,10 @@ class PdmService:
             int(cad_document_id), int(actor_id), note
         )
 
-    def list_checked_out_cad_for_item(self, item_id: int) -> list[dict]:
-        return self.repo.list_checked_out_cad_for_item(int(item_id))
+    def list_checked_out_cad_for_item(self, item_id: int, *, connection=None) -> list[dict]:
+        return self.repo.list_checked_out_cad_for_item(
+            int(item_id), connection=connection
+        )
 
     def cad_checkout_history(self, cad_document_id: int) -> list[dict]:
         return self.repo.list_cad_checkout_history(int(cad_document_id))
@@ -947,4 +953,6 @@ class PdmService:
         return self.repo.revise_cad_document(int(cad_document_id), int(actor_id))
 
     def release_cad_document(self, cad_document_id: int) -> dict:
+        from core.services.cad_structure_sync_service import CadStructureSyncService
+        CadStructureSyncService(self.db_name).assert_current(int(cad_document_id))
         return self.repo.release_cad_document(int(cad_document_id))

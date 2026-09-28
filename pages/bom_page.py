@@ -3563,6 +3563,21 @@ class BomPage(QWidget):
             recurse(tree.topLevelItem(index))
         return visible_count
 
+    def validate_native_cad_structure(self, cad_document_id):
+        from pages.dialogs.cad_structure_scan_dialog import CadStructureScanDialog
+        try:
+            dialog = CadStructureScanDialog(
+                self.bom_service.pdm_service.db_name, int(self.session.project_id),
+                int(cad_document_id), int(self.session.user_id),
+                can_manage=self.perm.can("manage_parts"), can_merge=self.perm.can("merge"),
+                parent=self,
+            )
+            dialog.exec_()
+            if dialog.changed:
+                self.load_tree()
+        except Exception as exc:
+            QMessageBox.warning(self, "Validate CAD Structure", str(exc))
+
     def _load_pdm_cad_tree(self) -> None:
         tree = getattr(self, "_cad_tree", None)
         if tree is None:
@@ -13668,6 +13683,11 @@ class BomPage(QWidget):
                 lambda _checked=False, data=payload, parent_value=parent_item_id:
                 create_item_from_cad_context(data, parent_value)
             )
+            if category in {"ASSEMBLY", "COMPONENT", "DRAWING"}:
+                scan_action = menu.addAction("Validate Structure from CAD Files...")
+                scan_action.triggered.connect(
+                    lambda _checked=False, value=cad_id: self.validate_native_cad_structure(value)
+                )
             if tree is self._cad_tree:
                 selected_cad_rows = [
                     row for row in self._selected_pdm_rows(tree, item)

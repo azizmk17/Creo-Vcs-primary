@@ -6,6 +6,10 @@ Nexus database. It uses an authenticated localhost API, so the existing Nexus
 permission, lifecycle, checkout, Item, CAD Document, and audit rules remain the
 authority.
 
+Check-in relationship capture uses the active, synchronous J-Link session. The
+separate **Validate CAD Structure** command still uses the on-demand worker
+described in [async/README.md](async/README.md).
+
 ## Current commands
 
 - **Connect to Active Project** shows the Nexus user and selected product version.
@@ -33,6 +37,21 @@ authority.
   revision/iteration baseline, required dependencies, modified dependencies omitted
   from the selection, and duplicate Pending files. All findings are resolved together
   in the multi-object **Conflicts** window.
+  Valid unregistered native `.prt`, `.asm`, and `.drw` files appear as **New CAD
+  Document** candidates. Selecting them asks Nexus to create the CAD identities and
+  acquire normal workspace checkouts. Synchronous J-Link reads loaded assembly
+  component occurrences and drawing model references for both existing and new CAD
+  selections. Selected new files must be open from this Nexus workspace; a new drawing
+  must reference exactly one PRT or ASM. Selected, loaded assembly workspace copies
+  are marked as complete snapshots and shown to the user for confirmation. Those
+  snapshots can add, update, or remove CAD occurrence links, but only after approval
+  and merge. Unloaded assemblies and partial dependency observations never imply
+  removals. New assembly children must already be managed or selected for registration,
+  and a changed parent ASM must be checked out and included in the same Pending commit.
+  If no loaded ASM contains a new part, Creo asks before Nexus registers it as a
+  top-level document. Duplicate identities, ambiguous
+  drawing owners, unresolved models, and non-Creo file headers are rejected; new
+  documents are never silently placed at the project root.
   If the user already owns a Pending commit, Creo asks whether to add the files to
   that group or create a new one. If a model is already pending, its conflict row
   offers Replace Pending Copy or Skip Object. The selected files then appear in the

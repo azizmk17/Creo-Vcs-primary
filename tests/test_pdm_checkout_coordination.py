@@ -102,6 +102,69 @@ class PdmCheckoutCoordinationTests(unittest.TestCase):
             self.repo.get_cad_document(int(self.owner_cad["id"]))["checked_out_by"]
         )
 
+    def test_item_checkin_writes_share_supplied_transaction(self):
+        self.service.checkout_item(1)
+        with sqlite3.connect(self.db_path) as conn:
+            iteration_count = conn.execute(
+                "SELECT COUNT(*) FROM bom_iterations"
+            ).fetchone()[0]
+
+        with self.assertRaisesRegex(RuntimeError, "rollback check-in"):
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute("BEGIN IMMEDIATE")
+                self.service.checkin_by_part_id(
+                    1, 1, "atomic item check-in", "commit-atomic",
+                    exact_item=True, connection=conn,
+                )
+                raise RuntimeError("rollback check-in")
+
+        self.assertIsNotNone(self.service.lock_repo.get_by_part(1))
+        with sqlite3.connect(self.db_path) as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM lock_logs WHERE action='checkin'"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM signature WHERE action='checkin'"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM bom_iterations").fetchone()[0],
+                iteration_count,
+            )
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN IMMEDIATE")
+            self.service.checkin_by_part_id(
+                1, 1, "atomic item check-in", "commit-atomic",
+                exact_item=True, connection=conn,
+            )
+
+        self.assertIsNone(self.service.lock_repo.get_by_part(1))
+        with sqlite3.connect(self.db_path) as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM lock_logs WHERE action='checkin'"
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM signature WHERE action='checkin'"
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM bom_iterations").fetchone()[0],
+                iteration_count + 1,
+            )
+
     def test_item_checkout_can_explicitly_include_owner_cad_workspace(self):
         self.service.checkout_item(
             1,
@@ -236,6 +299,22 @@ class PdmCheckoutCoordinationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "associated Item"):
             self.service.checkout_pdm_cad_document(int(self.owner_cad["id"]))
+        self.assertIsNone(
+            self.repo.get_cad_document(int(self.owner_cad["id"]))["checked_out_by"]
+        )
+
+    def test_related_drawing_conflict_rolls_back_the_entire_checkout(self):
+        drawing_id = self.repo.create_cad_document(
+            7, "MACHINE-DRW", "Machine drawing", "machine.drw",
+            category="DRAWING",
+            drawing_owner_cad_document_id=int(self.owner_cad["id"]),
+        )
+        self.repo.checkout_cad_document(drawing_id, 2)
+
+        with self.assertRaisesRegex(ValueError, "checked out by another user"):
+            self.service.checkout_pdm_cad_document(int(self.owner_cad["id"]))
+
+        self.assertIsNone(self.service.lock_repo.get_by_part(1))
         self.assertIsNone(
             self.repo.get_cad_document(int(self.owner_cad["id"]))["checked_out_by"]
         )

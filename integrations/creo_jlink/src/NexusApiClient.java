@@ -136,6 +136,25 @@ public class NexusApiClient {
         return request("POST", "/checkin/plan", body);
     }
 
+    public Map<String, Object> registerNewCad(
+        String workspaceId, List<Map<String, Object>> files
+    ) throws Exception {
+        Map<String, Object> body = new LinkedHashMap<String, Object>();
+        body.put("workspace_id", workspaceId == null ? "" : workspaceId);
+        body.put("files", files);
+        return request("POST", "/cad/register-new", body);
+    }
+
+    public Map<String, Object> stageCadStructure(
+        String commitId, List<Integer> cadDocumentIds, Map<String, Object> structure
+    ) throws Exception {
+        Map<String, Object> body = new LinkedHashMap<String, Object>();
+        body.put("commit_id", commitId == null ? "" : commitId);
+        body.put("cad_document_ids", cadDocumentIds);
+        body.put("structure", structure);
+        return request("POST", "/cad/structure/stage", body);
+    }
+
     public Map<String, Object> undoCheckout(int cadId, String note) throws Exception {
         Map<String, Object> body = new LinkedHashMap<String, Object>();
         body.put("note", note);

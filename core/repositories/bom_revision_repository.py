@@ -1,6 +1,7 @@
 import json
 import re
 import sqlite3
+from contextlib import nullcontext
 
 from config import DB_NAME
 from core.ebom_policy import (
@@ -448,8 +449,9 @@ class BomRevisionRepository:
         result["version_label"] = f"{result['revision_code']}.{int(result['iteration_number'])}"
         return result
 
-    def get_current_context(self, bom_id: int) -> dict:
-        with self.get_conn() as conn:
+    def get_current_context(self, bom_id: int, *, connection=None) -> dict:
+        context = self.get_conn() if connection is None else nullcontext(connection)
+        with context as conn:
             self._ensure_bom_conn(conn, int(bom_id))
             return self._current_context_conn(conn, int(bom_id))
 
@@ -1163,9 +1165,10 @@ class BomRevisionRepository:
                 "members": members,
             }
 
-    def validate_released_checkout(self, bom_id: int, revision_code: str) -> dict:
+    def validate_released_checkout(self, bom_id: int, revision_code: str, *, connection=None) -> dict:
         code = self.normalize_revision_code(revision_code)
-        with self.get_conn() as conn:
+        context = self.get_conn() if connection is None else nullcontext(connection)
+        with context as conn:
             current = self._ensure_bom_conn(conn, int(bom_id))
             if str(current.get("state") or "").strip().lower() != "released":
                 raise ValueError(f"{current['version_label']} is not Released.")
@@ -1178,9 +1181,10 @@ class BomRevisionRepository:
             current["pending_revision_code"] = code
             return current
 
-    def prepare_released_checkout(self, bom_id: int, revision_code: str) -> dict:
+    def prepare_released_checkout(self, bom_id: int, revision_code: str, *, connection=None) -> dict:
         code = self.normalize_revision_code(revision_code)
-        with self.get_conn() as conn:
+        context = self.get_conn() if connection is None else nullcontext(connection)
+        with context as conn:
             current = self._ensure_bom_conn(conn, int(bom_id))
             if str(current.get("state") or "").strip().lower() != "released":
                 raise ValueError(f"{current['version_label']} is not Released.")
@@ -1207,8 +1211,8 @@ class BomRevisionRepository:
             raise ValueError("Obsolete revisions cannot be modified.")
         return context
 
-    def assert_checkout_mutable(self, bom_id: int) -> dict:
-        context = self.get_current_context(int(bom_id))
+    def assert_checkout_mutable(self, bom_id: int, *, connection=None) -> dict:
+        context = self.get_current_context(int(bom_id), connection=connection)
         state = str(context.get("state") or "").strip().lower()
         if state == "obsolete":
             raise ValueError("Obsolete revisions cannot be modified.")
@@ -1282,8 +1286,9 @@ class BomRevisionRepository:
         child = self._ensure_bom_conn(conn, int(child_bom_id))
         return int(child["current_revision_id"]), int(child["current_iteration_id"])
 
-    def initialize_checkout(self, bom_id: int, user_id: int) -> None:
-        with self.get_conn() as conn:
+    def initialize_checkout(self, bom_id: int, user_id: int, *, connection=None) -> None:
+        context = self.get_conn() if connection is None else nullcontext(connection)
+        with context as conn:
             self._ensure_bom_conn(conn, int(bom_id), created_by=user_id)
             current = self._current_context_conn(conn, int(bom_id))
             state = str(current["state"]).lower()
@@ -1516,8 +1521,12 @@ class BomRevisionRepository:
                 ),
             )
 
-    def record_checkin(self, bom_id: int, user_id: int, note: str = "", source_commit_id=None) -> dict:
-        with self.get_conn() as conn:
+    def record_checkin(
+        self, bom_id: int, user_id: int, note: str = "", source_commit_id=None, *,
+        connection=None,
+    ) -> dict:
+        context = self.get_conn() if connection is None else nullcontext(connection)
+        with context as conn:
             current = self._ensure_bom_conn(conn, int(bom_id), created_by=user_id)
             state = str(current["state"]).strip().lower()
             pending_code = str(current.get("pending_revision_code") or "").strip()

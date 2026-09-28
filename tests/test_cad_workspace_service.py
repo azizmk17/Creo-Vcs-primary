@@ -1,7 +1,9 @@
 import os
+import sqlite3
 import stat
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -79,6 +81,57 @@ class CadWorkspaceServiceTests(unittest.TestCase):
             }),
         )
 
+    def test_approval_workspace_release_queue_retries_locally(self):
+        db_path = self.base / "workspace-queue.db"
+        with closing(sqlite3.connect(db_path)) as conn, conn:
+            conn.execute("""
+                CREATE TABLE cad_workspace_release_queue(
+                    id INTEGER PRIMARY KEY,approval_key TEXT,workspace_id TEXT,
+                    machine_id TEXT,cad_document_id INTEGER,completed_at TEXT,last_error TEXT
+                )
+            """)
+            conn.executemany(
+                """
+                INSERT INTO cad_workspace_release_queue(
+                    id,approval_key,workspace_id,machine_id,cad_document_id
+                ) VALUES(?,?,?,?,?)
+                """,
+                [
+                    (1, "approval-a", "ws-local", self.service.machine_id, 11),
+                    (2, "approval-b", "ws-other", "another-machine", 22),
+                ],
+            )
+
+        attempts = []
+        def fail_once(workspace_id, cad_document_id):
+            attempts.append((workspace_id, cad_document_id))
+            if len(attempts) == 1:
+                raise OSError("workspace is temporarily unavailable")
+
+        self.service.release_cad_document = fail_once
+        first = self.service.process_pending_approval_releases(str(db_path))
+        self.assertEqual(first["failed_ids"], [1])
+        self.assertEqual(attempts, [("ws-local", 11)])
+        with closing(sqlite3.connect(db_path)) as conn:
+            self.assertIn(
+                "temporarily unavailable",
+                conn.execute(
+                    "SELECT last_error FROM cad_workspace_release_queue WHERE id=1"
+                ).fetchone()[0],
+            )
+
+        second = self.service.process_pending_approval_releases(str(db_path))
+        self.assertEqual(second, {"completed": 1, "failed_ids": []})
+        with closing(sqlite3.connect(db_path)) as conn:
+            local = conn.execute(
+                "SELECT completed_at FROM cad_workspace_release_queue WHERE id=1"
+            ).fetchone()[0]
+            remote = conn.execute(
+                "SELECT completed_at FROM cad_workspace_release_queue WHERE id=2"
+            ).fetchone()[0]
+        self.assertTrue(local)
+        self.assertIsNone(remote)
+
     def test_named_workspace_materializes_and_finds_latest_modified_iteration(self):
         workspace = self.service.create_workspace("Gearbox redesign")
         copied = self.service.materialize_cad_document(workspace["id"], 11)
@@ -92,16 +145,64 @@ class CadWorkspaceServiceTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "READY")
         self.assertTrue(rows[0]["selectable"])
 
+    def test_workspace_scan_blocks_checkout_when_approved_iteration_advanced(self):
+        workspace = self.service.create_workspace("Stale baseline")
+        self.service.materialize_cad_document(workspace["id"], 11)
+        self.repo.documents[11]["iteration"] = 3
+
+        rows = self.service.scan_workspace(workspace["id"], 1, 7)
+
+        self.assertEqual(rows[0]["status"], "OUT_OF_DATE")
+        self.assertFalse(rows[0]["selectable"])
+        self.assertEqual(rows[0]["baseline_cad_iteration"], 2)
+
+    def test_reconcile_archives_local_edits_and_refreshes_read_only_approved_copy(self):
+        workspace = self.service.create_workspace("Reconcile draft")
+        copied = self.service.materialize_cad_document(workspace["id"], 11)
+        Path(copied["path"]).write_bytes(b"my local draft")
+        (self.project_one / "housing.prt.5").write_bytes(b"approved-v5")
+        self.repo.documents[11].update({
+            "latest_creo_file_name": "housing.prt.5",
+            "revision": "B",
+            "iteration": 1,
+            "checked_out_by": None,
+        })
+
+        result = self.service.reconcile_cad_document(workspace["id"], 11)
+
+        latest_path = Path(result["path"])
+        archive_file = self.service.workspace_path(workspace["id"]) / result[
+            "archived_draft_files"
+        ][0]["path"]
+        self.assertEqual(latest_path.read_bytes(), b"approved-v5")
+        self.assertEqual(archive_file.read_bytes(), b"my local draft")
+        self.assertFalse(bool(latest_path.stat().st_mode & stat.S_IWRITE))
+        self.assertEqual(result["baseline_cad_revision"], "B")
+        self.assertEqual(result["baseline_cad_iteration"], 1)
+
+        rows = self.service.scan_workspace(workspace["id"], 1, 7)
+        self.assertEqual([row["filename"] for row in rows], ["housing.prt.5"])
+
     def test_unversioned_creo_file_is_visible_as_unmapped(self):
         workspace = self.service.create_workspace("Unmapped local files")
         path = Path(workspace["path"]) / "scratch.prt"
-        path.write_bytes(b"local-only")
+        path.write_bytes(b"#UGC:2 PART\nlocal-only")
 
         rows = self.service.scan_workspace(workspace["id"], 1, 7)
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["filename"], "scratch.prt")
         self.assertEqual(rows[0]["status"], "UNMAPPED")
+        self.assertFalse(rows[0]["selectable"])
+
+    def test_invalid_creo_extension_is_not_offered_as_new_cad(self):
+        workspace = self.service.create_workspace("Invalid local file")
+        path = Path(workspace["path"]) / "not_a_part.prt"
+        path.write_bytes(b"SketchUp STL payload")
+
+        rows = self.service.scan_workspace(workspace["id"], 1, 7)
+
+        self.assertEqual(rows[0]["status"], "INVALID_NATIVE_FILE")
         self.assertFalse(rows[0]["selectable"])
 
     def test_workspace_is_not_project_bound_but_blocks_flat_name_collision(self):

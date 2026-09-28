@@ -30,6 +30,7 @@ from core.repositories.bom_repository import BomRepository
 from core.repositories.lock_repository import LockRepository
 from core.repositories.permission_repository import PermissionRepository
 from core.repositories.signature_repository import SignatureRepository
+from core.integrations.creo_file_validation import is_native_creo_file
 from core.services.bom_service import BomService
 from core.services.cad_workspace_service import CadWorkspaceService
 from core.services.commit_service import CommitService
@@ -131,6 +132,10 @@ class CreoBridgeController:
             return self.project_cad_documents()
         if method == "POST" and path == "/api/v1/checkin/plan":
             return self.checkin_plan(body)
+        if method == "POST" and path == "/api/v1/cad/register-new":
+            return self.register_new_cad(body)
+        if method == "POST" and path == "/api/v1/cad/structure/stage":
+            return self.stage_cad_structure(body)
         if method == "GET" and path == "/api/v1/cad/resolve":
             values = query.get("file_name") or []
             file_name = values[0] if values else ""
@@ -1284,6 +1289,259 @@ class CreoBridgeController:
             )
         return candidate
 
+    def register_new_cad(self, body: dict) -> dict:
+        """Register and check out a new native model selected from this workspace."""
+        with self._operation_lock:
+            user_id, project_id, _project = self._require_commit_permission()
+            workspace_service, workspace = self._workspace(body.get("workspace_id"))
+            files = body.get("files")
+            if not isinstance(files, list):
+                files = [body]
+            if not files or len(files) > 50:
+                raise BridgeApiError(
+                    400,
+                    "new_cad_source_required",
+                    "Select between one and 50 new PRT/ASM/DRW files.",
+                )
+            workspace_root = Path(str(workspace["path"])).resolve()
+            scanned = workspace_service.scan_workspace(
+                str(workspace["id"]), int(project_id), int(user_id)
+            )
+            pdm_service = self._pdm_service()
+            prepared = []
+            seen_names = set()
+            for item in files:
+                if not isinstance(item, dict):
+                    raise BridgeApiError(
+                        400, "invalid_new_cad_file", "Invalid new CAD selection."
+                    )
+                requested_name = Path(
+                    str(item.get("filename") or "").replace("\\", "/")
+                ).name.strip()
+                requested_path = str(item.get("path") or "").strip()
+                if not requested_name or not requested_path:
+                    raise BridgeApiError(
+                        400, "new_cad_source_required",
+                        "Choose new PRT/ASM files from this workspace.",
+                    )
+                original_path = Path(requested_path).expanduser()
+                if original_path.is_symlink():
+                    raise BridgeApiError(
+                        400, "invalid_source_path",
+                        "Symbolic links cannot be registered as new CAD files.",
+                    )
+                source = original_path.resolve()
+                if source.parent != workspace_root or source.name != requested_name:
+                    raise BridgeApiError(
+                        400, "invalid_source_path",
+                        "New CAD files must be selected directly from this Nexus workspace.",
+                    )
+                if not source.is_file():
+                    raise BridgeApiError(404, "source_not_found", "A selected new CAD file is unavailable.")
+                logical_name = workspace_service.logical_name(source.name)
+                extension = Path(logical_name).suffix.casefold()
+                if extension not in {".prt", ".asm", ".drw"}:
+                    raise BridgeApiError(
+                        400, "unsupported_new_cad_type",
+                        "Only new native PRT, ASM, and DRW documents can be registered from Creo check-in.",
+                    )
+                candidate = next((row for row in scanned
+                                  if str(row.get("path") or "")
+                                  and Path(row["path"]).resolve() == source
+                                  and row.get("cad_document_id") is None), None)
+                if not candidate:
+                    raise BridgeApiError(
+                        409, "new_cad_candidate_changed",
+                        "A selected file is no longer an unregistered workspace candidate. Refresh the check-in list.",
+                    )
+                if candidate.get("status") == "INVALID_NATIVE_FILE" or not is_native_creo_file(
+                    source, extension
+                ):
+                    raise BridgeApiError(
+                        400, "invalid_native_creo_file",
+                        f"{source.name} does not have a valid Creo native header for its extension.",
+                    )
+                clean_name = workspace_service.logical_name(source.name)
+                key = clean_name.casefold()
+                if key in seen_names:
+                    raise BridgeApiError(409, "duplicate_new_cad_selection", f"{clean_name} was selected more than once.")
+                seen_names.add(key)
+                existing = pdm_service.repo.get_cad_document_by_file(int(project_id), clean_name)
+                if existing:
+                    raise BridgeApiError(
+                        409, "cad_already_registered",
+                        f"{clean_name} already exists in Nexus. Retrieve or check out that CAD Document instead of registering a second one.",
+                        {"cad_document_id": int(existing["id"])},
+                    )
+                drawing_models = []
+                if extension == ".drw":
+                    raw_models = item.get("drawing_models")
+                    if not isinstance(raw_models, list):
+                        raw_models = []
+                    drawing_models = sorted({
+                        workspace_service.logical_name(str(value)).casefold()
+                        for value in raw_models if str(value or "").strip()
+                    })
+                    if len(drawing_models) != 1:
+                        raise BridgeApiError(
+                            409, "drawing_primary_model_required",
+                            f"{clean_name} must reference exactly one PRT or ASM before it can be registered.",
+                        )
+                prepared.append({
+                    "candidate": candidate,
+                    "source": source,
+                    "clean_name": clean_name,
+                    "extension": extension,
+                    "drawing_models": drawing_models,
+                })
+
+            created = []
+            bom_service = self._bom_service()
+            try:
+                prepared_by_name = {item["clean_name"].casefold(): item for item in prepared}
+                creation_order = sorted(prepared, key=lambda item: item["extension"] == ".drw")
+                for item in creation_order:
+                    owner_id = None
+                    if item["extension"] == ".drw":
+                        owner_name = item["drawing_models"][0]
+                        owner_item = prepared_by_name.get(owner_name)
+                        owner_id = owner_item.get("cad_id") if owner_item else None
+                        if owner_id is None:
+                            owner = pdm_service.repo.get_cad_document_by_file(
+                                int(project_id), owner_name
+                            )
+                            owner_id = int(owner["id"]) if owner else None
+                        if owner_id is None:
+                            raise BridgeApiError(
+                                409, "drawing_model_required",
+                                f"Register or select the related model {owner_name} with {item['clean_name']}.",
+                            )
+                    cad_id = pdm_service.create_cad_document(
+                        int(project_id),
+                        number=item["clean_name"],
+                        name=Path(item["clean_name"]).stem,
+                        file_name=item["clean_name"],
+                        category=(
+                            "ASSEMBLY" if item["extension"] == ".asm"
+                            else "DRAWING" if item["extension"] == ".drw"
+                            else "COMPONENT"
+                        ),
+                        authoring_application="CREO",
+                        document_type="CAD_DOCUMENT",
+                        drawing_owner_cad_document_id=owner_id,
+                    )
+                    created.append({"id": int(cad_id), "checked_out": False})
+                    bom_service.checkout_pdm_cad_document(
+                        int(cad_id),
+                        explicit_item_checkout=True,
+                        **workspace_service.checkout_descriptor(str(workspace["id"])),
+                    )
+                    created[-1]["checked_out"] = True
+                    item["cad_id"] = int(cad_id)
+                    item["local_entry"] = workspace_service.materialize_cad_document(
+                        str(workspace["id"]),
+                        int(cad_id),
+                        preserve_existing=True,
+                        source_path=item["source"],
+                        editable=True,
+                    )
+            except Exception:
+                for created_item in reversed(created):
+                    if created_item["checked_out"]:
+                        try:
+                            bom_service.undo_checkout_pdm_cad_document(
+                                created_item["id"],
+                                "Rollback failed new Creo CAD registration",
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Could not release failed new CAD checkout %s",
+                                created_item["id"],
+                            )
+                    try:
+                        workspace_service.release_cad_document(
+                            str(workspace["id"]), created_item["id"]
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not remove failed new CAD workspace entry %s",
+                            created_item["id"],
+                        )
+                    try:
+                        pdm_service.delete_cad_document(created_item["id"])
+                    except Exception:
+                        logger.exception(
+                            "Could not remove failed new CAD registration %s",
+                            created_item["id"],
+                        )
+                raise
+            registered = []
+            for item in prepared:
+                document = pdm_service.repo.get_cad_document(item["cad_id"]) or {}
+                registered.append({
+                    "cad": self._status_payload(
+                        document, local_workspace_id=str(workspace["id"])
+                    ),
+                    "local_file": {
+                        **item["candidate"],
+                        "cad_document_id": item["cad_id"],
+                        "status": "READY",
+                        "selectable": True,
+                        "detail": "New CAD Document registered and checked out for this workspace.",
+                        "manifest_entry": item["local_entry"],
+                    },
+                })
+            return {"registered": registered}
+
+    def stage_cad_structure(self, body: dict) -> dict:
+        """Attach synchronous Creo relationship metadata to its Pending commit."""
+        with self._operation_lock:
+            user_id, project_id, _project = self._require_commit_permission()
+            commit_id = str(body.get("commit_id") or "").strip()
+            required_ids = []
+            commit_service = self._commit_service()
+            for value in body.get("cad_document_ids") or []:
+                try:
+                    cad_id = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if cad_id > 0 and cad_id not in required_ids:
+                    required_ids.append(cad_id)
+            if not commit_id or not required_ids:
+                raise BridgeApiError(
+                    400, "cad_structure_commit_required",
+                    "A Pending commit and its CAD Documents are required to stage Creo structure metadata.",
+                )
+            for cad_id in required_ids:
+                document = self._pdm_service().repo.get_cad_document(cad_id) or {}
+                if int(document.get("project_id") or 0) != int(project_id):
+                    raise BridgeApiError(404, "cad_not_found", "A selected CAD Document is not in this project.")
+                filename = commit_service._clean_creo_file_name(
+                    str(document.get("file_name") or "")
+                )
+                rows = commit_service.commit_repository.get_pending_rows_by_base_filename(
+                    filename, int(project_id)
+                )
+                if not any(str(row.get("commit_id") or "") == commit_id for row in rows or []):
+                    raise BridgeApiError(
+                        409, "cad_not_in_pending_commit",
+                        f"{filename} is not staged in Pending commit {commit_id}.",
+                    )
+            try:
+                from core.services.cad_structure_sync_service import CadStructureSyncService
+                service = CadStructureSyncService(self._pdm_service().db_name)
+                result = service.stage_pending_commit(
+                    commit_id, int(project_id), int(user_id), required_ids,
+                    body.get("structure"),
+                )
+                from core.services.commit_snapshot_service import CommitSnapshotService
+                CommitSnapshotService(self._pdm_service().db_name).record_pending_structure(
+                    int(project_id), commit_id, int(user_id)
+                )
+            except (ValueError, PermissionError) as exc:
+                raise BridgeApiError(409, "cad_structure_conflict", str(exc)) from exc
+            return result
+
     def checkin(self, cad_document_id: int, body: dict) -> dict:
         with self._operation_lock:
             user_id, _project_id, project = self._require_commit_permission()
@@ -1361,6 +1619,9 @@ class CreoBridgeController:
                         "path": str(source),
                         "workspace_id": str(workspace["id"]),
                         "cad_document_id": int(cad_document_id),
+                        "baseline_sha256": manifest_entry.get("baseline_sha256"),
+                        "baseline_cad_revision": manifest_entry.get("baseline_cad_revision"),
+                        "baseline_cad_iteration": manifest_entry.get("baseline_cad_iteration"),
                     }],
                     target_commit_id=target_commit_id or None,
                     duplicate_action=duplicate_action,

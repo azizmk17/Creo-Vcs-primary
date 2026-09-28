@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from contextlib import nullcontext
 from typing import Iterable
 
 from config import DB_NAME
@@ -39,7 +40,8 @@ class ProjectEventRepository:
                         entity_type TEXT DEFAULT '',
                         entity_id TEXT DEFAULT '',
                         payload_json TEXT DEFAULT '{}',
-                        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        event_key TEXT
                     );
                     CREATE INDEX IF NOT EXISTS idx_project_events_project_id_id
                         ON project_events(project_id, id);
@@ -47,6 +49,18 @@ class ProjectEventRepository:
                         ON project_events(created_at);
                     """
                 )
+                columns = {
+                    str(row[1])
+                    for row in conn.execute(
+                        "PRAGMA table_info(project_events)"
+                    ).fetchall()
+                }
+                if "event_key" not in columns:
+                    conn.execute("ALTER TABLE project_events ADD COLUMN event_key TEXT")
+                conn.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_project_events_event_key
+                    ON project_events(event_key) WHERE event_key IS NOT NULL
+                """)
         except Exception:
             # Event sync is a convenience layer; domain operations must not fail
             # because the invalidation feed could not be initialized.
@@ -60,10 +74,40 @@ class ProjectEventRepository:
         entity_type: str = "",
         entity_id=None,
         payload: dict | None = None,
+        *,
+        conn=None,
+        event_key: str | None = None,
     ) -> int | None:
+        context = self.get_conn() if conn is None else nullcontext(conn)
         try:
-            with self.get_conn() as conn:
-                cur = conn.execute(
+            with context as active_conn:
+                if event_key:
+                    cur = active_conn.execute(
+                        """
+                        INSERT INTO project_events(
+                            project_id, actor_user_id, event_type, entity_type,
+                            entity_id, payload_json, event_key
+                        ) VALUES(?,?,?,?,?,?,?)
+                        ON CONFLICT(event_key) WHERE event_key IS NOT NULL DO NOTHING
+                        """,
+                        (
+                            int(project_id) if project_id is not None else None,
+                            int(actor_user_id) if actor_user_id is not None else None,
+                            str(event_type or "changed"),
+                            str(entity_type or ""),
+                            "" if entity_id is None else str(entity_id),
+                            json.dumps(payload or {}, ensure_ascii=False, default=str),
+                            str(event_key),
+                        ),
+                    )
+                    if cur.rowcount == 0:
+                        row = active_conn.execute(
+                            "SELECT id FROM project_events WHERE event_key=?",
+                            (str(event_key),),
+                        ).fetchone()
+                        return int(row[0]) if row else None
+                else:
+                    cur = active_conn.execute(
                     """
                     INSERT INTO project_events(
                         project_id, actor_user_id, event_type, entity_type,
@@ -78,9 +122,11 @@ class ProjectEventRepository:
                         "" if entity_id is None else str(entity_id),
                         json.dumps(payload or {}, ensure_ascii=False, default=str),
                     ),
-                )
+                    )
                 return int(cur.lastrowid)
         except Exception:
+            if conn is not None:
+                raise
             return None
 
     def current_id(self, project_id=None) -> int:

@@ -5,7 +5,9 @@ import tempfile
 import unittest
 
 from core.services.ebom_service import EbomResolver
-from setup.migrations import _migration_22, _migration_29, _migration_30, _migration_31
+from setup.migrations import (
+    _migration_17, _migration_22, _migration_29, _migration_30, _migration_31,
+)
 
 
 class EbomMigrationTests(unittest.TestCase):
@@ -16,6 +18,7 @@ class EbomMigrationTests(unittest.TestCase):
             conn.row_factory = sqlite3.Row
             conn.executescript(
                 """
+                CREATE TABLE users (id INTEGER PRIMARY KEY);
                 CREATE TABLE bom (
                     id INTEGER PRIMARY KEY, type TEXT, name TEXT,
                     aes_number TEXT, part_number TEXT, drawing_number TEXT,
@@ -116,6 +119,35 @@ class EbomMigrationTests(unittest.TestCase):
             self.assertTrue(
                 all(row.get("cad_control_mode") == "CONTROLLED" for row in snapshots)
             )
+
+    def test_migration_17_preserves_append_only_audit_rows(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript("""
+                CREATE TABLE signature(id INTEGER PRIMARY KEY, action TEXT);
+                CREATE TABLE lock_logs(id INTEGER PRIMARY KEY, action TEXT, signature INTEGER);
+                INSERT INTO signature VALUES(1, 'checkin');
+                INSERT INTO lock_logs VALUES(1, 'checkin', 1);
+                CREATE TRIGGER no_signature_update BEFORE UPDATE ON signature
+                BEGIN SELECT RAISE(ABORT, 'signature is append-only'); END;
+            """)
+
+            _migration_17(conn)
+
+            self.assertEqual(
+                conn.execute("SELECT action FROM signature WHERE id=1").fetchone()[0],
+                "checkin",
+            )
+            self.assertEqual(
+                conn.execute("SELECT action FROM lock_logs WHERE id=1").fetchone()[0],
+                "checkin",
+            )
+            self.assertEqual(
+                conn.execute("SELECT value FROM app_metadata WHERE key='db_schema_version'").fetchone()[0],
+                "17",
+            )
+        finally:
+            conn.close()
 
     def test_existing_bom_resolves_identically_after_migration(self):
         with sqlite3.connect(self.db_path) as conn:

@@ -244,12 +244,14 @@ class WorkspaceStagingDialog(QDialog):
         parent=None,
         *,
         checkout_callback=None,
+        reconcile_callback=None,
     ):
         super().__init__(parent)
         self.service = service
         self.project_id = int(project_id)
         self.user_id = int(user_id)
         self.checkout_callback = checkout_callback
+        self.reconcile_callback = reconcile_callback
         self.rows = []
         self.setWindowTitle("Stage from CAD Workspace")
         self.resize(980, 570)
@@ -295,6 +297,10 @@ class WorkspaceStagingDialog(QDialog):
         checkout.clicked.connect(self._checkout_selected)
         checkout.setEnabled(callable(checkout_callback))
         actions.addWidget(checkout)
+        reconcile = QPushButton("Preserve Draft + Refresh Latest")
+        reconcile.clicked.connect(self._reconcile_selected)
+        reconcile.setEnabled(callable(reconcile_callback))
+        actions.addWidget(reconcile)
         actions.addStretch(1)
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self.buttons.button(QDialogButtonBox.Ok).setText("Stage Selected")
@@ -372,6 +378,43 @@ class WorkspaceStagingDialog(QDialog):
             self.refresh()
         except Exception as exc:
             QMessageBox.warning(self, "CAD Checkout", str(exc))
+
+    def _reconcile_selected(self):
+        item = self.tree.currentItem()
+        row = item.data(0, Qt.UserRole) if item else None
+        if not row or not (
+            row.get("status") == "OUT_OF_DATE" or row.get("edit_intent")
+        ):
+            QMessageBox.information(
+                self,
+                "Reconcile CAD Workspace",
+                "Select an outdated CAD row or a row with local edit intent.",
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "Preserve Draft and Refresh",
+            "Close this model in Creo first. Nexus will archive every local iteration "
+            "as a draft, then replace the workspace copy with the latest approved, "
+            "read-only CAD file. Your archived draft will not be submitted automatically.",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            result = self.reconcile_callback(
+                row, self.service.get_workspace(self.combo.currentData())
+            )
+            QMessageBox.information(
+                self,
+                "CAD Workspace Reconciled",
+                "The latest approved CAD file is in the workspace. Local work was "
+                f"preserved at:\n{result.get('archive_directory') or ''}",
+            )
+            self.refresh()
+        except Exception as exc:
+            QMessageBox.warning(self, "Reconcile CAD Workspace", str(exc))
 
     def selected_rows(self):
         selected = []

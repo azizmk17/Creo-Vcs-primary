@@ -37,6 +37,7 @@ class PdmServiceTests(unittest.TestCase):
                     status TEXT DEFAULT 'Design',
                     created TEXT,
                     modified TEXT,
+                    deleted_at TEXT,
                     project_id INTEGER,
                     represented_part_id INTEGER,
                     default_ebom_behavior TEXT DEFAULT 'NORMAL'

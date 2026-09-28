@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import nullcontext
 from typing import List, Optional
 from core.models.lock_model import Locks
 from core.models.lock_logs_model import Lock_logs
@@ -52,9 +53,10 @@ class LockRepository:
                 )
 
     # -------------------------------
-    def checkin(self, part_id, user_id, signature, object_iteration_id=None) -> int:
-        with self.get_conn() as conn:
-            cur = conn.cursor()
+    def checkin(self, part_id, user_id, signature, object_iteration_id=None, *, conn=None) -> int:
+        context = self.get_conn() if conn is None else nullcontext(conn)
+        with context as active_conn:
+            cur = active_conn.cursor()
             cur.execute("DELETE FROM locks WHERE part_id = ?", (part_id,))
             cur.execute("""
                 INSERT INTO lock_logs (
@@ -90,12 +92,15 @@ class LockRepository:
         signature,
         object_iteration_id=None,
         checkout_origin: str = "ITEM",
+        *,
+        conn=None,
     ) -> int:
         origin = str(checkout_origin or "ITEM").strip().upper()
         if origin not in {"ITEM", "CAD"}:
             raise ValueError(f"Unsupported checkout origin: {checkout_origin}.")
-        with self.get_conn() as conn:
-            cur = conn.cursor()
+        context = self.get_conn() if conn is None else nullcontext(conn)
+        with context as active_conn:
+            cur = active_conn.cursor()
             cur.execute("""
                 INSERT INTO locks (
                     part_id, user_id, checkout_origin, checked_out_at
@@ -114,13 +119,14 @@ class LockRepository:
             ))
             return int(cur.lastrowid)
 
-    def set_checkout_origin(self, part_id: int, checkout_origin: str) -> bool:
+    def set_checkout_origin(self, part_id: int, checkout_origin: str, *, conn=None) -> bool:
         """Change why an active Item working copy is being retained."""
         origin = str(checkout_origin or "ITEM").strip().upper()
         if origin not in {"ITEM", "CAD"}:
             raise ValueError(f"Unsupported checkout origin: {checkout_origin}.")
-        with self.get_conn() as conn:
-            cur = conn.execute(
+        context = self.get_conn() if conn is None else nullcontext(conn)
+        with context as active_conn:
+            cur = active_conn.execute(
                 "UPDATE locks SET checkout_origin=? WHERE part_id=?",
                 (origin, int(part_id)),
             )
@@ -138,9 +144,10 @@ class LockRepository:
             )
             return bool(cur.rowcount)
 
-    def set_log_object_iteration(self, log_id: int, object_iteration_id: int) -> None:
-        with self.get_conn() as conn:
-            conn.execute(
+    def set_log_object_iteration(self, log_id: int, object_iteration_id: int, *, conn=None) -> None:
+        context = self.get_conn() if conn is None else nullcontext(conn)
+        with context as active_conn:
+            active_conn.execute(
                 "UPDATE lock_logs SET object_iteration_id=? WHERE id=?",
                 (int(object_iteration_id), int(log_id)),
             )
@@ -150,9 +157,10 @@ class LockRepository:
     # -------------------------------
     # READ / GET
     # -------------------------------
-    def get_by_part(self, part_id: int) -> Optional[Locks]:
-        with self.get_conn() as conn:
-            cur = conn.cursor()
+    def get_by_part(self, part_id: int, *, conn=None) -> Optional[Locks]:
+        context = self.get_conn() if conn is None else nullcontext(conn)
+        with context as active_conn:
+            cur = active_conn.cursor()
             cur.execute("SELECT * FROM locks WHERE part_id=?", (part_id,))
             row = cur.fetchone()
             if row:

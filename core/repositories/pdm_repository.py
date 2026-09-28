@@ -3,6 +3,7 @@ import re
 import hashlib
 import json
 import sqlite3
+from contextlib import nullcontext
 from collections import defaultdict
 from typing import Optional
 
@@ -14,6 +15,8 @@ from setup.migrations import (
     _migration_35,
     _migration_38,
     _migration_39,
+    _migration_43,
+    _migration_44,
 )
 from utils import get_base_name, get_version_number, is_creo_file
 
@@ -110,6 +113,8 @@ class PdmRepository:
                     "source_file_name TEXT",
                 )
             self._backfill_legacy_approved_creo_files(conn)
+            _migration_43(conn)
+            _migration_44(conn)
 
     @staticmethod
     def _dict(row) -> Optional[dict]:
@@ -1154,8 +1159,10 @@ class PdmRepository:
         workspace_id: str | None = None,
         workspace_name: str | None = None,
         workspace_machine_id: str | None = None,
+        connection=None,
     ) -> dict:
-        with self.get_conn() as conn:
+        context = self.get_conn() if connection is None else nullcontext(connection)
+        with context as conn:
             row = conn.execute(
                 "SELECT * FROM cad_documents WHERE id=?", (int(cad_document_id),)
             ).fetchone()
@@ -1259,14 +1266,22 @@ class PdmRepository:
                     str(workspace_machine_id or "") or None,
                 ),
             )
+            if connection is not None:
+                checked_out = self._dict(conn.execute(
+                    "SELECT * FROM cad_documents WHERE id=?",
+                    (int(cad_document_id),),
+                ).fetchone())
+                checked_out["checkout_item_ids"] = list(checkout_item_ids)
+                return checked_out
         return self.get_cad_document(int(cad_document_id))
 
     def checkin_cad_document(
         self, cad_document_id: int, user_id: int, source_path: str,
         note: str = "", source_commit_id=None, source_file_name=None,
-        creo_file_version=None,
+        creo_file_version=None, *, connection=None,
     ) -> dict:
-        with self.get_conn() as conn:
+        context = self.get_conn() if connection is None else nullcontext(connection)
+        with context as conn:
             row = conn.execute(
                 "SELECT * FROM cad_documents WHERE id=?", (int(cad_document_id),)
             ).fetchone()
@@ -1378,8 +1393,11 @@ class PdmRepository:
                 "DELETE FROM cad_document_checkout_items WHERE cad_document_id=?",
                 (int(cad_document_id),),
             )
+            updated = conn.execute(
+                "SELECT * FROM cad_documents WHERE id=?", (int(cad_document_id),)
+            ).fetchone()
         return {
-            **self.get_cad_document(int(cad_document_id)),
+            **dict(updated),
             "iteration_id": iteration_id,
             "checkout_item_ids": checkout_item_ids,
         }
@@ -1462,14 +1480,15 @@ class PdmRepository:
                 ).fetchall()
             ]
 
-    def list_checked_out_cad_for_item(self, item_id: int) -> list[dict]:
+    def list_checked_out_cad_for_item(self, item_id: int, *, connection=None) -> list[dict]:
         """Return every active CAD working copy associated with one Item.
 
         The checkout link is authoritative for current working copies, while
         the active association also covers CAD data created by older Nexus
         versions before checkout links were persisted.
         """
-        with self.get_conn() as conn:
+        context = self.get_conn() if connection is None else nullcontext(connection)
+        with context as conn:
             rows = conn.execute(
                 """
                 SELECT d.*,

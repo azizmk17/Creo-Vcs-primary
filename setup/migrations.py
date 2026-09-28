@@ -737,7 +737,7 @@ def _migration_16(conn):
 
 
 def _migration_17(conn):
-    """Correct inverted check-in/check-out action names in existing audit rows."""
+    """Record version metadata without rewriting historical audit records."""
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS app_metadata (
@@ -756,33 +756,8 @@ def _migration_17(conn):
             (key, value),
         )
 
-    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    if "lock_logs" in tables:
-        conn.execute(
-            """
-            UPDATE lock_logs
-            SET action = CASE LOWER(action)
-                WHEN 'checkin' THEN 'checkout'
-                WHEN 'checkout' THEN 'checkin'
-                ELSE action
-            END
-            WHERE LOWER(action) IN ('checkin', 'checkout')
-            """
-        )
-
-    if "signature" in tables:
-        conn.execute(
-            """
-            UPDATE signature
-            SET action = CASE LOWER(action)
-                WHEN 'checkin' THEN 'checkout'
-                WHEN 'checkout' THEN 'checkin'
-                ELSE action
-            END
-            WHERE LOWER(action) IN ('checkin', 'checkout')
-              AND id IN (SELECT signature FROM lock_logs WHERE signature IS NOT NULL)
-            """
-        )
+    # These rows are audit history. Correcting old labels in place would
+    # invalidate signatures and violate append-only database triggers.
 
 
 def _migration_18(conn):
@@ -1808,8 +1783,6 @@ def _migration_32(conn):
             ON cad_item_associations(item_id, active, association_type);
         CREATE INDEX IF NOT EXISTS idx_cad_assoc_document
             ON cad_item_associations(cad_document_id, active);
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_active_cad_item_association
-            ON cad_item_associations(cad_document_id) WHERE active=1;
         CREATE UNIQUE INDEX IF NOT EXISTS uq_active_owner_per_item
             ON cad_item_associations(item_id)
             WHERE active=1 AND association_type='OWNER';
@@ -3238,6 +3211,163 @@ def _migration_42(conn):
     )
 
 
+def _migration_43(conn):
+    """Immutable native CAD scan evidence and reviewed reconciliation records."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cad_structure_scans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            root_cad_document_id INTEGER NOT NULL,
+            created_by INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            status TEXT NOT NULL DEFAULT 'PREVIEW',
+            input_digest TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL,
+            baseline_json TEXT NOT NULL,
+            plan_json TEXT NOT NULL,
+            applied_at TEXT,
+            applied_by INTEGER,
+            applied_state_json TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cad_scans_root
+        ON cad_structure_scans(project_id, root_cad_document_id, id)
+    """)
+
+
+def _migration_44(conn):
+    """Keep Creo-reported CAD relationships pending until their commit merges."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cad_pending_structure_changes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            commit_id TEXT NOT NULL,
+            submitted_by INTEGER NOT NULL,
+            required_cad_document_ids_json TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            applied_at TEXT,
+            UNIQUE(project_id, commit_id)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cad_pending_structure_status
+        ON cad_pending_structure_changes(project_id, status, commit_id)
+    """)
+
+
+def _migration_45(conn):
+    """Persist immutable content manifests for each pending CAD submission snapshot."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cad_commit_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            commit_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            manifest_json TEXT NOT NULL,
+            manifest_sha256 TEXT NOT NULL,
+            created_by INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(project_id, commit_id, generation)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cad_commit_snapshots_latest
+        ON cad_commit_snapshots(project_id, commit_id, generation DESC)
+    """)
+
+
+def _migration_46(conn):
+    """Journal each approval so its exact plan can be resumed after interruption."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cad_submission_approvals (
+            approval_id TEXT PRIMARY KEY,
+            project_id INTEGER NOT NULL,
+            commit_id TEXT NOT NULL,
+            snapshot_sha256 TEXT NOT NULL,
+            approver_id INTEGER NOT NULL,
+            merge_id TEXT NOT NULL,
+            message TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'PREPARING',
+            plan_json TEXT NOT NULL DEFAULT '{}',
+            last_error TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at TEXT,
+            UNIQUE(project_id, commit_id, snapshot_sha256)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cad_submission_approvals_status
+        ON cad_submission_approvals(status, updated_at)
+    """)
+    if "signature" in {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }:
+        _ensure_column(conn, "signature", "idempotency_key", "idempotency_key TEXT")
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_signature_idempotency_key
+            ON signature(idempotency_key) WHERE idempotency_key IS NOT NULL
+        """)
+
+
+def _migration_47(conn):
+    """Persist idempotent approval events and retryable local workspace cleanup."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS project_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER,
+            actor_user_id INTEGER,
+            event_type TEXT NOT NULL,
+            entity_type TEXT DEFAULT '',
+            entity_id TEXT DEFAULT '',
+            payload_json TEXT DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            event_key TEXT
+        )
+    """)
+    _ensure_column(conn, "project_events", "event_key", "event_key TEXT")
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_project_events_event_key
+        ON project_events(event_key) WHERE event_key IS NOT NULL
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cad_workspace_release_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            approval_key TEXT NOT NULL,
+            project_id INTEGER NOT NULL,
+            workspace_id TEXT NOT NULL,
+            machine_id TEXT NOT NULL DEFAULT '',
+            cad_document_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at TEXT,
+            last_error TEXT,
+            UNIQUE(approval_key, workspace_id, cad_document_id)
+        )
+    """)
+    _ensure_column(
+        conn, "cad_workspace_release_queue", "machine_id",
+        "machine_id TEXT NOT NULL DEFAULT ''",
+    )
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cad_workspace_release_pending
+        ON cad_workspace_release_queue(completed_at, created_at)
+    """)
+
+
+def _repair_snapshot_schema(conn):
+    """Repair migration-45 schema drift without changing the migration ledger."""
+    table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cad_commit_snapshots'"
+    ).fetchone()
+    if table is None:
+        _migration_45(conn)
+
+
 MIGRATIONS = {
     1: """
     CREATE TABLE IF NOT EXISTS users (
@@ -3632,6 +3762,11 @@ WHERE r.name = 'designer' AND p.name = 'manage_issues';
     41: _migration_41,
 
     42: _migration_42,
+    43: _migration_43,
+    44: _migration_44,
+    45: _migration_45,
+    46: _migration_46,
+    47: _migration_47,
 
 }
 
@@ -3655,5 +3790,11 @@ def migrate():
                     cur.executescript(migration)
                 cur.execute("INSERT INTO schema_migrations (version) VALUES (?)", (version,))
             print(f"Migration {version} applied.")
+
+    # Shared-folder databases can be copied or restored independently of their
+    # migration ledger. Ensure the table required by commit approval exists even
+    # when schema_migrations already records version 45.
+    with DatabaseConnection() as conn:
+        _repair_snapshot_schema(conn)
 
     print("All migrations are up to date.")

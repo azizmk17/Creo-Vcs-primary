@@ -14,15 +14,18 @@ import os
 import re
 import shutil
 import socket
+import sqlite3
 import stat
 import tempfile
 import uuid
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
 from core.services.pdm_service import PdmService
 from core.services.project_service import ProjectService
 from core.session_manager import SessionManager
+from core.integrations.creo_file_validation import is_native_creo_file
 
 
 _MANIFEST_NAME = ".creovcs-workspace.json"
@@ -531,6 +534,126 @@ class CadWorkspaceService:
             )
         return materialized
 
+    def reconcile_cad_document(self, workspace_id: str, cad_document_id: int) -> dict:
+        """Archive local Creo iterations, then refresh the workspace from approved CAD."""
+        workspace = self.get_workspace(workspace_id)
+        if not workspace or not workspace.get("available"):
+            raise ValueError("The selected CAD workspace is not available.")
+        document = self.pdm_service.repo.get_cad_document(int(cad_document_id))
+        if not document:
+            raise ValueError("The CAD Document was not found.")
+        manifest = self.load_manifest(workspace_id)
+        entry_key = str(int(cad_document_id))
+        entry = (manifest.get("entries") or {}).get(entry_key) or {}
+        logical = self.logical_name(document.get("file_name") or "")
+        logical_key = logical.casefold()
+        workspace_path = self.workspace_path(workspace_id)
+        if document.get("checked_out_by") is not None:
+            owner_workspace = str(document.get("checkout_workspace_id") or "").casefold()
+            owner_machine = str(document.get("checkout_workspace_machine_id") or "").casefold()
+            if owner_workspace != str(workspace_id).casefold() or owner_machine != self.machine_id.casefold():
+                raise ValueError(
+                    "This CAD Document is actively checked out in another workspace. "
+                    "Wait for that checkout to finish before reconciling this copy."
+                )
+            raise ValueError(
+                "Undo or check in this workspace's active CAD checkout before reconciling."
+            )
+
+        candidates = sorted(
+            (
+                child for child in workspace_path.iterdir()
+                if child.is_file() and not child.is_symlink()
+                and self.logical_name(child.name).casefold() == logical_key
+                and (_CREO_RE.match(child.name) or _CREO_UNVERSIONED_RE.match(child.name))
+            ),
+            key=lambda child: child.name.casefold(),
+        )
+        source = self.resolve_controlled_source(document)
+        source_hash = self._sha256(source)
+        token = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid.uuid4().hex[:8]
+        archive_dir = workspace_path / ".nexus-drafts" / str(int(cad_document_id)) / token
+        archive_dir.mkdir(parents=True, exist_ok=False)
+        archived_files = []
+        staged_source = workspace_path / f".nexus-refresh-{uuid.uuid4().hex}.tmp"
+        installed = False
+        try:
+            for candidate in candidates:
+                archived = archive_dir / candidate.name
+                shutil.copy2(candidate, archived)
+                digest = self._sha256(archived)
+                if digest != self._sha256(candidate):
+                    raise ValueError(f"Could not preserve the local draft file {candidate.name}.")
+                archived_files.append({
+                    "name": candidate.name,
+                    "path": archived.relative_to(workspace_path).as_posix(),
+                    "sha256": digest,
+                })
+
+            shutil.copy2(source, staged_source)
+            if self._sha256(staged_source) != source_hash:
+                raise ValueError("The approved CAD file changed while reconciliation was running.")
+            destination = workspace_path / source.name
+            for candidate in candidates:
+                if candidate.resolve() != destination.resolve():
+                    candidate.unlink()
+            os.replace(staged_source, destination)
+            installed = True
+            self._set_path_editable(destination, False)
+
+            history = list(entry.get("draft_history") or [])
+            history.append({
+                "captured_at": _utc_now(),
+                "archive_directory": archive_dir.relative_to(workspace_path).as_posix(),
+                "files": archived_files,
+            })
+            entry.update({
+                "cad_document_id": int(cad_document_id),
+                "project_id": int(document["project_id"]),
+                "logical_file_name": logical,
+                "baseline_file_name": source.name,
+                "baseline_sha256": source_hash,
+                "baseline_cad_revision": str(document.get("revision") or ""),
+                "baseline_cad_iteration": int(document.get("iteration") or 0),
+                "checkout_user_id": None,
+                "editable": False,
+                "stage_ready_after_checkout": False,
+                "draft_history": history,
+                "reconciled_at": _utc_now(),
+            })
+            entry.pop("edit_intent", None)
+            manifest.setdefault("entries", {})[entry_key] = entry
+            self._save_manifest(workspace_id, manifest)
+        except Exception:
+            if staged_source.exists():
+                staged_source.unlink()
+            if installed:
+                try:
+                    destination.unlink()
+                except OSError:
+                    pass
+            for item in archived_files:
+                original = workspace_path / item["name"]
+                archived = workspace_path / item["path"]
+                if archived.is_file() and not original.exists():
+                    try:
+                        shutil.copy2(archived, original)
+                    except OSError:
+                        pass
+            shutil.rmtree(archive_dir, ignore_errors=True)
+            raise
+
+        return {
+            "cad_document_id": int(cad_document_id),
+            "workspace_id": str(workspace_id),
+            "path": str(destination),
+            "baseline_cad_revision": entry["baseline_cad_revision"],
+            "baseline_cad_iteration": entry["baseline_cad_iteration"],
+            "baseline_sha256": source_hash,
+            "archived_draft_files": archived_files,
+            "archive_directory": str(archive_dir),
+        }
+
     def set_document_files_editable(
         self, workspace_id: str, cad_document_id: int, editable: bool
     ) -> list[str]:
@@ -626,6 +749,62 @@ class CadWorkspaceService:
             entries.pop(str(int(cad_document_id)), None)
             self._save_manifest(str(workspace_id), manifest)
 
+    def process_pending_approval_releases(
+        self, db_name: str, *, approval_key: str | None = None, limit: int = 100
+    ) -> dict:
+        """Retry durable workspace cleanup on the machine that owns each workspace."""
+        completed = 0
+        failed = []
+        batch_size = max(1, int(limit))
+        while True:
+            with closing(sqlite3.connect(db_name, timeout=10)) as conn:
+                conn.row_factory = sqlite3.Row
+                params = [str(self.machine_id)]
+                approval_clause = ""
+                if approval_key is not None:
+                    approval_clause = "AND approval_key=?"
+                    params.append(str(approval_key))
+                params.append(batch_size)
+                rows = conn.execute(
+                    f"""
+                    SELECT id,workspace_id,cad_document_id
+                    FROM cad_workspace_release_queue
+                    WHERE completed_at IS NULL AND machine_id=? {approval_clause}
+                    ORDER BY id LIMIT ?
+                    """,
+                    tuple(params),
+                ).fetchall()
+            if not rows:
+                break
+
+            batch_failed = []
+            for row in rows:
+                try:
+                    self.release_cad_document(
+                        str(row["workspace_id"]), int(row["cad_document_id"])
+                    )
+                    with closing(sqlite3.connect(db_name, timeout=10)) as conn, conn:
+                        conn.execute(
+                            """
+                            UPDATE cad_workspace_release_queue
+                            SET completed_at=datetime('now'),last_error=NULL
+                            WHERE id=? AND completed_at IS NULL
+                            """,
+                            (int(row["id"]),),
+                        )
+                    completed += 1
+                except Exception as exc:
+                    with closing(sqlite3.connect(db_name, timeout=10)) as conn, conn:
+                        conn.execute(
+                            "UPDATE cad_workspace_release_queue SET last_error=? WHERE id=?",
+                            (str(exc)[:2000], int(row["id"])),
+                        )
+                    failed.append(int(row["id"]))
+                    batch_failed.append(int(row["id"]))
+            if batch_failed or len(rows) < batch_size:
+                break
+        return {"completed": completed, "failed_ids": failed}
+
     def scan_workspace(self, workspace_id: str, project_id: int, user_id: int) -> list[dict]:
         workspace = self.get_workspace(workspace_id)
         if not workspace or not workspace.get("available"):
@@ -634,7 +813,7 @@ class CadWorkspaceService:
         path = self.workspace_path(workspace_id)
         grouped: dict[str, list[tuple[int, Path]]] = {}
         for child in path.iterdir():
-            if not child.is_file():
+            if not child.is_file() or child.is_symlink():
                 continue
             match = _CREO_RE.match(child.name)
             if match:
@@ -673,8 +852,19 @@ class CadWorkspaceService:
             if document:
                 document_project = int(document.get("project_id") or 0)
                 owner = document.get("checked_out_by")
+                baseline_revision = str(entry.get("baseline_cad_revision") or "")
+                baseline_iteration = int(entry.get("baseline_cad_iteration") or 0)
                 if document_project != int(project_id):
                     status, detail = "OTHER_PROJECT", "This CAD Document belongs to another project."
+                elif entry and (
+                    baseline_revision != str(document.get("revision") or "")
+                    or baseline_iteration != int(document.get("iteration") or 0)
+                ):
+                    status, detail = (
+                        "OUT_OF_DATE",
+                        "The approved CAD revision or iteration changed after retrieval. "
+                        "Update this workspace copy before check-in.",
+                    )
                 elif owner is None:
                     status, detail = "NOT_CHECKED_OUT", "Check out this CAD Document before staging it."
                 elif int(owner) != int(user_id):
@@ -694,6 +884,9 @@ class CadWorkspaceService:
                         "Local edit intent is active; Nexus server check-in remains blocked "
                         "until this CAD Document is checked out by you."
                     )
+            elif not is_native_creo_file(candidate, Path(self.logical_name(candidate.name)).suffix):
+                status = "INVALID_NATIVE_FILE"
+                detail = "This file has a Creo extension but does not have a matching native Creo file header."
             rows.append({
                 "workspace_id": workspace_id,
                 "workspace_name": workspace["name"],
@@ -705,6 +898,8 @@ class CadWorkspaceService:
                 "candidate_sha256": candidate_hash,
                 "baseline_file_name": entry.get("baseline_file_name"),
                 "baseline_sha256": baseline_hash or None,
+                "baseline_cad_revision": entry.get("baseline_cad_revision"),
+                "baseline_cad_iteration": entry.get("baseline_cad_iteration"),
                 "modified": modified,
                 "status": status,
                 "detail": detail,

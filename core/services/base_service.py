@@ -30,6 +30,7 @@ class BaseService:
         payload: dict | None = None,
         project_id=None,
         actor_user_id=None,
+        conn=None,
     ) -> int | None:
         """Best-effort multi-user invalidation event.
 
@@ -46,6 +47,7 @@ class BaseService:
                 entity_type=entity_type,
                 entity_id=entity_id,
                 payload=payload or {},
+                conn=conn,
             )
         except Exception:
             return None

@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import nullcontext
 from typing import List, Optional
 from core.models.bom_model import Bom
 from core.ebom_policy import (
@@ -1308,11 +1309,12 @@ class BomRepository:
     # -------------------------------
     # UPDATE
     # -------------------------------
-    def update(self, bom: Bom):
+    def update(self, bom: Bom, *, conn=None):
         if not bom.id:
             raise ValueError("Bom ID is required for update")
-        with self.get_conn() as conn:
-            cur = conn.cursor()
+        context = self.get_conn() if conn is None else nullcontext(conn)
+        with context as active_conn:
+            cur = active_conn.cursor()
             cur.execute("""
                 UPDATE bom
                 SET type=?, name=?, part_number=?, drawing_number=?, aes_number=?,
@@ -1370,9 +1372,10 @@ class BomRepository:
             )
             return bool(cur.rowcount)
 
-    def checkin_bom(self, id):
-        with self.get_conn() as conn:
-            cur = conn.cursor()
+    def checkin_bom(self, id, *, conn=None):
+        context = self.get_conn() if conn is None else nullcontext(conn)
+        with context as active_conn:
+            cur = active_conn.cursor()
             cur.execute("""
                 UPDATE bom
                 SET locked = 0
@@ -1381,9 +1384,10 @@ class BomRepository:
                 id,
             ))
 
-    def checkout_bom(self, id):
-        with self.get_conn() as conn:
-            cur = conn.cursor()
+    def checkout_bom(self, id, *, conn=None):
+        context = self.get_conn() if conn is None else nullcontext(conn)
+        with context as active_conn:
+            cur = active_conn.cursor()
             cur.execute("""
                 UPDATE bom
                 SET locked = 1
