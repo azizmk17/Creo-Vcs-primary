@@ -1069,6 +1069,51 @@ class CommitService(BaseService):
             reverse=True,
         )
 
+    @require_permission("commit")
+    def withdraw_cad_submission(self, commit_id: str, reason: str = "") -> dict:
+        """Withdraw the current user's CAD submission before approval; retain its files and locks."""
+        result = self.commit_repository.withdraw_cad_submission(
+            commit_id,
+            int(self.session.project_id),
+            int(self.session.user_id),
+            reason,
+        )
+        self.emit_project_event(
+            "cad.submission_withdrawn",
+            entity_type="CAD_SUBMISSION",
+            entity_id=result["commit_id"],
+            project_id=result["project_id"],
+            payload={
+                "commit_id": result["commit_id"],
+                "from_status": result["from_status"],
+                "status": result["status"],
+            },
+        )
+        return result
+
+    @require_permission("merge")
+    def reject_cad_submission(self, commit_id: str, reason: str) -> dict:
+        """Reject a validated CAD submission with an audited reviewer reason."""
+        result = self.commit_repository.reject_cad_submission(
+            commit_id,
+            int(self.session.project_id),
+            int(self.session.user_id),
+            reason,
+        )
+        self.emit_project_event(
+            "cad.submission_rejected",
+            entity_type="CAD_SUBMISSION",
+            entity_id=result["commit_id"],
+            project_id=result["project_id"],
+            payload={
+                "commit_id": result["commit_id"],
+                "from_status": result["from_status"],
+                "status": result["status"],
+                "reason": result["reason"],
+            },
+        )
+        return result
+
 
     def get_commit_history (self):
         project_id = self.session.project_id
@@ -1218,7 +1263,10 @@ class CommitService(BaseService):
             return {"commit_id": str(commit_id), "files": [], "issues": []}
 
         first = rows[0]
-        status_order = {"Reverted": 5, "Approved": 4, "Validated": 3, "Pending": 2, "Integrated": 1}
+        status_order = {
+            "Withdrawn": 7, "Rejected": 6, "Reverted": 5,
+            "Approved": 4, "Validated": 3, "Pending": 2, "Integrated": 1,
+        }
         statuses = [str(r.get("status") or "") for r in rows]
         group_status = max(statuses, key=lambda s: status_order.get(s, 0)) if statuses else ""
         issues = self.issue_service.issues_for_commit(str(commit_id))
@@ -1249,6 +1297,9 @@ class CommitService(BaseService):
                 item for item in pending_items
                 if item.get("file_role") not in {"exported_pdf", "exported_step"}
             ]
+        lifecycle_events = self.commit_repository.get_submission_lifecycle_events(
+            str(commit_id), int(project_id) if project_id is not None else None
+        )
         return {
             "commit_id": str(commit_id),
             "title": first.get("title") or "",
@@ -1275,6 +1326,7 @@ class CommitService(BaseService):
             "issues": issues,
             "engineering_files": engineering_files,
             "validation_docs": validation_docs,
+            "lifecycle_events": lifecycle_events,
         }
 
     def _resolve_engineering_file_path(self, item: dict):
@@ -1375,6 +1427,8 @@ class CommitService(BaseService):
             self.session.user_id,
             int(project_id) if project_id is not None else self.session.project_id,
         )
+        if not result:
+            raise ValueError("The Pending submission was not found; refresh and retry.")
         self.issue_service.validate_commit_issues(
             str(commit_id), confirmed_issue_ids or [], rejected_issue_ids or [], validation_comment
         )

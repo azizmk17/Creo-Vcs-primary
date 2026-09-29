@@ -67,6 +67,8 @@ _DEFAULT_STATUS = {"icon": "ðŸ“‹", "color": "#6b7280", "bg": "#f3f4f6", "l
 _STATUS_STYLES = {
     "approved":   {"icon": "[OK]", "color": "#16a34a", "bg": "#dcfce7", "label": "Approved"},
     "validated":  {"icon": "[VAL]", "color": "#2563eb", "bg": "#dbeafe", "label": "Validated"},
+    "rejected":   {"icon": "[NO]", "color": "#b42318", "bg": "#fee4e2", "label": "Rejected"},
+    "withdrawn":  {"icon": "[OUT]", "color": "#6b7280", "bg": "#f3f4f6", "label": "Withdrawn"},
     "pending":    {"icon": "[PEND]", "color": "#ca8a04", "bg": "#fef9c3", "label": "Pending"},
     "integrated": {"icon": "[INT]", "color": "#6b7280", "bg": "#f3f4f6", "label": "Integrated"},
     "reverted":   {"icon": "[REV]", "color": "#dc2626", "bg": "#fee2e2", "label": "Reverted"},
@@ -1414,7 +1416,7 @@ class CommitPage(QWidget):
 
         self.history_status_filter = QComboBox()
         self.history_status_filter.addItems([
-            "All", "Pending", "Validated", "Approved", "Pushed",
+            "All", "Pending", "Validated", "Approved", "Rejected", "Withdrawn", "Pushed",
             "Integrated", "Released", "Reverted", "WIP",
         ])
         self.history_status_filter.setFixedWidth(110)
@@ -2872,6 +2874,22 @@ class CommitPage(QWidget):
                                                  f"{num_parts} file{'s' if num_parts != 1 else ''}"))
         main.addLayout(cards_row)
 
+        lifecycle_events = group_details.get("lifecycle_events") or []
+        if lifecycle_events:
+            latest_event = lifecycle_events[-1]
+            event_text = (
+                f"{latest_event.get('to_status', '')}: "
+                f"{latest_event.get('reason') or 'No reviewer note'}"
+            )
+            review_note = QLabel(event_text)
+            review_note.setWordWrap(True)
+            review_note.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            review_note.setStyleSheet(
+                "background: #fff7ed; color: #7c2d12; border-left: 3px solid #c2410c; "
+                "padding: 7px; font-size: 9px;"
+            )
+            main.addWidget(review_note)
+
         # ── Parts list ────────────────────────────────────────────────
         main.addWidget(QLabel("<b style='font-size: 9px; color: #374151;'>CONTROLLED FILES</b>"))
         parts_list = QListWidget()
@@ -2963,22 +2981,102 @@ class CommitPage(QWidget):
             if success:
                 dialog.accept()
 
+        def handle_withdraw():
+            answer = QMessageBox.question(
+                dialog,
+                "Withdraw CAD Submission",
+                "Withdraw this submission from review? Its submitted files and CAD/Item checkouts will be retained.",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if answer != QMessageBox.Yes:
+                return
+            try:
+                self.commit_service.withdraw_cad_submission(
+                    str(group.get("commit_id") or "")
+                )
+                self.load_pending_commits()
+                self.load_commit_history()
+                self.selected_group = None
+                self.selected_card = None
+                QMessageBox.information(
+                    dialog, "Withdrawn", "The CAD submission was withdrawn. Its files and checkouts were retained."
+                )
+                dialog.accept()
+            except Exception as exc:
+                QMessageBox.critical(dialog, "Withdrawal Failed", str(exc))
+
+        def handle_reject():
+            reason, accepted = QInputDialog.getMultiLineText(
+                dialog,
+                "Reject CAD Submission",
+                "Rejection reason (required):",
+            )
+            reason = str(reason or "").strip()
+            if not accepted:
+                return
+            if not reason:
+                QMessageBox.warning(dialog, "Reason Required", "Enter a reason before rejecting this submission.")
+                return
+            try:
+                self.commit_service.reject_cad_submission(
+                    str(group.get("commit_id") or ""), reason
+                )
+                self.load_pending_commits()
+                self.load_commit_history()
+                self.selected_group = None
+                self.selected_card = None
+                QMessageBox.information(
+                    dialog,
+                    "Submission Rejected",
+                    "The submission was rejected. Its files and CAD/Item checkouts were retained.",
+                )
+                dialog.accept()
+            except Exception as exc:
+                QMessageBox.critical(dialog, "Rejection Failed", str(exc))
+
         revert_btn = QPushButton("Revert")
         revert_btn.setObjectName("danger")
         revert_btn.setCursor(Qt.PointingHandCursor)
         revert_btn.clicked.connect(handle_revert)
 
+        withdraw_btn = QPushButton("Withdraw")
+        withdraw_btn.setObjectName("danger")
+        withdraw_btn.setCursor(Qt.PointingHandCursor)
+        withdraw_btn.clicked.connect(handle_withdraw)
+        try:
+            can_withdraw = (
+                int(group.get("designer") or 0) == int(self.session.user_id)
+                and str(group.get("status") or "").casefold() in {"pending", "validated"}
+            )
+        except Exception:
+            can_withdraw = False
+        withdraw_btn.setVisible(can_withdraw)
+
+        reject_btn = QPushButton("Reject")
+        reject_btn.setObjectName("danger")
+        reject_btn.setCursor(Qt.PointingHandCursor)
+        reject_btn.clicked.connect(handle_reject)
+        reject_btn.setVisible(str(group.get("status") or "").casefold() == "validated")
+        reject_btn.setEnabled(self.perm.can("merge"))
+
         validate_btn = QPushButton("Validate")
         validate_btn.setObjectName("neutral")
         validate_btn.setCursor(Qt.PointingHandCursor)
         validate_btn.clicked.connect(handle_validate)
-        validate_btn.setEnabled(self.perm.can("validate"))
+        validate_btn.setEnabled(
+            self.perm.can("validate")
+            and str(group.get("status") or "").casefold() == "pending"
+        )
 
         push_btn = QPushButton("Push to Master")
         push_btn.setObjectName("primary")
         push_btn.setCursor(Qt.PointingHandCursor)
         push_btn.clicked.connect(handle_push)
-        push_btn.setEnabled(self.perm.can("merge"))
+        push_btn.setEnabled(
+            self.perm.can("merge")
+            and str(group.get("status") or "").casefold() == "validated"
+        )
 
         close_btn = QPushButton("Close")
         close_btn.setObjectName("neutral")
@@ -2988,6 +3086,8 @@ class CommitPage(QWidget):
         btn_layout.addWidget(warning_label)
         btn_layout.addStretch()
         btn_layout.addWidget(close_btn)
+        btn_layout.addWidget(withdraw_btn)
+        btn_layout.addWidget(reject_btn)
         btn_layout.addWidget(revert_btn)
         btn_layout.addWidget(validate_btn)
         btn_layout.addWidget(push_btn)

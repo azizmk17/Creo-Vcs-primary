@@ -80,6 +80,13 @@ class ApprovalJournalService:
             """, (approval_id, int(project_id), str(commit_id),
                   str(snapshot_sha256), int(approver_id), stable_merge_id,
                   str(message or "")))
+            conn.execute("""
+                INSERT INTO cad_submission_approval_events(
+                    approval_id,project_id,commit_id,actor_user_id,
+                    from_status,to_status
+                ) VALUES(?,?,?,?,?,?)
+            """, (approval_id, int(project_id), str(commit_id),
+                  int(approver_id), "NONE", "PREPARING"))
             return dict(conn.execute(
                 "SELECT * FROM cad_submission_approvals WHERE approval_id=?",
                 (approval_id,),
@@ -125,13 +132,17 @@ class ApprovalJournalService:
             if conn is None:
                 active_conn.execute("BEGIN IMMEDIATE")
             row = active_conn.execute(
-                "SELECT status FROM cad_submission_approvals WHERE approval_id=?",
+                "SELECT project_id,commit_id,approver_id,status FROM cad_submission_approvals WHERE approval_id=?",
                 (str(approval_id),),
             ).fetchone()
             if not row:
                 raise ValueError("Approval journal entry was not found.")
             current = str(row["status"] or "PREPARING")
+            if current in {"WITHDRAWN", "REJECTED"}:
+                return current
             if _PHASES.get(current, -1) > _PHASES[status]:
+                return current
+            if current == status:
                 return current
             active_conn.execute("""
                 UPDATE cad_submission_approvals
@@ -139,7 +150,22 @@ class ApprovalJournalService:
                     completed_at=CASE WHEN ?='COMPLETED' THEN datetime('now') ELSE completed_at END
                 WHERE approval_id=?
             """, (status, status, str(approval_id)))
+            active_conn.execute("""
+                INSERT INTO cad_submission_approval_events(
+                    approval_id,project_id,commit_id,actor_user_id,
+                    from_status,to_status
+                ) VALUES(?,?,?,?,?,?)
+            """, (str(approval_id), int(row["project_id"]), str(row["commit_id"]),
+                  int(row["approver_id"]), current, status))
         return status
+
+    def events(self, approval_id):
+        with self._connection() as conn:
+            rows = conn.execute("""
+                SELECT * FROM cad_submission_approval_events
+                WHERE approval_id=? ORDER BY id
+            """, (str(approval_id),)).fetchall()
+        return [dict(row) for row in rows]
 
     def record_error(self, approval_id, error):
         with self._connection() as conn:

@@ -42,6 +42,26 @@ class MergePreflightTests(unittest.TestCase):
     def repository_rows(self, commits):
         return [{"id": c.id, "status": c.status} for c in commits]
 
+    def test_approver_cannot_approve_their_own_submission(self):
+        commits = [SimpleNamespace(committed_by=7), SimpleNamespace(committed_by=8)]
+        with self.assertRaisesRegex(PermissionError, "cannot approve it"):
+            self.service._assert_not_submitter_approval(commits, 7)
+
+    def test_different_approver_can_review_submission(self):
+        commits = [SimpleNamespace(committed_by=7), SimpleNamespace(committed_by=8)]
+        self.service._assert_not_submitter_approval(commits, 9)
+
+    def test_interrupted_approval_can_only_be_resumed_by_original_approver(self):
+        journal = {"status": "FILES_READY", "approver_id": 9}
+        with self.assertRaisesRegex(PermissionError, "original approver"):
+            self.service._assert_approval_retry_owner(journal, 10)
+        self.service._assert_approval_retry_owner(journal, 9)
+
+    def test_completed_approval_is_not_bound_to_retry_owner(self):
+        self.service._assert_approval_retry_owner(
+            {"status": "COMPLETED", "approver_id": 9}, 10
+        )
+
     def test_preflight_requires_complete_group_and_validates_structure_read_only(self):
         commits = self.commits()
         self.write_sources(commits)

@@ -155,6 +155,15 @@ public class NexusApiClient {
         return request("POST", "/cad/structure/stage", body);
     }
 
+    public Map<String, Object> reviewCadStructure(
+        List<Integer> cadDocumentIds, Map<String, Object> structure
+    ) throws Exception {
+        Map<String, Object> body = new LinkedHashMap<String, Object>();
+        body.put("cad_document_ids", cadDocumentIds);
+        body.put("structure", structure);
+        return request("POST", "/cad/structure/review", body);
+    }
+
     public Map<String, Object> undoCheckout(int cadId, String note) throws Exception {
         Map<String, Object> body = new LinkedHashMap<String, Object>();
         body.put("note", note);

@@ -150,12 +150,168 @@ class CadStructureSyncService:
             current = dict(document)
             if (str(current.get("revision") or "") != baseline["revision"]
                 or int(current.get("iteration") or 0) != baseline["iteration"]):
-                raise ValueError("CAD dependency changed after structure staging; refresh and submit again: "
+                raise ValueError("CAD dependency changed since review or staging; refresh and submit again: "
                                  + baseline["file_name"])
             expected_hash = baseline["sha256"]
             if expected_hash and self._current_iteration_hash(conn, current) != expected_hash:
-                raise ValueError("CAD dependency content changed after structure staging; refresh and submit again: "
+                raise ValueError("CAD dependency content changed since review or staging; refresh and submit again: "
                                  + baseline["file_name"])
+
+    def review_pending_structure(self, project_id, actor_id, required_ids, payload):
+        """Return a server-authoritative CAD relationship diff before check-in staging."""
+        normalized = self._normalize_pending_payload(payload)
+        required = {int(value) for value in required_ids if int(value) > 0}
+        with self.repo.get_conn() as conn:
+            documents = conn.execute(
+                "SELECT * FROM cad_documents WHERE project_id=?", (int(project_id),)
+            ).fetchall()
+            by_name = {logical_name(row["file_name"]): dict(row) for row in documents}
+            by_id = {int(row["id"]): dict(row) for row in documents}
+            if not required.issubset(by_id):
+                raise ValueError("A selected CAD Document no longer belongs to this project.")
+            complete_ids = {}
+            for name in normalized["complete_assemblies"]:
+                assembly = by_name.get(name)
+                if not assembly or str(assembly.get("category") or "").upper() != "ASSEMBLY":
+                    raise ValueError("Complete Creo assembly is not registered in this project: " + name)
+                cad_id = int(assembly["id"])
+                if cad_id not in required:
+                    raise ValueError("Check in the complete assembly in the same batch: " + name)
+                if assembly.get("checked_out_by") is None or int(assembly["checked_out_by"]) != int(actor_id):
+                    raise ValueError("The complete assembly must be checked out by you: " + name)
+                complete_ids[name] = cad_id
+
+            submitted_counts = Counter()
+            for edge in normalized["members"]:
+                parent = by_name.get(edge["parent_file_name"])
+                child = by_name.get(edge["child_file_name"])
+                if not parent or str(parent.get("category") or "").upper() != "ASSEMBLY":
+                    raise ValueError("Assembly not registered in this project: " + edge["parent_file_name"])
+                if not child or str(child.get("category") or "").upper() not in {"ASSEMBLY", "COMPONENT"}:
+                    raise ValueError("Assembly child not registered in this project: " + edge["child_file_name"])
+                submitted_counts[(int(parent["id"]), int(child["id"]))] += 1
+
+            changes = []
+            current_rows = conn.execute("""
+                SELECT m.parent_cad_document_id,m.child_cad_document_id,m.quantity,
+                       p.file_name AS parent_name,c.file_name AS child_name
+                FROM cad_document_members m
+                JOIN cad_documents p ON p.id=m.parent_cad_document_id
+                JOIN cad_documents c ON c.id=m.child_cad_document_id
+                WHERE p.project_id=?
+            """, (int(project_id),)).fetchall()
+            current_counts = {
+                (int(row["parent_cad_document_id"]), int(row["child_cad_document_id"])):
+                int(row["quantity"] or 0) for row in current_rows
+            }
+            display_names = {
+                (int(row["parent_cad_document_id"]), int(row["child_cad_document_id"])):
+                (str(row["parent_name"]), str(row["child_name"])) for row in current_rows
+            }
+            for name, parent_id in complete_ids.items():
+                children = {
+                    child_id for (candidate_parent, child_id) in current_counts
+                    if candidate_parent == parent_id
+                } | {
+                    child_id for (candidate_parent, child_id) in submitted_counts
+                    if candidate_parent == parent_id
+                }
+                for child_id in children:
+                    key = (parent_id, child_id)
+                    before = current_counts.get(key, 0)
+                    after = submitted_counts.get(key, 0)
+                    if before == after:
+                        continue
+                    if key in display_names:
+                        parent_name, child_name = display_names[key]
+                    else:
+                        parent_name = name
+                        child_name = str(by_id[child_id]["file_name"])
+                    changes.append({
+                        "action": "ADD" if before == 0 else "REMOVE" if after == 0 else "QUANTITY",
+                        "parent_file_name": parent_name,
+                        "child_file_name": child_name,
+                        "before_quantity": before,
+                        "after_quantity": after,
+                    })
+            for (parent_id, child_id), after in submitted_counts.items():
+                if parent_id in complete_ids.values():
+                    continue
+                before = current_counts.get((parent_id, child_id), 0)
+                if before == after:
+                    continue
+                parent = by_id[parent_id]
+                if parent_id not in required:
+                    raise ValueError("Check in the containing assembly in the same batch: "
+                                     + str(parent["file_name"]))
+                if parent.get("checked_out_by") is None or int(parent["checked_out_by"]) != int(actor_id):
+                    raise ValueError("The containing assembly must be checked out by you before its structure can change: "
+                                     + str(parent["file_name"]))
+                parent_name = str(by_id[parent_id]["file_name"])
+                child_name = str(by_id[child_id]["file_name"])
+                changes.append({
+                    "action": "ADD" if before == 0 else "QUANTITY",
+                    "parent_file_name": parent_name,
+                    "child_file_name": child_name,
+                    "before_quantity": before,
+                    "after_quantity": after,
+                })
+
+            dependencies = {}
+            referenced_names = set()
+            for edge in normalized["members"]:
+                referenced_names.update((edge["parent_file_name"], edge["child_file_name"]))
+            for relation in normalized["drawings"]:
+                referenced_names.update((relation["drawing_file_name"], relation["model_file_name"]))
+            for name in referenced_names:
+                document = by_name.get(name)
+                if not document:
+                    raise ValueError("Creo structure references a CAD Document not registered in this project: " + name)
+                cad_id = int(document["id"])
+                if cad_id in required:
+                    continue
+                dependencies[cad_id] = {
+                    "cad_document_id": cad_id,
+                    "file_name": name,
+                    "revision": str(document.get("revision") or ""),
+                    "iteration": int(document.get("iteration") or 0),
+                    "sha256": self._current_iteration_hash(conn, document),
+                }
+            drawing_rows = []
+            for relation in normalized["drawings"]:
+                drawing = by_name.get(relation["drawing_file_name"])
+                model = by_name.get(relation["model_file_name"])
+                if not drawing or str(drawing.get("category") or "").upper() != "DRAWING":
+                    raise ValueError("Related drawing is not registered in this project: "
+                                     + relation["drawing_file_name"])
+                if not model or str(model.get("category") or "").upper() not in {"ASSEMBLY", "COMPONENT"}:
+                    raise ValueError("Drawing model is not registered in this project: "
+                                     + relation["model_file_name"])
+                owner_id = drawing.get("drawing_owner_cad_document_id")
+                owner = by_id.get(int(owner_id)) if owner_id is not None else None
+                model_id = int(model["id"])
+                if owner_id is not None and int(owner_id) != model_id:
+                    raise ValueError("Drawing is already bound to a different model: "
+                                     + relation["drawing_file_name"])
+                if owner_id is None and (
+                    int(drawing["id"]) not in required or model_id not in required
+                ):
+                    raise ValueError("Check in the drawing and its related model in the same batch: "
+                                     + relation["drawing_file_name"])
+                drawing_rows.append({
+                    "drawing_file_name": relation["drawing_file_name"],
+                    "model_file_name": relation["model_file_name"],
+                    "current_owner_file_name": str(owner["file_name"]) if owner else "",
+                    "model_revision": str(model.get("revision") or ""),
+                    "model_iteration": int(model.get("iteration") or 0),
+                })
+            return {
+                "changes": sorted(changes, key=lambda item: (
+                    item["parent_file_name"].casefold(), item["child_file_name"].casefold()
+                )),
+                "dependencies": sorted(dependencies.values(), key=lambda item: item["file_name"].casefold()),
+                "drawings": drawing_rows,
+            }
 
     def stage_pending_commit(self, commit_id, project_id, actor_id, required_ids, payload):
         """Stage Creo structure evidence beside a Pending commit, without changing live links."""
@@ -209,19 +365,11 @@ class CadStructureSyncService:
                             "Check in the containing assembly in the same Pending commit: "
                             + str(parent.get("file_name") or parent_id)
                         )
-            for assembly_id in complete_ids:
-                parent = by_id[assembly_id]
-                existing_counts = Counter({
-                    int(row["child_cad_document_id"]): int(row["quantity"] or 0)
-                    for row in conn.execute("""
-                        SELECT child_cad_document_id,quantity FROM cad_document_members
-                        WHERE parent_cad_document_id=?
-                    """, (assembly_id,))
-                })
-                submitted_counts = Counter({
-                    child_id: count for (parent_id, child_id), count in member_counts.items()
-                    if parent_id == assembly_id
-                })
+                    if parent.get("checked_out_by") is None or int(parent["checked_out_by"]) != int(actor_id):
+                        raise ValueError(
+                            "The containing assembly must be checked out by you before its structure can change: "
+                            + str(parent.get("file_name") or parent_id)
+                        )
             drawing_refs = defaultdict(set)
             for relation in normalized["drawings"]:
                 drawing_refs[relation["drawing_file_name"]].add(relation["model_file_name"])
@@ -254,12 +402,18 @@ class CadStructureSyncService:
                 FROM cad_pending_structure_changes WHERE project_id=? AND commit_id=?
                   AND status='PENDING'
             """, (int(project_id), commit_key)).fetchone()
-            previous_baselines = []
+            previous_baselines = list(normalized["dependency_baselines"])
             if existing:
                 if int(existing["submitted_by"]) != int(actor_id):
                     raise ValueError("Only the original submitter can extend this Pending CAD structure update.")
                 old_payload = self._normalize_pending_payload(json.loads(existing["payload_json"]))
-                previous_baselines = old_payload["dependency_baselines"]
+                baseline_by_id = {
+                    int(row["cad_document_id"]): row
+                    for row in old_payload["dependency_baselines"]
+                }
+                for row in previous_baselines:
+                    baseline_by_id.setdefault(int(row["cad_document_id"]), row)
+                previous_baselines = list(baseline_by_id.values())
                 merged_members = {
                     (row["parent_file_name"], row["child_file_name"], row["feature_id"]): row
                     for row in old_payload["members"]

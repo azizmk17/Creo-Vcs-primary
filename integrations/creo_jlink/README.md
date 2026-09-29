@@ -46,7 +46,10 @@ described in [async/README.md](async/README.md).
   are marked as complete snapshots and shown to the user for confirmation. Those
   snapshots can add, update, or remove CAD occurrence links, but only after approval
   and merge. Unloaded assemblies and partial dependency observations never imply
-  removals. New assembly children must already be managed or selected for registration,
+  removals. Before staging, a Nexus-backed review shows the relationship diff and pins
+  each unchanged dependency to its approved revision, iteration, and available SHA-256.
+  A dependency change between review and staging or before approval blocks the submission.
+  New assembly children must already be managed or selected for registration,
   and a changed parent ASM must be checked out and included in the same Pending commit.
   If no loaded ASM contains a new part, Creo asks before Nexus registers it as a
   top-level document. Duplicate identities, ambiguous

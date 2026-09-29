@@ -967,7 +967,7 @@ public class NexusJLink {
         }
         NexusDialogs.ChecklistResult selection = NexusDialogs.checklist(
             "Workspace: " + MiniJson.text(workspace, "name")
-                + "    Select CAD Documents to check in:",
+                + "    Select parts, assemblies, and drawings to check in:",
             "Nexus Check In",
             labels,
             selected,
@@ -1153,6 +1153,21 @@ public class NexusJLink {
             }
         }
 
+        List<Object> reviewedDependencies = new ArrayList<Object>();
+        Map<String, Object> reviewSnapshot = filterCreoStructure(
+            creoMetadata, selectedNewCandidates, selectedChoices
+        );
+        Map<String, Object> reviewStructure = MiniJson.object(reviewSnapshot.get("structure"));
+        if (!MiniJson.array(reviewStructure.get("members")).isEmpty()
+            || !MiniJson.array(reviewStructure.get("drawings")).isEmpty()
+            || !MiniJson.array(reviewStructure.get("complete_assemblies")).isEmpty()) {
+            Map<String, Object> review = api.reviewCadStructure(
+                new ArrayList<Integer>(selectedChoices.keySet()), reviewStructure
+            );
+            reviewedDependencies = MiniJson.array(review.get("dependencies"));
+            if (!confirmStructureReview(review)) return;
+        }
+
         List<CheckinChoice> stagingChoices = new ArrayList<CheckinChoice>();
         for (CheckinChoice choice : selectedChoices.values()) {
             if (!isDrawingChoice(choice)) stagingChoices.add(choice);
@@ -1212,7 +1227,7 @@ public class NexusJLink {
             : "\n\nSkipped:\n" + joinList(skipped, "\n");
         if (staged.isEmpty()) {
             NexusDialogs.info(
-                "No models were staged." + skippedText,
+                "No CAD files were staged." + skippedText,
                 "Nexus Check In"
             );
             return;
@@ -1223,6 +1238,7 @@ public class NexusJLink {
                 creoMetadata, selectedNewCandidates, stagedChoices
             );
             Map<String, Object> structure = MiniJson.object(stagedStructure.get("structure"));
+            structure.put("dependency_baselines", reviewedDependencies);
             if (!MiniJson.array(structure.get("members")).isEmpty()
                 || !MiniJson.array(structure.get("drawings")).isEmpty()
                 || !MiniJson.array(structure.get("complete_assemblies")).isEmpty()) {
@@ -1235,7 +1251,7 @@ public class NexusJLink {
             }
         }
         NexusDialogs.info(
-            "Models staged in Pending commit " + targetCommitId + ":\n"
+            "CAD files staged in Pending commit " + targetCommitId + ":\n"
                 + joinList(staged, "\n") + skippedText
                 + "\n\nThe CAD and associated Item checkouts remain active until approval and merge."
                 + structureNotice,
@@ -1520,55 +1536,64 @@ public class NexusJLink {
         structure.put("members", members);
         structure.put("drawings", drawings);
         structure.put("complete_assemblies", completeAssemblies);
-        if (!completeAssemblies.isEmpty()) {
-            Map<String, Map<String, Integer>> occurrencesByAssembly =
-                new LinkedHashMap<String, Map<String, Integer>>();
-            for (Object value : members) {
-                Map<String, Object> edge = MiniJson.object(value);
-                String parent = MiniJson.text(edge, "parent_file_name");
-                if (completeAssemblies.contains(parent)) {
-                    Map<String, Integer> children = occurrencesByAssembly.get(parent);
-                    if (children == null) {
-                        children = new LinkedHashMap<String, Integer>();
-                        occurrencesByAssembly.put(parent, children);
-                    }
-                    String child = MiniJson.text(edge, "child_file_name");
-                    Integer count = children.get(child);
-                    children.put(child, Integer.valueOf(count == null ? 1 : count.intValue() + 1));
-                }
-            }
-            List<String> reviewLines = new ArrayList<String>();
-            reviewLines.add("Creo read complete assembly structure from the selected Nexus workspace:");
-            for (Object value : completeAssemblies) {
-                String name = String.valueOf(value);
-                reviewLines.add("  " + name + ":");
-                Map<String, Integer> children = occurrencesByAssembly.get(name);
-                if (children == null || children.isEmpty()) {
-                    reviewLines.add("    No component occurrences");
-                } else {
-                    for (Map.Entry<String, Integer> child : children.entrySet()) {
-                        reviewLines.add("    " + child.getKey() + "  x" + child.getValue());
-                    }
-                }
-            }
-            if (!drawings.isEmpty()) {
-                reviewLines.add("Drawing references:");
-                for (Object value : drawings) {
-                    Map<String, Object> relation = MiniJson.object(value);
-                    reviewLines.add("  " + MiniJson.text(relation, "drawing_file_name")
-                        + " -> " + MiniJson.text(relation, "model_file_name"));
-                }
-            }
-            reviewLines.add("");
-            reviewLines.add("These assembly links will be synchronized only after this Pending commit is approved.");
-            if (!NexusDialogs.confirm(
-                joinList(reviewLines, "\n"), "Review Creo Structure", JOptionPane.QUESTION_MESSAGE
-            )) return null;
-        }
         Map<String, Object> result = new LinkedHashMap<String, Object>();
         result.put("structure", structure);
         result.put("drawing_models_by_file", drawingModelsByFile);
         return result;
+    }
+
+    private static boolean confirmStructureReview(Map<String, Object> review) {
+        List<String> lines = new ArrayList<String>();
+        lines.add("Nexus will use these approved CAD dependencies and relationship changes:");
+        List<Object> dependencies = MiniJson.array(review.get("dependencies"));
+        if (!dependencies.isEmpty()) {
+            lines.add("");
+            lines.add("Unchanged dependencies (pinned at approval):");
+            for (Object value : dependencies) {
+                Map<String, Object> dependency = MiniJson.object(value);
+                String hash = MiniJson.text(dependency, "sha256");
+                String line = "  " + MiniJson.text(dependency, "file_name") + "  Rev "
+                    + MiniJson.text(dependency, "revision") + "."
+                    + MiniJson.integer(dependency, "iteration");
+                lines.add(line);
+                if (hash.length() > 0) lines.add("    SHA-256: " + hash);
+            }
+        }
+        List<Object> changes = MiniJson.array(review.get("changes"));
+        lines.add("");
+        lines.add("Assembly relationship changes:");
+        if (changes.isEmpty()) {
+            lines.add("  No assembly link changes");
+        } else {
+            for (Object value : changes) {
+                Map<String, Object> change = MiniJson.object(value);
+                lines.add("  " + MiniJson.text(change, "action") + "  "
+                    + MiniJson.text(change, "parent_file_name") + " -> "
+                    + MiniJson.text(change, "child_file_name") + "  ("
+                    + MiniJson.integer(change, "before_quantity") + " to "
+                    + MiniJson.integer(change, "after_quantity") + ")");
+            }
+        }
+        List<Object> drawings = MiniJson.array(review.get("drawings"));
+        if (!drawings.isEmpty()) {
+            lines.add("");
+            lines.add("Drawing references:");
+            for (Object value : drawings) {
+                Map<String, Object> relation = MiniJson.object(value);
+                String owner = MiniJson.text(relation, "current_owner_file_name");
+                if (owner.length() == 0) owner = "unbound";
+                lines.add("  " + MiniJson.text(relation, "drawing_file_name") + " -> "
+                    + MiniJson.text(relation, "model_file_name") + "  Rev "
+                    + MiniJson.text(relation, "model_revision") + "."
+                    + MiniJson.integer(relation, "model_iteration") + "  (current owner: "
+                    + owner + ")");
+            }
+        }
+        lines.add("");
+        lines.add("CAD relationships will be published only after this Pending commit is approved.");
+        return NexusDialogs.confirmScrollable(
+            joinList(lines, "\n"), "Review Creo Structure", JOptionPane.QUESTION_MESSAGE
+        );
     }
 
     private static Map<String, Object> filterCreoStructure(
@@ -2147,9 +2172,10 @@ public class NexusJLink {
         private NexusDialogs.ChecklistItem checklistItem() {
             String name = fileName();
             if (name.length() == 0) name = MiniJson.text(status, "number");
+            boolean drawing = isDrawingChoice(this);
             String revision = MiniJson.text(status, "revision");
             int iteration = MiniJson.integer(status, "iteration");
-            String primary = name;
+            String primary = drawing ? name + "    [DRAWING]" : name;
             if (revision.length() > 0 || iteration > 0) {
                 primary += "    Rev " + revision + "." + iteration;
             }
@@ -2170,6 +2196,7 @@ public class NexusJLink {
             }
             if (workspaceCheckout) context.add("Workspace checkout");
             else if (localFile != null) context.add("Workspace file");
+            if (drawing) context.add("Creo drawing");
             if (newCandidate) context.add("New CAD Document");
 
             String reason = MiniJson.text(status, "read_only_reason");
@@ -2179,7 +2206,11 @@ public class NexusJLink {
             String description = !selectable
                 ? reason.length() > 0 ? reason : "This CAD Document cannot be checked in."
                 : newCandidate
-                    ? "New native model. Nexus will register and check it out before staging."
+                    ? drawing
+                        ? "New native Creo drawing. Nexus will register and check it out before staging."
+                        : "New native Creo model. Nexus will register and check it out before staging."
+                : drawing
+                    ? "Creo drawing ready to check in. Nexus will include its related model when required."
                 : changed
                     ? "The CAD Document has local modifications and is ready to check in."
                     : "The checked-out CAD Document is ready to check in.";

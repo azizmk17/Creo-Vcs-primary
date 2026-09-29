@@ -316,21 +316,75 @@ class CadStructureSyncTests(unittest.TestCase):
         )
         with repo.get_conn() as conn:
             conn.execute("UPDATE cad_documents SET checked_out_by=1 WHERE id=?", (assembly_id,))
+        payload = {"schema": 1, "members": [{
+            "parent_file_name": "dependency_test.asm",
+            "child_file_name": "bracket.prt", "feature_id": 4, "status": "ACTIVE",
+        }], "drawings": []}
+        review = self.service.review_pending_structure(7, 1, [assembly_id], payload)
+        payload["dependency_baselines"] = review["dependencies"]
         self.service.stage_pending_commit(
-            "pending-stale-dependency", 7, 1, [assembly_id],
-            {"schema": 1, "members": [{
-                "parent_file_name": "dependency_test.asm",
-                "child_file_name": "bracket.prt", "feature_id": 4, "status": "ACTIVE",
-            }], "drawings": []},
+            "pending-stale-dependency", 7, 1, [assembly_id], payload,
         )
         with repo.get_conn() as conn:
             conn.execute(
                 "UPDATE cad_documents SET iteration=iteration+1 WHERE file_name='bracket.prt'"
             )
-        with self.assertRaisesRegex(ValueError, "dependency changed after structure staging"):
+        with self.assertRaisesRegex(ValueError, "dependency changed since review or staging"):
             self.service.validate_pending_commit(
                 "pending-stale-dependency", 7, [assembly_id]
             )
+
+    def test_structure_stage_rejects_dependency_changed_after_user_review(self):
+        repo = self.service.repo
+        assembly_id = repo.create_cad_document(
+            7, "review_race.asm", "Review race", "review_race.asm", category="ASSEMBLY"
+        )
+        with repo.get_conn() as conn:
+            conn.execute("UPDATE cad_documents SET checked_out_by=1 WHERE id=?", (assembly_id,))
+        payload = {"schema": 1, "members": [{
+            "parent_file_name": "review_race.asm", "child_file_name": "bracket.prt",
+            "feature_id": 6, "status": "ACTIVE",
+        }], "drawings": []}
+        review = self.service.review_pending_structure(7, 1, [assembly_id], payload)
+        payload["dependency_baselines"] = review["dependencies"]
+        with repo.get_conn() as conn:
+            conn.execute(
+                "UPDATE cad_documents SET iteration=iteration+1 WHERE file_name='bracket.prt'"
+            )
+        with self.assertRaisesRegex(ValueError, "dependency changed since review or staging"):
+            self.service.stage_pending_commit(
+                "pending-review-race", 7, 1, [assembly_id], payload
+            )
+
+    def test_structure_review_returns_server_diff_and_pinned_dependency_revision(self):
+        repo = self.service.repo
+        with repo.get_conn() as conn:
+            conn.execute("UPDATE cad_documents SET checked_out_by=1 WHERE id=?", (self.root,))
+        result = self.service.review_pending_structure(
+            7, 1, [self.root],
+            {"schema": 1, "members": [], "drawings": [],
+             "complete_assemblies": ["machine.asm"]},
+        )
+        self.assertTrue(any(
+            row["action"] == "REMOVE" and row["parent_file_name"] == "machine.asm"
+            for row in result["changes"]
+        ))
+
+        result = self.service.review_pending_structure(
+            7, 1, [self.root],
+            {"schema": 1, "members": [{
+                "parent_file_name": "machine.asm", "child_file_name": "bracket.prt",
+                "feature_id": 22, "status": "ACTIVE",
+            }], "drawings": [], "complete_assemblies": ["machine.asm"]},
+        )
+        dependency = next(row for row in result["dependencies"]
+                          if row["file_name"] == "bracket.prt")
+        with repo.get_conn() as conn:
+            current = conn.execute(
+                "SELECT revision,iteration FROM cad_documents WHERE file_name='bracket.prt'"
+            ).fetchone()
+        self.assertEqual(dependency["revision"], current["revision"])
+        self.assertEqual(dependency["iteration"], current["iteration"])
 
 
 if __name__ == "__main__":

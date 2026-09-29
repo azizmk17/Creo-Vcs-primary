@@ -136,6 +136,8 @@ class CreoBridgeController:
             return self.register_new_cad(body)
         if method == "POST" and path == "/api/v1/cad/structure/stage":
             return self.stage_cad_structure(body)
+        if method == "POST" and path == "/api/v1/cad/structure/review":
+            return self.review_cad_structure(body)
         if method == "GET" and path == "/api/v1/cad/resolve":
             values = query.get("file_name") or []
             file_name = values[0] if values else ""
@@ -1541,6 +1543,31 @@ class CreoBridgeController:
             except (ValueError, PermissionError) as exc:
                 raise BridgeApiError(409, "cad_structure_conflict", str(exc)) from exc
             return result
+
+    def review_cad_structure(self, body: dict) -> dict:
+        """Return the approved dependency versions and relationship diff for Creo review."""
+        with self._operation_lock:
+            user_id, project_id, _project = self._require_commit_permission()
+            cad_ids = []
+            for value in body.get("cad_document_ids") or []:
+                try:
+                    cad_id = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if cad_id > 0 and cad_id not in cad_ids:
+                    cad_ids.append(cad_id)
+            if not cad_ids:
+                raise BridgeApiError(
+                    400, "cad_structure_documents_required",
+                    "Select CAD Documents before reviewing Creo structure changes.",
+                )
+            try:
+                from core.services.cad_structure_sync_service import CadStructureSyncService
+                return CadStructureSyncService(self._pdm_service().db_name).review_pending_structure(
+                    int(project_id), int(user_id), cad_ids, body.get("structure")
+                )
+            except (ValueError, PermissionError) as exc:
+                raise BridgeApiError(409, "cad_structure_conflict", str(exc)) from exc
 
     def checkin(self, cad_document_id: int, body: dict) -> dict:
         with self._operation_lock:

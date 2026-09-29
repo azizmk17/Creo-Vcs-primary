@@ -12,7 +12,7 @@ from core.repositories.merge_repository import MergeRepository
 from core.repositories.project_event_repository import ProjectEventRepository
 from core.services.approval_journal_service import ApprovalJournalService
 from core.services.merge_service import MergeService
-from setup.migrations import _migration_46, _migration_47
+from setup.migrations import _migration_46, _migration_47, _migration_48
 
 
 class ApprovalJournalServiceTests(unittest.TestCase):
@@ -23,6 +23,7 @@ class ApprovalJournalServiceTests(unittest.TestCase):
             conn.execute("CREATE TABLE signature(id INTEGER PRIMARY KEY, action TEXT, user_id INTEGER, note TEXT, timestamp TEXT)")
             _migration_46(conn)
             _migration_47(conn)
+            _migration_48(conn)
         self.service = ApprovalJournalService(self.db_path)
 
     def tearDown(self):
@@ -49,6 +50,30 @@ class ApprovalJournalServiceTests(unittest.TestCase):
             self.service.get_by_id(first["approval_id"])["status"],
             "STRUCTURE_APPLIED",
         )
+        events = self.service.events(first["approval_id"])
+        self.assertEqual(
+            [event["to_status"] for event in events],
+            ["PREPARING", "FILES_READY", "STRUCTURE_APPLIED"],
+        )
+        self.assertEqual(
+            [event["from_status"] for event in events],
+            ["NONE", "PREPARING", "FILES_READY"],
+        )
+
+    def test_withdrawn_or_rejected_approval_journal_is_terminal(self):
+        for status, logical_id in (("WITHDRAWN", "withdrawn"), ("REJECTED", "rejected")):
+            journal = self.service.begin(2, "batch-" + logical_id, "hash", 7, "approve")
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "UPDATE cad_submission_approvals SET status=? WHERE approval_id=?",
+                    (status, journal["approval_id"]),
+                )
+            self.assertEqual(
+                self.service.advance(journal["approval_id"], "FILES_READY"), status
+            )
+            self.assertEqual(
+                self.service.get_by_id(journal["approval_id"])["status"], status
+            )
 
     def test_signature_idempotency_does_not_update_audit_rows(self):
         signature_repo = SignatureRepository(self.db_path)

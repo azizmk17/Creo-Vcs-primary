@@ -736,16 +736,158 @@ class CommitRepository:
 
     def validate(self, commit_id, checker,  project_id):
         with self.get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                UPDATE commits
-                SET status='Validated', checked_by = ?
-                WHERE commit_id=? AND project_id = ?
-            """, (
-                checker, commit_id, project_id,
-            ))
-            conn.commit()
-            return cur.rowcount > 0  # True if at least one row was deleted
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute("""
+                SELECT status FROM commits WHERE commit_id=? AND project_id=?
+            """, (str(commit_id), int(project_id))).fetchall()
+            if not rows:
+                return False
+            statuses = {str(row["status"] or "").strip() for row in rows}
+            if statuses != {"Pending"}:
+                raise ValueError("Only a complete Pending submission can be validated.")
+            cur = conn.execute("""
+                UPDATE commits SET status='Validated',checked_by=?
+                WHERE commit_id=? AND project_id=? AND status='Pending'
+            """, (int(checker), str(commit_id), int(project_id)))
+            if cur.rowcount != len(rows):
+                raise ValueError("The submission changed while validation was being processed; refresh and retry.")
+            return True
+
+    def withdraw_cad_submission(self, commit_id, project_id, actor_user_id, reason=""):
+        """Withdraw a submitter-owned Pending/Validated group without deleting its files."""
+        logical_id = str(commit_id or "").strip()
+        project_id = int(project_id)
+        actor_user_id = int(actor_user_id)
+        if not logical_id:
+            raise ValueError("Submission ID is required.")
+
+        with self.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute("""
+                SELECT id,designer,status FROM commits
+                WHERE commit_id=? AND project_id=? ORDER BY id
+            """, (logical_id, project_id)).fetchall()
+            if not rows:
+                raise ValueError("The CAD submission was not found in this project.")
+            if any(int(row["designer"] or 0) != actor_user_id for row in rows):
+                raise PermissionError("Only the original submitter can withdraw this CAD submission.")
+            statuses = {str(row["status"] or "").strip() for row in rows}
+            if len(statuses) != 1 or next(iter(statuses)).casefold() not in {"pending", "validated"}:
+                raise ValueError("Only a Pending or Validated submission can be withdrawn before approval.")
+            from_status = next(iter(statuses))
+
+            journal = conn.execute("""
+                SELECT approval_id,status FROM cad_submission_approvals
+                WHERE project_id=? AND commit_id=? ORDER BY rowid DESC LIMIT 1
+            """, (project_id, logical_id)).fetchone()
+            if journal and str(journal["status"] or "").upper() == "COMPLETED":
+                raise ValueError("An approved submission cannot be withdrawn.")
+
+            cur = conn.execute("""
+                UPDATE commits SET status='Withdrawn'
+                WHERE commit_id=? AND project_id=? AND status=?
+            """, (logical_id, project_id, from_status))
+            if cur.rowcount != len(rows):
+                raise ValueError("The submission changed while withdrawal was being processed; refresh and retry.")
+
+            conn.execute("""
+                INSERT INTO cad_submission_lifecycle_events(
+                    project_id,commit_id,actor_user_id,from_status,to_status,reason
+                ) VALUES(?,?,?,?,'Withdrawn',?)
+            """, (project_id, logical_id, actor_user_id, from_status, str(reason or "")[:2000]))
+
+            if journal:
+                conn.execute("""
+                    UPDATE cad_submission_approvals
+                    SET status='WITHDRAWN',updated_at=datetime('now'),last_error=NULL
+                    WHERE approval_id=? AND status!='COMPLETED'
+                """, (str(journal["approval_id"]),))
+                conn.execute("""
+                    INSERT OR IGNORE INTO cad_submission_approval_events(
+                        approval_id,project_id,commit_id,actor_user_id,
+                        from_status,to_status
+                    ) VALUES(?,?,?,?,?,'WITHDRAWN')
+                """, (str(journal["approval_id"]), project_id, logical_id,
+                      actor_user_id, str(journal["status"] or "PREPARING")))
+
+        return {"commit_id": logical_id, "project_id": project_id,
+                "from_status": from_status, "status": "Withdrawn",
+                "row_count": len(rows)}
+
+    def reject_cad_submission(self, commit_id, project_id, actor_user_id, reason):
+        """Reject a validated submission as a different reviewer, preserving submitted files."""
+        logical_id = str(commit_id or "").strip()
+        project_id = int(project_id)
+        actor_user_id = int(actor_user_id)
+        reason = str(reason or "").strip()
+        if not logical_id:
+            raise ValueError("Submission ID is required.")
+        if not reason:
+            raise ValueError("A rejection reason is required.")
+
+        with self.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute("""
+                SELECT id,designer,status FROM commits
+                WHERE commit_id=? AND project_id=? ORDER BY id
+            """, (logical_id, project_id)).fetchall()
+            if not rows:
+                raise ValueError("The CAD submission was not found in this project.")
+            if any(int(row["designer"] or 0) == actor_user_id for row in rows):
+                raise PermissionError("A submitter cannot reject their own CAD submission.")
+            statuses = {str(row["status"] or "").strip() for row in rows}
+            if len(statuses) != 1 or next(iter(statuses)).casefold() != "validated":
+                raise ValueError("Only a complete Validated submission can be rejected.")
+
+            journal = conn.execute("""
+                SELECT approval_id,status FROM cad_submission_approvals
+                WHERE project_id=? AND commit_id=? ORDER BY rowid DESC LIMIT 1
+            """, (project_id, logical_id)).fetchone()
+            if journal and str(journal["status"] or "").upper() == "COMPLETED":
+                raise ValueError("An approved submission cannot be rejected.")
+
+            cur = conn.execute("""
+                UPDATE commits SET status='Rejected'
+                WHERE commit_id=? AND project_id=? AND status=?
+            """, (logical_id, project_id, next(iter(statuses))))
+            if cur.rowcount != len(rows):
+                raise ValueError("The submission changed while rejection was being processed; refresh and retry.")
+            conn.execute("""
+                INSERT INTO cad_submission_lifecycle_events(
+                    project_id,commit_id,actor_user_id,from_status,to_status,reason
+                ) VALUES(?,?,?,'Validated','Rejected',?)
+            """, (project_id, logical_id, actor_user_id, reason[:2000]))
+
+            if journal:
+                conn.execute("""
+                    UPDATE cad_submission_approvals
+                    SET status='REJECTED',updated_at=datetime('now'),last_error=?
+                    WHERE approval_id=? AND status!='COMPLETED'
+                """, (reason[:2000], str(journal["approval_id"])))
+                conn.execute("""
+                    INSERT OR IGNORE INTO cad_submission_approval_events(
+                        approval_id,project_id,commit_id,actor_user_id,
+                        from_status,to_status
+                    ) VALUES(?,?,?,?,?,'REJECTED')
+                """, (str(journal["approval_id"]), project_id, logical_id,
+                      actor_user_id, str(journal["status"] or "PREPARING")))
+
+        return {"commit_id": logical_id, "project_id": project_id,
+                "from_status": "Validated", "status": "Rejected",
+                "reason": reason, "row_count": len(rows)}
+
+    def get_submission_lifecycle_events(self, commit_id, project_id=None):
+        params = [str(commit_id)]
+        project_clause = ""
+        if project_id is not None:
+            project_clause = " AND project_id=?"
+            params.append(int(project_id))
+        with self.get_conn() as conn:
+            rows = conn.execute(f"""
+                SELECT * FROM cad_submission_lifecycle_events
+                WHERE commit_id=?{project_clause} ORDER BY id
+            """, tuple(params)).fetchall()
+        return [dict(row) for row in rows]
 
     def get_forced_integrated_base_names(self, project_id: int):
         """Return base_file_name list for files that were force-integrated (status='Integrated')."""

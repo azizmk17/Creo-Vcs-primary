@@ -5,6 +5,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from core.integrations.creo_bridge import (
     BridgeApiError,
@@ -468,6 +469,27 @@ class CreoBridgeControllerTests(unittest.TestCase):
 
         self.assertEqual(result["history"], history)
         self.assertEqual(result["cad"]["id"], 1)
+
+    def test_structure_review_route_uses_active_project_and_selected_cad_ids(self):
+        self.controller._require_commit_permission = lambda: (7, 9, {})
+        self.controller._pdm_service_factory = lambda: SimpleNamespace(db_name="review-test.db")
+        structure = {"schema": 1, "members": [], "drawings": [],
+                     "complete_assemblies": ["machine.asm"]}
+        expected = {"changes": [], "dependencies": [], "drawings": []}
+        with patch(
+            "core.services.cad_structure_sync_service.CadStructureSyncService"
+        ) as service_class:
+            service_class.return_value.review_pending_structure.return_value = expected
+            result = self.controller.dispatch(
+                "POST", "/api/v1/cad/structure/review", {},
+                {"cad_document_ids": [1], "structure": structure},
+            )
+
+        self.assertEqual(result, expected)
+        service_class.assert_called_once_with("review-test.db")
+        service_class.return_value.review_pending_structure.assert_called_once_with(
+            9, 7, [1], structure
+        )
 
     def test_edit_intent_route_records_local_only_permission(self):
         result = self.controller.dispatch(

@@ -3359,6 +3359,55 @@ def _migration_47(conn):
     """)
 
 
+def _migration_48(conn):
+    """Keep an append-only history of durable CAD approval phase transitions."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cad_submission_approval_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            approval_id TEXT NOT NULL,
+            project_id INTEGER NOT NULL,
+            commit_id TEXT NOT NULL,
+            actor_user_id INTEGER NOT NULL,
+            from_status TEXT NOT NULL,
+            to_status TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(approval_id, to_status),
+            FOREIGN KEY (approval_id) REFERENCES cad_submission_approvals(approval_id)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cad_submission_approval_events
+        ON cad_submission_approval_events(approval_id, id)
+    """)
+    conn.execute("""
+        INSERT OR IGNORE INTO cad_submission_approval_events(
+            approval_id,project_id,commit_id,actor_user_id,from_status,to_status,created_at
+        )
+        SELECT approval_id,project_id,commit_id,approver_id,'LEGACY',status,created_at
+        FROM cad_submission_approvals
+    """)
+
+
+def _migration_49(conn):
+    """Audit withdrawal of pending or validated CAD submissions."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cad_submission_lifecycle_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            commit_id TEXT NOT NULL,
+            actor_user_id INTEGER NOT NULL,
+            from_status TEXT NOT NULL,
+            to_status TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cad_submission_lifecycle
+        ON cad_submission_lifecycle_events(project_id, commit_id, id)
+    """)
+
+
 def _repair_snapshot_schema(conn):
     """Repair migration-45 schema drift without changing the migration ledger."""
     table = conn.execute(
@@ -3767,6 +3816,8 @@ WHERE r.name = 'designer' AND p.name = 'manage_issues';
     45: _migration_45,
     46: _migration_46,
     47: _migration_47,
+    48: _migration_48,
+    49: _migration_49,
 
 }
 

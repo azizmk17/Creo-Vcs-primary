@@ -663,6 +663,30 @@ class MergeService(BaseService):
             }
         return snapshots
 
+    @staticmethod
+    def _assert_not_submitter_approval(commits, approver_id):
+        approver = int(approver_id or 0)
+        submitters = {
+            int(getattr(commit, "committed_by"))
+            for commit in commits
+            if getattr(commit, "committed_by", None) is not None
+        }
+        if approver and approver in submitters:
+            raise PermissionError(
+                "You submitted this CAD change and cannot approve it. A different project approver must review it."
+            )
+
+    @staticmethod
+    def _assert_approval_retry_owner(journal, approver_id):
+        if (
+            journal
+            and journal.get("status") != "COMPLETED"
+            and int(journal.get("approver_id") or 0) != int(approver_id or 0)
+        ):
+            raise PermissionError(
+                "An interrupted approval must be resumed by the original approver."
+            )
+
     def _approve_submission(self, commit_data, message="", *, process_attachments=False):
         if not commit_data:
             raise ValueError("No validated CAD submission was found.")
@@ -677,6 +701,15 @@ class MergeService(BaseService):
         db_name = self.bom_service.pdm_service.db_name
         journal_service = ApprovalJournalService(db_name)
         journal = journal_service.latest(project_id, logical_id)
+        already_completed = bool(
+            journal
+            and journal.get("status") == "COMPLETED"
+            and all(str(getattr(row, "status", "")).casefold() == "approved" for row in commit_data)
+        )
+        if not already_completed:
+            approver_id = int(self.user_id or 0)
+            self._assert_approval_retry_owner(journal, approver_id)
+            self._assert_not_submitter_approval(commit_data, approver_id)
         plan = None
         snapshot_records = None
 
@@ -1136,6 +1169,20 @@ class MergeService(BaseService):
                     raise RuntimeError(
                         f"Could not record the approval signature for commit row {item['commit_id']}."
                     )
+
+            if approval_id and bool(
+                getattr(getattr(self, "session", None), "is_admin", False)
+            ):
+                override_signature = self.signature_repo.add_signature(
+                    "Administrator Approval Override",
+                    merge_user_id,
+                    "Administrator approval for " + str(approval_id)
+                        + (": " + str(message) if str(message or "").strip() else ""),
+                    idempotency_key=f"{approval_id}:admin-override",
+                    conn=conn,
+                )
+                if int(override_signature or -1) <= 0:
+                    raise RuntimeError("Could not record the administrator approval audit entry.")
 
             for part_id, source_commit_id in pdm_item_checkin_sources.items():
                 if self.bom_service.checked_out_cad_for_item(

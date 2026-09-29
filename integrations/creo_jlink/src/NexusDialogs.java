@@ -71,6 +71,25 @@ public final class NexusDialogs {
             && ((Integer) value).intValue() == JOptionPane.YES_OPTION;
     }
 
+    public static boolean confirmScrollable(String message, String title, int messageType) {
+        JTextArea details = new JTextArea(message, 22, 78);
+        details.setEditable(false);
+        details.setLineWrap(true);
+        details.setWrapStyleWord(true);
+        details.setCaretPosition(0);
+        details.setBorder(BorderFactory.createEmptyBorder(8, 9, 8, 9));
+        JScrollPane scroll = new JScrollPane(details);
+        scroll.setPreferredSize(new Dimension(700, 430));
+        JOptionPane pane = new JOptionPane(
+            scroll,
+            messageType,
+            JOptionPane.YES_NO_OPTION
+        );
+        Object value = show(pane, title);
+        return value instanceof Integer
+            && ((Integer) value).intValue() == JOptionPane.YES_OPTION;
+    }
+
     public static String input(String message, String title) {
         final JTextField field = new JTextField(34);
         JOptionPane pane = new JOptionPane(
