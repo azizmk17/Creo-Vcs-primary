@@ -42,6 +42,7 @@ class MergeRepository:
             cur = conn.cursor()
             cur.execute("""
                 SELECT c.id, c.type, c.part_id, c.cad_document_id, c.creo_file_version, c.status,
+                       c.designer, c.committed_by,
                        c.filename, c.title, c.commit_id, c.project_id,
                        u.username AS designer_username
                 FROM commits c
@@ -64,6 +65,7 @@ class MergeRepository:
                 params.append(int(project_id))
             rows = conn.execute(f"""
                 SELECT c.id, c.type, c.part_id, c.cad_document_id, c.creo_file_version, c.status,
+                       c.designer, c.committed_by,
                        c.filename, c.title, c.commit_id, c.project_id,
                        u.username AS designer_username
                 FROM commits c
@@ -86,7 +88,8 @@ class MergeRepository:
         # Fields expected by Commit dataclass
         keys = [
             'id', 'part_id', 'cad_document_id', 'creo_file_version', 'type', 'filename',
-            'designer_username', 'status', 'title', 'commit_id', 'project_id'
+            'designer_username', 'status', 'title', 'commit_id', 'project_id',
+            'designer', 'committed_by',
         ]
         filtered = {k: data.get(k) for k in keys}
         return Merge(**filtered)

@@ -338,7 +338,7 @@ public class NexusJLink {
         String workspaceId = selectedWorkspace == null
             ? ""
             : MiniJson.text(selectedWorkspace, "id");
-        return api.resolveCad(model.GetFileName(), workspaceId);
+        return api.resolveCad(logicalModelFileName(model), workspaceId);
     }
 
     private static String projectLabel(Map<String, Object> project) {
@@ -347,6 +347,116 @@ public class NexusJLink {
         String version = MiniJson.text(project, "version_label");
         String label = number.length() > 0 ? number + " - " + name : name;
         return version.length() > 0 ? label + " / " + version : label;
+    }
+
+    private static boolean isCadNameManaged(
+        String fileName, Map<String, Object> workspace
+    ) throws Exception {
+        Map<String, Object> status = api.resolveCad(
+            fileName, MiniJson.text(workspace, "id")
+        );
+        return MiniJson.bool(status, "managed");
+    }
+
+    private static boolean registerUnmanagedWorkspaceModel(
+        Model current, Map<String, Object> workspace
+    ) throws Exception {
+        String currentName = logicalModelFileName(current);
+        Map<String, Object> workspaceState = loadWorkspaceState(
+            MiniJson.text(workspace, "id")
+        );
+        List<Object> localFiles = MiniJson.array(workspaceState.get("local_files"));
+        Map<String, Object> source = findUnmappedWorkspaceFile(localFiles, currentName);
+        if (source == null || !loadedModelMatchesWorkspaceFile(
+            current, MiniJson.text(source, "path")
+        )) {
+            throw new IllegalStateException(
+                "This CAD file is not an unmapped file in the selected Nexus workspace. "
+                    + "Only files physically present in that workspace can be registered here."
+            );
+        }
+        List<Map<String, Object>> files = new ArrayList<Map<String, Object>>();
+        List<String> ownerNames = new ArrayList<String>();
+        if (current instanceof Model2D) {
+            Models references = ((Model2D) current).ListModels();
+            if (references != null) {
+                for (int index = 0; index < references.getarraysize(); index++) {
+                    Model reference = references.get(index);
+                    String name = logicalModelFileName(reference);
+                    String lower = name.toLowerCase();
+                    if ((lower.endsWith(".prt") || lower.endsWith(".asm"))
+                        && !ownerNames.contains(name)) ownerNames.add(name);
+                }
+            }
+            if (ownerNames.size() != 1) {
+                throw new IllegalStateException(
+                    "A new drawing must reference exactly one PRT or ASM model before it can be registered."
+                );
+            }
+            String ownerName = ownerNames.get(0);
+            if (!isCadNameManaged(ownerName, workspace)) {
+                Map<String, Object> ownerSource = findUnmappedWorkspaceFile(
+                    localFiles, ownerName
+                );
+                Model ownerModel = findSessionModel(ownerName);
+                if (ownerSource == null || ownerModel == null
+                    || !loadedModelMatchesWorkspaceFile(
+                        ownerModel, MiniJson.text(ownerSource, "path")
+                    )) {
+                    throw new IllegalStateException(
+                        "The drawing's unregistered model " + ownerName
+                            + " must also be present and loaded from this Nexus workspace."
+                    );
+                }
+                files.add(registrationFile(ownerSource));
+            }
+        }
+        Map<String, Object> currentFile = registrationFile(source);
+        if (!ownerNames.isEmpty()) currentFile.put("drawing_models", ownerNames);
+        files.add(currentFile);
+        StringBuilder prompt = new StringBuilder();
+        prompt.append("Nexus will register and check out these new native CAD files in the selected workspace:\n\n");
+        for (Map<String, Object> file : files) {
+            prompt.append("  ").append(MiniJson.text(file, "filename")).append("\n");
+        }
+        prompt.append("\nContinue?");
+        if (!NexusDialogs.confirm(
+            prompt.toString(), "Register New CAD", JOptionPane.QUESTION_MESSAGE
+        )) return false;
+        api.registerNewCad(MiniJson.text(workspace, "id"), files);
+        return true;
+    }
+
+    private static Map<String, Object> findUnmappedWorkspaceFile(
+        List<Object> localFiles, String wantedName
+    ) {
+        for (Object value : localFiles) {
+            Map<String, Object> local = MiniJson.object(value);
+            if ("UNMAPPED".equalsIgnoreCase(MiniJson.text(local, "status"))
+                && logicalCreoFileName(MiniJson.text(local, "logical_file_name"))
+                    .equalsIgnoreCase(logicalCreoFileName(wantedName))) {
+                return local;
+            }
+        }
+        return null;
+    }
+
+    private static Map<String, Object> registrationFile(Map<String, Object> local) {
+        Map<String, Object> file = new LinkedHashMap<String, Object>();
+        file.put("filename", MiniJson.text(local, "filename"));
+        file.put("path", MiniJson.text(local, "path"));
+        return file;
+    }
+
+    private static Model findSessionModel(String wantedName) throws Exception {
+        Models models = session.ListModels();
+        if (models == null) return null;
+        for (int index = 0; index < models.getarraysize(); index++) {
+            Model model = models.get(index);
+            if (model != null && logicalModelFileName(model)
+                .equalsIgnoreCase(logicalCreoFileName(wantedName))) return model;
+        }
+        return null;
     }
 
     private static Map<String, Object> chooseWorkspace() throws Exception {
@@ -743,6 +853,15 @@ public class NexusJLink {
         installCommandGuards();
         Model current = requireCurrentModel();
         Map<String, Object> status = resolveCadForModel(current);
+        if (!MiniJson.bool(status, "managed")) {
+            if (!registerUnmanagedWorkspaceModel(current, workspace)) return;
+            activateModel(current);
+            NexusDialogs.info(
+                "The new CAD file was registered and checked out in the selected Nexus workspace.",
+                "Nexus Check Out"
+            );
+            return;
+        }
         requireManaged(status);
         boolean currentIsWorkspaceModel = modelMatchesWorkspace(
             current,
@@ -1003,9 +1122,53 @@ public class NexusJLink {
             NexusDialogs.info("No CAD Documents were selected.", "Nexus Check In");
             return;
         }
-        Map<String, Object> creoMetadata = null;
-        creoMetadata = captureCreoStructure(selectedNewCandidates, selectedChoices);
+        Map<String, Object> creoMetadata = captureCreoStructure(
+            selectedNewCandidates, selectedChoices
+        );
         if (creoMetadata == null) return;
+        Map<String, Object> detectedDrawingModels = MiniJson.object(
+            creoMetadata.get("drawing_models_by_file")
+        );
+        boolean addedDrawingOwner = false;
+        for (CheckinChoice drawing : new ArrayList<CheckinChoice>(selectedNewCandidates)) {
+            Object rawNames = detectedDrawingModels.get(drawing.fileName().toLowerCase());
+            List<Object> ownerNames = MiniJson.array(rawNames);
+            if (!isDrawingChoice(drawing) || ownerNames.size() != 1) continue;
+            String ownerName = String.valueOf(ownerNames.get(0));
+            boolean alreadySelected = false;
+            for (CheckinChoice selectedChoice : selectedNewCandidates) {
+                if (selectedChoice.fileName().equalsIgnoreCase(ownerName)) {
+                    alreadySelected = true;
+                    break;
+                }
+            }
+            if (alreadySelected || isCadNameManaged(ownerName, workspace)) continue;
+            CheckinChoice ownerCandidate = null;
+            for (CheckinChoice choice : choices) {
+                if (choice.isNewCadCandidate()
+                    && choice.fileName().equalsIgnoreCase(ownerName)
+                    && choice.localFile != null
+                    && choice.loaded != null
+                    && loadedModelMatchesWorkspaceFile(
+                        choice.loaded.model, MiniJson.text(choice.localFile, "path")
+                    )) {
+                    ownerCandidate = choice;
+                    break;
+                }
+            }
+            if (ownerCandidate == null) {
+                throw new IllegalStateException(
+                    "The new drawing references unregistered model " + ownerName
+                        + ", but that model is not an unmapped file in the selected Nexus workspace."
+                );
+            }
+            selectedNewCandidates.add(ownerCandidate);
+            addedDrawingOwner = true;
+        }
+        if (addedDrawingOwner) {
+            creoMetadata = captureCreoStructure(selectedNewCandidates, selectedChoices);
+            if (creoMetadata == null) return;
+        }
         if (!selectedNewCandidates.isEmpty()) {
             StringBuilder prompt = new StringBuilder();
             prompt.append("Nexus will create CAD Document records and check out these new Creo files before staging them in Pending:\n\n");
@@ -1109,6 +1272,40 @@ public class NexusJLink {
                             selectionChanged = true;
                         }
                     }
+                    continue;
+                }
+                if ("CHECKOUT_REQUIRED_MODEL".equals(action)) {
+                    List<Object> relatedIds = MiniJson.array(
+                        conflict.get("related_cad_document_ids")
+                    );
+                    if (relatedIds.isEmpty()) {
+                        throw new IllegalStateException(
+                            "Nexus did not identify the drawing's related CAD model."
+                        );
+                    }
+                    int relatedId = jsonInteger(relatedIds.get(0));
+                    CheckinChoice relatedChoice = allChoices.get(Integer.valueOf(relatedId));
+                    if (relatedChoice == null || relatedChoice.localFile == null) {
+                        throw new IllegalStateException(
+                            "The related model is not present in this Nexus workspace. Retrieve it before checking in the drawing."
+                        );
+                    }
+                    api.checkout(relatedId, MiniJson.text(workspace, "id"), false, null, false);
+                    relatedChoice.status = api.cadStatus(relatedId);
+                    Map<String, Object> refreshed = loadWorkspaceState(
+                        MiniJson.text(workspace, "id")
+                    );
+                    for (Object localValue : MiniJson.array(refreshed.get("local_files"))) {
+                        Map<String, Object> local = MiniJson.object(localValue);
+                        if (MiniJson.integer(local, "cad_document_id") == relatedId) {
+                            relatedChoice.localFile = local;
+                            break;
+                        }
+                    }
+                    relatedChoice.workspaceCheckout = true;
+                    selectedChoices.put(Integer.valueOf(relatedId), relatedChoice);
+                    resolvedConflictActions.clear();
+                    selectionChanged = true;
                     continue;
                 }
                 throw new IllegalStateException(
@@ -1326,7 +1523,7 @@ public class NexusJLink {
             if (!MiniJson.bool(status, "managed")) {
                 String modelName = "";
                 try {
-                    modelName = logicalCreoFileName(info.model.GetFileName()).toLowerCase();
+                    modelName = logicalModelFileName(info.model).toLowerCase();
                 } catch (Exception ignored) {
                 }
                 for (CheckinChoice choice : choices) {
@@ -1359,7 +1556,7 @@ public class NexusJLink {
                 for (int index = 0; index < sessionModels.getarraysize(); index++) {
                     Model model = sessionModels.get(index);
                     if (model != null
-                        && wanted.equalsIgnoreCase(logicalCreoFileName(model.GetFileName()))
+                        && wanted.equalsIgnoreCase(logicalModelFileName(model))
                         && loadedModelMatchesWorkspaceFile(
                             model, MiniJson.text(choice.localFile, "path")
                         )) {
@@ -1385,19 +1582,16 @@ public class NexusJLink {
     ) throws Exception {
         Set<String> selectedNames = new LinkedHashSet<String>();
         Set<String> newCandidateNames = new LinkedHashSet<String>();
-        Set<String> selectedBatchNames = new LinkedHashSet<String>();
         Map<String, String> selectedPaths = new LinkedHashMap<String, String>();
         for (CheckinChoice choice : candidates) {
             String name = logicalCreoFileName(choice.fileName()).toLowerCase();
             selectedNames.add(name);
             newCandidateNames.add(name);
-            selectedBatchNames.add(name);
             selectedPaths.put(name, MiniJson.text(choice.localFile, "path"));
         }
         for (CheckinChoice choice : selectedChoices.values()) {
             String name = logicalCreoFileName(choice.fileName()).toLowerCase();
             selectedNames.add(name);
-            selectedBatchNames.add(name);
             selectedPaths.put(name, MiniJson.text(choice.localFile, "path"));
         }
         Models sessionModels = session.ListModels();
@@ -1406,16 +1600,34 @@ public class NexusJLink {
             for (int index = 0; index < sessionModels.getarraysize(); index++) {
                 Model model = sessionModels.get(index);
                 if (model == null) continue;
-                String name = logicalCreoFileName(model.GetFileName()).toLowerCase();
+                String name = logicalModelFileName(model).toLowerCase();
                 if (name.length() > 0) modelsByName.put(name, model);
             }
         }
         for (String name : newCandidateNames) {
             Model model = modelsByName.get(name);
-            if (model == null || !loadedModelMatchesWorkspaceFile(model, selectedPaths.get(name))) {
+            String targetPath = selectedPaths.get(name);
+
+            if (model == null) {
                 throw new IllegalStateException(
-                    "Open the selected new Creo file from this Nexus workspace before check-in so its structure can be read: "
-                        + name
+                    "Model missing from Nexus session lookup: " + name
+                    + "\nSession model names: " + modelsByName.keySet()
+                );
+            }
+
+            if (!loadedModelMatchesWorkspaceFile(model, targetPath)) {
+                String origin;
+                try {
+                    origin = model.GetOrigin();
+                } catch (Exception error) {
+                    origin = "<unavailable: " + error.toString() + ">";
+                }
+
+                throw new IllegalStateException(
+                    "Model found, but workspace file matching failed."
+                    + "\nModel: " + name
+                    + "\nModel origin: " + origin
+                    + "\nExpected workspace file: " + targetPath
                 );
             }
         }
@@ -1429,8 +1641,29 @@ public class NexusJLink {
             for (int index = 0; index < sessionModels.getarraysize(); index++) {
                 Model model = sessionModels.get(index);
                 if (model == null) continue;
-                String fileName = logicalCreoFileName(model.GetFileName()).toLowerCase();
+                String fileName = logicalModelFileName(model).toLowerCase();
                 if (fileName.endsWith(".asm")) {
+                    boolean familyTableInstance = isFamilyTableInstance(model);
+                    if (familyTableInstance
+                        && !hasSeparateFamilyInstanceIdentity(model, fileName)) {
+                        if (model instanceof Solid) {
+                            Features instanceFeatures = ((Solid) model).ListFeaturesByType(
+                                Boolean.FALSE, FeatureType.FEATTYPE_COMPONENT
+                            );
+                            if (instanceFeatures != null) {
+                                for (int featureIndex = 0;
+                                     featureIndex < instanceFeatures.getarraysize();
+                                     featureIndex++) {
+                                    ComponentFeat component = (ComponentFeat)
+                                        instanceFeatures.get(featureIndex);
+                                    componentChildren.add(logicalCreoFileName(
+                                        component.GetModelDescr().GetFileName()
+                                    ).toLowerCase());
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if (!(model instanceof Solid)) {
                         if (selectedNames.contains(fileName)
                             && selectedPaths.containsKey(fileName)
@@ -1463,7 +1696,14 @@ public class NexusJLink {
                         ).toLowerCase();
                         if ((!selectedAssembly || !workspaceAssembly)
                             && (!selectedNames.contains(childName) || !workspaceDirectory)) continue;
-                        if (feature.GetStatus().getValue() != FeatureStatus._FEAT_ACTIVE) {
+                        int featureStatus = feature.GetStatus().getValue();
+                        if (featureStatus != FeatureStatus._FEAT_ACTIVE
+                            && familyTableInstance
+                            && (featureStatus == FeatureStatus._FEAT_FAMILY_TABLE_SUPPRESSED
+                                || featureStatus == FeatureStatus._FEAT_SUPPRESSED)) {
+                            continue;
+                        }
+                        if (featureStatus != FeatureStatus._FEAT_ACTIVE) {
                             throw new IllegalStateException(
                                 "Resolve the inactive or suppressed assembly component before check-in: "
                                     + fileName + " / " + childName
@@ -1486,7 +1726,7 @@ public class NexusJLink {
                     if (references != null) {
                         for (int refIndex = 0; refIndex < references.getarraysize(); refIndex++) {
                             Model reference = references.get(refIndex);
-                            String modelName = logicalCreoFileName(reference.GetFileName()).toLowerCase();
+                            String modelName = logicalModelFileName(reference).toLowerCase();
                             if (!modelName.endsWith(".prt") && !modelName.endsWith(".asm")) continue;
                             if (!names.contains(modelName)) names.add(modelName);
                             if (selectedNames.contains(fileName) || selectedNames.contains(modelName)) {
@@ -1503,13 +1743,6 @@ public class NexusJLink {
                             throw new IllegalStateException(
                                 "A new drawing must reference exactly one PRT or ASM model before check-in: "
                                     + fileName
-                            );
-                        }
-                        String ownerName = String.valueOf(names.get(0)).toLowerCase();
-                        if (!selectedBatchNames.contains(ownerName)) {
-                            throw new IllegalStateException(
-                                "Select the drawing's owning model in the same check-in batch: "
-                                    + ownerName
                             );
                         }
                     }
@@ -1644,36 +1877,54 @@ public class NexusJLink {
         return result;
     }
 
-    private static boolean loadedModelMatchesWorkspaceFile(Model model, String path) {
-        if (model == null || path == null || path.trim().length() == 0) return false;
+    private static boolean loadedModelMatchesWorkspaceFile(
+            Model model, String path) {
+
+        if (model == null || path == null
+                || path.trim().length() == 0) return false;
+
         try {
-            File expected = new File(path).getCanonicalFile();
-            ModelDescriptor descriptor = model.GetDescr();
-            String originText = descriptor == null ? "" : descriptor.GetPath();
-            if (originText == null || originText.trim().length() == 0) return false;
+            String originText = model.GetOrigin();
+            if (originText == null
+                    || originText.trim().length() == 0) return false;
+
             File origin = new File(originText).getCanonicalFile();
-            return origin.equals(expected) || origin.equals(expected.getParentFile());
-        } catch (Throwable ignored) {
+            File expected = new File(path).getCanonicalFile();
+
+            return origin.equals(expected);
+        } catch (Exception error) {
             return false;
         }
     }
 
     private static boolean modelInSelectedWorkspaceDirectory(
-        Model model, Map<String, String> selectedPaths
-    ) {
-        if (model == null || selectedPaths == null || selectedPaths.isEmpty()) return false;
+            Model model, Map<String, String> selectedPaths) {
+
+        if (model == null || selectedPaths == null
+                || selectedPaths.isEmpty()) return false;
+
         try {
-            ModelDescriptor descriptor = model.GetDescr();
-            String originText = descriptor == null ? "" : descriptor.GetPath();
-            if (originText == null || originText.trim().length() == 0) return false;
-            File origin = new File(originText).getCanonicalFile();
+            String originText = model.GetOrigin();
+            if (originText == null
+                    || originText.trim().length() == 0) return false;
+
+            File originDirectory =
+                new File(originText).getCanonicalFile().getParentFile();
+
+            if (originDirectory == null) return false;
+
             for (String path : selectedPaths.values()) {
                 if (path == null || path.trim().length() == 0) continue;
-                File selected = new File(path).getCanonicalFile();
-                if (origin.equals(selected) || origin.equals(selected.getParentFile())) return true;
+
+                File expectedDirectory =
+                    new File(path).getCanonicalFile().getParentFile();
+
+                if (originDirectory.equals(expectedDirectory)) return true;
             }
-        } catch (Throwable ignored) {
+        } catch (Exception error) {
+            return false;
         }
+
         return false;
     }
 
@@ -1710,7 +1961,7 @@ public class NexusJLink {
     ) {
         if (model == null) return;
         String key = "";
-        try { key = logicalCreoFileName(model.GetFileName()).toLowerCase(); }
+        try { key = logicalModelFileName(model).toLowerCase(); }
         catch (Throwable ignored) { }
         if (key.length() == 0 || !visiting.add(key)) return;
         addLoadedModel(loaded, model, source);
@@ -1738,7 +1989,7 @@ public class NexusJLink {
         String source
     ) {
         try {
-            String key = logicalCreoFileName(model.GetFileName()).toLowerCase();
+            String key = logicalModelFileName(model).toLowerCase();
             if (key.length() > 0 && !loaded.containsKey(key)) {
                 loaded.put(key, new LoadedModelInfo(model, source));
             }
@@ -1847,7 +2098,7 @@ public class NexusJLink {
             try { return model.GetIsModified(); }
             catch (Throwable ignored) { return false; }
         }
-        String logical = logicalCreoFileName(safeFileName(model));
+        String logical = logicalModelFileName(model);
         for (Object raw : MiniJson.array(workspaceState.get("local_files"))) {
             Map<String, Object> file = MiniJson.object(raw);
             String candidate = MiniJson.text(file, "logical_file_name");
@@ -1957,7 +2208,7 @@ public class NexusJLink {
         if (model == null || !modelIsInsideWorkspace(model, workspacePath)) {
             return false;
         }
-        return logicalCreoFileName(safeFileName(model)).equalsIgnoreCase(
+        return logicalModelFileName(model).equalsIgnoreCase(
             logicalCreoFileName(logicalFileName)
         );
     }
@@ -1997,13 +2248,100 @@ public class NexusJLink {
 
     private static String logicalCreoFileName(String fileName) {
         String name = fileName == null ? "" : new File(fileName).getName();
-        return name.replaceFirst("(?i)\\.(prt|asm|drw)\\.\\d+$", ".$1");
+        name = name.replaceFirst("(?i)\\.(prt|asm|drw)\\.\\d+$", ".$1");
+        return name.replaceFirst(
+            "(?i)^([^<>]+)<[^<>]+>(\\.(?:prt|asm|drw))$", "$1$2"
+        );
+    }
+
+    private static String logicalModelFileName(Model model) {
+        if (model == null) return "";
+        String rawFileName;
+        try {
+            rawFileName = model.GetFileName();
+        } catch (Throwable ignored) {
+            return "";
+        }
+        String instanceFileName = logicalCreoFileName(rawFileName);
+        String genericFileName = genericFamilyFileName(model, rawFileName, instanceFileName);
+        if (genericFileName.length() == 0) return instanceFileName;
+
+        Map<String, Object> workspace = selectedWorkspace;
+        String workspaceId = MiniJson.text(workspace, "id");
+        if (workspaceId.length() == 0 || api == null) return instanceFileName;
+        try {
+            if (MiniJson.bool(api.resolveCad(instanceFileName, workspaceId), "managed")) {
+                return instanceFileName;
+            }
+            Map<String, Object> state = loadWorkspaceState(workspaceId);
+            if (findUnmappedWorkspaceFile(
+                MiniJson.array(state.get("local_files")), instanceFileName
+            ) != null) return instanceFileName;
+            if (MiniJson.bool(api.resolveCad(genericFileName, workspaceId), "managed")) {
+                return genericFileName;
+            }
+            if (findUnmappedWorkspaceFile(
+                MiniJson.array(state.get("local_files")), genericFileName
+            ) != null) return genericFileName;
+        } catch (Exception ignored) {
+        }
+        return instanceFileName;
+    }
+
+    private static String genericFamilyFileName(Model model, String rawFileName,
+                                                  String instanceFileName) {
+        String genericName = "";
+        try {
+            String value = model.GetGenericName();
+            genericName = value == null ? "" : value.trim();
+        } catch (Throwable ignored) {
+        }
+        int genericStart = rawFileName == null ? -1 : rawFileName.lastIndexOf('<');
+        int genericEnd = rawFileName == null ? -1 : rawFileName.lastIndexOf('>');
+        if (genericName.length() == 0 && genericStart >= 0 && genericEnd > genericStart) {
+            genericName = rawFileName.substring(genericStart + 1, genericEnd).trim();
+        }
+        if (genericName.length() == 0) return "";
+
+        String extension = instanceFileName.replaceFirst(
+            "^.*(\\.(?:prt|asm|drw))$", "$1"
+        );
+        if (extension.equals(instanceFileName)) return instanceFileName;
+        String genericFileName = genericName;
+        if (!genericFileName.toLowerCase().endsWith(extension.toLowerCase())) {
+            genericFileName += extension;
+        }
+        return logicalCreoFileName(genericFileName);
+    }
+
+    private static boolean isFamilyTableInstance(Model model) {
+        if (model == null) return false;
+        try {
+            String raw = model.GetFileName();
+            return genericFamilyFileName(
+                model, raw, logicalCreoFileName(raw)
+            ).length() > 0;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static boolean hasSeparateFamilyInstanceIdentity(
+        Model model, String selectedName
+    ) {
+        if (model == null) return false;
+        try {
+            String raw = model.GetFileName();
+            return logicalCreoFileName(raw).equalsIgnoreCase(selectedName);
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     private static String localDraftKey(Model model) {
         if (model == null || selectedWorkspace == null) return "";
         String workspaceId = MiniJson.text(selectedWorkspace, "id").toLowerCase();
-        String fileName = logicalCreoFileName(safeFileName(model)).toLowerCase();
+        String fileName = logicalModelFileName(model).toLowerCase();
         if (workspaceId.length() == 0 || fileName.length() == 0) return "";
         return workspaceId + "|" + fileName;
     }

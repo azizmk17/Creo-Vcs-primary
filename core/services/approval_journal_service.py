@@ -112,6 +112,28 @@ class ApprovalJournalService:
             """, (encoded, str(approval_id)))
         return json.loads(encoded)
 
+    def set_message_if_empty(self, approval_id, message):
+        value = str(message or "").strip()
+        if not value:
+            raise ValueError("Approval message is required.")
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT message FROM cad_submission_approvals WHERE approval_id=?",
+                (str(approval_id),),
+            ).fetchone()
+            if not row:
+                raise ValueError("Approval journal entry was not found.")
+            current = str(row["message"] or "").strip()
+            if not current:
+                conn.execute("""
+                    UPDATE cad_submission_approvals
+                    SET message=?,updated_at=datetime('now')
+                    WHERE approval_id=? AND trim(message)=''
+                """, (value, str(approval_id)))
+                return value
+            return current
+
     def plan(self, record):
         try:
             value = json.loads(record.get("plan_json") or "{}")

@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from core.repositories.signature_repository import SignatureRepository
 from core.repositories.merge_repository import MergeRepository
 from core.repositories.project_event_repository import ProjectEventRepository
+from core.session_manager import SessionManager
 from core.services.approval_journal_service import ApprovalJournalService
 from core.services.merge_service import MergeService
 from setup.migrations import _migration_46, _migration_47, _migration_48
@@ -240,6 +241,10 @@ class ApprovalJournalServiceTests(unittest.TestCase):
             ]),
         )
         service = object.__new__(MergeService)
+        session = SessionManager()
+        session.start_session(7, "approver", None, project_id=2)
+        self.addCleanup(session.end_session)
+        service.session = session
         service.bom_service = bom_service
         service.merge_repository = merge_repo
         service.bom_repo = SimpleNamespace(get_by_id=Mock(return_value=None))
@@ -284,13 +289,14 @@ class ApprovalJournalServiceTests(unittest.TestCase):
                     )
                     return {"completed": cur.rowcount, "failed_ids": []}
 
-        with patch(
+        with patch("core.services.permission_decorators.PermissionRepository") as permission_repository, patch(
             "core.services.cad_structure_sync_service.CadStructureSyncService",
             StructureService,
         ), patch(
             "core.services.cad_workspace_service.CadWorkspaceService",
             WorkspaceService,
         ):
+            permission_repository.return_value.user_has_permission.return_value = True
             with self.assertRaisesRegex(RuntimeError, "Item check-in failure"):
                 service.finalize_merge(
                     [entry], 7, journal["merge_id"], "approve",

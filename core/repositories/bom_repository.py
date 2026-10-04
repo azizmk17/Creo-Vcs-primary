@@ -1343,7 +1343,7 @@ class BomRepository:
                 bom.id,
             ))
 
-            conn.commit()
+            active_conn.commit()
 
     def update_bom_file_names(self, id, base_file_name, base_drw_name, project_id):
         with self.get_conn() as conn:

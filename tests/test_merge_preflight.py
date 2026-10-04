@@ -51,6 +51,35 @@ class MergePreflightTests(unittest.TestCase):
         commits = [SimpleNamespace(committed_by=7), SimpleNamespace(committed_by=8)]
         self.service._assert_not_submitter_approval(commits, 9)
 
+    def test_master_or_admin_permission_can_approve_own_submission(self):
+        commits = [SimpleNamespace(committed_by=7)]
+        self.service.session = SimpleNamespace(project_id=7, user_id=7, is_admin=False)
+        self.service.bom_service.permission_repo = SimpleNamespace(
+            user_has_permission=lambda user_id, permission, project_id: (
+                user_id == 7 and permission == "merge" and project_id == 7
+            )
+        )
+
+        self.assertTrue(self.service._can_approve_own_submission(7))
+        self.service._assert_not_submitter_approval(
+            commits, 7,
+            allow_submitter=self.service._can_approve_own_submission(7),
+        )
+
+    def test_submitter_without_merge_permission_remains_blocked(self):
+        commits = [SimpleNamespace(committed_by=7)]
+        self.service.session = SimpleNamespace(project_id=7, user_id=7, is_admin=False)
+        self.service.bom_service.permission_repo = SimpleNamespace(
+            user_has_permission=lambda *_args: False
+        )
+
+        self.assertFalse(self.service._can_approve_own_submission(7))
+        with self.assertRaisesRegex(PermissionError, "cannot approve it"):
+            self.service._assert_not_submitter_approval(
+                commits, 7,
+                allow_submitter=self.service._can_approve_own_submission(7),
+            )
+
     def test_interrupted_approval_can_only_be_resumed_by_original_approver(self):
         journal = {"status": "FILES_READY", "approver_id": 9}
         with self.assertRaisesRegex(PermissionError, "original approver"):

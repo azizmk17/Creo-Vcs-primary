@@ -664,17 +664,38 @@ class MergeService(BaseService):
         return snapshots
 
     @staticmethod
-    def _assert_not_submitter_approval(commits, approver_id):
+    def _assert_not_submitter_approval(
+        commits, approver_id, *, allow_submitter=False
+    ):
+        if allow_submitter:
+            return
         approver = int(approver_id or 0)
-        submitters = {
-            int(getattr(commit, "committed_by"))
-            for commit in commits
-            if getattr(commit, "committed_by", None) is not None
-        }
+        submitters = set()
+        for commit in commits:
+            for field in ("committed_by", "designer"):
+                try:
+                    value = int(getattr(commit, field, None) or 0)
+                except (TypeError, ValueError):
+                    value = 0
+                if value:
+                    submitters.add(value)
         if approver and approver in submitters:
             raise PermissionError(
                 "You submitted this CAD change and cannot approve it. A different project approver must review it."
             )
+
+    def _can_approve_own_submission(self, project_id):
+        if bool(getattr(self.session, "is_admin", False)):
+            return True
+        permission_repo = getattr(self.bom_service, "permission_repo", None)
+        if permission_repo is None:
+            return False
+        try:
+            return bool(permission_repo.user_has_permission(
+                int(self.user_id or 0), "merge", int(project_id)
+            ))
+        except Exception:
+            return False
 
     @staticmethod
     def _assert_approval_retry_owner(journal, approver_id):
@@ -701,15 +722,31 @@ class MergeService(BaseService):
         db_name = self.bom_service.pdm_service.db_name
         journal_service = ApprovalJournalService(db_name)
         journal = journal_service.latest(project_id, logical_id)
+        is_admin_override = bool(getattr(self.session, "is_admin", False))
+        can_approve_own_submission = self._can_approve_own_submission(project_id)
         already_completed = bool(
             journal
             and journal.get("status") == "COMPLETED"
             and all(str(getattr(row, "status", "")).casefold() == "approved" for row in commit_data)
         )
+        if is_admin_override and not already_completed:
+            audit_reason = str(journal.get("message") or "").strip() if journal else ""
+            if not audit_reason:
+                audit_reason = str(message or "").strip()
+            if not audit_reason:
+                raise ValueError("Administrator approval requires a reason for the audit record.")
+            if journal and not str(journal.get("message") or "").strip():
+                journal_service.set_message_if_empty(journal["approval_id"], audit_reason)
+                journal = journal_service.get_by_id(journal["approval_id"])
+            message = audit_reason
         if not already_completed:
             approver_id = int(self.user_id or 0)
             self._assert_approval_retry_owner(journal, approver_id)
-            self._assert_not_submitter_approval(commit_data, approver_id)
+            self._assert_not_submitter_approval(
+                commit_data,
+                approver_id,
+                allow_submitter=can_approve_own_submission,
+            )
         plan = None
         snapshot_records = None
 
@@ -984,8 +1021,20 @@ class MergeService(BaseService):
 
         return merged_entries
 
+    @require_permission("merge")
     def finalize_merge(self, merged_entries, merge_user_id, merge_id, message, *, approval_id=None):
         """Finalize the merge by updating database entries."""
+        if not merged_entries:
+            raise ValueError("No approved submission entries were provided for publication.")
+        actor_id = int(self.session.user_id or 0)
+        if not actor_id or int(merge_user_id or 0) != actor_id:
+            raise PermissionError("Only the current authorized approver can finalize this publication.")
+        active_project_id = int(self.session.project_id or 0)
+        entry_project_ids = {
+            int(item.get("project_id") or 0) for item in merged_entries
+        }
+        if not active_project_id or entry_project_ids != {active_project_id}:
+            raise PermissionError("A publication can only update the active project submission.")
         journal_service = (
             ApprovalJournalService(self.bom_service.pdm_service.db_name)
             if approval_id else None

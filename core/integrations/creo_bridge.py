@@ -671,6 +671,16 @@ class CreoBridgeController:
                 {"related_cad_document_id": model_id},
             )
         model = self._pdm_service().repo.get_cad_document(model_id) or {}
+        model_extension = Path(
+            str(model.get("file_name") or "")
+        ).suffix.casefold()
+        if model_extension not in {".prt", ".asm"}:
+            raise BridgeApiError(
+                409,
+                "drawing_model_not_bound",
+                "A drawing must be related to a PRT or ASM CAD Document.",
+                {"related_cad_document_id": model_id},
+            )
         if not model or not self._checked_out_in_workspace(
             model, int(user_id), workspace, workspace_service
         ):
@@ -792,6 +802,10 @@ class CreoBridgeController:
                         and drawing_model_id in local_by_id
                         and model_status.get("can_checkin")
                     )
+                    can_checkout_model = bool(
+                        drawing_model_id in local_by_id
+                        and model_status.get("can_checkout")
+                    )
                     actions = [skip, cancel]
                     default_action = "CANCEL"
                     severity = "BLOCKING"
@@ -805,6 +819,15 @@ class CreoBridgeController:
                         ))
                         default_action = "ADD_REQUIRED_OBJECTS"
                         severity = "OVERRIDABLE"
+                    elif can_checkout_model:
+                        actions.insert(0, self._conflict_action(
+                            "CHECKOUT_REQUIRED_MODEL", "Check Out Related Model"
+                        ))
+                        default_action = "CHECKOUT_REQUIRED_MODEL"
+                        severity = "OVERRIDABLE"
+                        description += (
+                            " Check out the related model in this workspace to continue."
+                        )
                     else:
                         description += (
                             " Retrieve and check out the related model in this workspace first."
@@ -1408,10 +1431,22 @@ class CreoBridgeController:
                         owner_name = item["drawing_models"][0]
                         owner_item = prepared_by_name.get(owner_name)
                         owner_id = owner_item.get("cad_id") if owner_item else None
+                        if owner_item and owner_item["extension"] not in {".prt", ".asm"}:
+                            raise BridgeApiError(
+                                409, "drawing_model_invalid",
+                                f"{owner_name} is not a PRT or ASM CAD model.",
+                            )
                         if owner_id is None:
                             owner = pdm_service.repo.get_cad_document_by_file(
                                 int(project_id), owner_name
                             )
+                            if owner and Path(
+                                str(owner.get("file_name") or "")
+                            ).suffix.casefold() not in {".prt", ".asm"}:
+                                raise BridgeApiError(
+                                    409, "drawing_model_invalid",
+                                    f"{owner_name} is not a PRT or ASM CAD model.",
+                                )
                             owner_id = int(owner["id"]) if owner else None
                         if owner_id is None:
                             raise BridgeApiError(

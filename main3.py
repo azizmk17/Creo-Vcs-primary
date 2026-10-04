@@ -99,13 +99,9 @@ PAGE_PRESENTATION = {
 
 
 def _run_migrations_safely():
-    try:
-        from setup.migrations import migrate
+    from setup.migrations import migrate
 
-        migrate()
-    except Exception as _e:
-        # Don't block app startup on migration issues.
-        print(f"[migrations] warning: {_e}")
+    migrate()
 
 
 
@@ -219,11 +215,15 @@ class AdvancedLoader(QWidget):
 
 
 class _MigrateWorker(QObject):
-    finished = pyqtSignal()
+    finished = pyqtSignal(object)
 
     def run(self):
-        _run_migrations_safely()
-        self.finished.emit()
+        try:
+            _run_migrations_safely()
+        except Exception as exc:
+            self.finished.emit(exc)
+        else:
+            self.finished.emit(None)
 
 
 class StartupWindow(QMainWindow):
@@ -269,8 +269,21 @@ class StartupWindow(QMainWindow):
         self._migrate_worker.finished.connect(self._migrate_thread.quit)
         self._migrate_worker.finished.connect(self._migrate_worker.deleteLater)
         self._migrate_thread.finished.connect(self._migrate_thread.deleteLater)
-        self._migrate_thread.finished.connect(self._build_main_window)
+        self._migrate_worker.finished.connect(self._on_migrations_finished)
         self._migrate_thread.start()
+
+    def _on_migrations_finished(self, error):
+        if error is not None:
+            self._minimum_loader_timer.stop()
+            self._startup_gate.reset()
+            QMessageBox.critical(
+                self,
+                "Database Migration Failed",
+                f"{APP_NAME} could not prepare its database and will not continue.\n\n{error}",
+            )
+            self.close()
+            return
+        self._build_main_window()
 
     def _set_loading_status(self, message):
         self.loader_page.set_status(message)
@@ -358,6 +371,7 @@ class BomGUI(QMainWindow):
         self._project_combo_initializing = False
         self._projects_for_user = []
         self._ensure_valid_current_project()
+        self._drain_cad_workspace_release_queue()
         self._start_creo_bridge()
 
         # Persistent application shell
@@ -366,6 +380,20 @@ class BomGUI(QMainWindow):
 
         self._build_ui(startup_progress=startup_progress)
         self._start_project_event_sync()
+
+    def _drain_cad_workspace_release_queue(self):
+        try:
+            from config import DB_NAME
+            from core.services.cad_workspace_service import CadWorkspaceService
+
+            result = CadWorkspaceService().process_pending_approval_releases(DB_NAME)
+            if result["failed_ids"]:
+                print(
+                    "[cad-workspace] queued approval cleanup failed for "
+                    f"entries {result['failed_ids']}"
+                )
+        except Exception as exc:
+            print(f"[cad-workspace] could not process approval cleanup queue: {exc}")
 
     def _start_creo_bridge(self):
         if str(os.environ.get("NEXUS_CREO_BRIDGE_DISABLED", "")).lower() in {

@@ -927,7 +927,6 @@ class CommitPage(QWidget):
         self.push_dev_btn.setEnabled(project_loaded and self.perm.can("merge"))
         self.merge_master_btn.setEnabled(project_loaded and self.perm.can("merge"))
         self.snapshot_btn.setEnabled(project_loaded)
-        self.revert_btn.setEnabled(project_loaded)
 
         if self.session.project_id:
             QTimer.singleShot(0, self.load_commit_history)
@@ -1343,12 +1342,6 @@ class CommitPage(QWidget):
         self.pending_container_layout.setSpacing(4)
         pending_scroll.setWidget(pending_content)
         pending_lay.addWidget(pending_scroll, 1)
-
-        self.revert_btn = QPushButton("Revert Selected Commit")
-        self.revert_btn.setObjectName("danger")
-        self.revert_btn.setCursor(Qt.PointingHandCursor)
-        self.revert_btn.clicked.connect(self.revert_commit)
-        pending_lay.addWidget(self.revert_btn)
 
         top_layout.addWidget(pending_group, 1)
         main_splitter.addWidget(top_widget)
@@ -2947,14 +2940,6 @@ class CommitPage(QWidget):
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(8)
 
-        warning_label = QLabel("Revert is irreversible")
-        warning_label.setStyleSheet("color: #dc2626; font-size: 10px;")
-        warning_label.setVisible(False)
-
-        def show_warning():
-            warning_label.setVisible(True)
-            QTimer.singleShot(3000, lambda: warning_label.setVisible(False))
-
         def handle_validate():
             confirmed = []
             rejected = []
@@ -2974,12 +2959,6 @@ class CommitPage(QWidget):
         def handle_push():
             self.push_to_master(group)
             dialog.accept()
-
-        def handle_revert():
-            show_warning()
-            success = self.revert_commit(group)
-            if success:
-                dialog.accept()
 
         def handle_withdraw():
             answer = QMessageBox.question(
@@ -3035,11 +3014,6 @@ class CommitPage(QWidget):
             except Exception as exc:
                 QMessageBox.critical(dialog, "Rejection Failed", str(exc))
 
-        revert_btn = QPushButton("Revert")
-        revert_btn.setObjectName("danger")
-        revert_btn.setCursor(Qt.PointingHandCursor)
-        revert_btn.clicked.connect(handle_revert)
-
         withdraw_btn = QPushButton("Withdraw")
         withdraw_btn.setObjectName("danger")
         withdraw_btn.setCursor(Qt.PointingHandCursor)
@@ -3057,7 +3031,14 @@ class CommitPage(QWidget):
         reject_btn.setObjectName("danger")
         reject_btn.setCursor(Qt.PointingHandCursor)
         reject_btn.clicked.connect(handle_reject)
-        reject_btn.setVisible(str(group.get("status") or "").casefold() == "validated")
+        try:
+            is_submitter = int(group.get("designer") or 0) == int(self.session.user_id)
+        except (TypeError, ValueError):
+            is_submitter = False
+        reject_btn.setVisible(
+            str(group.get("status") or "").casefold() == "validated"
+            and not is_submitter
+        )
         reject_btn.setEnabled(self.perm.can("merge"))
 
         validate_btn = QPushButton("Validate")
@@ -3083,12 +3064,10 @@ class CommitPage(QWidget):
         close_btn.setCursor(Qt.PointingHandCursor)
         close_btn.clicked.connect(dialog.reject)
 
-        btn_layout.addWidget(warning_label)
         btn_layout.addStretch()
         btn_layout.addWidget(close_btn)
         btn_layout.addWidget(withdraw_btn)
         btn_layout.addWidget(reject_btn)
-        btn_layout.addWidget(revert_btn)
         btn_layout.addWidget(validate_btn)
         btn_layout.addWidget(push_btn)
 
@@ -3444,7 +3423,6 @@ class CommitPage(QWidget):
             (getattr(self, "attach_affected_btn", None), can_commit and bool(self.uncommitted_parts)),
             (getattr(self, "push_dev_btn", None), can_merge),
             (getattr(self, "merge_master_btn", None), can_merge),
-            (getattr(self, "revert_btn", None), project_loaded),
             (getattr(self, "snapshot_btn", None), project_loaded),
         ):
             try:
@@ -3871,8 +3849,27 @@ class CommitPage(QWidget):
                 "Switch to that project to push/merge it.",
             )
             return
+        approval_message = ""
+        if bool(getattr(self.session, "is_admin", False)):
+            approval_message, accepted = QInputDialog.getMultiLineText(
+                self,
+                "Administrator Approval",
+                "Reason for approving this submission (required):",
+            )
+            approval_message = str(approval_message or "").strip()
+            if not accepted:
+                return
+            if not approval_message:
+                QMessageBox.warning(
+                    self,
+                    "Reason Required",
+                    "Enter an approval reason to create the administrator audit record.",
+                )
+                return
         def do_push():
-            merge_result = self.merge_service.excute_merge_by_commit_id(group["commit_id"])
+            merge_result = self.merge_service.excute_merge_by_commit_id(
+                group["commit_id"], approval_message
+            )
             if isinstance(merge_result, dict):
                 affected_part_ids = merge_result.get("affected_part_ids") or []
                 affected_cad_document_ids = merge_result.get("affected_cad_document_ids") or []
@@ -4051,42 +4048,6 @@ class CommitPage(QWidget):
                 bom_page.refresh_issue_indicators(affected_part_ids)
         except Exception:
             pass
-
-    def revert_commit(self, group=None):
-        if not group:
-            if not getattr(self, "selected_group", None):
-                QMessageBox.warning(self, "Error",
-                    "Select a commit group to revert.")
-                return False
-            group = self.selected_group
-
-        commit_id = group.get("commit_id") or group.get("id")
-        title = group.get("title", "Untitled")
-
-        if not commit_id:
-            QMessageBox.warning(self, "Error", "Invalid commit data.")
-            return False
-
-        confirm = QMessageBox.question(
-            self, "Confirm Revert",
-            f"Are you sure you want to revert:\n\n🧩 {title}\n(ID: {commit_id})?",
-            QMessageBox.Yes | QMessageBox.No,
-        )
-
-        if confirm == QMessageBox.Yes:
-            try:
-                self.commit_service.revert_commit(
-                    commit_id, project_id=group.get("project_id"))
-                QMessageBox.information(self, "Reverted",
-                    f"Commit '{title}' reverted successfully.")
-                self.load_pending_commits()
-                self.selected_group = None
-                self.selected_card = None
-                return True
-            except Exception as e:
-                QMessageBox.critical(self, "Error",
-                    f"Failed to revert:\n\n{str(e)}")
-        return False
 
     def create_snapshot(self):
         QMessageBox.critical(self, "Error", "Failed to create snapshot")

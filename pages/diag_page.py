@@ -11,6 +11,9 @@ from core.repositories.diag_repository import DiagRepository
 from core.services.project_service import ProjectService
 from core.session_manager import SessionManager
 from core.services.ui_permission import UIPermissionHelper
+from core.services.cad_workspace_service import CadWorkspaceService
+from core.services.pdm_operations_health_service import PdmOperationsHealthService
+from config import DB_NAME
 
 import os
 
@@ -19,6 +22,7 @@ class DiagPage(QDialog):
         super().__init__(parent)
         self.setFont(QFont("Segoe UI", 8))
         self.service = DiagService()
+        self.pdm_operations_health = PdmOperationsHealthService()
         self.session = SessionManager()
         self.project_service = ProjectService()
         self.perm = UIPermissionHelper()
@@ -46,6 +50,7 @@ class DiagPage(QDialog):
                 self.commits_dir = self.working_dir + "/commits"
 
         self._apply_action_permissions()
+        self._set_initial_pdm_health_row()
 
     def _apply_action_permissions(self):
         project_loaded = bool(self.session.project_id)
@@ -56,6 +61,10 @@ class DiagPage(QDialog):
             self.btn_delete_selected.setEnabled(can_admin_actions)
             self.btn_assign_supplier.setEnabled(can_admin_actions)
             self.btn_unassign_supplier.setEnabled(can_admin_actions)
+            self.btn_check_pdm_health.setEnabled(self.session.is_active())
+            self.btn_retry_workspace_cleanup.setEnabled(
+                project_loaded and self.session.is_active()
+            )
             if not project_loaded:
                 tip = "Load a project to use this action."
             elif not can_admin_actions:
@@ -140,10 +149,34 @@ class DiagPage(QDialog):
         self.tab_working = self.create_tab_table("Working Directory Validation")
         self.tab_orphan = self.create_tab_table("Untracked / Orphan Files")
         self.tab_supplier = self.create_tab_table("Supplier-owned CAD Dependencies")
+        self.tab_pdm_operations = self.create_tab_table("PDM Operations Health")
         self.tabs.addTab(self.tab_db, "Database Sync")
         self.tabs.addTab(self.tab_working, "Working Dir Check")
         self.tabs.addTab(self.tab_orphan, "Orphan Files")
         self.tabs.addTab(self.tab_supplier, "Supplier Packages")
+        self.tabs.addTab(self.tab_pdm_operations, "PDM Operations")
+        self.tab_pdm_operations.table.setHorizontalHeaderLabels(
+            ["Area", "Status", "Details / Recovery"]
+        )
+        self.tab_pdm_operations.table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeToContents
+        )
+        self.tab_pdm_operations.table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeToContents
+        )
+        self.tab_pdm_operations.table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.Stretch
+        )
+        operations_layout = self.tab_pdm_operations.layout()
+        operations_actions = QHBoxLayout()
+        self.btn_check_pdm_health = QPushButton("Run Health Check")
+        self.btn_retry_workspace_cleanup = QPushButton("Retry Local Cleanup")
+        self.btn_check_pdm_health.setObjectName("secondary")
+        self.btn_retry_workspace_cleanup.setObjectName("primary")
+        operations_actions.addWidget(self.btn_check_pdm_health)
+        operations_actions.addWidget(self.btn_retry_workspace_cleanup)
+        operations_actions.addStretch(1)
+        operations_layout.insertLayout(0, operations_actions)
         layout.addWidget(self.tabs, 3)
 
         # Actions for unexpected parts
@@ -300,6 +333,8 @@ class DiagPage(QDialog):
         self.table_search_input.textChanged.connect(self._apply_current_table_filter)
         self.show_only_selected_input.toggled.connect(self._apply_current_table_filter)
         self.tabs.currentChanged.connect(self._apply_current_table_filter)
+        self.btn_check_pdm_health.clicked.connect(self.refresh_pdm_operations_health)
+        self.btn_retry_workspace_cleanup.clicked.connect(self.retry_local_workspace_cleanup)
 
     def create_status_box(self, title, value, color):
         frame = QFrame()
@@ -447,7 +482,72 @@ class DiagPage(QDialog):
         update_status(self.lbl_status_orphan, "#F39C12")
 
         self.console.append(">> Scan complete.\n")
+        self.refresh_pdm_operations_health()
         self._apply_action_permissions()
+
+    def refresh_pdm_operations_health(self):
+        project_id = self.session.project_id
+        try:
+            health_rows = self.pdm_operations_health.inspect(project_id)
+        except Exception as exc:
+            health_rows = [{
+                "area": "PDM Operations",
+                "status": "ERROR",
+                "details": f"Health inspection failed: {exc}",
+            }]
+
+        table = self.tab_pdm_operations.table
+        table.setRowCount(len(health_rows))
+        for row_index, row in enumerate(health_rows):
+            values = (row.get("area", ""), row.get("status", ""), row.get("details", ""))
+            for column, value in enumerate(values):
+                cell = QTableWidgetItem(str(value or ""))
+                if column == 2:
+                    cell.setToolTip(str(value or ""))
+                table.setItem(row_index, column, cell)
+        self.console.append(">> PDM operations health refreshed.\n")
+
+    def _set_initial_pdm_health_row(self):
+        table = self.tab_pdm_operations.table
+        table.setRowCount(1)
+        table.setItem(0, 0, QTableWidgetItem("PDM Operations"))
+        table.setItem(0, 1, QTableWidgetItem("READY"))
+        table.setItem(
+            0,
+            2,
+            QTableWidgetItem("Run Health Check to inspect the shared database, file stores, and recovery queues."),
+        )
+
+    def retry_local_workspace_cleanup(self):
+        if not self.session.is_active():
+            QMessageBox.warning(self, "Sign in required", "Sign in before retrying workspace recovery.")
+            return
+        answer = QMessageBox.question(
+            self,
+            "Retry Local Cleanup",
+            "Retry approved CAD workspace cleanup tasks assigned to this machine?\n\n"
+            "This does not approve submissions or release checkouts owned by another machine.",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            result = CadWorkspaceService().process_pending_approval_releases(
+                DB_NAME, project_id=int(self.session.project_id), limit=50
+            )
+            failed = list(result.get("failed_ids") or [])
+            message = f"Completed {int(result.get('completed') or 0)} cleanup task(s)."
+            if failed:
+                message += "\n\nStill pending: " + ", ".join(str(value) for value in failed)
+                QMessageBox.warning(self, "Cleanup Retry", message)
+            else:
+                QMessageBox.information(self, "Cleanup Retry", message)
+            self.console.append(">> " + message.replace("\n", " ") + "\n")
+        except Exception as exc:
+            QMessageBox.critical(self, "Cleanup Retry Failed", str(exc))
+            self.console.append(f">> Workspace cleanup retry failed: {exc}\n")
+        self.refresh_pdm_operations_health()
 
     def _populate_supplier_dependencies(self, dependencies) -> None:
         table = self.tab_supplier.table

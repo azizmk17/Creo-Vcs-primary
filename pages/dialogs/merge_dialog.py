@@ -52,10 +52,15 @@ class MergeDialog(QDialog):
         self.tree.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         layout.addWidget(self.tree, 1)
 
-        # Merge message
-        layout.addWidget(make_section_title("INTEGRATION COMMENT"))
+        is_admin = bool(getattr(getattr(self.merge_service, "session", None), "is_admin", False))
+        layout.addWidget(make_section_title(
+            "ADMINISTRATOR APPROVAL REASON" if is_admin else "INTEGRATION COMMENT"
+        ))
         self.message_edit = QTextEdit()
-        self.message_edit.setPlaceholderText("Required: describe the integrated change set")
+        self.message_edit.setPlaceholderText(
+            "Required: explain this administrator approval" if is_admin
+            else "Required: describe the integrated change set"
+        )
         self.message_edit.setFixedHeight(72)
         layout.addWidget(self.message_edit)
 

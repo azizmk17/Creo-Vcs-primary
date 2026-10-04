@@ -27,6 +27,20 @@ def encode(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
+def _payload_integer(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if re.fullmatch(r"[0-9]+", text):
+            return int(text)
+    return None
+
+
 def file_hash(path):
     digest = hashlib.sha256()
     with open(path, "rb") as stream:
@@ -81,9 +95,9 @@ class CadStructureSyncService:
         for raw in payload.get("dependency_baselines") or []:
             if not isinstance(raw, dict):
                 raise ValueError("Creo dependency baseline is invalid.")
-            cad_id = raw.get("cad_document_id")
-            iteration = raw.get("iteration")
-            if type(cad_id) is not int or cad_id <= 0 or type(iteration) is not int or iteration < 0:
+            cad_id = _payload_integer(raw.get("cad_document_id"))
+            iteration = _payload_integer(raw.get("iteration"))
+            if cad_id is None or cad_id <= 0 or iteration is None or iteration < 0:
                 raise ValueError("Creo dependency baseline identity or iteration is invalid.")
             dependency_baselines.append({
                 "cad_document_id": cad_id,

@@ -35,7 +35,8 @@ echo Compiling Nexus PDM J-Link with Java 7...
     "%SOURCE%\NexusFeatureMutationGuard.java" ^
     "%SOURCE%\NexusSolidMutationGuard.java" ^
     "%SOURCE%\NexusSessionMutationGuard.java" ^
-    "%SOURCE%\NexusJLink.java"
+    "%SOURCE%\NexusJLink.java" ^
+    "%SOURCE%\NexusParameterChangeGuard.java"
 
 if errorlevel 1 (
     echo ERROR: Compilation failed.

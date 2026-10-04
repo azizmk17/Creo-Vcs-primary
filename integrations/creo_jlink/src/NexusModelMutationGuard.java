@@ -11,10 +11,17 @@ public class NexusModelMutationGuard extends DefaultModelActionListener {
         NexusJLink.requireModelEdit(owner, "parameter creation");
     }
 
-    public void OnBeforeParameterModify(Parameter parameter, ParamValue value)
-        throws jxthrowable {
+    public void OnBeforeParameterModify(
+            Parameter parameter, ParamValue value)
+            throws jxthrowable {
+
+        if (NexusParameterChangeGuard.isUnchanged(parameter, value)) {
+            return;
+        }
+
         NexusJLink.requireModelEdit(
-            NexusJLink.modelForChild(parameter), "parameter modification"
+            NexusJLink.modelForChild(parameter),
+            "parameter modification"
         );
     }
 

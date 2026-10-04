@@ -750,7 +750,8 @@ class CadWorkspaceService:
             self._save_manifest(str(workspace_id), manifest)
 
     def process_pending_approval_releases(
-        self, db_name: str, *, approval_key: str | None = None, limit: int = 100
+        self, db_name: str, *, approval_key: str | None = None,
+        project_id: int | None = None, limit: int = 100
     ) -> dict:
         """Retry durable workspace cleanup on the machine that owns each workspace."""
         completed = 0
@@ -761,15 +762,19 @@ class CadWorkspaceService:
                 conn.row_factory = sqlite3.Row
                 params = [str(self.machine_id)]
                 approval_clause = ""
+                project_clause = ""
                 if approval_key is not None:
                     approval_clause = "AND approval_key=?"
                     params.append(str(approval_key))
+                if project_id is not None:
+                    project_clause = "AND project_id=?"
+                    params.append(int(project_id))
                 params.append(batch_size)
                 rows = conn.execute(
                     f"""
                     SELECT id,workspace_id,cad_document_id
                     FROM cad_workspace_release_queue
-                    WHERE completed_at IS NULL AND machine_id=? {approval_clause}
+                    WHERE completed_at IS NULL AND machine_id=? {approval_clause} {project_clause}
                     ORDER BY id LIMIT ?
                     """,
                     tuple(params),

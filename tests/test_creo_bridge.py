@@ -632,6 +632,46 @@ class CreoBridgeControllerTests(unittest.TestCase):
             [row["code"] for row in complete_conflicts],
         )
 
+    def test_drawing_preflight_offers_checkout_for_local_managed_owner(self):
+        self.repo.documents[1].update({
+            "category": "ASSEMBLY",
+            "checked_out_by": None,
+            "checkout_workspace_id": None,
+            "checkout_workspace_machine_id": "",
+        })
+        self.repo.documents[5] = {
+            "id": 5,
+            "project_id": 9,
+            "file_name": "machine.drw",
+            "category": "DRAWING",
+            "drawing_owner_cad_document_id": 1,
+            "checked_out_by": 7,
+            "checkout_workspace_id": "workspace-one",
+            "checkout_workspace_machine_id": "",
+        }
+        self.workspace_service.manifest_entries = {
+            1: {"baseline_cad_revision": "", "baseline_cad_iteration": 0},
+            5: {"baseline_cad_revision": "", "baseline_cad_iteration": 0},
+        }
+        self.workspace_service.local_rows = [
+            {"cad_document_id": 1, "modified": False},
+            {"cad_document_id": 5, "modified": True},
+        ]
+
+        conflicts = self.controller._checkin_preflight_conflicts(
+            [5], self.workspace_service,
+            self.workspace_service.get_workspace("workspace-one"), 7, 9,
+        )
+        owner_conflict = next(
+            row for row in conflicts
+            if row["code"] == "DRAWING_MODEL_NOT_SELECTED"
+        )
+        self.assertEqual(owner_conflict["default_action"], "CHECKOUT_REQUIRED_MODEL")
+        self.assertEqual(
+            owner_conflict["actions"][0]["code"], "CHECKOUT_REQUIRED_MODEL"
+        )
+        self.assertEqual(owner_conflict["related_cad_document_ids"], [1])
+
     def test_drawing_checkin_endpoint_revalidates_batch_and_workspace(self):
         self.repo.documents[1].update({
             "category": "ASSEMBLY",

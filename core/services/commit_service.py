@@ -1403,22 +1403,6 @@ class CommitService(BaseService):
         return result
 
     
-    def revert_commit(self, commit_id: int, project_id: int = None):
-        effective_project_id = int(project_id) if project_id is not None else self.session.project_id
-        result = self.traceability_service.mark_commit_reverted(
-            str(commit_id),
-            effective_project_id,
-            "Reverted from Commit page",
-        )
-        self.emit_project_event(
-            "commit.reverted",
-            entity_type="COMMIT",
-            entity_id=str(commit_id),
-            payload={"commit_id": str(commit_id), "status": "Reverted"},
-            project_id=effective_project_id,
-        )
-        return result
-    
     @require_permission("validate")
     def validate_commit(self, commit_id: int, project_id: int = None,
                         confirmed_issue_ids=None, rejected_issue_ids=None, validation_comment=""):

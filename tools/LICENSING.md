@@ -178,7 +178,7 @@ The application needs two things at startup:
 **Running manually (development / testing):**
 ```powershell
 $env:CREOVCS_PUBLIC_KEY_HEX = "ab9020d80ccc70146c1eb9100b562022c46d326e7e9a2c0ce566591415064907"
-$env:CREOVCS_LICENSE_PATH   = "customer.lic"
+$env:CREOVCS_LICENSE_PATH   = "creovcs.lic"
 python main3.py
 ```
 

@@ -17,5 +17,7 @@ class Merge:
     designer_username: str
     cad_document_id: Optional[int] = None
     creo_file_version: Optional[int] = None
+    designer: Optional[int] = None
+    committed_by: Optional[int] = None
     
     
