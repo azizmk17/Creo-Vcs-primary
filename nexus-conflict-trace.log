@@ -1,0 +1,126 @@
+
+Tue Sep 29 17:34:40 WAT 2026
+File: test_prt.prt
+can_modify: false
+local_edit_intent: false
+preserveLocalChanges: false
+java.lang.Exception: Caller of Nexus conflict dialog
+	at NexusJLink.resolveModelConflict(NexusJLink.java:750)
+	at NexusJLink.requireModelEdit(NexusJLink.java:684)
+	at NexusModelMutationGuard.OnBeforeParameterModify(NexusModelMutationGuard.java:16)
+	at com.ptc.pfc.Implementation.PFCRemoteCommImpl.dispatch(PFCRemoteCommImpl.java:309)
+	at com.ptc.cipjava.CIPRemoteComm.processMessages(CIPRemoteComm.java:116)
+	at com.ptc.pfc.Implementation.Starter.serverLoop(Starter.java:66)
+	at com.ptc.pfc.Implementation.Starter.main(Starter.java:44)
+
+Tue Sep 29 17:34:42 WAT 2026
+File: test_prt.prt
+can_modify: false
+local_edit_intent: false
+preserveLocalChanges: false
+java.lang.Exception: Caller of Nexus conflict dialog
+	at NexusJLink.resolveModelConflict(NexusJLink.java:750)
+	at NexusJLink.requireModelEdit(NexusJLink.java:684)
+	at NexusModelMutationGuard.OnBeforeParameterModify(NexusModelMutationGuard.java:16)
+	at com.ptc.pfc.Implementation.PFCRemoteCommImpl.dispatch(PFCRemoteCommImpl.java:309)
+	at com.ptc.cipjava.CIPRemoteComm.processMessages(CIPRemoteComm.java:116)
+	at com.ptc.pfc.Implementation.Starter.serverLoop(Starter.java:66)
+	at com.ptc.pfc.Implementation.Starter.main(Starter.java:44)
+
+Tue Sep 29 17:34:53 WAT 2026
+File: test_prt.prt
+can_modify: false
+local_edit_intent: false
+preserveLocalChanges: false
+java.lang.Exception: Caller of Nexus conflict dialog
+	at NexusJLink.resolveModelConflict(NexusJLink.java:750)
+	at NexusJLink.requireModelEdit(NexusJLink.java:684)
+	at NexusModelMutationGuard.OnBeforeParameterModify(NexusModelMutationGuard.java:16)
+	at com.ptc.pfc.Implementation.PFCRemoteCommImpl.dispatch(PFCRemoteCommImpl.java:309)
+	at com.ptc.cipjava.CIPRemoteComm.processMessages(CIPRemoteComm.java:116)
+	at com.ptc.pfc.Implementation.Starter.serverLoop(Starter.java:66)
+	at com.ptc.pfc.Implementation.Starter.main(Starter.java:44)
+
+Tue Sep 29 17:34:58 WAT 2026
+File: test_prt.prt
+can_modify: false
+local_edit_intent: false
+preserveLocalChanges: false
+java.lang.Exception: Caller of Nexus conflict dialog
+	at NexusJLink.resolveModelConflict(NexusJLink.java:750)
+	at NexusJLink.requireModelEdit(NexusJLink.java:684)
+	at NexusModelMutationGuard.OnBeforeParameterModify(NexusModelMutationGuard.java:16)
+	at com.ptc.pfc.Implementation.PFCRemoteCommImpl.dispatch(PFCRemoteCommImpl.java:309)
+	at com.ptc.cipjava.CIPRemoteComm.processMessages(CIPRemoteComm.java:116)
+	at com.ptc.pfc.Implementation.Starter.serverLoop(Starter.java:66)
+	at com.ptc.pfc.Implementation.Starter.main(Starter.java:44)
+
+Tue Sep 29 17:35:02 WAT 2026
+File: test_prt.prt
+can_modify: false
+local_edit_intent: false
+preserveLocalChanges: false
+java.lang.Exception: Caller of Nexus conflict dialog
+	at NexusJLink.resolveModelConflict(NexusJLink.java:750)
+	at NexusJLink.requireModelEdit(NexusJLink.java:684)
+	at NexusModelMutationGuard.OnBeforeParameterModify(NexusModelMutationGuard.java:16)
+	at com.ptc.pfc.Implementation.PFCRemoteCommImpl.dispatch(PFCRemoteCommImpl.java:309)
+	at com.ptc.cipjava.CIPRemoteComm.processMessages(CIPRemoteComm.java:116)
+	at com.ptc.pfc.Implementation.Starter.serverLoop(Starter.java:66)
+	at com.ptc.pfc.Implementation.Starter.main(Starter.java:44)
+
+Tue Sep 29 17:35:02 WAT 2026
+File: test_prt.prt
+can_modify: false
+local_edit_intent: false
+preserveLocalChanges: false
+java.lang.Exception: Caller of Nexus conflict dialog
+	at NexusJLink.resolveModelConflict(NexusJLink.java:750)
+	at NexusJLink.requireModelEdit(NexusJLink.java:684)
+	at NexusModelMutationGuard.OnBeforeParameterModify(NexusModelMutationGuard.java:16)
+	at com.ptc.pfc.Implementation.PFCRemoteCommImpl.dispatch(PFCRemoteCommImpl.java:309)
+	at com.ptc.cipjava.CIPRemoteComm.processMessages(CIPRemoteComm.java:116)
+	at com.ptc.pfc.Implementation.Starter.serverLoop(Starter.java:66)
+	at com.ptc.pfc.Implementation.Starter.main(Starter.java:44)
+
+Tue Sep 29 17:35:03 WAT 2026
+File: test_prt.prt
+can_modify: false
+local_edit_intent: false
+preserveLocalChanges: true
+java.lang.Exception: Caller of Nexus conflict dialog
+	at NexusJLink.resolveModelConflict(NexusJLink.java:750)
+	at NexusJLink.requireModelEdit(NexusJLink.java:684)
+	at NexusModelMutationGuard.OnBeforeParameterModify(NexusModelMutationGuard.java:16)
+	at com.ptc.pfc.Implementation.PFCRemoteCommImpl.dispatch(PFCRemoteCommImpl.java:309)
+	at com.ptc.cipjava.CIPRemoteComm.processMessages(CIPRemoteComm.java:116)
+	at com.ptc.pfc.Implementation.Starter.serverLoop(Starter.java:66)
+	at com.ptc.pfc.Implementation.Starter.main(Starter.java:44)
+
+Tue Sep 29 17:35:03 WAT 2026
+File: test_prt.prt
+can_modify: false
+local_edit_intent: false
+preserveLocalChanges: true
+java.lang.Exception: Caller of Nexus conflict dialog
+	at NexusJLink.resolveModelConflict(NexusJLink.java:750)
+	at NexusJLink.requireModelEdit(NexusJLink.java:684)
+	at NexusModelMutationGuard.OnBeforeParameterModify(NexusModelMutationGuard.java:16)
+	at com.ptc.pfc.Implementation.PFCRemoteCommImpl.dispatch(PFCRemoteCommImpl.java:309)
+	at com.ptc.cipjava.CIPRemoteComm.processMessages(CIPRemoteComm.java:116)
+	at com.ptc.pfc.Implementation.Starter.serverLoop(Starter.java:66)
+	at com.ptc.pfc.Implementation.Starter.main(Starter.java:44)
+
+Tue Sep 29 17:35:04 WAT 2026
+File: test_prt.prt
+can_modify: false
+local_edit_intent: false
+preserveLocalChanges: true
+java.lang.Exception: Caller of Nexus conflict dialog
+	at NexusJLink.resolveModelConflict(NexusJLink.java:750)
+	at NexusJLink.requireModelEdit(NexusJLink.java:684)
+	at NexusModelMutationGuard.OnBeforeParameterModify(NexusModelMutationGuard.java:16)
+	at com.ptc.pfc.Implementation.PFCRemoteCommImpl.dispatch(PFCRemoteCommImpl.java:309)
+	at com.ptc.cipjava.CIPRemoteComm.processMessages(CIPRemoteComm.java:116)
+	at com.ptc.pfc.Implementation.Starter.serverLoop(Starter.java:66)
+	at com.ptc.pfc.Implementation.Starter.main(Starter.java:44)
