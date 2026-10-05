@@ -569,6 +569,14 @@ class CommitService(BaseService):
                     )
                 raise ValueError(f"cad_register_required:{filename}")
 
+            expected_baseline_hash = str(
+                (workspace_expected or {}).get("baseline_sha256") or ""
+            ).strip().casefold()
+            current_iteration = self.pdm_service.repo.get_current_cad_iteration(
+                int(cad_document["id"])
+            ) or {}
+            approved_hash = str(current_iteration.get("sha256") or "").strip().casefold()
+
             if workspace_expected:
                 expected_cad_id = workspace_expected.get("cad_document_id")
                 if (
@@ -607,13 +615,6 @@ class CommitService(BaseService):
                         f"{baseline_iteration}, but the current approved iteration is "
                         f"{cad_document.get('iteration') or 'unknown'}. Retrieve the latest copy."
                     )
-                expected_baseline_hash = str(
-                    workspace_expected.get("baseline_sha256") or ""
-                ).strip().casefold()
-                current_iteration = self.pdm_service.repo.get_current_cad_iteration(
-                    int(cad_document["id"])
-                ) or {}
-                approved_hash = str(current_iteration.get("sha256") or "").strip().casefold()
                 if expected_baseline_hash:
                     if approved_hash and approved_hash != expected_baseline_hash:
                         raise ValueError(
