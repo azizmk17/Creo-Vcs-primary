@@ -24,6 +24,19 @@ if not exist "%DIST%" mkdir "%DIST%"
 del /q "%OUTPUT%\*.class" >nul 2>&1
 
 echo Compiling Nexus PDM J-Link with Java 7...
+"%JDK_HOME%\bin\javac.exe" -source 1.7 -target 1.7 -Xlint:all -d "%OUTPUT%" ^
+    "%~dp0tools\GenerateNexusIcons.java"
+if errorlevel 1 (
+    echo ERROR: Icon generator compilation failed.
+    exit /b 1
+)
+
+"%JDK_HOME%\bin\java.exe" -cp "%OUTPUT%" GenerateNexusIcons "%~dp0text\usascii\resource"
+if errorlevel 1 (
+    echo ERROR: Nexus ribbon icon generation failed.
+    exit /b 1
+)
+
 "%JDK_HOME%\bin\javac.exe" -source 1.7 -target 1.7 -Xlint:all -classpath "%PFC_JAR%" -d "%OUTPUT%" ^
     "%SOURCE%\MiniJson.java" ^
     "%SOURCE%\NexusDialogs.java" ^

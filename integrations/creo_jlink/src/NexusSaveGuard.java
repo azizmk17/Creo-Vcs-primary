@@ -71,8 +71,18 @@ public class NexusSaveGuard extends DefaultUICommandBracketListener {
                         }
                     }
                 } else if (!modelIsInsideWorkspace(model, MiniJson.text(status, "workspace_path"))) {
-                    block = true;
-                    reason = "Open the checked-out copy from its assigned Nexus CAD workspace before editing.";
+                    File origin = modelOrigin(model);
+                    if ("save".equals(action)
+                        && MiniJson.bool(status, "can_modify")
+                        && origin != null) {
+                        conflictHandled = true;
+                        if (confirmSaveFromOtherLocation(origin, status)) return;
+                        block = true;
+                        reason = "Save from the alternate location was canceled.";
+                    } else {
+                        block = true;
+                        reason = "Open the checked-out copy from its assigned Nexus CAD workspace before editing.";
+                    }
                 } else if (MiniJson.bool(status, "local_edit_intent")) {
                     if ("save".equals(action)) {
                         // Local intent permits local Save only; server check-in remains blocked.
@@ -98,6 +108,24 @@ public class NexusSaveGuard extends DefaultUICommandBracketListener {
             }
             XCancelProEAction.Throw();
         }
+    }
+
+    private boolean confirmSaveFromOtherLocation(
+        File origin, Map<String, Object> status
+    ) {
+        String assignedWorkspace = MiniJson.text(status, "workspace_path");
+        return NexusDialogs.confirm(
+            "This model is loaded from a different location:\n\n"
+                + origin.getAbsolutePath()
+                + "\n\nIts assigned Nexus workspace is:\n\n"
+                + assignedWorkspace
+                + "\n\nSaving will modify only the currently loaded copy. "
+                + "The assigned workspace copy will not be updated, and Nexus check-in "
+                + "still requires the file from that workspace.\n\n"
+                + "Continue saving this copy from its current location?",
+            "Save Model From Another Location",
+            javax.swing.JOptionPane.WARNING_MESSAGE
+        );
     }
 
     private boolean modelIsInsideWorkspace(Model model, String workspacePath) {

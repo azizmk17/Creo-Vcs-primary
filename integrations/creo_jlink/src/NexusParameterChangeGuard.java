@@ -9,34 +9,13 @@ import java.io.PrintWriter;
 import java.util.Date;
 
 /**
- * Candidate correction and diagnostic for Nexus parameter-change callbacks.
- * Java 7 syntax. Compile with the J-Link libraries from the target Creo install.
- * Not compiled against pfc.jar or executed inside Creo by the author.
- *
- * Put this file beside NexusModelMutationGuard.java. In that class, replace ONLY
- * OnBeforeParameterModify with:
- *
- * public void OnBeforeParameterModify(Parameter parameter, ParamValue value)
- *         throws com.ptc.cipjava.jxthrowable {
- *     if (NexusParameterChangeGuard.isUnchanged(parameter, value)) return;
- *     NexusJLink.requireModelEdit(
- *         NexusJLink.modelForChild(parameter), "parameter modification");
- * }
- *
- * Include this source in your existing compilation and its resulting class in
- * the deployed JAR/classes directory, then restart Creo to load the change.
- * Keep all other guards and checkout/save rules.
+ * Identifies parameter callbacks that are no-op assignments or Creo-computed
+ * relation values. Relation editing and model save/check-in remain guarded.
  *
  * Logs each invocation to java.io.tmpdir/nexus-parameter-trace.log (normally
  * %TEMP% on Windows), including the absolute log path in every record.
- * If the popup remains, inspect GUARD_CHANGED_OR_UNKNOWN records to identify
- * the parameter and old/proposed values. Relation-driven status is information
- * only: it NEVER grants permission. There is no name/prefix bypass.
- *
- * Check with an unchecked-out disposable part: open it, regenerate it, then
- * deliberately change a user parameter. A different value must still reach
- * the existing checkout/conflict guard. This candidate addresses identical
- * value assignments only; it cannot settle the cause of genuine auto-updates.
+ * Inspect the decision field to confirm relation-driven callbacks are skipped
+ * while ordinary changed values still reach the checkout/conflict guard.
  */
 public final class NexusParameterChangeGuard {
     private NexusParameterChangeGuard() { }
@@ -72,14 +51,18 @@ public final class NexusParameterChangeGuard {
             rethrowFatal(error);
         }
 
+        boolean drivenByRelation = "true".equalsIgnoreCase(relationDriven);
+        boolean skipGuard = drivenByRelation || identical;
+        String decision = drivenByRelation
+            ? "SKIP_RELATION_DRIVEN"
+            : identical ? "SKIP_IDENTICAL_VALUE" : "GUARD_CHANGED_OR_UNKNOWN";
         appendTrace("parameter=" + escape(name)
             + " relationDriven=" + relationDriven
             + " current=" + describe(current)
             + " proposed=" + describe(proposed)
-            + " decision=" + (identical
-                ? "SKIP_IDENTICAL_VALUE" : "GUARD_CHANGED_OR_UNKNOWN")
+            + " decision=" + decision
             + " comparisonError=" + escape(comparisonError));
-        return identical;
+        return skipGuard;
     }
 
     private static boolean sameExactValue(ParamValue a, ParamValue b)

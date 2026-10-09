@@ -108,7 +108,7 @@ class CadWorkspaceServiceTests(unittest.TestCase):
             if len(attempts) == 1:
                 raise OSError("workspace is temporarily unavailable")
 
-        self.service.release_cad_document = fail_once
+        self.service.release_approved_cad_document = fail_once
         first = self.service.process_pending_approval_releases(str(db_path))
         self.assertEqual(first["failed_ids"], [1])
         self.assertEqual(attempts, [("ws-local", 11)])
@@ -155,6 +155,47 @@ class CadWorkspaceServiceTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "OUT_OF_DATE")
         self.assertFalse(rows[0]["selectable"])
         self.assertEqual(rows[0]["baseline_cad_iteration"], 2)
+
+    def test_approved_checkout_can_be_checked_out_again_without_retrieve(self):
+        workspace = self.service.create_workspace("Repeat checkout")
+        first_checkout = self.service.materialize_cad_document(workspace["id"], 11)
+        local_path = Path(first_checkout["path"])
+        local_path.write_bytes(b"approved-v5")
+
+        approved_source = self.project_one / "housing.prt.5"
+        approved_source.write_bytes(b"approved-v5")
+        self.repo.documents[11].update({
+            "latest_creo_file_name": approved_source.name,
+            "revision": "B",
+            "iteration": 1,
+            "checked_out_by": None,
+        })
+        self.service.release_approved_cad_document(workspace["id"], 11)
+
+        manifest = self.service.load_manifest(workspace["id"])
+        entry = manifest["entries"]["11"]
+        self.assertEqual(entry["baseline_file_name"], local_path.name)
+        self.assertEqual(entry["baseline_cad_revision"], "B")
+        self.assertEqual(entry["baseline_cad_iteration"], 1)
+        self.assertFalse(entry["editable"])
+        self.assertFalse(bool(local_path.stat().st_mode & stat.S_IWRITE))
+        self.assertEqual(
+            self.service.scan_workspace(workspace["id"], 1, 7)[0]["status"],
+            "NOT_CHECKED_OUT",
+        )
+
+        self.repo.documents[11]["checked_out_by"] = 7
+        second_checkout = self.service.materialize_cad_document(
+            workspace["id"], 11, editable=True
+        )
+
+        self.assertEqual(Path(second_checkout["path"]), local_path)
+        self.assertEqual(local_path.read_bytes(), b"approved-v5")
+        self.assertTrue(bool(local_path.stat().st_mode & stat.S_IWRITE))
+        self.assertEqual(
+            self.service.scan_workspace(workspace["id"], 1, 7)[0]["status"],
+            "UNCHANGED",
+        )
 
     def test_reconcile_archives_local_edits_and_refreshes_read_only_approved_copy(self):
         workspace = self.service.create_workspace("Reconcile draft")

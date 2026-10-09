@@ -454,7 +454,27 @@ class CadWorkspaceService:
         if not source.is_file():
             raise ValueError("The controlled CAD source file does not exist.")
         baseline_hash = self._sha256(source)
-        if not preserve_local_file:
+        reused_existing_file = False
+        if not preserve_local_file and existing_entry and not source_path:
+            def _version_key(candidate: Path) -> tuple[int, str]:
+                match = _CREO_RE.match(candidate.name)
+                version = int(match.group(2)) if match else 0
+                return version, candidate.name.casefold()
+
+            newest_existing = max(existing, key=_version_key) if existing else None
+            preferred_name = str(existing_entry.get("baseline_file_name") or "")
+            matching_files = [
+                candidate for candidate in existing
+                if self._sha256(candidate).casefold() == baseline_hash.casefold()
+            ]
+            if newest_existing in matching_files:
+                destination = next(
+                    (candidate for candidate in matching_files
+                     if candidate.name.casefold() == preferred_name.casefold()),
+                    newest_existing,
+                ).resolve()
+                reused_existing_file = True
+        if not preserve_local_file and not reused_existing_file:
             destination = path / source.name
         if destination.exists():
             if (
@@ -473,7 +493,7 @@ class CadWorkspaceService:
             "cad_document_id": int(cad_document_id),
             "project_id": int(document["project_id"]),
             "logical_file_name": logical,
-            "baseline_file_name": source.name,
+            "baseline_file_name": destination.name,
             "baseline_sha256": baseline_hash,
             "baseline_cad_revision": str(document.get("revision") or ""),
             "baseline_cad_iteration": int(document.get("iteration") or 0),
@@ -749,6 +769,74 @@ class CadWorkspaceService:
             entries.pop(str(int(cad_document_id)), None)
             self._save_manifest(str(workspace_id), manifest)
 
+    def release_approved_cad_document(
+        self, workspace_id: str | None, cad_document_id: int
+    ) -> None:
+        """Retain the local checked-in bytes as the next retrieve baseline."""
+        if not workspace_id:
+            return
+        try:
+            manifest = self.load_manifest(str(workspace_id))
+            workspace = self.get_workspace(str(workspace_id))
+            document = self.pdm_service.repo.get_cad_document(int(cad_document_id))
+        except (OSError, ValueError, TypeError):
+            return
+        if not workspace or not document:
+            self.release_cad_document(workspace_id, cad_document_id)
+            return
+
+        entry_key = str(int(cad_document_id))
+        entry = (manifest.get("entries") or {}).get(entry_key)
+        if not entry:
+            return
+        logical_key = str(entry.get("logical_file_name") or "").casefold()
+        path = self.workspace_path(str(workspace_id))
+        candidates = sorted(
+            (
+                child for child in path.iterdir()
+                if child.is_file() and _CREO_RE.match(child.name)
+                and self.logical_name(child.name).casefold() == logical_key
+            ),
+            key=lambda candidate: (
+                int(_CREO_RE.match(candidate.name).group(2)),
+                candidate.name.casefold(),
+            ),
+        )
+        try:
+            source = self.resolve_controlled_source(document)
+            approved_hash = self._sha256(source)
+        except (OSError, ValueError):
+            self.release_cad_document(workspace_id, cad_document_id)
+            return
+
+        for candidate in candidates:
+            self._set_path_editable(candidate, False)
+        if not candidates or self._sha256(candidates[-1]).casefold() != approved_hash.casefold():
+            # Keep the old baseline so workspace status reports it as stale;
+            # never claim different local bytes are the approved version.
+            entry["editable"] = False
+            entry["stage_ready_after_checkout"] = False
+            entry.pop("edit_intent", None)
+            self._save_manifest(str(workspace_id), manifest)
+            return
+
+        entry.update({
+            "cad_document_id": int(cad_document_id),
+            "project_id": int(document["project_id"]),
+            "logical_file_name": self.logical_name(document.get("file_name") or ""),
+            "baseline_file_name": candidates[-1].name,
+            "baseline_sha256": approved_hash,
+            "baseline_cad_revision": str(document.get("revision") or ""),
+            "baseline_cad_iteration": int(document.get("iteration") or 0),
+            "checkout_user_id": None,
+            "editable": False,
+            "stage_ready_after_checkout": False,
+            "approved_at": _utc_now(),
+        })
+        entry.pop("edit_intent", None)
+        manifest.setdefault("entries", {})[entry_key] = entry
+        self._save_manifest(str(workspace_id), manifest)
+
     def process_pending_approval_releases(
         self, db_name: str, *, approval_key: str | None = None,
         project_id: int | None = None, limit: int = 100
@@ -785,7 +873,7 @@ class CadWorkspaceService:
             batch_failed = []
             for row in rows:
                 try:
-                    self.release_cad_document(
+                    self.release_approved_cad_document(
                         str(row["workspace_id"]), int(row["cad_document_id"])
                     )
                     with closing(sqlite3.connect(db_name, timeout=10)) as conn, conn:

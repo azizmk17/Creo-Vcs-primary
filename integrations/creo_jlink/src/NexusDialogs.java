@@ -29,6 +29,8 @@ import javax.swing.JTextArea;
 import javax.swing.JTextField;
 import javax.swing.ListSelectionModel;
 import javax.swing.SwingUtilities;
+import javax.swing.RowFilter;
+import javax.swing.table.TableRowSorter;
 import javax.swing.event.ListSelectionEvent;
 import javax.swing.event.ListSelectionListener;
 import javax.swing.table.AbstractTableModel;
@@ -132,6 +134,311 @@ public final class NexusDialogs {
             return null;
         }
         return choices.getSelectedItem();
+    }
+
+    public static Map<String, Object> chooseCadDocument(
+        String title,
+        String message,
+        List<Map<String, Object>> documents
+    ) {
+        if (documents == null || documents.isEmpty()) return null;
+
+        final CadDocumentTableModel model = new CadDocumentTableModel(documents);
+        final JTable table = new JTable(model);
+        table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        table.setRowHeight(27);
+        table.setShowGrid(true);
+        table.setGridColor(new Color(215, 220, 224));
+        table.setFillsViewportHeight(true);
+        table.setAutoCreateRowSorter(true);
+        table.getTableHeader().setReorderingAllowed(false);
+        table.getColumnModel().getColumn(0).setPreferredWidth(110);
+        table.getColumnModel().getColumn(1).setPreferredWidth(230);
+        table.getColumnModel().getColumn(2).setPreferredWidth(215);
+        table.getColumnModel().getColumn(3).setPreferredWidth(125);
+        table.getColumnModel().getColumn(4).setPreferredWidth(90);
+        table.getColumnModel().getColumn(5).setPreferredWidth(145);
+        table.getColumnModel().getColumn(6).setPreferredWidth(130);
+        table.getColumnModel().getColumn(2).setCellRenderer(new DrawingNamesRenderer());
+        final TableRowSorter<CadDocumentTableModel> sorter =
+            new TableRowSorter<CadDocumentTableModel>(model);
+        table.setRowSorter(sorter);
+
+        final JTextField search = new JTextField(28);
+        final JComboBox<String> typeFilter = new JComboBox<String>(
+            new String[] {"All types", "Assembly", "Part"}
+        );
+        final JLabel resultCount = new JLabel();
+        JLabel searchLabel = new JLabel("Search");
+        JLabel typeLabel = new JLabel("Type");
+        JPanel filterPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        filterPanel.add(searchLabel);
+        filterPanel.add(search);
+        filterPanel.add(typeLabel);
+        filterPanel.add(typeFilter);
+        filterPanel.add(resultCount);
+
+        final JTextArea details = new JTextArea(5, 82);
+        details.setEditable(false);
+        details.setLineWrap(true);
+        details.setWrapStyleWord(true);
+        details.setBackground(new Color(248, 249, 250));
+        details.setBorder(BorderFactory.createEmptyBorder(7, 9, 7, 9));
+        JPanel detailsPanel = new JPanel(new BorderLayout());
+        detailsPanel.setBorder(BorderFactory.createTitledBorder("Selected CAD Document"));
+        detailsPanel.add(new JScrollPane(details), BorderLayout.CENTER);
+        detailsPanel.setPreferredSize(new Dimension(920, 120));
+
+        final Runnable updateFilter = new Runnable() {
+            public void run() {
+                final String query = search.getText().trim().toLowerCase();
+                final String selectedType = String.valueOf(typeFilter.getSelectedItem());
+                sorter.setRowFilter(new RowFilter<CadDocumentTableModel, Integer>() {
+                    public boolean include(Entry<? extends CadDocumentTableModel, ? extends Integer> entry) {
+                        int row = entry.getIdentifier().intValue();
+                        Map<String, Object> cad = model.documentAt(row);
+                        if (!"All types".equals(selectedType)
+                            && !selectedType.equals(displayCadType(MiniJson.text(cad, "category")))) {
+                            return false;
+                        }
+                        if (query.length() == 0) return true;
+                        String searchable = model.searchText(row).toLowerCase();
+                        String[] terms = query.split("\\s+");
+                        for (int index = 0; index < terms.length; index++) {
+                            if (terms[index].length() > 0 && searchable.indexOf(terms[index]) < 0) {
+                                return false;
+                            }
+                        }
+                        return true;
+                    }
+                });
+                resultCount.setText("Showing " + sorter.getViewRowCount()
+                    + " of " + model.getRowCount());
+                updateCadRowHeights(table, model);
+                if (table.getSelectedRow() < 0 && sorter.getViewRowCount() > 0) {
+                    table.setRowSelectionInterval(0, 0);
+                }
+                updateCadSelectionDetails(table, model, details);
+            }
+        };
+        search.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
+            public void insertUpdate(javax.swing.event.DocumentEvent event) { updateFilter.run(); }
+            public void removeUpdate(javax.swing.event.DocumentEvent event) { updateFilter.run(); }
+            public void changedUpdate(javax.swing.event.DocumentEvent event) { updateFilter.run(); }
+        });
+        typeFilter.addActionListener(new java.awt.event.ActionListener() {
+            public void actionPerformed(java.awt.event.ActionEvent event) { updateFilter.run(); }
+        });
+        table.getSelectionModel().addListSelectionListener(new ListSelectionListener() {
+            public void valueChanged(ListSelectionEvent event) {
+                if (!event.getValueIsAdjusting()) {
+                    updateCadSelectionDetails(table, model, details);
+                }
+            }
+        });
+        table.addMouseListener(new java.awt.event.MouseAdapter() {
+            public void mouseClicked(java.awt.event.MouseEvent event) {
+                if (event.getClickCount() == 2 && table.getSelectedRow() >= 0) {
+                    JOptionPane pane = (JOptionPane) SwingUtilities.getAncestorOfClass(
+                        JOptionPane.class, table
+                    );
+                    if (pane != null) pane.setValue("Retrieve CAD Model");
+                }
+            }
+        });
+
+        JScrollPane tableScroll = new JScrollPane(table);
+        tableScroll.setPreferredSize(new Dimension(920, 310));
+        JLabel heading = new JLabel(message);
+        heading.setFont(heading.getFont().deriveFont(Font.BOLD));
+        JPanel header = new JPanel(new GridLayout(2, 1, 0, 7));
+        header.add(heading);
+        header.add(filterPanel);
+        JPanel panel = new JPanel(new BorderLayout(0, 8));
+        panel.add(header, BorderLayout.NORTH);
+        panel.add(tableScroll, BorderLayout.CENTER);
+        panel.add(detailsPanel, BorderLayout.SOUTH);
+        table.setRowSelectionInterval(0, 0);
+        updateFilter.run();
+
+        final Object[] options = new Object[] {
+            "Retrieve CAD Model", "Retrieve Drawing", "Cancel"
+        };
+        JOptionPane pane = new JOptionPane(
+            panel,
+            JOptionPane.PLAIN_MESSAGE,
+            JOptionPane.DEFAULT_OPTION,
+            null,
+            options,
+            options[0]
+        );
+        Object value = show(pane, title, new Runnable() {
+            public void run() { search.requestFocusInWindow(); }
+        });
+        if (table.getSelectedRow() < 0
+            || !("Retrieve CAD Model".equals(value) || "Retrieve Drawing".equals(value))) {
+            return null;
+        }
+        int modelRow = table.convertRowIndexToModel(table.getSelectedRow());
+        Map<String, Object> selectedCad = new LinkedHashMap<String, Object>(
+            model.documentAt(modelRow)
+        );
+        if ("Retrieve Drawing".equals(value)) {
+            Map<String, Object> drawing = chooseRelatedDrawing(
+                MiniJson.array(selectedCad.get("related_drawings")),
+                MiniJson.text(selectedCad, "file_name")
+            );
+            if (drawing == null) return null;
+            selectedCad.put("_nexus_retrieve_action", "DRAWING");
+            selectedCad.put("_nexus_selected_drawing_id", drawing.get("id"));
+        } else {
+            selectedCad.put("_nexus_retrieve_action", "MODEL");
+        }
+        return selectedCad;
+    }
+
+    public static String chooseRetrieveDrawingAction(
+        String modelName, String drawingName
+    ) {
+        JPanel content = new JPanel(new GridLayout(2, 1, 0, 6));
+        JLabel notice = new JLabel("The CAD model is already loaded: " + modelName);
+        JLabel question = new JLabel(
+            "Retrieve " + drawingName + " only, or replace the model and retrieve it?"
+        );
+        content.add(notice);
+        content.add(question);
+        Object[] options = new Object[] {
+            "Drawing Only", "Replace Model + Drawing", "Cancel"
+        };
+        JOptionPane pane = new JOptionPane(
+            content,
+            JOptionPane.QUESTION_MESSAGE,
+            JOptionPane.DEFAULT_OPTION,
+            null,
+            options,
+            options[0]
+        );
+        Object value = show(pane, "Retrieve Related Drawing");
+        return value == null ? "Cancel" : String.valueOf(value);
+    }
+
+    private static Map<String, Object> chooseRelatedDrawing(
+        List<Object> rawDrawings, String modelName
+    ) {
+        List<Map<String, Object>> drawings = new ArrayList<Map<String, Object>>();
+        for (Object raw : rawDrawings) {
+            if (raw instanceof Map) drawings.add(MiniJson.object(raw));
+        }
+        if (drawings.isEmpty()) {
+            warning("No related drawings are registered for " + modelName + ".", "Retrieve Drawing");
+            return null;
+        }
+        final CadDrawingTableModel model = new CadDrawingTableModel(drawings);
+        final JTable table = new JTable(model);
+        table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        table.setRowHeight(26);
+        table.setFillsViewportHeight(true);
+        table.getTableHeader().setReorderingAllowed(false);
+        table.getColumnModel().getColumn(0).setPreferredWidth(280);
+        table.getColumnModel().getColumn(1).setPreferredWidth(145);
+        table.getColumnModel().getColumn(2).setPreferredWidth(105);
+        table.getColumnModel().getColumn(3).setPreferredWidth(160);
+        table.setRowSelectionInterval(0, 0);
+
+        JPanel panel = new JPanel(new BorderLayout(0, 8));
+        panel.add(new JLabel("Select a drawing related to " + modelName + ":"), BorderLayout.NORTH);
+        JScrollPane scroll = new JScrollPane(table);
+        scroll.setPreferredSize(new Dimension(570, Math.min(260, 45 + drawings.size() * 27)));
+        panel.add(scroll, BorderLayout.CENTER);
+        Object[] options = new Object[] {"Retrieve Drawing", "Cancel"};
+        JOptionPane pane = new JOptionPane(
+            panel,
+            JOptionPane.PLAIN_MESSAGE,
+            JOptionPane.DEFAULT_OPTION,
+            null,
+            options,
+            options[0]
+        );
+        Object value = show(pane, "Select Related Drawing");
+        if (!"Retrieve Drawing".equals(value) || table.getSelectedRow() < 0) return null;
+        return model.drawingAt(table.convertRowIndexToModel(table.getSelectedRow()));
+    }
+
+    private static void updateCadSelectionDetails(
+        JTable table, CadDocumentTableModel model, JTextArea details
+    ) {
+        int viewRow = table.getSelectedRow();
+        if (viewRow < 0) {
+            details.setText("No CAD Document selected.");
+            return;
+        }
+        Map<String, Object> cad = model.documentAt(table.convertRowIndexToModel(viewRow));
+        String status = displayCadStatus(MiniJson.text(cad, "checkout_state"));
+        String owner = MiniJson.text(cad, "checked_out_by_username");
+        String workspace = MiniJson.text(cad, "checkout_workspace_name");
+        String drawingNames = model.drawingNames(table.convertRowIndexToModel(viewRow));
+        StringBuilder text = new StringBuilder();
+        text.append("File: ").append(MiniJson.text(cad, "file_name"));
+        text.append("\nCAD number: ").append(MiniJson.text(cad, "number"));
+        text.append("\nType: ").append(displayCadType(MiniJson.text(cad, "category")));
+        text.append("    Revision: ").append(MiniJson.text(cad, "revision"));
+        text.append(".").append(MiniJson.integer(cad, "iteration"));
+        text.append("    Lifecycle: ").append(MiniJson.text(cad, "lifecycle_state"));
+        text.append("\nStatus: ").append(status);
+        if (owner.length() > 0) text.append("    Checked out by: ").append(owner);
+        if (workspace.length() > 0) text.append("    Workspace: ").append(workspace);
+        text.append("\nRelated drawings: ")
+            .append(drawingNames.length() == 0 ? "None" : drawingNames.replace("\n", ", "));
+        details.setText(text.toString());
+        details.setCaretPosition(0);
+    }
+
+    private static String displayCadType(String category) {
+        String value = category == null ? "" : category.toUpperCase();
+        if ("ASSEMBLY".equals(value)) return "Assembly";
+        if ("DRAWING".equals(value)) return "Drawing";
+        if ("COMPONENT".equals(value) || "PART".equals(value)) return "Part";
+        return value.length() == 0 ? "CAD Document" : value;
+    }
+
+    private static String displayCadStatus(String status) {
+        if ("CHECKED_OUT_BY_ME".equals(status)) return "Checked out by you";
+        if ("CHECKED_OUT_BY_OTHER".equals(status)) return "Checked out by another user";
+        if ("CHECKED_IN".equals(status)) return "Available";
+        return status.length() == 0 ? "Status unavailable" : status.replace('_', ' ');
+    }
+
+    private static void updateCadRowHeights(
+        JTable table, CadDocumentTableModel model
+    ) {
+        for (int viewRow = 0; viewRow < table.getRowCount(); viewRow++) {
+            int modelRow = table.convertRowIndexToModel(viewRow);
+            int lines = model.drawingLineCount(modelRow);
+            table.setRowHeight(viewRow, Math.max(27, Math.min(125, 8 + lines * 20)));
+        }
+    }
+
+    private static final class DrawingNamesRenderer extends JTextArea
+        implements javax.swing.table.TableCellRenderer {
+        private static final long serialVersionUID = 1L;
+
+        private DrawingNamesRenderer() {
+            setLineWrap(true);
+            setWrapStyleWord(true);
+            setBorder(BorderFactory.createEmptyBorder(3, 5, 3, 5));
+            setOpaque(true);
+        }
+
+        public Component getTableCellRendererComponent(
+            JTable table, Object value, boolean selected, boolean focused,
+            int row, int column
+        ) {
+            setText(String.valueOf(value));
+            setFont(table.getFont());
+            setBackground(selected ? table.getSelectionBackground() : table.getBackground());
+            setForeground(selected ? table.getSelectionForeground() : table.getForeground());
+            return this;
+        }
     }
 
     public static ConflictResult conflicts(
@@ -499,6 +806,120 @@ public final class NexusDialogs {
         Object value = pane.getValue();
         dialog.dispose();
         return value;
+    }
+
+    private static final class CadDocumentTableModel extends AbstractTableModel {
+        private static final long serialVersionUID = 1L;
+        private final String[] columns = new String[] {
+            "Type", "CAD Document", "Drawings", "Number", "Revision", "Status", "Checked Out By"
+        };
+        private final List<Map<String, Object>> documents;
+
+        private CadDocumentTableModel(List<Map<String, Object>> documents) {
+            this.documents = new ArrayList<Map<String, Object>>(documents);
+        }
+
+        public int getRowCount() { return documents.size(); }
+        public int getColumnCount() { return columns.length; }
+        public String getColumnName(int column) { return columns[column]; }
+        public boolean isCellEditable(int row, int column) { return false; }
+
+        public Object getValueAt(int row, int column) {
+            Map<String, Object> cad = documentAt(row);
+            switch (column) {
+                case 0: return displayCadType(MiniJson.text(cad, "category"));
+                case 1: return MiniJson.text(cad, "file_name");
+                case 2: return drawingNames(row);
+                case 3: return MiniJson.text(cad, "number");
+                case 4:
+                    return MiniJson.text(cad, "revision") + "."
+                        + MiniJson.integer(cad, "iteration");
+                case 5: return displayCadStatus(MiniJson.text(cad, "checkout_state"));
+                case 6: return MiniJson.text(cad, "checked_out_by_username");
+                default: return "";
+            }
+        }
+
+        private Map<String, Object> documentAt(int row) {
+            return documents.get(row);
+        }
+
+        private String searchText(int row) {
+            Map<String, Object> cad = documentAt(row);
+            return MiniJson.text(cad, "file_name") + " "
+                + MiniJson.text(cad, "number") + " "
+                + MiniJson.text(cad, "name") + " "
+                + MiniJson.text(cad, "category") + " "
+                + MiniJson.text(cad, "revision") + " "
+                + MiniJson.integer(cad, "iteration") + " "
+                + MiniJson.text(cad, "lifecycle_state") + " "
+                + MiniJson.text(cad, "checkout_state") + " "
+                + MiniJson.text(cad, "checked_out_by_username") + " "
+                + MiniJson.text(cad, "checkout_workspace_name") + " "
+                + drawingNames(row);
+        }
+
+        private String drawingNames(int row) {
+            List<Object> drawings = MiniJson.array(documentAt(row).get("related_drawings"));
+            StringBuilder names = new StringBuilder();
+            for (int index = 0; index < drawings.size(); index++) {
+                Map<String, Object> drawing = MiniJson.object(drawings.get(index));
+                String name = MiniJson.text(drawing, "file_name");
+                if (name.length() == 0) name = MiniJson.text(drawing, "name");
+                if (name.length() == 0) name = MiniJson.text(drawing, "number");
+                if (name.length() == 0) continue;
+                if (names.length() > 0) names.append('\n');
+                names.append(name);
+            }
+            return names.length() == 0 ? "None" : names.toString();
+        }
+
+        private int drawingLineCount(int row) {
+            String names = drawingNames(row);
+            if ("None".equals(names)) return 1;
+            int lines = 0;
+            String[] values = names.split("\\n");
+            for (int index = 0; index < values.length; index++) {
+                lines += Math.max(1, (values[index].length() + 31) / 32);
+            }
+            return lines;
+        }
+    }
+
+    private static final class CadDrawingTableModel extends AbstractTableModel {
+        private static final long serialVersionUID = 1L;
+        private final String[] columns = new String[] {
+            "Drawing", "Number", "Revision", "Status"
+        };
+        private final List<Map<String, Object>> drawings;
+
+        private CadDrawingTableModel(List<Map<String, Object>> drawings) {
+            this.drawings = drawings;
+        }
+
+        public int getRowCount() { return drawings.size(); }
+        public int getColumnCount() { return columns.length; }
+        public String getColumnName(int column) { return columns[column]; }
+        public boolean isCellEditable(int row, int column) { return false; }
+
+        public Object getValueAt(int row, int column) {
+            Map<String, Object> drawing = drawingAt(row);
+            switch (column) {
+                case 0: return MiniJson.text(drawing, "file_name");
+                case 1: return MiniJson.text(drawing, "number");
+                case 2:
+                    return MiniJson.text(drawing, "revision") + "."
+                        + MiniJson.integer(drawing, "iteration");
+                case 3:
+                    String owner = MiniJson.text(drawing, "checked_out_by_username");
+                    return owner.length() == 0 ? "Available" : "Checked out by " + owner;
+                default: return "";
+            }
+        }
+
+        private Map<String, Object> drawingAt(int row) {
+            return drawings.get(row);
+        }
     }
 
     public static final class ChecklistResult {

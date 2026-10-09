@@ -2,6 +2,7 @@ import com.ptc.cipjava.jxthrowable;
 import com.ptc.pfc.pfcFeature.DefaultFeatureActionListener;
 import com.ptc.pfc.pfcFeature.Feature;
 import com.ptc.pfc.pfcFeature.FeatureCopyType;
+import com.ptc.pfc.pfcModel.Model;
 import com.ptc.pfc.pfcModelItem.Parameter;
 import com.ptc.pfc.pfcModelItem.ParamValue;
 
@@ -9,6 +10,19 @@ import com.ptc.pfc.pfcModelItem.ParamValue;
 public class NexusFeatureMutationGuard extends DefaultFeatureActionListener {
     private void require(Feature feature, String operation) throws jxthrowable {
         NexusJLink.requireModelEdit(NexusJLink.modelForChild(feature), operation);
+    }
+
+    public void OnBeforeRegen(Feature feature) throws jxthrowable {
+        Model model = NexusJLink.modelForChild(feature);
+        NexusJLink.beginModelRegeneration(model);
+    }
+
+    public void OnAfterRegen(Feature feature) throws jxthrowable {
+        NexusJLink.endModelRegeneration(NexusJLink.modelForChild(feature));
+    }
+
+    public void OnRegenFailure(Feature feature) throws jxthrowable {
+        NexusJLink.endModelRegeneration(NexusJLink.modelForChild(feature));
     }
 
     public void OnBeforeDelete(Feature feature) throws jxthrowable {
@@ -31,6 +45,9 @@ public class NexusFeatureMutationGuard extends DefaultFeatureActionListener {
 
     public void OnBeforeParameterModify(Parameter parameter, ParamValue value)
         throws jxthrowable {
+        if (NexusParameterChangeGuard.isUnchanged(parameter, value)) {
+            return;
+        }
         NexusJLink.requireModelEdit(
             NexusJLink.modelForChild(parameter), "feature parameter modification"
         );

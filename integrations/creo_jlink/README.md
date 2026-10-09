@@ -12,6 +12,26 @@ described in [async/README.md](async/README.md).
 
 ## Current commands
 
+The commands are designated for Creo's Ribbon customization and use individual Nexus
+icons. The integration does not use a dropdown as its primary UI: the target is a
+dedicated **Nexus** ribbon tab with command groups, like the built-in Tools tab.
+Creo 3 generates the tab layout file itself, so it must be saved once from Creo after
+the commands are registered. In **File > Options > Customize Ribbon**, choose
+**Toolkit Commands**, create a tab named **Nexus**, and create these groups:
+
+- **Workspace**: Connect to Active Project, Select CAD Workspace, Retrieve
+- **Document**: Status, Workspace Status, CAD History
+- **Checkout**: Check Out, Check In, Undo Check Out
+- **Lifecycle**: Create CAD Revision, Release CAD Document
+
+Save through **Import/Export > Save Auxiliary Application User Interface**. Creo
+creates `toolkitribbonui.rbn`; place it in
+`integrations/creo_jlink/text/ribbon/toolkitribbonui.rbn`. The configured
+`tk_enable_ribbon_custom_save yes` option enables this save command. Creo stores
+separate layouts per mode, so repeat the tab setup and save in Part, Assembly, and
+Drawing modes if Nexus should be visible in all three. The legacy Nexus PDM menu
+remains available as a fallback during setup.
+
 - **Connect to Active Project** shows the Nexus user and selected product version.
 - **Select CAD Workspace** selects or creates a machine-local managed workspace.
 - **Retrieve** lists CAD Documents from the active Nexus product version, then copies
@@ -150,7 +170,7 @@ No Creo Object TOOLKIT Java installation or license is used.
 3. Sign in and select the required product and version in Nexus.
 4. Run `compile.bat` once, or whenever Java source changes.
 5. Run `run_creo.bat`.
-6. In Creo, open **Applications > Nexus PDM > Connect to Active Project**.
+6. In Creo, use the **Nexus** ribbon tab, or the fallback **Applications > Nexus PDM** menu.
 7. Select a CAD workspace before Retrieve or Check Out.
 
 `build_and_run.bat` combines steps 4 and 5.

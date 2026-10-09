@@ -995,7 +995,10 @@ class CreoBridgeController:
                     bool(preserve_local_changes)
                     and document_id == int(root_cad_document_id)
                 ),
-                include_related_drawings=include_related_drawings,
+                include_related_drawings=(
+                    include_related_drawings
+                    and document_id == int(root_cad_document_id)
+                ),
                 editable=editable,
             )
             for row in copied:
@@ -1110,7 +1113,27 @@ class CreoBridgeController:
             include_related_drawings=True,
             include_legacy_fallback=True,
         )
-        documents = [self._status_payload(dict(row)) for row in rows or []]
+        documents = []
+        for row in rows or []:
+            payload = self._status_payload(dict(row))
+            payload["related_drawings"] = [
+                {
+                    "id": int(drawing["id"]),
+                    "file_name": str(drawing.get("file_name") or ""),
+                    "name": str(drawing.get("name") or ""),
+                    "number": str(drawing.get("number") or ""),
+                    "revision": str(drawing.get("revision") or ""),
+                    "iteration": int(drawing.get("iteration") or 0),
+                    "lifecycle_state": str(drawing.get("lifecycle_state") or ""),
+                    "checked_out_by_username": str(
+                        drawing.get("checked_out_by_username") or ""
+                    ),
+                }
+                for drawing in (row.get("related_drawings") or [])
+                if str(drawing.get("category") or "").upper() == "DRAWING"
+                and drawing.get("id") is not None
+            ]
+            documents.append(payload)
         documents.sort(
             key=lambda row: (
                 str(row.get("category") or ""),
@@ -1143,6 +1166,45 @@ class CreoBridgeController:
         with self._operation_lock:
             user_id, _project_id, _project, document = self._document(cad_document_id)
             workspace_service, workspace = self._workspace(body.get("workspace_id"))
+            drawing_id = body.get("drawing_id")
+            if drawing_id not in (None, ""):
+                drawing_id = int(drawing_id)
+                if str(document.get("category") or "").upper() == "DRAWING":
+                    raise BridgeApiError(
+                        400, "drawing_owner_required",
+                        "Select the related model when retrieving a drawing.",
+                    )
+                related_drawings = self._pdm_service().repo.list_related_drawings(
+                    int(cad_document_id)
+                ) or []
+                drawing = next((
+                    row for row in related_drawings
+                    if int(row.get("id") or 0) == drawing_id
+                ), None)
+                if drawing is None:
+                    raise BridgeApiError(
+                        409, "drawing_not_related",
+                        "The selected drawing is no longer related to this CAD model.",
+                        {"cad_document_id": int(cad_document_id), "drawing_id": drawing_id},
+                    )
+                editable = self._checked_out_in_workspace(
+                    drawing, user_id, workspace, workspace_service
+                )
+                files = workspace_service.materialize_cad_document_package(
+                    str(workspace["id"]),
+                    drawing_id,
+                    preserve_existing=True,
+                    include_related_drawings=False,
+                    editable=editable,
+                )
+                return {
+                    "workspace": workspace,
+                    "files": files,
+                    "root_path": files[0]["path"] if files else None,
+                    "dependency_document_ids": [],
+                    "cad": self.cad_status(drawing_id),
+                    "retrieved_for_cad": self.cad_status(cad_document_id),
+                }
             owner = document.get("checked_out_by")
             checked_out_here = self._checked_out_in_workspace(
                 document, user_id, workspace, workspace_service

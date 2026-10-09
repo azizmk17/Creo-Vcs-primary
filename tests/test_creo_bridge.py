@@ -84,6 +84,13 @@ class _CadRepo:
     def list_cad_members(self, parent_id):
         return list(self.members.get(int(parent_id), []))
 
+    def list_related_drawings(self, model_id):
+        return [
+            dict(row) for row in self.documents.values()
+            if int(row.get("drawing_owner_cad_document_id") or 0) == int(model_id)
+            and str(row.get("category") or "").upper() == "DRAWING"
+        ]
+
     def list_cad_documents(
         self,
         project_id,
@@ -288,6 +295,22 @@ class CreoBridgeControllerTests(unittest.TestCase):
         )
 
     def test_project_cad_documents_lists_only_active_project(self):
+        self.repo.documents[1].update({
+            "category": "ASSEMBLY",
+            "related_drawings": [{
+                "id": 5,
+                "category": "DRAWING",
+                "file_name": "machine_layout.drw",
+                "name": "Machine Layout",
+                "number": "DRW-100",
+            }, {
+                "id": 6,
+                "category": "DRAWING",
+                "file_name": "machine_detail.drw",
+                "name": "Machine Detail",
+                "number": "DRW-101",
+            }],
+        })
         result = self.controller.dispatch("GET", "/api/v1/cad", {}, {})
 
         self.assertEqual(
@@ -298,6 +321,14 @@ class CreoBridgeControllerTests(unittest.TestCase):
         self.assertNotIn(
             "other_project.prt",
             [row["file_name"] for row in result["cad_documents"]],
+        )
+        machine = next(
+            row for row in result["cad_documents"]
+            if row["file_name"] == "machine.asm"
+        )
+        self.assertEqual(
+            [(drawing["id"], drawing["file_name"]) for drawing in machine["related_drawings"]],
+            [(5, "machine_layout.drw"), (6, "machine_detail.drw")],
         )
 
     def test_resolve_uses_cache_until_database_or_workspace_metadata_changes(self):
@@ -718,6 +749,26 @@ class CreoBridgeControllerTests(unittest.TestCase):
         self.assertEqual(result["root_path"], "C:/workspace/1")
         self.assertIsNone(result["cad"]["checked_out_by"])
 
+    def test_retrieve_related_drawing_materializes_only_the_selected_drawing(self):
+        self.repo.documents[1]["category"] = "ASSEMBLY"
+        self.repo.documents[5] = {
+            "id": 5,
+            "project_id": 9,
+            "file_name": "machine.drw",
+            "category": "DRAWING",
+            "drawing_owner_cad_document_id": 1,
+            "checked_out_by": None,
+        }
+
+        result = self.controller.retrieve(
+            1, {"workspace_id": "workspace-one", "drawing_id": 5}
+        )
+
+        self.assertEqual(result["root_path"], "C:/workspace/5")
+        self.assertEqual(result["cad"]["id"], 5)
+        self.assertEqual(result["retrieved_for_cad"]["id"], 1)
+        self.assertEqual(self.workspace_service.calls, [(5, False)])
+
     def test_revision_and_release_routes_use_the_pdm_service(self):
         calls = []
         self.controller._bom_service_factory = lambda: SimpleNamespace(
@@ -748,6 +799,24 @@ class CreoBridgeControllerTests(unittest.TestCase):
         self.assertEqual(dependency_ids, [2, 3])
         self.assertEqual(workspace_service.calls, [(1, True), (2, False), (3, False)])
         self.assertEqual([row["cad_document_id"] for row in files], [1, 2, 3])
+
+    def test_related_drawings_are_included_for_root_only_not_child_models(self):
+        workspace_service = _WorkspaceService()
+        workspace = {"id": "workspace-one", "path": "C:/workspace"}
+
+        self.controller._materialize_cad_package(
+            workspace_service,
+            workspace,
+            1,
+            7,
+            include_related_drawings=True,
+            include_dependencies=True,
+        )
+
+        self.assertEqual(
+            workspace_service.calls,
+            [(1, True), (2, False), (3, False)],
+        )
 
     def test_checkout_is_not_editable_when_machine_does_not_match(self):
         workspace_service = _WorkspaceService()

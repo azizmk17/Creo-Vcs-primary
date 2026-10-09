@@ -6,12 +6,14 @@ import com.ptc.pfc.pfcExceptions.XCancelProEAction;
 public class NexusEditGuard extends DefaultUICommandBracketListener {
     public void OnBeforeCommand() throws jxthrowable {
         try {
-            if (!NexusJLink.allowModelEdit()) {
+            if (!NexusJLink.beginEditCommand()) {
                 XCancelProEAction.Throw();
             }
         } catch (jxthrowable error) {
+            NexusJLink.endEditCommand();
             throw error;
         } catch (Throwable error) {
+            NexusJLink.endEditCommand();
             NexusDialogs.error(
                 error.getMessage() == null ? String.valueOf(error) : error.getMessage(),
                 "Nexus Edit Conflict"
@@ -21,6 +23,7 @@ public class NexusEditGuard extends DefaultUICommandBracketListener {
     }
 
     public void OnAfterCommand() throws jxthrowable {
+        NexusJLink.endEditCommand();
         NexusJLink.refreshCommandProtection();
     }
 }

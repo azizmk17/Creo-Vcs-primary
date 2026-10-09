@@ -80,6 +80,15 @@ public class NexusApiClient {
         return request("POST", "/cad/" + cadId + "/retrieve", body);
     }
 
+    public Map<String, Object> retrieveDrawing(
+        int modelCadId, int drawingCadId, String workspaceId
+    ) throws Exception {
+        Map<String, Object> body = new LinkedHashMap<String, Object>();
+        body.put("workspace_id", workspaceId);
+        body.put("drawing_id", Integer.valueOf(drawingCadId));
+        return request("POST", "/cad/" + modelCadId + "/retrieve", body);
+    }
+
     public Map<String, Object> checkout(
         int cadId,
         String workspaceId,

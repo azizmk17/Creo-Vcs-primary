@@ -43,6 +43,10 @@ public class NexusJLink {
         new LinkedHashSet<String>();
     private static final Set<String> localDraftModels =
         new LinkedHashSet<String>();
+    private static final Map<String, Integer> modelRegenerationDepth =
+        new LinkedHashMap<String, Integer>();
+    private static final ThreadLocal<Set<String>> authorizedEditModels =
+        new ThreadLocal<Set<String>>();
     private static Map<String, Object> selectedWorkspace;
 
     public static void start() {
@@ -75,6 +79,10 @@ public class NexusJLink {
         mutationGuards.clear();
         registeredGuardNames.clear();
         localDraftModels.clear();
+        synchronized (modelRegenerationDepth) {
+            modelRegenerationDepth.clear();
+        }
+        authorizedEditModels.remove();
         selectedWorkspace = null;
         api = null;
         session = null;
@@ -299,6 +307,9 @@ public class NexusJLink {
         String commandName, String labelKey, String helpKey, CommandAction action
     ) throws jxthrowable {
         UICommand command = session.UICreateCommand(commandName, new CommandListener(action));
+        String iconName = commandName.substring("NexusPDM.".length());
+        command.SetIcon("nexus_" + iconName.toLowerCase() + ".png");
+        command.Designate("nexus_jlink.txt", labelKey, helpKey, helpKey);
         session.UIAddButton(
             command, "NexusPDM", null, labelKey, helpKey, "nexus_jlink.txt"
         );
@@ -522,9 +533,46 @@ public class NexusJLink {
             return;
         }
         requireManaged(status);
-        Map<String, Object> result = api.retrieve(
-            MiniJson.integer(status, "id"), MiniJson.text(workspace, "id")
-        );
+        int cadId = MiniJson.integer(status, "id");
+        String workspaceId = MiniJson.text(workspace, "id");
+        String action = MiniJson.text(status, "_nexus_retrieve_action");
+        Map<String, Object> result;
+        if ("DRAWING".equals(action)) {
+            int drawingId = MiniJson.integer(status, "_nexus_selected_drawing_id");
+            String modelName = MiniJson.text(status, "file_name");
+            String drawingName = selectedDrawingName(status, drawingId);
+            String modelKey = logicalCreoFileName(modelName).toLowerCase();
+            LoadedModelInfo loaded = loadedCreoModels().get(modelKey);
+            boolean modelReplaced = false;
+            if (loaded != null) {
+                String drawingAction = NexusDialogs.chooseRetrieveDrawingAction(
+                    modelName, drawingName
+                );
+                if ("Cancel".equals(drawingAction)) return;
+                if ("Replace Model + Drawing".equals(drawingAction)) {
+                    ensureReloadIsSafe(loaded.model, workspace, false);
+                    eraseForReload(loaded.model);
+                    Map<String, Object> modelResult = api.retrieve(cadId, workspaceId);
+                    displayManagedResult(modelResult);
+                    modelReplaced = true;
+                }
+                result = api.retrieveDrawing(cadId, drawingId, workspaceId);
+            } else {
+                Map<String, Object> modelResult = api.retrieve(cadId, workspaceId);
+                displayManagedResult(modelResult);
+                result = api.retrieveDrawing(cadId, drawingId, workspaceId);
+            }
+            displayManagedResult(result);
+            NexusDialogs.info(
+                drawingName + " was retrieved. "
+                    + (loaded == null ? "The model package was retrieved as well."
+                        : modelReplaced ? "The selected model was replaced."
+                            : "The selected model was kept loaded."),
+                "Nexus Retrieve"
+            );
+            return;
+        }
+        result = api.retrieve(cadId, workspaceId);
         displayManagedResult(result);
         Map<String, Object> refreshed = MiniJson.object(result.get("cad"));
         String mode = MiniJson.bool(refreshed, "can_modify") ? "editable" : "read-only";
@@ -532,6 +580,19 @@ public class NexusJLink {
             MiniJson.text(refreshed, "file_name") + " was retrieved " + mode + ".",
             "Nexus Retrieve"
         );
+    }
+
+    private static String selectedDrawingName(
+        Map<String, Object> cad, int drawingId
+    ) {
+        for (Object raw : MiniJson.array(cad.get("related_drawings"))) {
+            Map<String, Object> drawing = MiniJson.object(raw);
+            if (MiniJson.integer(drawing, "id") == drawingId) {
+                String name = MiniJson.text(drawing, "file_name");
+                return name.length() == 0 ? MiniJson.text(drawing, "name") : name;
+            }
+        }
+        return "Related drawing";
     }
 
     private static Map<String, Object> chooseProjectCadDocument(String title) throws Exception {
@@ -547,28 +608,24 @@ public class NexusJLink {
             }
             throw error;
         }
-        List<CadChoice> choices = new ArrayList<CadChoice>();
+        List<Map<String, Object>> choices = new ArrayList<Map<String, Object>>();
         for (Object item : raw) {
             Map<String, Object> cad = MiniJson.object(item);
-            if (MiniJson.bool(cad, "managed")) {
-                choices.add(new CadChoice(cad));
+            if (MiniJson.bool(cad, "managed")
+                && !"DRAWING".equalsIgnoreCase(MiniJson.text(cad, "category"))) {
+                choices.add(cad);
             }
         }
         if (choices.isEmpty()) {
             throw new IllegalStateException(
-                "The active Nexus project has no managed CAD Documents to retrieve."
+                "The active Nexus project has no managed part or assembly CAD Documents to retrieve."
             );
         }
-        Object selected = NexusDialogs.choose(
-            "Select a CAD Document from the active Nexus project:",
+        return NexusDialogs.chooseCadDocument(
             title,
-            choices.toArray(),
-            choices.get(0)
+            "Select a CAD Document from the active Nexus project:",
+            choices
         );
-        if (!(selected instanceof CadChoice)) {
-            return null;
-        }
-        return ((CadChoice) selected).cad;
     }
 
     private static void showStatus() throws Exception {
@@ -778,14 +835,77 @@ public class NexusJLink {
         return false;
     }
 
-    /** Called immediately before Creo starts a feature, dimension, or delete edit. */
-    static boolean allowModelEdit() throws Exception {
-        Model current = currentOrActiveModel();
-        return resolveModelConflict(current, false);
+    static boolean beginEditCommand() throws Exception {
+        Model model = currentOrActiveModel();
+        if (!resolveModelConflict(model, false)) return false;
+        if (model != null) {
+            Set<String> authorized = authorizedEditModels.get();
+            if (authorized == null) {
+                authorized = new LinkedHashSet<String>();
+                authorizedEditModels.set(authorized);
+            }
+            authorized.add(modelGuardKey(model));
+        }
+        return true;
+    }
+
+    static void endEditCommand() {
+        authorizedEditModels.remove();
+    }
+
+    static void beginModelRegeneration(Model model) {
+        String key = modelGuardKey(model);
+        if (key.length() == 0) return;
+        synchronized (modelRegenerationDepth) {
+            Integer depth = modelRegenerationDepth.get(key);
+            modelRegenerationDepth.put(key, Integer.valueOf(
+                depth == null ? 1 : depth.intValue() + 1
+            ));
+        }
+    }
+
+    static void endModelRegeneration(Model model) {
+        String key = modelGuardKey(model);
+        if (key.length() == 0) return;
+        synchronized (modelRegenerationDepth) {
+            Integer depth = modelRegenerationDepth.get(key);
+            if (depth == null || depth.intValue() <= 1) {
+                modelRegenerationDepth.remove(key);
+            } else {
+                modelRegenerationDepth.put(key, Integer.valueOf(depth.intValue() - 1));
+            }
+        }
+    }
+
+    private static boolean isModelRegenerating(Model model) {
+        String key = modelGuardKey(model);
+        if (key.length() == 0) return false;
+        synchronized (modelRegenerationDepth) {
+            return modelRegenerationDepth.containsKey(key);
+        }
+    }
+
+    private static boolean isAuthorizedEditCommand(Model model) {
+        Set<String> authorized = authorizedEditModels.get();
+        return authorized != null && authorized.contains(modelGuardKey(model));
+    }
+
+    private static String modelGuardKey(Model model) {
+        if (model == null) return "";
+        try {
+            String fileName = logicalCreoFileName(model.GetFileName()).toLowerCase();
+            String origin = model.GetOrigin();
+            String path = origin == null ? "" : origin.replace('/', '\\').toLowerCase();
+            return path + "|" + fileName;
+        } catch (Throwable ignored) {
+            return "";
+        }
     }
 
     static void requireModelEdit(Model model, String operation) throws jxthrowable {
         try {
+            // The edit command checks authorization once; regeneration is not a user edit.
+            if (isAuthorizedEditCommand(model) || isModelRegenerating(model)) return;
             boolean preserveLocalChanges = false;
             try {
                 preserveLocalChanges = model != null && model.GetIsModified();
@@ -2415,37 +2535,6 @@ public class NexusJLink {
             String name = MiniJson.text(workspace, "name");
             String path = MiniJson.text(workspace, "path");
             return name + (path.length() == 0 ? "" : "  [" + path + "]");
-        }
-    }
-
-    private static final class CadChoice {
-        private final Map<String, Object> cad;
-
-        private CadChoice(Map<String, Object> cad) {
-            this.cad = cad;
-        }
-
-        public String toString() {
-            String fileName = MiniJson.text(cad, "file_name");
-            String number = MiniJson.text(cad, "number");
-            String revision = MiniJson.text(cad, "revision");
-            String iteration = String.valueOf(MiniJson.integer(cad, "iteration"));
-            String category = MiniJson.text(cad, "category");
-            String state = MiniJson.text(cad, "checkout_state");
-            String label = fileName.length() > 0 ? fileName : number;
-            if (number.length() > 0 && !number.equals(label)) {
-                label = label + " - " + number;
-            }
-            if (revision.length() > 0 || iteration.length() > 0) {
-                label = label + "  Rev " + revision + "." + iteration;
-            }
-            if (category.length() > 0) {
-                label = label + "  [" + category + "]";
-            }
-            if (state.length() > 0) {
-                label = label + "  " + state;
-            }
-            return label;
         }
     }
 

@@ -3486,12 +3486,12 @@ class BomService(BaseService):
         try:
             from core.services.cad_workspace_service import CadWorkspaceService
             workspace_service = CadWorkspaceService()
-            workspace_service.release_cad_document(
+            workspace_service.release_approved_cad_document(
                 document.get("checkout_workspace_id"), cad_document_id
             )
             if str(document.get("category") or "").upper() != "DRAWING":
                 for drawing in self.pdm_service.repo.list_related_drawings(cad_document_id) or []:
-                    workspace_service.release_cad_document(
+                    workspace_service.release_approved_cad_document(
                         document.get("checkout_workspace_id"), int(drawing["id"])
                     )
         except Exception:
