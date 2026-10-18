@@ -1233,12 +1233,15 @@ class BomService(BaseService):
             raise ValueError("Part not found")
         related_parts = self._checkout_scope(part, exact_item=bool(exact_item))
         active_cad = []
-        for related in related_parts:
-            active_cad.extend(self.checked_out_cad_for_item(int(related.id)))
-        self._assert_no_active_cad_checkouts(
-            [int(related.id) for related in related_parts],
-            "undo the Item checkout",
-        )
+        # EBOM Item undo is independent of CAD working copies and their owners.
+        # The legacy shared-file workflow keeps its existing checkout guard.
+        if not exact_item:
+            for related in related_parts:
+                active_cad.extend(self.checked_out_cad_for_item(int(related.id)))
+            self._assert_no_active_cad_checkouts(
+                [int(related.id) for related in related_parts],
+                "undo the Item checkout",
+            )
         locks = {
             int(related.id): self.lock_repo.get_by_part(int(related.id))
             for related in related_parts

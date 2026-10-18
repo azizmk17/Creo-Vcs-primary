@@ -34,6 +34,15 @@ from utils import (
     safe_open,
     safe_rmtree,
 )
+class PendingCommitConflict(ValueError):
+    """A check-in needs an explicit decision about existing Pending files."""
+
+    def __init__(self, filename: str, replacement_blocked_reason: str = ""):
+        self.filename = filename
+        self.replacement_blocked_reason = replacement_blocked_reason
+        super().__init__(f"Pending commit already contains {filename}. Choose Replace or Skip.")
+
+
 class CommitService(BaseService):
     def __init__(self):
         super().__init__()
@@ -350,6 +359,20 @@ class CommitService(BaseService):
         cleaned = "".join(ch if ch.isalnum() or ch in "._- ()" else "_" for ch in os.path.basename(name or ""))
         return cleaned or f"attachment_{uuid.uuid4().hex[:8]}"
 
+    def _assert_master_submissions_mutable(self, commit_ids):
+        """Keep a published Pending snapshot and its source rows traceable."""
+        from core.services.master_work_service import MasterWorkService
+
+        project = self.project_service.get_project_by_id(int(self.session.project_id)) or {}
+        manifest = MasterWorkService.read_manifest(project.get("working_directory"))
+        published = {str(record.get("source_commit_id") or "")
+                     for record in (manifest.get("files") or {}).values()}
+        if published.intersection(str(value) for value in commit_ids if value):
+            raise ValueError(
+                "This submission is already in master. Withdraw it from review and create "
+                "a new commit for further changes; published snapshots cannot be replaced or extended."
+            )
+
     def _normalize_engineering_attachments(self, engineering_attachments) -> list[dict]:
         if not engineering_attachments:
             return []
@@ -478,6 +501,7 @@ class CommitService(BaseService):
                 raise ValueError("Only a Pending commit can receive additional Creo files.")
             if int(first_target.get("designer") or 0) != int(designer_id):
                 raise ValueError("Files can only be added to your own pending commit.")
+            self._assert_master_submissions_mutable([requested_commit_id])
             commit_id = requested_commit_id
             title = str(first_target.get("title") or title).strip()
         else:
@@ -533,17 +557,21 @@ class CommitService(BaseService):
                 pending_rows = self.commit_repository.get_pending_rows_by_base_filename(
                     base_f_name, int(self.session.project_id)
                 )
-                if any(int(row.get("designer") or 0) != int(designer_id) for row in pending_rows):
-                    raise ValueError(
-                        f"Pending commit for {base_f_name} belongs to another user and cannot be replaced."
-                    )
                 if duplicate_action == "skip":
                     skipped_files.append(filename)
                     continue
+                blocked_reason = ""
+                if any(int(row.get("designer") or 0) != int(designer_id) for row in pending_rows):
+                    blocked_reason = f"Pending commit for {base_f_name} belongs to another user and cannot be replaced."
+                else:
+                    try:
+                        self._assert_master_submissions_mutable(row.get("commit_id") for row in pending_rows)
+                    except ValueError as exc:
+                        blocked_reason = str(exc)
                 if duplicate_action != "replace":
-                    raise ValueError(
-                        f"Pending commit already contains {base_f_name}. Choose Replace or Skip."
-                    )
+                    raise PendingCommitConflict(base_f_name, blocked_reason)
+                if blocked_reason:
+                    raise ValueError(blocked_reason)
 
             part_type = "Drw" if category == "DRAWING" else "Cad"
             cad_document = self.pdm_service.repo.get_cad_document_by_file(
@@ -1042,6 +1070,61 @@ class CommitService(BaseService):
             "affected_part_ids": affected_part_ids,
             "affected_cad_document_ids": affected_cad_ids,
         }
+
+    @require_permission("merge")
+    def push_unvalidated_to_master(self, commit_id: str) -> dict:
+        """Master/admin publication of a whole Pending snapshot, without approval."""
+        from core.services.master_work_service import MasterWorkService
+
+        project_id = int(self.session.project_id)
+        logical_id = str(commit_id or "").strip()
+        rows = self.commit_repository.get_rows_by_commit_id(logical_id, project_id)
+        if not rows or any(int(row.get("project_id") or 0) != project_id for row in rows):
+            raise ValueError("The submission was not found in the active project.")
+        if any(str(row.get("status") or "").casefold() != "pending" for row in rows):
+            raise ValueError("Only a wholly Pending submission can be pushed as under development.")
+        project = self.project_service.get_project_by_id(project_id) or {}
+        working = str(project.get("working_directory") or "")
+        if not working:
+            raise ValueError("A project working directory is required to push to master.")
+        commits_root = os.path.realpath(os.path.join(working, "commits"))
+        snapshots = self.snapshot_service.verify_pending_snapshot(
+            commits_root, project_id, logical_id, rows
+        )
+        items = {}
+        for row in rows:
+            filename = os.path.basename(str(row.get("filename") or ""))
+            key = filename.casefold()
+            snapshot = snapshots[key]
+            source = os.path.realpath(os.path.join(commits_root, snapshot["path"]))
+            if os.path.commonpath((commits_root, source)) != commits_root:
+                raise ValueError("The frozen native file is outside the submission store.")
+            item = items.setdefault(key, {
+                "filename": filename, "dest_path": source,
+                "snapshot_sha256": snapshot["sha256"], "part_ids": [],
+                "cad_document_id": row.get("cad_document_id"), "source_order": 0,
+            })
+            item["source_order"] = max(item["source_order"], int(row["id"]))
+            if row.get("part_id") is not None:
+                item["part_ids"].append(int(row["part_id"]))
+        master_path = MasterWorkService.publish(
+            working, logical_id, list(items.values()), actor_user_id=int(self.session.user_id),
+            on_published=lambda: self.commit_repository.mark_integrated_under_development(
+                logical_id, project_id, int(self.session.user_id), [int(row["id"]) for row in rows]
+            ),
+        )
+        result = {
+            "commit_id": logical_id, "master_path": master_path,
+            "affected_part_ids": sorted({int(row["part_id"]) for row in rows if row.get("part_id") is not None}),
+            "affected_cad_document_ids": sorted({int(row["cad_document_id"]) for row in rows if row.get("cad_document_id") is not None}),
+            "status": "Integrated", "native_state": "Under development",
+        }
+        self.emit_project_event(
+            "commit.pushed_under_development", entity_type="COMMIT", entity_id=logical_id,
+            payload={**result, "item_ids": result["affected_part_ids"],
+                     "cad_document_ids": result["affected_cad_document_ids"]}, project_id=project_id,
+        )
+        return result
 
     def pending_commit_choices(self, user_id: int | None = None) -> list[dict]:
         """Return the current user's persisted Pending commit groups."""

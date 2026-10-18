@@ -174,7 +174,9 @@ class CheckoutReviewDialog(QDialog):
             line.setStyleSheet("border:0; background:transparent; padding:1px 3px;")
             layout.addWidget(line)
             for detail in details:
-                detail_label = QLabel(f"&nbsp;&nbsp;&nbsp;&nbsp;{html.escape(str(detail))}")
+                detail_label = QLabel(str(detail))
+                detail_label.setTextFormat(Qt.PlainText)
+                detail_label.setContentsMargins(16, 0, 0, 0)
                 detail_label.setWordWrap(True)
                 detail_label.setStyleSheet("color:#4b5563; border:0; background:transparent;")
                 layout.addWidget(detail_label)

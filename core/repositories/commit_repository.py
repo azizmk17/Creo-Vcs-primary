@@ -734,6 +734,29 @@ class CommitRepository:
                 last_snapshot_id, filename, project_id,
             ))
 
+    def mark_integrated_under_development(self, commit_id, project_id, actor_user_id, expected_row_ids):
+        """Remove a whole published group from review without granting validation."""
+        with self.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT id,status FROM commits WHERE commit_id=? AND project_id=? ORDER BY id",
+                (str(commit_id), int(project_id)),
+            ).fetchall()
+            if (not rows or {int(row["id"]) for row in rows} != {int(value) for value in expected_row_ids}
+                    or any(str(row["status"]).casefold() != "pending" for row in rows)):
+                raise ValueError("The Pending submission changed during publication; refresh and retry.")
+            conn.execute(
+                "UPDATE commits SET status='Integrated' WHERE commit_id=? AND project_id=?",
+                (str(commit_id), int(project_id)),
+            )
+            conn.execute("""
+                INSERT INTO cad_submission_lifecycle_events(
+                    project_id,commit_id,actor_user_id,from_status,to_status,reason
+                ) VALUES(?,?,?,'Pending','Integrated',?)
+            """, (int(project_id), str(commit_id), int(actor_user_id),
+                  "Pushed to master without validation; Under development"))
+        return True
+
     def validate(self, commit_id, checker,  project_id):
         with self.get_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -743,12 +766,13 @@ class CommitRepository:
             if not rows:
                 return False
             statuses = {str(row["status"] or "").strip() for row in rows}
-            if statuses != {"Pending"}:
-                raise ValueError("Only a complete Pending submission can be validated.")
+            if statuses not in ({"Pending"}, {"Integrated"}):
+                raise ValueError("Only a complete Pending submission or an Integrated submission can be validated.")
+            from_status = next(iter(statuses))
             cur = conn.execute("""
                 UPDATE commits SET status='Validated',checked_by=?
-                WHERE commit_id=? AND project_id=? AND status='Pending'
-            """, (int(checker), str(commit_id), int(project_id)))
+                WHERE commit_id=? AND project_id=? AND status=?
+            """, (int(checker), str(commit_id), int(project_id), from_status))
             if cur.rowcount != len(rows):
                 raise ValueError("The submission changed while validation was being processed; refresh and retry.")
             return True

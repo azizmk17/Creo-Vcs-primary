@@ -24,7 +24,7 @@ from collections import Counter
 
 from core.services.user_service import UserService
 from core.repositories.user_repository import UserRepository
-from core.services.commit_service import CommitService
+from core.services.commit_service import CommitService, PendingCommitConflict
 from pages.part_dialog import PartDialog
 from pages.dialogs.merge_dialog import MergeDialog
 from core.services.merge_service import MergeService
@@ -2578,6 +2578,24 @@ class CommitPage(QWidget):
                 diff_b.clicked.connect(lambda _c=False, d=data: self._show_step_diff_for_commit_history(d))
                 btn_row.addWidget(diff_b)
 
+        if str(group_details.get("status") or "").casefold() == "integrated":
+            review_btn = QPushButton("Review for Validation")
+            review_btn.setEnabled(self.perm.can("validate"))
+            review_btn.setToolTip("Review this integrated, unvalidated commit")
+
+            def review_integrated():
+                dlg.accept()
+                self.show_commit_details({
+                    **group_details,
+                    "parts": [row.get("filename") or "" for row in files],
+                    "username": group_details.get("designer") or group_details.get("author") or "",
+                    "date": group_details.get("committed_at") or "",
+                    "related_issues": group_details.get("issues") or [],
+                })
+
+            review_btn.clicked.connect(review_integrated)
+            btn_row.addWidget(review_btn)
+
         copy_btn = QPushButton("Copy Details")
         copy_btn.setObjectName("neutral")
         copy_btn.clicked.connect(lambda _c=False, d=data: self._copy_commit_to_clipboard(d))
@@ -2952,13 +2970,15 @@ class CommitPage(QWidget):
                 group['status'] = 'Validated'
                 status_badge.setText("  VALIDATED  ")
                 validate_btn.setEnabled(False)
+                push_btn.setEnabled(self.perm.can("merge"))
+                push_btn.setToolTip("Approve and publish this validated submission to master")
                 self.load_pending_commits()
                 QMessageBox.information(self, "Validated",
                     f"Commit '{group.get('title')}' validated.")
 
         def handle_push():
-            self.push_to_master(group)
-            dialog.accept()
+            if self.push_to_master(group):
+                dialog.accept()
 
         def handle_withdraw():
             answer = QMessageBox.question(
@@ -3047,7 +3067,7 @@ class CommitPage(QWidget):
         validate_btn.clicked.connect(handle_validate)
         validate_btn.setEnabled(
             self.perm.can("validate")
-            and str(group.get("status") or "").casefold() == "pending"
+            and str(group.get("status") or "").casefold() in {"pending", "integrated"}
         )
 
         push_btn = QPushButton("Push to Master")
@@ -3056,8 +3076,9 @@ class CommitPage(QWidget):
         push_btn.clicked.connect(handle_push)
         push_btn.setEnabled(
             self.perm.can("merge")
-            and str(group.get("status") or "").casefold() == "validated"
+            and str(group.get("status") or "").casefold() in {"pending", "validated"}
         )
+        push_btn.setToolTip("Publish Pending work as Under development, or approve a Validated submission")
 
         close_btn = QPushButton("Close")
         close_btn.setObjectName("neutral")
@@ -3522,6 +3543,54 @@ class CommitPage(QWidget):
 
         QTimer.singleShot(0, run_next)
 
+    def _ask_pending_conflict_action(self, conflict):
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Warning)
+        dialog.setWindowTitle("Pending File Conflict")
+        dialog.setText(f"A Pending submission already contains {conflict.filename}.")
+        explanation = (
+            "Replace updates existing Pending files with the staged versions. "
+            "Skip checks in only files without a Pending conflict and keeps skipped files staged. "
+            "Your choice applies to all conflicting files in this check-in."
+        )
+        if conflict.replacement_blocked_reason:
+            explanation += "\n\n" + conflict.replacement_blocked_reason
+        dialog.setInformativeText(explanation)
+        replace_button = dialog.addButton("Replace", QMessageBox.AcceptRole)
+        skip_button = dialog.addButton("Skip", QMessageBox.ActionRole)
+        cancel_button = dialog.addButton(QMessageBox.Cancel)
+        replace_button.setEnabled(not bool(conflict.replacement_blocked_reason))
+        replace_button.setToolTip(conflict.replacement_blocked_reason)
+        dialog.setDefaultButton(cancel_button)
+        dialog.setEscapeButton(cancel_button)
+        dialog.exec_()
+        selected = dialog.clickedButton()
+        if selected == replace_button and replace_button.isEnabled():
+            return "replace"
+        if selected == skip_button:
+            return "skip"
+        return None
+
+    def _finish_commit_staging(self, commit_result):
+        skipped = {str(name).casefold() for name in commit_result.get("skipped_files") or []}
+        if skipped:
+            for index in range(len(self.uncommitted_parts) - 1, -1, -1):
+                staged = self.uncommitted_parts[index]
+                name = os.path.basename(str(staged.get("path") or staged.get("filename") or ""))
+                if name.casefold() not in skipped:
+                    self.uncommitted_parts.pop(index)
+                    self.changes_list.takeItem(index)
+        else:
+            self.commit_title.clear()
+            self.commit_message.clear()
+            self.step_compare_checkbox.setChecked(False)
+            self.commit_jira_key.clear()
+            self.commit_jira_url.clear()
+            self.uncommitted_parts.clear()
+            self._pending_engineering_attachments.clear()
+            self.changes_list.clear()
+        self._update_staged_count()
+
     def commit_changes(self):
         if getattr(self, "_processing_action", False):
             return
@@ -3585,6 +3654,8 @@ class CommitPage(QWidget):
                 continue
 
         if self.commit_service:
+            duplicate_action = "error"
+
             def do_commit():
                 commit_result = self.commit_service.commit_file(
                     self.commits_dir,
@@ -3600,11 +3671,13 @@ class CommitPage(QWidget):
                     jira_url=jira_url,
                     engineering_attachments=self._pending_engineering_attachments,
                     workspace_expectations=workspace_expectations,
+                    duplicate_action=duplicate_action,
                 )
                 affected_part_ids = set((commit_result or {}).get("affected_part_ids") or [])
                 affected_part_ids.update(resolved_issue_part_ids)
                 return {
                     "affected_part_ids": sorted(int(pid) for pid in affected_part_ids if pid is not None),
+                    "commit_result": commit_result or {},
                     "history": self.commit_service.get_commit_history() or [],
                     "pending": self.commit_service.get_pending_commits_grouped(
                         self.session.project_id, self.session.user_id, self.is_designer
@@ -3612,37 +3685,36 @@ class CommitPage(QWidget):
                 }
 
             def after_commit(result):
-                if False: QMessageBox.information(self, "Success",
-                    "Changes were checked in successfully.")
-                def update_status():
-                    self.window().statusBar().showMessage("Changes committed successfully.")
-
-                def clear_commit_form():
-                    self.commit_title.clear()
-                    self.commit_message.clear()
-                    self.step_compare_checkbox.setChecked(False)
-                    self.commit_jira_key.clear()
-                    self.commit_jira_url.clear()
-                    self.uncommitted_parts.clear()
-                    self._pending_engineering_attachments.clear()
-                    self.changes_list.clear()
-                    self._update_staged_count()
+                commit_result = (result or {}).get("commit_result") or {}
+                committed = len(commit_result.get("staged_files") or [])
+                skipped = len(commit_result.get("skipped_files") or [])
+                if skipped:
+                    summary = f"{committed} file(s) checked in; {skipped} conflicting file(s) skipped and remain staged."
+                else:
+                    summary = "Changes were checked in successfully."
 
                 return {
                     "steps": [
-                        update_status,
-                        clear_commit_form,
+                        lambda: self.window().statusBar().showMessage(summary),
+                        lambda: self._finish_commit_staging(commit_result),
                         lambda: self._refresh_bom_rows_for_parts((result or {}).get("affected_part_ids")),
                         lambda: self._refresh_issue_views(resolved_issue_part_ids),
                         lambda: self._set_commit_history_rows((result or {}).get("history") or []),
                         lambda: self._set_pending_commit_groups((result or {}).get("pending") or []),
                     ],
                     "popup": lambda: QMessageBox.information(
-                        self, "Check In Complete", "Changes were checked in successfully."
+                        self, "Check In Complete" if committed else "Check In Skipped", summary
                     ),
                 }
 
             def on_commit_error(exc):
+                nonlocal duplicate_action
+                if isinstance(exc, PendingCommitConflict):
+                    action = self._ask_pending_conflict_action(exc)
+                    if action:
+                        duplicate_action = action
+                        self._run_processing_task("Committing changes...", do_commit, after_commit, on_commit_error)
+                    return
                 error_str = str(exc)
                 if error_str.startswith("cad_register_required:"):
                     missing_file = error_str.split(":", 1)[1]
@@ -3849,8 +3921,24 @@ class CommitPage(QWidget):
                 "Switch to that project to push/merge it.",
             )
             return
+        under_development = str(group.get("status") or "").casefold() == "pending"
+        if under_development:
+            warning = QMessageBox(self)
+            warning.setIcon(QMessageBox.Warning)
+            warning.setWindowTitle("Push Without Validation")
+            warning.setText("This commit has not been validated. Push it to master anyway?")
+            warning.setInformativeText(
+                "The commit will leave the pending queue and be recorded as Integrated into master, "
+                "with its BOM state still Under development. Existing validated PDF/STEP files "
+                "will keep their previous source version."
+            )
+            warning.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+            warning.setDefaultButton(QMessageBox.Cancel)
+            warning.setEscapeButton(QMessageBox.Cancel)
+            if warning.exec_() != QMessageBox.Yes:
+                return
         approval_message = ""
-        if bool(getattr(self.session, "is_admin", False)):
+        if not under_development and bool(getattr(self.session, "is_admin", False)):
             approval_message, accepted = QInputDialog.getMultiLineText(
                 self,
                 "Administrator Approval",
@@ -3867,30 +3955,35 @@ class CommitPage(QWidget):
                 )
                 return
         def do_push():
-            merge_result = self.merge_service.excute_merge_by_commit_id(
-                group["commit_id"], approval_message
-            )
+            if under_development:
+                merge_result = self.commit_service.push_unvalidated_to_master(group["commit_id"])
+            else:
+                merge_result = self.merge_service.excute_merge_by_commit_id(
+                    group["commit_id"], approval_message
+                )
             if isinstance(merge_result, dict):
                 affected_part_ids = merge_result.get("affected_part_ids") or []
                 affected_cad_document_ids = merge_result.get("affected_cad_document_ids") or []
             else:
                 affected_part_ids = merge_result or []
                 affected_cad_document_ids = []
-            try:
-                self.commit_service.emit_project_event(
-                    "commit.merged",
-                    entity_type="COMMIT",
-                    entity_id=str(group.get("commit_id") or ""),
-                    payload={
-                        "commit_id": str(group.get("commit_id") or ""),
-                        "item_ids": [int(value) for value in affected_part_ids if value is not None],
-                        "cad_document_ids": [int(value) for value in affected_cad_document_ids if value is not None],
-                        "status": "Approved",
-                    },
-                    project_id=group.get("project_id") or self.session.project_id,
-                )
-            except Exception:
-                pass
+            if not under_development:
+                try:
+                    self.commit_service.emit_project_event(
+                        "commit.merged",
+                        entity_type="COMMIT",
+                        entity_id=str(group.get("commit_id") or ""),
+                        payload={
+                            "commit_id": str(group.get("commit_id") or ""),
+                            "item_ids": [int(value) for value in affected_part_ids if value is not None],
+                            "cad_document_ids": [int(value) for value in affected_cad_document_ids if value is not None],
+                            "status": "Approved",
+                            "native_state": "Validated",
+                        },
+                        project_id=group.get("project_id") or self.session.project_id,
+                    )
+                except Exception:
+                    pass
             return {
                 "affected_part_ids": affected_part_ids,
                 "affected_cad_document_ids": affected_cad_document_ids,
@@ -3911,13 +4004,16 @@ class CommitPage(QWidget):
                     lambda: self._set_pending_commit_groups(result.get("pending") or []),
                     lambda: self._set_commit_history_rows(result.get("history") or []),
                 ],
-                "popup": None,
+                "popup": (lambda: QMessageBox.information(self, "Pushed to Master",
+                    "The commit is integrated into master and has left the pending queue. The BOM remains Under development; it is not validated."))
+                    if under_development else None,
             }
 
         def on_push_error(exc):
             QMessageBox.warning(self, "Merge Blocked", str(exc))
 
         self._run_processing_task("Pushing commit to master...", do_push, after_push, on_push_error)
+        return True
 
     def _restore_commit_group_from_history(self, group):
         if getattr(self, "_processing_action", False):

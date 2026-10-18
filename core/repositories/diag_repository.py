@@ -3,6 +3,8 @@ from datetime import datetime
 from core.models.commit_model import Commit 
 from config import DB_NAME # adjust to your ORM or query interface
 import sqlite3
+from dataclasses import fields
+from contextlib import closing
 
 
 class DiagRepository:
@@ -20,7 +22,7 @@ class DiagRepository:
 
     # --- Database ---
     def get_all_commits(self, project_id: int):
-        with self.get_conn() as conn:
+        with closing(self.get_conn()) as conn:
             cur = conn.cursor()
             cur.execute("SELECT * FROM commits WHERE project_id=? ORDER BY committed_at DESC", (project_id,))
             rows = cur.fetchall()
@@ -38,9 +40,6 @@ class DiagRepository:
             return None
         data = dict(row)
         # Fields expected by Commit dataclass
-        keys = [
-            'id','part_id','filename','file_path','base_file_name','designer',
-            'message','committed_by','checked_by','status','committed_at','signature','title','commit_id','username'
-        ]
-        filtered = {k: data.get(k) for k in keys}
+        keys = {field.name for field in fields(Commit)}
+        filtered = {k: value for k, value in data.items() if k in keys}
         return Commit(**filtered)

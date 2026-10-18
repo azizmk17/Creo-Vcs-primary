@@ -92,6 +92,11 @@ class PdmCheckoutCoordinationTests(unittest.TestCase):
         except OSError:
             pass
 
+    def _stored_cad(self, cad_id):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            return dict(conn.execute("SELECT * FROM cad_documents WHERE id=?", (cad_id,)).fetchone())
+
     def test_item_checkout_is_exact_and_does_not_checkout_cad(self):
         self.service.checkout_item(1)
 
@@ -196,16 +201,50 @@ class PdmCheckoutCoordinationTests(unittest.TestCase):
         self.assertEqual(machine["locked_by_username"], "designer")
         self.assertEqual(machine["category_names"], ["Mechanical"])
 
-    def test_cad_checkout_auto_locks_item_and_item_actions_are_blocked(self):
+    def test_item_undo_is_independent_of_auto_cad_checkout(self):
         result = self.service.checkout_pdm_cad_document(int(self.owner_cad["id"]))
 
         self.assertTrue(result["item_checkout_auto_created"])
         item_lock = self.service.lock_repo.get_by_part(1)
         self.assertEqual((item_lock.user_id, item_lock.checkout_origin), (1, "CAD"))
         with self.assertRaisesRegex(ValueError, "associated CAD working copies"):
-            self.service.undo_item_checkout(1)
-        with self.assertRaisesRegex(ValueError, "associated CAD working copies"):
             self.service.checkin_item_data(1, "metadata")
+        before = self._stored_cad(int(self.owner_cad["id"]))
+        self.assertTrue(self.service.undo_item_checkout(1))
+        self.assertIsNone(self.service.lock_repo.get_by_part(1))
+        self.assertEqual(self._stored_cad(int(self.owner_cad["id"])), before)
+
+    def test_item_undo_keeps_other_user_cad_workspace_and_sibling_checkout(self):
+        self.service.checkout_item(1)
+        self.service.session.user_id = 2
+        self.service.checkout_item(2)
+        self.service.session.user_id = 1
+        cad_id = int(self.owner_cad["id"])
+        self.repo.checkout_cad_document(
+            cad_id, 2, workspace_id="c" * 32,
+            workspace_name="Other machine work", workspace_machine_id="DESIGN-OTHER",
+        )
+        before = self._stored_cad(cad_id)
+        history_before = self.repo.list_cad_checkout_history(cad_id)
+        iteration = self.service.revision_repo.get_current_context(1)["current_iteration_id"]
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("UPDATE bom SET material='Working edit' WHERE id=1")
+
+        self.assertTrue(self.service.undo_item_checkout(1))
+
+        self.assertIsNone(self.service.lock_repo.get_by_part(1))
+        self.assertEqual(self.service.lock_repo.get_by_part(2).user_id, 2)
+        self.assertEqual(self._stored_cad(cad_id), before)
+        self.assertEqual(self.repo.list_cad_checkout_history(cad_id), history_before)
+        self.assertEqual(self.service.revision_repo.get_current_context(1)["current_iteration_id"], iteration)
+        self.assertIsNone(self.service.bom_repo.get_by_id(1).material)
+
+    def test_item_undo_still_rejects_undoing_another_users_item(self):
+        self.service.checkout_item(1)
+        self.service.session.user_id = 2
+        with self.assertRaisesRegex(ValueError, "checked out by another user"):
+            self.service.undo_item_checkout(1)
+        self.assertEqual(self.service.lock_repo.get_by_part(1).user_id, 1)
 
     def test_cad_checkout_can_create_an_explicit_associated_item_checkout(self):
         result = self.service.checkout_pdm_cad_document(

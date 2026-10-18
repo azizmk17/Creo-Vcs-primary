@@ -27,6 +27,9 @@ from core.session_manager import SessionManager
 from core.services.diag_service import DiagService
 from core.services.project_service import ProjectService
 from core.services.part_file_service import PartFileService
+from core.services.master_work_service import (
+    MasterWorkService, deliverable_provenance, native_work_state, master_commit_for_part,
+)
 from core.services.managed_file_service import ManagedFileService
 from core.services.package_export_service import PackageExportService
 from core.services.ui_permission import UIPermissionHelper
@@ -42,6 +45,7 @@ from core.bom_filter import (
     split_bom_filter_terms,
 )
 from core.repositories.commit_repository import CommitRepository
+from core.repositories.user_repository import UserRepository
 from core.services.commit_service import CommitService
 from pages.dialogs.package_parts_dialog import PackagePartsDialog
 from pages.dialogs.assembly_iteration_compare_dialog import AssemblyIterationCompareDialog
@@ -581,6 +585,8 @@ _BOM_PRODUCT_ROW_FG = "#FFFFFF"
 _BOM_PRODUCT_ROW_MUTED_FG = "#FFE2C6"
 
 _FILE_BADGE_STYLES = {
+    "previous": {"bg": "#FAEEDA", "fg": "#854F0B", "dot": "#BA7517", "dash": False},
+    "unverified": {"bg": "#E6F1FB", "fg": "#185FA5", "dot": "#378ADD", "dash": False},
     "ok": {
         "bg": "#EAF3DE", "fg": "#3B6D11", "dot": "#639922", "dash": False,
     },
@@ -598,6 +604,8 @@ _FILE_BADGE_STYLES = {
 _STATUS_BADGE_STYLES = {
     "released": {"bg": "#EAF3DE", "fg": "#3B6D11"},
     "design": {"bg": "#E6F1FB", "fg": "#185FA5"},
+    "validated": {"bg": "#EAF3DE", "fg": "#3B6D11"},
+    "under development": {"bg": "#FAEEDA", "fg": "#854F0B"},
     "in work": {"bg": "#FAEEDA", "fg": "#854F0B"},
     "obsolete": {"bg": "#F5F5F5", "fg": "#888888"},
 }
@@ -607,6 +615,9 @@ _STATUS_BADGE_CORNER_RADIUS = 6
 
 def _normalize_file_badge(doc_key: str, issues: set, doc_info: dict) -> tuple[str, str]:
     """Map PDF/STEP indicator state + integrity issues to badge kind and tooltip."""
+    provenance = str((doc_info or {}).get("state") or "").lower()
+    if provenance in {"previous", "unverified"}:
+        return provenance, str(doc_info.get("tooltip") or "")
     miss = f"missing_{doc_key}"
     out = f"outdated_{doc_key}"
     if miss in issues:
@@ -685,6 +696,8 @@ def _status_badge_key(raw: str) -> str | None:
     s = (raw or "").strip().lower()
     if not s:
         return None
+    if s in {"validated", "under development"}:
+        return s
     if "release" in s:
         return "released"
     if "obsolete" in s:
@@ -694,6 +707,11 @@ def _status_badge_key(raw: str) -> str | None:
     if "work" in s or "check" in s or "wip" in s:
         return "in work"
     return None
+
+
+def _file_pill_label(label, kind):
+    suffix = {"previous": " prev", "unverified": " ?", "missing": " missing"}.get(kind, "")
+    return label + suffix
 
 
 def _paint_file_pill(painter: QPainter, rect: QRect, label: str, kind: str) -> int:
@@ -707,7 +725,7 @@ def _paint_file_pill(painter: QPainter, rect: QRect, label: str, kind: str) -> i
     f.setBold(True)
     painter.setFont(f)
     fm = QFontMetrics(f)
-    text = (label or "").upper()
+    text = _file_pill_label(label or "", kind).upper()
     dot_r = 5
     gap_after_dot = 4
     pad_h = 6
@@ -760,7 +778,7 @@ def _files_delegate_pill_rects(option_rect: QRect, payload: dict) -> tuple[QRect
     fm = QFontMetrics(f)
 
     def _pill_w(kind: str, label: str) -> int:
-        text = label.upper()
+        text = _file_pill_label(label, kind).upper()
         dot_r = 5
         gap_after_dot = 4
         pad_h = 6
@@ -1166,7 +1184,7 @@ class _BomTreeStatusDelegate(QStyledItemDelegate):
             return super().helpEvent(event, view, option, index)
         item = self._tree.itemFromIndex(index)
         if item and (item.text(BOM_COL_STATUS) or "").strip():
-            QToolTip.showText(event.globalPos(), item.text(BOM_COL_STATUS), view)
+            QToolTip.showText(event.globalPos(), item.toolTip(BOM_COL_STATUS) or item.text(BOM_COL_STATUS), view)
             return True
         return super().helpEvent(event, view, option, index)
 
@@ -8490,25 +8508,100 @@ class BomPage(QWidget):
         }
 
     def _visible_bom_column_keys(self) -> set[str]:
-        settings = QSettings("Nexus", "NexusPDM")
-        raw = str(settings.value("bom/visible_extra_columns", "") or "").strip()
-        if not raw:
+        loaded = self._bom_column_preferences().get("visible_extra_columns")
+        if loaded is None:
+            raw = str(QSettings("Nexus", "NexusPDM").value("bom/visible_extra_columns", "") or "")
+            try:
+                loaded = json.loads(raw) if raw else None
+            except (ValueError, TypeError):
+                loaded = None
+        if not isinstance(loaded, list):
             return self._default_visible_bom_column_keys()
-        try:
-            loaded = json.loads(raw)
-            return {
-                str(value)
-                for value in (loaded or [])
-                if str(value) in {spec[0] for spec in BOM_EXTRA_COLUMN_SPECS}
-            } | {"cad_revision", "drw_revision"}
-        except Exception:
-            return self._default_visible_bom_column_keys()
+        allowed = {spec[0] for spec in BOM_EXTRA_COLUMN_SPECS}
+        return {str(key) for key in loaded if str(key) in allowed}
+
+    def _bom_column_preferences(self) -> dict:
+        if self.session.user_id is None:
+            return {}
+        if not hasattr(self, "_bom_column_repo"):
+            self._bom_column_repo = UserRepository()
+        return self._bom_column_repo.get_bom_column_preferences(int(self.session.user_id))
 
     def _save_visible_bom_column_keys(self, keys: set[str]) -> None:
-        QSettings("Nexus", "NexusPDM").setValue(
-            "bom/visible_extra_columns",
-            json.dumps(sorted(str(key) for key in keys)),
-        )
+        if self.session.user_id is None:
+            raise ValueError("Log in to save a personal column layout.")
+        preferences = self._bom_column_preferences()
+        preferences["visible_extra_columns"] = sorted(keys)
+        self._bom_column_repo.set_bom_column_preferences(int(self.session.user_id), preferences)
+
+    def _bom_column_tree_kind(self, tree):
+        if tree is getattr(self, "_cad_tree", None):
+            return "cad"
+        if tree in (getattr(self, "_ebom_tree", None), getattr(self, "_ebom_filter_tree", None)):
+            return "ebom"
+        return "bom"
+
+    def _install_bom_column_menu(self, tree):
+        header = tree.header()
+        header.setSectionsMovable(True)
+        header.setStretchLastSection(False)
+        if header.property("nexusDefaultColumnState") is None:
+            header.setProperty("nexusDefaultColumnState", header.saveState())
+        if not bool(header.property("nexusColumnMenuInstalled")):
+            header.setContextMenuPolicy(Qt.CustomContextMenu)
+            header.customContextMenuRequested.connect(
+                lambda _pos, tree=tree: self.show_bom_column_dialog(tree=tree)
+            )
+            header.setProperty("nexusColumnMenuInstalled", True)
+            header.setToolTip("Resize or reorder columns, then right-click and Save for Me.")
+
+    def _restore_saved_bom_columns(self):
+        from PyQt5.QtCore import QByteArray
+
+        preferences = self._bom_column_preferences()
+        layouts = preferences.get("layouts")
+        if not isinstance(layouts, dict):
+            layouts = {}
+        for name in ("tree", "_search_tree", "_ebom_tree", "_ebom_filter_tree", "_cad_tree"):
+            tree = getattr(self, name, None)
+            if tree is None:
+                continue
+            self._install_bom_column_menu(tree)
+            tree.header().restoreState(tree.header().property("nexusDefaultColumnState"))
+            saved = layouts.get(self._bom_column_tree_kind(tree))
+            if not isinstance(saved, dict):
+                saved = {}
+            headers = [tree.headerItem().text(column) for column in range(tree.columnCount())]
+            if saved.get("headers") == headers and isinstance(saved.get("state"), str):
+                tree.header().restoreState(QByteArray.fromBase64(saved["state"].encode("ascii", errors="ignore")))
+        self._apply_bom_column_visibility()
+        cad = getattr(self, "_cad_tree", None)
+        if cad is not None:
+            visible = preferences.get("cad_visible_columns", list(range(cad.columnCount())))
+            if not isinstance(visible, list):
+                visible = list(range(cad.columnCount()))
+            for column in range(cad.columnCount()):
+                cad.setColumnHidden(column, column != CAD_COL_NUMBER and column not in visible)
+        self._bom_column_layout_user = self.session.user_id
+
+    def _save_personal_bom_columns(self, tree, selected):
+        if self.session.user_id is None:
+            raise ValueError("Log in to save a personal column layout.")
+        preferences = self._bom_column_preferences()
+        kind = self._bom_column_tree_kind(tree)
+        if kind == "cad":
+            preferences["cad_visible_columns"] = sorted({CAD_COL_NUMBER, *selected})
+        else:
+            preferences["visible_extra_columns"] = sorted(selected)
+        layouts = preferences.get("layouts")
+        layouts = dict(layouts) if isinstance(layouts, dict) else {}
+        layouts[kind] = {
+            "headers": [tree.headerItem().text(column) for column in range(tree.columnCount())],
+            "state": bytes(tree.header().saveState().toBase64()).decode("ascii"),
+        }
+        preferences["layouts"] = layouts
+        self._bom_column_repo.set_bom_column_preferences(int(self.session.user_id), preferences)
+        self._restore_saved_bom_columns()
 
     def _configure_bom_tree_columns(self, tree: QTreeWidget | None, ebom: bool = False) -> None:
         if tree is None:
@@ -8517,11 +8610,11 @@ class BomPage(QWidget):
         widths = {
             BOM_COL_ROW: 38,
             BOM_COL_NAME: 260 if ebom else 280,
-            BOM_COL_FILES: 100,
+            BOM_COL_FILES: 190,
             BOM_COL_AES: 125 if ebom else 90,
             BOM_COL_TYPE: 70,
             BOM_COL_REV: 70,
-            BOM_COL_STATUS: 85,
+            BOM_COL_STATUS: 145,
             BOM_COL_INTEGRITY: 55,
             EBOM_COL_SOURCE_QTY: 74,
             EBOM_COL_EFFECTIVE_QTY: 84,
@@ -8542,17 +8635,7 @@ class BomPage(QWidget):
             tree.setTreePosition(BOM_COL_NAME)
         except Exception:
             pass
-        try:
-            header = tree.header()
-            if not bool(header.property("nexusColumnMenuInstalled")):
-                header.setContextMenuPolicy(Qt.CustomContextMenu)
-                header.customContextMenuRequested.connect(
-                    lambda _pos, self=self: self.show_bom_column_dialog()
-                )
-                header.setProperty("nexusColumnMenuInstalled", True)
-                header.setToolTip("Right-click to manage visible tree columns.")
-        except Exception:
-            pass
+        self._install_bom_column_menu(tree)
 
     def _apply_bom_column_visibility(self, tree: QTreeWidget | None = None, ebom: bool | None = None) -> None:
         trees = []
@@ -8613,7 +8696,11 @@ class BomPage(QWidget):
             except Exception:
                 pass
 
-    def show_bom_column_dialog(self):
+    def show_bom_column_dialog(self, _checked=False, *, tree=None):
+        if tree is None:
+            stack = getattr(self, "_tree_stack", None)
+            tree = stack.currentWidget() if stack is not None else self._current_tree_for_filtering()
+        is_cad = self._bom_column_tree_kind(tree) == "cad"
         dialog = QDialog(self)
         dialog.setWindowTitle("Tree Columns")
         dialog.resize(520, 620)
@@ -8622,16 +8709,20 @@ class BomPage(QWidget):
         title.setStyleSheet("font-weight:700;font-size:13px;color:#1f3347;")
         layout.addWidget(title)
         help_label = QLabel(
-            "Choose the metadata columns shown in the Product Structure tree. "
-            "The main tree column remains fixed, like Creo/Windchill."
+            "Choose visible columns and click Save for Me to remember your choices, "
+            "column widths, and order for future sessions. Other users keep their own layouts."
         )
         help_label.setWordWrap(True)
         layout.addWidget(help_label)
 
         list_widget = QListWidget()
         list_widget.setAlternatingRowColors(True)
-        visible = self._visible_bom_column_keys()
-        for key, label, _width, _default, _aliases in BOM_EXTRA_COLUMN_SPECS:
+        visible = ({column for column in range(tree.columnCount()) if not tree.isColumnHidden(column)}
+                   if is_cad else self._visible_bom_column_keys())
+        specs = ([(column, tree.headerItem().text(column), 0, True, ())
+                  for column in range(tree.columnCount()) if column != CAD_COL_NUMBER]
+                 if is_cad else BOM_EXTRA_COLUMN_SPECS)
+        for key, label, _width, _default, _aliases in specs:
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, key)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
@@ -8651,7 +8742,8 @@ class BomPage(QWidget):
         quick_row.addStretch()
         layout.addLayout(quick_row)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText("Save for Me")
         layout.addWidget(buttons)
 
         def set_all(state):
@@ -8662,7 +8754,7 @@ class BomPage(QWidget):
         clear_all.clicked.connect(lambda: set_all(Qt.Unchecked))
 
         def reset_default():
-            defaults = self._default_visible_bom_column_keys()
+            defaults = set(range(tree.columnCount())) if is_cad else self._default_visible_bom_column_keys()
             for row in range(list_widget.count()):
                 item = list_widget.item(row)
                 item.setCheckState(Qt.Checked if item.data(Qt.UserRole) in defaults else Qt.Unchecked)
@@ -8676,11 +8768,14 @@ class BomPage(QWidget):
         for row in range(list_widget.count()):
             item = list_widget.item(row)
             if item.checkState() == Qt.Checked:
-                selected.add(str(item.data(Qt.UserRole)))
-        self._save_visible_bom_column_keys(selected)
-        self._apply_bom_column_visibility()
+                selected.add(item.data(Qt.UserRole))
         try:
-            self.window().statusBar().showMessage("BOM tree columns updated.")
+            self._save_personal_bom_columns(tree, selected)
+        except Exception as exc:
+            QMessageBox.warning(self, "Save Columns", f"Could not save your column layout: {exc}")
+            return
+        try:
+            self.window().statusBar().showMessage("Your BOM column layout was saved.")
         except Exception:
             pass
 
@@ -8773,7 +8868,7 @@ class BomPage(QWidget):
         self.clear_filter_btn.setEnabled(False)
         self.bom_columns_btn = QPushButton("Columns")
         self.bom_columns_btn.setProperty("structureTool", True)
-        self.bom_columns_btn.setToolTip("Manage visible Product Structure tree columns.")
+        self.bom_columns_btn.setToolTip("Save your visible columns, widths, and order for future sessions.")
         self.bom_columns_btn.clicked.connect(self.show_bom_column_dialog)
         filter_row.addWidget(self.advanced_filter_btn)
         filter_row.addWidget(self.saved_filters_btn)
@@ -9067,6 +9162,7 @@ class BomPage(QWidget):
             self._handle_pdm_folder_drag_reorder
         )
         self._tree_stack.addWidget(self._cad_tree)              # index 5
+        self._restore_saved_bom_columns()
 
         _bom_tree_qss = f"""
             QTreeWidget {{
@@ -9538,6 +9634,10 @@ class BomPage(QWidget):
         files_actions.addWidget(self.open_active_btn)
         files_actions.addWidget(self.preview_file_btn)
         files_actions.addWidget(self.open_folder_btn)
+        self.open_master_btn = QPushButton("Open Master")
+        self.open_master_btn.setToolTip("Latest shared native CAD, including work under development")
+        self.open_master_btn.clicked.connect(self._open_master_directory)
+        files_actions.addWidget(self.open_master_btn)
         files_actions.addWidget(self.remove_attachment_btn)
         files_actions.addWidget(self.link_file_issue_btn)
         files_actions.addWidget(self.export_package_btn)
@@ -13843,7 +13943,7 @@ class BomPage(QWidget):
         undo_action = menu.addAction("Undo Item Checkout")
         undo_action.setEnabled(locked and can_finish_checkout)
         if active_cad:
-            undo_action.setToolTip("Undo Item checkout and automatically undo associated CAD checkouts.")
+            undo_action.setToolTip("Undo this Item checkout; associated CAD checkouts stay active.")
         undo_action.triggered.connect(lambda: self.undo_checkout(item_id))
         menu.addSeparator()
         cad_menu = menu.addMenu("Associated CAD Documents")
@@ -17651,6 +17751,7 @@ class BomPage(QWidget):
                     self._indicator_refresh_timer.start()
                 return
             summary = self._indicator_summary_for_part(part_id, issues)
+            self._apply_native_work_status(item, part_id)
             item.setData(BOM_COL_FILES, BOM_TREE_FILES_ROLE, _file_badges_payload(part_id, issues, summary))
             item.setData(BOM_COL_INTEGRITY, BOM_TREE_INTEGRITY_ROLE, _integrity_payload(part_id, self.missing_files, self.missing_ids))
             item.setIcon(BOM_COL_NAME, _bom_type_icon(info.get("type")))
@@ -19083,7 +19184,7 @@ class BomPage(QWidget):
             self,
             "Undo Checkout",
             "Discard the working Item attributes/structure and release this checkout?\n\n"
-            "Any associated CAD checkout owned by the same acting user will also be undone. "
+            "Associated CAD Documents and other Items will stay checked out. "
             "CAD/Item associations will not be removed.\n\n"
             "This does not create an iteration and is not a check-in.",
             QMessageBox.Yes | QMessageBox.No,
@@ -19400,35 +19501,43 @@ class BomPage(QWidget):
         except Exception:
             return None
 
-    def _latest_change_commit_for_part(self, part_id: int):
-        """Latest real CAD/DRW change for this part across the project family."""
-        try:
-            proj = self.project_service.get_project_by_id(self.session.project_id) or {}
-            root_id = proj.get("root_project_id")
-            commits = (
-                self.diag_service.repo.get_all_commits_for_root(int(root_id))
-                if root_id else self.diag_service.repo.get_all_commits(self.session.project_id)
-            )
-        except Exception:
-            commits = []
+    def _open_master_directory(self):
+        project = self.project_service.get_project_by_id(int(self.session.project_id)) or {}
+        working = str(project.get("working_directory") or "")
+        path = os.path.join(working, "master") if working else ""
+        if not path or not safe_exists(path):
+            QMessageBox.information(self, "Master", "Master is created when a master or admin pushes a native CAD submission.")
+            return
+        safe_startfile(path)
 
-        latest = None
-        latest_key = (datetime.min, -1)
-        good_statuses = {"pending", "validated", "approved"}
-        for c in commits or []:
-            try:
-                if int(getattr(c, "part_id", 0) or 0) != int(part_id):
-                    continue
-                if str(getattr(c, "status", "") or "").lower() not in good_statuses:
-                    continue
-                dt = self._commit_effective_dt(c) or datetime.min
-                key = (dt, int(getattr(c, "id", 0) or 0))
-                if key > latest_key:
-                    latest = c
-                    latest_key = key
-            except Exception:
-                continue
-        return latest
+    def _part_change_commits(self, part_id: int):
+        # Scope to the active project: another project version is not this master.
+        repository = self.diag_service.repo
+        return [c for c in repository.get_all_commits(self.session.project_id)
+                if int(getattr(c, "part_id", 0) or 0) == int(part_id)]
+
+    def _latest_change_commit_for_part(self, part_id: int):
+        commits = self._part_change_commits(part_id)
+        # Approval time must not make an older native look newer than subsequent work.
+        return max(commits, key=lambda c: (
+            self._parse_dt(getattr(c, "committed_at", "")) or datetime.min,
+            int(getattr(c, "id", 0) or 0)), default=None)
+
+    def _master_change_commit_for_part(self, part_id):
+        project = self.project_service.get_project_by_id(int(self.session.project_id)) or {}
+        manifest = MasterWorkService.read_manifest(project.get("working_directory"))
+        return master_commit_for_part(self._part_change_commits(int(part_id)), manifest, int(part_id))
+
+    def _apply_native_work_status(self, item, part_id):
+        if part_id is None:
+            return
+        if item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+            return
+        latest = self._master_change_commit_for_part(int(part_id))
+        if latest:
+            state = native_work_state(latest)
+            item.setText(BOM_COL_STATUS, state)
+            item.setToolTip(BOM_COL_STATUS, f"Master native: {latest.commit_id} — {state}")
 
     def _commit_ack_token(self, commit) -> str:
         if not commit:
@@ -19473,73 +19582,38 @@ class BomPage(QWidget):
 
     def _doc_indicator_state(self, part_id: int, doc_type: str, attachments: list | None = None, latest_commit=None) -> dict:
         doc_type = str(doc_type).upper()
-        label = doc_type
-        latest_commit = latest_commit if latest_commit is not None else self._latest_change_commit_for_part(int(part_id))
-        commit_dt = self._commit_effective_dt(latest_commit) if latest_commit else None
-
+        commits = self._part_change_commits(int(part_id))
+        latest_commit = latest_commit if latest_commit is not None else self._master_change_commit_for_part(int(part_id))
+        sources = {str(c.commit_id): c for c in commits}
         if attachments is None:
-            try:
-                attachments = self.part_file_service.list_attachments(int(part_id))
-            except Exception:
-                attachments = []
-
+            attachments = self.part_file_service.list_attachments(int(part_id))
         candidates = []
         for att in attachments or []:
-            try:
-                if str(getattr(att, "file_type", "") or "").upper() != doc_type:
-                    continue
-                ver = self.part_file_service.get_active_version(att.id)
-                created_dt = self._parse_dt(getattr(ver, "created_at", None) or "") if ver else None
-                sort_dt = created_dt or self._parse_dt(getattr(att, "created_at", None) or "") or datetime.min
-                candidates.append((sort_dt, att, ver))
-            except Exception:
+            if str(getattr(att, "file_type", "") or "").upper() != doc_type:
                 continue
-
+            active = self.part_file_service.get_active_version(att.id)
+            versions = list(self.part_file_service.list_versions(att.id) or [])
+            if active and all(v.id != active.id for v in versions):
+                versions.append(active)
+            for version in versions:
+                if getattr(version, "deleted_at", None):
+                    continue
+                path = self.part_file_service.resolve_version_path(version)
+                if not path or not safe_exists(path):
+                    continue
+                source = sources.get(str(getattr(version, "source_commit_id", "") or ""))
+                info = deliverable_provenance(doc_type, version, latest_commit, source)
+                # Keep the last validated deliverable visible even if a newer draft exists.
+                rank = {"ok": 3, "previous": 2, "unverified": 1}[info["state"]]
+                source_order = (str(getattr(source, "committed_at", "") or ""),
+                                int(getattr(source, "id", 0) or 0))
+                candidates.append(((rank, source_order, int(version.id)), info))
         if candidates:
-            candidates.sort(key=lambda row: (row[0], int(getattr(row[1], "id", 0) or 0)), reverse=True)
-            _sort_dt, att, ver = candidates[0]
-            if not ver:
-                return {"state": "bad", "tooltip": f"{label}: attachment has no active version"}
-
-            created_dt = self._parse_dt(getattr(ver, "created_at", None) or "")
-            path = self.part_file_service.resolve_version_path(ver)
-            if not path or not safe_exists(path):
-                return {"state": "bad", "tooltip": f"{label}: file missing on disk"}
-
-            if doc_type == "STEP" and latest_commit:
-                latest_step_path = str(getattr(latest_commit, "step_file_path", "") or "").strip()
-                latest_step_name = os.path.basename(latest_step_path)
-                version_name = str(getattr(ver, "original_filename", "") or "").strip()
-                if latest_step_name and version_name and latest_step_name == version_name:
-                    return {"state": "ok", "tooltip": f"{label}: current from compared commit STEP"}
-
-            if latest_commit and (not created_dt or (commit_dt and commit_dt > created_dt)):
-                try:
-                    ack = self.part_doc_ack_service.get_ack(int(part_id), doc_type)
-                except Exception:
-                    ack = None
-                if self._ack_covers_commit(ack, latest_commit):
-                    return {"state": "ack", "tooltip": f"{label}: safe by user acknowledgement"}
-                return {"state": "bad", "tooltip": f"{label}: newer commit needs review"}
-
-            return {"state": "ok", "tooltip": f"{label}: current"}
-
+            return max(candidates, key=lambda candidate: candidate[0])[1]
         legacy_path = self._legacy_doc_path(int(part_id), doc_type)
-        if legacy_path:
-            resolved = self._resolve_file_path(legacy_path)
-            if not resolved or not safe_exists(resolved):
-                return {"state": "bad", "tooltip": f"{label}: file missing on disk"}
-            if latest_commit:
-                try:
-                    ack = self.part_doc_ack_service.get_ack(int(part_id), doc_type)
-                except Exception:
-                    ack = None
-                if self._ack_covers_commit(ack, latest_commit):
-                    return {"state": "ack", "tooltip": f"{label}: legacy file safe by user acknowledgement"}
-                return {"state": "bad", "tooltip": f"{label}: legacy file needs review after newer commit"}
-            return {"state": "ok", "tooltip": f"{label}: legacy file exists"}
-
-        return {"state": "absent", "tooltip": f"{label}: no attachment"}
+        if legacy_path and safe_exists(self._resolve_file_path(legacy_path)):
+            return deliverable_provenance(doc_type, None, latest_commit, None)
+        return {"state": "absent", "tooltip": f"{doc_type}: no available attachment"}
 
     def _indicator_summary_for_part(self, part_id: int | None, issues: set | None = None) -> dict:
         if part_id is None:
@@ -19563,7 +19637,7 @@ class BomPage(QWidget):
                 attachments = self.part_file_service.list_attachments(pid)
             except Exception:
                 attachments = []
-            latest_commit = self._latest_change_commit_for_part(pid)
+            latest_commit = self._master_change_commit_for_part(pid)
             cached = {
                 "pdf": self._doc_indicator_state(pid, "PDF", attachments, latest_commit),
                 "step": self._doc_indicator_state(pid, "STEP", attachments, latest_commit),
@@ -19578,9 +19652,9 @@ class BomPage(QWidget):
         issues = issues or set()
         pdf_state = str(summary["pdf"].get("state") or "").lower()
         step_state = str(summary["step"].get("state") or "").lower()
-        if ("missing_pdf" in issues or "outdated_pdf" in issues) and pdf_state not in ("ok", "ack"):
+        if ("missing_pdf" in issues or "outdated_pdf" in issues) and pdf_state not in ("ok", "ack", "previous", "unverified"):
             summary["pdf"] = {"state": "bad", "tooltip": "PDF: file missing or outdated on disk"}
-        if ("missing_step" in issues or "outdated_step" in issues) and step_state not in ("ok", "ack"):
+        if ("missing_step" in issues or "outdated_step" in issues) and step_state not in ("ok", "ack", "previous", "unverified"):
             summary["step"] = {"state": "bad", "tooltip": "STEP: file missing or outdated on disk"}
         return summary
 
@@ -19592,6 +19666,8 @@ class BomPage(QWidget):
         )
 
     def load_tree(self):
+        if getattr(self, "_bom_column_layout_user", None) != self.session.user_id:
+            self._restore_saved_bom_columns()
         # Show spinner immediately, then fetch tree data in a background thread.
         self._cancel_lazy_level_requests()
         self._tree_load_seq += 1
@@ -20287,6 +20363,7 @@ class BomPage(QWidget):
                     continue
                 issues = self._issues_for_part(part_id)
                 summary = self._indicator_summary_for_part(part_id, issues)
+                self._apply_native_work_status(item, part_id)
                 item.setData(BOM_COL_FILES, BOM_TREE_FILES_ROLE, _file_badges_payload(part_id, issues, summary))
                 item.setData(BOM_COL_INTEGRITY, BOM_TREE_INTEGRITY_ROLE, _integrity_payload(part_id, self.missing_files, self.missing_ids))
                 item.setToolTip(BOM_COL_FILES, "\n".join([
@@ -20946,7 +21023,7 @@ class BomPage(QWidget):
                 f"Check in Item data only; associated CAD stays checked out: {labels}"
             )
             self.undo_checkout_btn.setToolTip(
-                f"Undo Item checkout and automatically undo associated CAD: {labels}"
+                f"Undo this Item checkout only; associated CAD stays checked out: {labels}"
             )
         elif can_promote_auto_checkout:
             self.checkout_part_btn.setToolTip(
@@ -21854,6 +21931,8 @@ class BomPage(QWidget):
             labels = {
                 "ok": "OK",
                 "outdated": "Outdated",
+                "previous": "Previous validated",
+                "unverified": "Unverified",
                 "missing": "Missing",
                 "na": "Not attached",
                 "bad": "Missing",
@@ -22223,6 +22302,8 @@ class BomPage(QWidget):
             if isinstance(value, bool):
                 return "ok" if value else "bad"
             value = str(value or "").lower()
+            if value in {"previous", "unverified"}:
+                return "ack"
             return value if value in {"ok", "ack", "bad", "absent"} else "absent"
 
         pdf_state = _state(pdf_ok)

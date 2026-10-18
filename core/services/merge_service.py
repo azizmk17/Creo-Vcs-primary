@@ -851,6 +851,7 @@ class MergeService(BaseService):
                 attachment_part_ids = self._process_commit_attachments(
                     self._commit_group_dir(commit_data[0]), logical_id, project_id
                 )
+            self._publish_approved_master(commit_data, snapshot_records)
             journal_service.advance(journal["approval_id"], "COMPLETED")
             return self._merge_refresh_payload(
                 merged_entries, extra_part_ids=attachment_part_ids
@@ -858,6 +859,28 @@ class MergeService(BaseService):
         except Exception as exc:
             journal_service.record_error(journal["approval_id"], exc)
             raise
+
+    def _publish_approved_master(self, commits, snapshot_records):
+        from core.services.master_work_service import MasterWorkService
+
+        items = {}
+        for commit in commits:
+            snapshot = snapshot_records[int(commit.id)]
+            filename = os.path.basename(str(commit.filename))
+            item = items.setdefault(filename.casefold(), {
+                "filename": filename,
+                "dest_path": os.path.join(self.commits_dir, snapshot["path"]),
+                "snapshot_sha256": snapshot["sha256"],
+                "part_ids": [], "cad_document_id": getattr(commit, "cad_document_id", None),
+                "source_order": 0,
+            })
+            item["source_order"] = max(item["source_order"], int(commit.id))
+            if getattr(commit, "part_id", None) is not None:
+                item["part_ids"].append(int(commit.part_id))
+        MasterWorkService.publish(
+            self.working_dir, str(commits[0].commit_id), list(items.values()),
+            actor_user_id=int(self.session.user_id), preserve_newer=True,
+        )
 
     @require_permission("merge")
     def excute_merge(self, selected_ids, message):

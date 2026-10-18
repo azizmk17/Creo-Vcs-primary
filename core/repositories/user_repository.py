@@ -1,4 +1,6 @@
 import sqlite3
+import json
+from contextlib import closing
 from config import DB_NAME
 from core.models.user_model import User
 
@@ -29,6 +31,8 @@ class UserRepository:
                 conn.execute(
                     "ALTER TABLE user_settings ADD COLUMN cli_enabled INTEGER DEFAULT 0"
                 )
+            if "bom_column_preferences_json" not in cols:
+                conn.execute("ALTER TABLE user_settings ADD COLUMN bom_column_preferences_json TEXT")
         except Exception:
             pass
 
@@ -110,6 +114,30 @@ class UserRepository:
                 (int(user_id),),
             ).fetchone()
             return bool(row and int(row["cli_enabled"] or 0))
+
+    def get_bom_column_preferences(self, user_id: int) -> dict:
+        with closing(self.get_conn()) as conn, conn:
+            self._ensure_user_settings_table(conn)
+            row = conn.execute(
+                "SELECT bom_column_preferences_json FROM user_settings WHERE user_id=?", (int(user_id),)
+            ).fetchone()
+            try:
+                value = json.loads(row[0]) if row and row[0] else {}
+            except (ValueError, TypeError):
+                return {}
+            return value if isinstance(value, dict) else {}
+
+    def set_bom_column_preferences(self, user_id: int, preferences: dict) -> None:
+        encoded = json.dumps(preferences)
+        with closing(self.get_conn()) as conn, conn:
+            self._ensure_user_settings_table(conn)
+            conn.execute("""
+                INSERT INTO user_settings(user_id,bom_column_preferences_json,updated_at)
+                VALUES(?,?,datetime('now'))
+                ON CONFLICT(user_id) DO UPDATE SET
+                    bom_column_preferences_json=excluded.bom_column_preferences_json,
+                    updated_at=excluded.updated_at
+            """, (int(user_id), encoded))
 
     def _table_columns(self, conn, table_name: str) -> set[str]:
         try:
