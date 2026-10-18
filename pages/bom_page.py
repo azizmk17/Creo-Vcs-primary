@@ -571,7 +571,9 @@ BOM_EXTRA_COLUMN_SPECS = [
     ("created", "Created", 125, False, ("created", "created_at")),
     ("modified", "Modified", 125, False, ("modified", "modified_at")),
     ("notes", "Notes", 180, False, ("notes",)),
+    ("item_status", "Item Status", 145, True, ("item_status", "status")),
 ]
+BOM_COL_ITEM_STATUS = BOM_COL_EXTRA_START + len(BOM_EXTRA_COLUMN_SPECS) - 1
 BOM_TREE_COLUMN_COUNT = BOM_COL_EXTRA_START + len(BOM_EXTRA_COLUMN_SPECS)
 
 # Inline "In Work" beside name (spec)
@@ -916,9 +918,11 @@ class _BomTreeNameDelegate(QStyledItemDelegate):
         )
         name_font = QFont(opt.font)
         name_font.setPixelSize(11)
-        name_font.setBold(bool(is_asm))
+        name_font.setBold(bool(is_asm or is_product_row or item.text(BOM_COL_ITEM_STATUS).strip().casefold() == "released"))
         display_inwork = "In Work" if suffix else ""
         issue_badges = []
+        if item.text(BOM_COL_ITEM_STATUS).strip().casefold() == "released":
+            issue_badges.append(("RELEASED", QColor("#15803d")))
         if direct_active_count:
             issue_badges.append((f"!{direct_active_count}", QColor("#c62828")))
         if inherited_active_count:
@@ -3774,6 +3778,7 @@ class BomPage(QWidget):
         payload["current_version"] = str(
             payload.get("version_label") or payload.get("current_version") or ""
         )
+        payload.setdefault("item_status", payload.get("status") or "")
         payload["status"] = str(payload.get("state") or payload.get("status") or "")
         payload["relation_parent_id"] = payload.get("effective_parent_bom_id")
         payload["usage_id"] = payload.get("item_usage_id") or payload.get("usage_id")
@@ -8021,7 +8026,7 @@ class BomPage(QWidget):
                 params.extend([like] * len(text_columns))
         status = str(filters.get("status") or "All").strip()
         if status and status != "All":
-            where.append(f"lower(COALESCE({bom_expr('lifecycle_state')}, {bom_expr('status')}, ''))=?")
+            where.append(f"lower(COALESCE({bom_expr('status')}, ''))=?")
             params.append(status.lower())
         part_type = str(filters.get("type") or "All").strip()
         if part_type and part_type != "All" and "type" in bom_columns:
@@ -8136,6 +8141,7 @@ class BomPage(QWidget):
                    {bom_expr('weight')} AS weight,
                    {bom_expr('notes')} AS notes,
                    {bom_expr('revision', 'A')} AS revision,
+                   {bom_expr('status')} AS item_status,
                    COALESCE({bom_expr('lifecycle_state')}, {bom_expr('status')}, '') AS lifecycle_state,
                    {bom_expr('item_type')} AS item_type,
                    {bom_expr('assembly_mode')} AS assembly_mode,
@@ -8244,6 +8250,7 @@ class BomPage(QWidget):
                                        {bom_expr('weight')} AS weight,
                                        {bom_expr('notes')} AS notes,
                                        {bom_expr('revision', 'A')} AS revision,
+                                       {bom_expr('status')} AS item_status,
                                        COALESCE({bom_expr('lifecycle_state')}, {bom_expr('status')}, '') AS lifecycle_state,
                                        {bom_expr('item_type')} AS item_type,
                                        {bom_expr('assembly_mode')} AS assembly_mode,
@@ -8307,6 +8314,7 @@ class BomPage(QWidget):
                     "type": row.get("type") or "",
                     "current_version": row.get("revision") or "A",
                     "revision": row.get("revision") or "A",
+                    "item_status": row.get("item_status") or "",
                     "status": row.get("lifecycle_state") or "",
                     "lifecycle_state": row.get("lifecycle_state") or "",
                     "item_type": row.get("item_type") or "",
@@ -8498,7 +8506,7 @@ class BomPage(QWidget):
         number_label = "Number / Association" if ebom else "AES Number"
         return [
             "#", base_name, "Files", number_label, "Object", "Rev/Iter",
-            "Status", "Integrity", "Source Qty", "Effective Qty", "Level",
+            "Development State", "Integrity", "Source Qty", "Effective Qty", "Level",
         ] + [label for _key, label, _width, _default, _aliases in BOM_EXTRA_COLUMN_SPECS]
 
     def _default_visible_bom_column_keys(self) -> set[str]:
@@ -8572,8 +8580,19 @@ class BomPage(QWidget):
             if not isinstance(saved, dict):
                 saved = {}
             headers = [tree.headerItem().text(column) for column in range(tree.columnCount())]
-            if saved.get("headers") == headers and isinstance(saved.get("state"), str):
+            previous_headers = list(saved.get("headers") or [])
+            if self._bom_column_tree_kind(tree) != "cad" and len(previous_headers) > BOM_COL_STATUS:
+                if previous_headers[BOM_COL_STATUS] == "Status":
+                    previous_headers[BOM_COL_STATUS] = "Development State"
+            compatible = previous_headers == headers or (
+                headers[-1:] == ["Item Status"] and previous_headers == headers[:-1]
+            )
+            if compatible and isinstance(saved.get("state"), str):
                 tree.header().restoreState(QByteArray.fromBase64(saved["state"].encode("ascii", errors="ignore")))
+            # Qt5 restoreState can leave hidden sections reserving their former
+            # widths. Rebuild visibility from shown sections to compact the view.
+            for column in range(tree.columnCount()):
+                tree.setColumnHidden(column, False)
         self._apply_bom_column_visibility()
         cad = getattr(self, "_cad_tree", None)
         if cad is not None:
@@ -8607,6 +8626,14 @@ class BomPage(QWidget):
         if tree is None:
             return
         tree.setHeaderLabels(self._bom_tree_headers(ebom=ebom))
+        tree.headerItem().setToolTip(
+            BOM_COL_STATUS,
+            "Master native work and validation state. Independent of the user-controlled Item Status parameter.",
+        )
+        tree.headerItem().setToolTip(
+            BOM_COL_ITEM_STATUS,
+            "User-controlled Item parameter, such as Design, Production, or Obsolete. Does not indicate master validation.",
+        )
         widths = {
             BOM_COL_ROW: 38,
             BOM_COL_NAME: 260 if ebom else 280,
@@ -11802,6 +11829,7 @@ class BomPage(QWidget):
                 payload["current_version"] = str(
                     payload.get("version_label") or payload.get("current_version") or ""
                 )
+                payload.setdefault("item_status", payload.get("status") or "")
                 payload["status"] = str(payload.get("state") or payload.get("status") or "")
                 payload["relation_parent_id"] = payload.get("effective_parent_bom_id")
                 payload["usage_id"] = payload.get("item_usage_id") or payload.get("usage_id")
@@ -14804,7 +14832,7 @@ class BomPage(QWidget):
             return False
 
         status = str(filters.get("status") or "All").strip()
-        if status and status != "All" and str(item.text(BOM_COL_STATUS) or "").strip().lower() != status.lower():
+        if status and status != "All" and str(item.text(BOM_COL_ITEM_STATUS) or "").strip().lower() != status.lower():
             return False
 
         part_type = str(filters.get("type") or "All").strip()
@@ -14946,10 +14974,10 @@ class BomPage(QWidget):
 
         status_combo = QComboBox()
         status_combo.addItem("All")
-        status_combo.addItems(self._collect_tree_column_values(BOM_COL_STATUS))
+        status_combo.addItems(self._collect_tree_column_values(BOM_COL_ITEM_STATUS))
         if status_combo.findText(str(current.get("status") or "All")) >= 0:
             status_combo.setCurrentText(str(current.get("status") or "All"))
-        grid.addWidget(QLabel("Status"), 2, 0)
+        grid.addWidget(QLabel("Item Status"), 2, 0)
         grid.addWidget(status_combo, 2, 1)
 
         type_combo = QComboBox()
@@ -15465,7 +15493,7 @@ class BomPage(QWidget):
             params.extend([like] * 4)
         status = str(filters.get("status") or "All").strip()
         if status and status != "All":
-            where.append("lower(COALESCE(lifecycle_state,status,''))=?")
+            where.append("lower(COALESCE(status,''))=?")
             params.append(status.lower())
         part_type = str(filters.get("type") or "All").strip()
         if part_type and part_type != "All":
@@ -17612,6 +17640,20 @@ class BomPage(QWidget):
         self._renumber_full_bom_tree_rows()
         self._sync_search_tree_row_numbers()
 
+    def _apply_item_status_style(self, item):
+        """Decorate controlled Item status independently of master validation."""
+        status = item.text(BOM_COL_ITEM_STATUS).strip().casefold()
+        product = bool(item.data(0, BOM_TREE_PRODUCT_ROLE))
+        count = item.treeWidget().columnCount() if item.treeWidget() else BOM_TREE_COLUMN_COUNT
+        for column in range(count):
+            font = item.font(column)
+            font.setStrikeOut(status == "obsolete")
+            font.setBold(product or status == "released")
+            item.setFont(column, font)
+            if not product:
+                item.setBackground(column, QBrush(QColor("#e7f5ec")) if status == "released" else QBrush())
+                item.setForeground(column, QBrush())
+
     def _apply_tree_item_data(self, item: QTreeWidgetItem, info: dict) -> None:
         part_id = info.get("id")
         existing_path = str(item.data(0, BOM_TREE_PATH_ROLE) or "")
@@ -17719,7 +17761,7 @@ class BomPage(QWidget):
             )
         item.setText(BOM_COL_TYPE, str(info.get("type", "") or ""))
         item.setText(BOM_COL_REV, str(info.get("current_version") or info.get("revision", "") or ""))
-        item.setText(BOM_COL_STATUS, str(info.get("status", "") or ""))
+        item.setText(BOM_COL_STATUS, "Not recorded")
         item.setText(BOM_COL_INTEGRITY, "")
         item.setData(0, Qt.UserRole, part_id)
         self._apply_extra_bom_columns(item, info)
@@ -17736,6 +17778,8 @@ class BomPage(QWidget):
             for column in range(column_count):
                 item.setBackground(column, product_bg)
                 item.setForeground(column, product_fg)
+
+        self._apply_item_status_style(item)
 
         try:
             if info.get("_defer_indicators"):
@@ -19538,6 +19582,9 @@ class BomPage(QWidget):
             state = native_work_state(latest)
             item.setText(BOM_COL_STATUS, state)
             item.setToolTip(BOM_COL_STATUS, f"Master native: {latest.commit_id} — {state}")
+        else:
+            item.setText(BOM_COL_STATUS, "Not recorded")
+            item.setToolTip(BOM_COL_STATUS, "No master submission is recorded for this Item. See Item Status for its controlled parameter.")
 
     def _commit_ack_token(self, commit) -> str:
         if not commit:
@@ -21716,7 +21763,7 @@ class BomPage(QWidget):
         table.setMinimumHeight(190)
         table.setMaximumHeight(330)
         rows = [
-            ("Status", details.get("status")),
+            ("Commit Status", details.get("status")),
             ("Commit ID", details.get("commit_id")),
             ("Project", details.get("project_name")),
             ("Project Version", details.get("project_version_label")),
@@ -22052,7 +22099,7 @@ class BomPage(QWidget):
             "text_match_mode": "Text match mode",
             "work_state": "Work state",
             "work_owner": "Owner",
-            "status": "Status",
+            "status": "Development State",
             "type": "Type",
             "revision": "Revision",
             "categories": "Categories",
@@ -22179,7 +22226,7 @@ class BomPage(QWidget):
             ("drw_revision", "DRW Rev"),
             ("variants", "Variants"),
             ("categories", "Categories"),
-            ("status", "Status"),
+            ("status", "Development State"),
             ("work_state", "Work State"),
             ("pdf_status", "PDF Status"),
             ("pdf_details", "PDF Details"),

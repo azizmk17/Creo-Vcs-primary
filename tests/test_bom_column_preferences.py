@@ -48,7 +48,7 @@ class BomColumnRepositoryTests(unittest.TestCase):
 os.environ.setdefault("QT_QPA_PLATFORM", "windows" if os.name == "nt" else "offscreen")
 try:
     from PyQt5.QtCore import Qt, QTimer
-    from PyQt5.QtWidgets import QApplication, QWidget, QTreeWidget, QListWidget, QDialogButtonBox
+    from PyQt5.QtWidgets import QApplication, QWidget, QTreeWidget, QTreeWidgetItem, QListWidget, QDialogButtonBox, QLabel
 except ImportError:
     QT_AVAILABLE = False
 else:
@@ -163,6 +163,113 @@ class BomColumnUiTests(unittest.TestCase):
         reopened = self.page()
         self.assertEqual(reopened._ebom_tree.columnWidth(BOM_COL_NAME), 260)
         self.assertEqual(reopened._visible_bom_column_keys(), {"material"})
+
+    def assert_compact_columns(self, tree):
+        header = tree.header()
+        visible = sorted((header.sectionPosition(column), header.sectionSize(column))
+                         for column in range(tree.columnCount()) if not tree.isColumnHidden(column))
+        self.assertEqual(visible[0][0], 0)
+        for left, right in zip(visible, visible[1:]):
+            self.assertEqual(left[0] + left[1], right[0], "Hidden columns must not reserve blank space")
+
+    def test_hidden_columns_do_not_leave_gaps_after_save_and_restore(self):
+        page = self.page()
+        page._save_personal_bom_columns(page._ebom_tree, {"drawing_number", "cad_revision", "drw_revision"})
+        reopened = self.page()
+        for tree in (page._ebom_tree, page._ebom_filter_tree, reopened._ebom_tree):
+            self.assert_compact_columns(tree)
+
+    def test_previous_status_header_layout_keeps_widths_and_has_no_gaps(self):
+        from pages.bom_page import BOM_COL_STATUS, BOM_COL_ITEM_STATUS
+        old = QTreeWidget()
+        self.addCleanup(old.close)
+        headers = self.page()._bom_tree_headers(ebom=True)[:-1]
+        headers[BOM_COL_STATUS] = "Status"
+        old.setHeaderLabels(headers)
+        old.header().setStretchLastSection(False)
+        old.setColumnWidth(BOM_COL_NAME, 399)
+        old.setColumnHidden(self.column("filename"), True)
+        self.repo.set_bom_column_preferences(1, {
+            "visible_extra_columns": ["drawing_number", "cad_revision", "drw_revision"],
+            "layouts": {"ebom": {"headers": headers,
+                                   "state": bytes(old.header().saveState().toBase64()).decode("ascii")}},
+        })
+        page = self.page()
+        self.assertEqual(page._ebom_tree.columnWidth(BOM_COL_NAME), 399)
+        self.assertEqual(page._ebom_tree.headerItem().text(BOM_COL_STATUS), "Development State")
+        self.assertEqual(page._ebom_tree.headerItem().text(BOM_COL_ITEM_STATUS), "Item Status")
+        self.assertEqual(page._ebom_tree.header().count(), len(page._bom_tree_headers(ebom=True)))
+        self.assert_compact_columns(page._ebom_tree)
+
+    def test_controlled_item_status_is_independent_of_master_development_state(self):
+        from pages.bom_page import BOM_COL_STATUS, BOM_COL_ITEM_STATUS
+        page = self.page()
+        page._master_change_commit_for_part = lambda part_id: SimpleNamespace(commit_id="draft", status="Integrated")
+        row = QTreeWidgetItem(page._ebom_tree)
+        row.setText(BOM_COL_ITEM_STATUS, "Obsolete")
+        BomPage._apply_native_work_status(page, row, 1)
+        self.assertEqual(row.text(BOM_COL_STATUS), "Under development")
+        self.assertEqual(row.text(BOM_COL_ITEM_STATUS), "Obsolete")
+        page._master_change_commit_for_part = lambda part_id: None
+        BomPage._apply_native_work_status(page, row, 1)
+        self.assertEqual(row.text(BOM_COL_STATUS), "Not recorded")
+        self.assertEqual(row.text(BOM_COL_ITEM_STATUS), "Obsolete")
+
+    def test_item_parameter_editor_uses_distinct_status_label_without_changing_value(self):
+        from pages.part_dialog import PartDialog
+        dialog = PartDialog(part_data={"id": 1, "name": "Part", "status": "Obsolete"})
+        self.addCleanup(dialog.close)
+        self.assertIn("Item Status", [label.text() for label in dialog.findChildren(QLabel)])
+        self.assertEqual(dialog.status_input.currentText(), "Obsolete")
+        self.assertIn("Development State", dialog.status_input.toolTip())
+
+    def test_item_status_dropdown_choices_and_legacy_preservation(self):
+        from pages.part_dialog import PartDialog
+        for value in ("Design", "Released", "Obsolete", "Production"):
+            dialog = PartDialog(part_data={"id": 1, "name": "Part", "status": value})
+            self.addCleanup(dialog.close)
+            combo = dialog.status_input
+            self.assertFalse(combo.isEditable())
+            self.assertEqual([combo.itemText(i) for i in range(3)], ["Design", "Released", "Obsolete"])
+            self.assertEqual(combo.currentText(), value)
+            self.assertEqual(dialog.get_data()["status"], value)
+
+    def test_item_status_row_styles_clear_when_status_changes(self):
+        from pages.bom_page import BOM_COL_ITEM_STATUS, BOM_COL_STATUS
+        page = self.page()
+        row = QTreeWidgetItem(page._ebom_tree)
+        row.setText(BOM_COL_STATUS, "Under development")
+        for status in ("Released", "Obsolete", "Design", "Released", "Design"):
+            row.setText(BOM_COL_ITEM_STATUS, status)
+            BomPage._apply_item_status_style(page, row)
+            for column in range(page._ebom_tree.columnCount()):
+                self.assertEqual(row.font(column).strikeOut(), status == "Obsolete")
+                self.assertEqual(row.font(column).bold(), status == "Released")
+                if status == "Released":
+                    self.assertEqual(row.background(column).color().name(), "#e7f5ec")
+                else:
+                    self.assertEqual(row.background(column).style(), Qt.NoBrush)
+            self.assertEqual(row.text(BOM_COL_STATUS), "Under development")
+
+    def test_item_status_filter_does_not_match_lifecycle_or_development_state(self):
+        page = self.page()
+        page.session.project_id = 7
+        page._bom_advanced_filters = {"status": "Obsolete"}
+        with sqlite3.connect(self.db) as conn:
+            conn.executescript("""
+                CREATE TABLE bom(id INTEGER,project_id INTEGER,represented_part_id INTEGER,
+                                 status TEXT,lifecycle_state TEXT);
+                INSERT INTO bom VALUES(1,7,NULL,'Obsolete','WIP'),(2,7,NULL,'Design','Obsolete');
+            """)
+        conn.close()
+
+        def connection():
+            conn = sqlite3.connect(self.db)
+            conn.row_factory = sqlite3.Row
+            return conn
+
+        page.bom_service = SimpleNamespace(bom_repo=SimpleNamespace(get_conn=connection))
+        self.assertEqual(BomPage._ebom_db_filter_item_ids(page), {1})
 
 
 if QT_AVAILABLE:

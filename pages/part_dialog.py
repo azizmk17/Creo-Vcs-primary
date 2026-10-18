@@ -319,8 +319,11 @@ class PartDialog(QDialog):
         self.cad_revision_input.setPlaceholderText("User-controlled CAD revision, e.g. A010")
         self.drawing_number_input = QLineEdit()
         self.drawing_number_input.setPlaceholderText("Optional drawing / reference designator")
-        self.status_input = QLineEdit()
-        self.status_input.setPlaceholderText("Design status, e.g. Design, Prototype, Production")
+        self.status_input = QComboBox()
+        self.status_input.addItems(["Design", "Released", "Obsolete"])
+        self.status_input.setToolTip(
+            "User-controlled Item parameter. Independent of the BOM Development State and master validation."
+        )
         self.classification_input = QComboBox()
         for value in CLASSIFICATIONS:
             self.classification_input.addItem(
@@ -328,7 +331,7 @@ class PartDialog(QDialog):
             )
         controlled_form.addRow("CAD Rev", self.cad_revision_input)
         controlled_form.addRow("Drawing Number", self.drawing_number_input)
-        controlled_form.addRow("Status", self.status_input)
+        controlled_form.addRow("Item Status", self.status_input)
         controlled_form.addRow("Classification", self.classification_input)
         body_layout.addWidget(controlled)
 
@@ -557,7 +560,13 @@ class PartDialog(QDialog):
         if not cad_revision and not self.part_data:
             cad_revision = self._project_version_label()
         self.cad_revision_input.setText(cad_revision)
-        self.status_input.setText(str(self.part_data.get("status") or "Design"))
+        status = str(self.part_data.get("status") or "Design")
+        status_index = self.status_input.findText(status)
+        if status_index < 0:
+            # Preserve existing company values until the user explicitly changes them.
+            self.status_input.addItem(status)
+            status_index = self.status_input.count() - 1
+        self.status_input.setCurrentIndex(status_index)
         self._set_combo_data(
             self.classification_input,
             self.part_data.get("classification") or "PHYSICAL",
@@ -654,7 +663,7 @@ class PartDialog(QDialog):
             "material": self.material_input.text().strip(),
             "weight": self.weight_input.value(),
             "notes": self.notes_input.toPlainText().strip(),
-            "status": self.status_input.text().strip() or "Design",
+            "status": self.status_input.currentText().strip() or "Design",
             "created": str(self.part_data.get("created") or now),
             "modified": now,
         }

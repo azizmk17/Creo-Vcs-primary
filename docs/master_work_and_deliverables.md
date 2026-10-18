@@ -1,4 +1,4 @@
-# Master work and deliverables — Nexus 4.0.7
+# Master work and deliverables — Nexus 4.0.8
 
 Each project's working directory contains a `master` folder. Checking in a
 native CAD submission leaves it Pending; it does not automatically publish it.
@@ -91,7 +91,7 @@ Validated approval queue.
 
 ## Existing database compatibility
 
-Upgrading to 4.0.7 preserves the original PDF/STEP status rules and stored manual
+Upgrading to 4.0.8 preserves the original PDF/STEP status rules and stored manual
 acknowledgements for parts that have not been explicitly pushed through the new
 master workflow. The upgrade does not require re-marking existing files as up
 to date and does not rewrite acknowledgements or fabricate source-version links.
