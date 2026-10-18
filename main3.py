@@ -344,7 +344,7 @@ class Notifier(QObject):
 
 
 # Ed25519 public key baked into the build. Override via CREOVCS_PUBLIC_KEY_HEX for dev.
-_PRODUCTION_PUBLIC_KEY = "fc941ecde885df70bfdcd71498d80fa8cfa7fe340c40c2292bbfc2b7960f529f"
+_PRODUCTION_PUBLIC_KEY = "a54608cbf2a2577268af5e99293822f69dbecd8721943f6d44dd4809b48eb71d"
 
 
 class BomGUI(QMainWindow):

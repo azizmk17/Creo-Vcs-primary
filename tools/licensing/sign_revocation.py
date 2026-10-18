@@ -18,6 +18,7 @@ Usage examples
         --private-key keys/ed25519_private.key \\
         --out "\\\\\\\\server\\\\share\\\\revoked.json"
 
+
 **Add another entry to an existing list:**
 
 .. code-block:: bash

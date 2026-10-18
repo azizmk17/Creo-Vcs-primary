@@ -1,8 +1,8 @@
 {
   "product": "CreoVCS",
-  "licensee": "Your Name or Organisation",
-  "issued_at": "2026-02-18T00:00:00+00:00",
-  "expires_at": "2027-02-18T00:00:00+00:00",
+  "licensee": "ACTIA  ES",
+  "issued_at": "2026-10-19T00:00:00+00:00",
+  "expires_at": "2027-10-18T00:00:00+00:00",
   "features": [
     "bom_management",
     "commit",

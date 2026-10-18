@@ -34,10 +34,8 @@ def _repo_root() -> str:
 
     - Dev / source run: the project root (three levels above this file,
       i.e. the directory that contains the ``tools/`` package).
-    - PyInstaller EXE: the folder that contains the EXE.  The viewer
-      must be installed inside the pyoccenv conda environment so that
-      ``python -m tools.CAD.step_viewer`` resolves via site-packages,
-      not via cwd.
+    - PyInstaller EXE: the folder that contains the EXE and its bundled
+      CADViewer.exe. No developer environment is consulted.
     """
     if _is_frozen():
         # Running inside a PyInstaller bundle — use the EXE's own directory.
@@ -73,6 +71,10 @@ def _build_cmd(module_args: list[str]) -> list[str]:
         for viewer_exe in viewer_candidates:
             if os.path.isfile(viewer_exe):
                 return [viewer_exe] + module_args
+        raise FileNotFoundError(
+            "The bundled CAD viewer is missing. Restore CADViewer.exe and the "
+            f"complete application folder beside {sys.executable}."
+        )
 
     conda = _conda_bat()
     if conda:

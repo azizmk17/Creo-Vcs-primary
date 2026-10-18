@@ -62,6 +62,7 @@ Usage
     print('OK — licensed to:', p.licensee)
     "
 
+
 Output format
 -------------
 The ``.lic`` file is pretty-printed JSON with the ``"signature"`` field

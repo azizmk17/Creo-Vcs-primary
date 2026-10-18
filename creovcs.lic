@@ -1,0 +1,18 @@
+{
+  "product": "CreoVCS",
+  "licensee": "ACTIA  ES",
+  "issued_at": "2026-10-19T00:00:00+00:00",
+  "expires_at": "2027-10-18T00:00:00+00:00",
+  "features": [
+    "bom_management",
+    "commit",
+    "snapshot",
+    "advanced_diff",
+    "admin",
+    "baseline",
+    "package_export"
+  ],
+  "version_constraint": ">=4.0,<5.0",
+  "machine_id": [],
+  "signature": "vRB5KjpWKFQjr38VHxiGXWQklLATVPthp3iw7gryvMz3OoDYFycCuWCDmK1jfbD4Qnd7zh8_QtavbBAObdLUCg"
+}
