@@ -19555,16 +19555,28 @@ class BomPage(QWidget):
             return False
         if value == self._commit_ack_token(commit):
             return True
+        # Older clients omitted merged_at when building the token. The same
+        # immutable commit row remains acknowledged even if its timestamp differs.
+        token = value.split(":", 3)
+        if (len(token) == 4 and token[0] == "commit"
+                and token[1] == str(getattr(commit, "id", ""))
+                and token[2] == str(getattr(commit, "commit_id", ""))):
+            return True
 
         # Backward compatibility: older acknowledgements stored a timestamp.
         ack_dt = self._parse_dt(value)
-        commit_dt = self._commit_effective_dt(commit)
+        # Review/merge timestamps can be filled later without changing native
+        # bytes. Keep acknowledgements made against the submitted version valid.
+        commit_dt = (self._parse_dt(getattr(commit, "committed_at", "") or "")
+                     or self._commit_effective_dt(commit))
         if ack_dt and commit_dt and ack_dt >= commit_dt:
             return True
         return False
 
     def _doc_ack_target(self, part_id: int, doc_type: str) -> str:
-        latest_commit = self._latest_change_commit_for_part(int(part_id))
+        latest_commit = (self._master_change_commit_for_part(int(part_id))
+                         if self._has_published_master_for_part(int(part_id))
+                         else self._legacy_latest_change_commit_for_part(int(part_id)))
         if latest_commit:
             return self._commit_ack_token(latest_commit)
         part_mod = self._get_part_modified_dt(int(part_id))
@@ -19580,13 +19592,78 @@ class BomPage(QWidget):
         key = "pdf_path" if str(doc_type).upper() == "PDF" else "step_path"
         return str(details.get(key) or "").strip()
 
+    def _has_published_master_for_part(self, part_id):
+        project = self.project_service.get_project_by_id(int(self.session.project_id)) or {}
+        manifest = MasterWorkService.read_manifest(project.get("working_directory"))
+        return any(record.get("source_commit_id") and int(part_id) in record.get("part_ids", [])
+                   for record in (manifest.get("files") or {}).values())
+
+    def _legacy_latest_change_commit_for_part(self, part_id):
+        commits = [commit for commit in self._part_change_commits(int(part_id))
+                   if str(getattr(commit, "status", "") or "").lower() in {"pending", "validated", "approved"}]
+        return max(commits, key=lambda commit: (self._commit_effective_dt(commit) or datetime.min,
+                                               int(getattr(commit, "id", 0) or 0)), default=None)
+
+    def _legacy_doc_indicator_state(self, part_id, doc_type, attachments, latest_commit):
+        """Keep existing status and acknowledgement rules until an explicit master push."""
+        candidates = []
+        for attachment in attachments or []:
+            if str(getattr(attachment, "file_type", "") or "").upper() != doc_type:
+                continue
+            version = self.part_file_service.get_active_version(attachment.id)
+            created = self._parse_dt(getattr(version, "created_at", "")) if version else None
+            order = created or self._parse_dt(getattr(attachment, "created_at", "")) or datetime.min
+            candidates.append((order, int(attachment.id), version))
+        try:
+            ack = self.part_doc_ack_service.get_ack(int(part_id), doc_type)
+        except Exception:
+            ack = None
+        if candidates:
+            version = max(candidates, key=lambda value: value[:2])[2]
+            if not version:
+                return {"state": "bad", "tooltip": f"{doc_type}: attachment has no active version"}
+            path = self.part_file_service.resolve_version_path(version)
+            if not path or not safe_exists(path):
+                return {"state": "bad", "tooltip": f"{doc_type}: file missing on disk"}
+            if latest_commit and doc_type == "STEP":
+                compared = os.path.basename(str(getattr(latest_commit, "step_file_path", "") or ""))
+                if compared and compared == str(getattr(version, "original_filename", "") or ""):
+                    return {"state": "ok", "tooltip": f"{doc_type}: current from compared commit STEP"}
+            created = self._parse_dt(getattr(version, "created_at", ""))
+            changed = self._commit_effective_dt(latest_commit) if latest_commit else None
+            if latest_commit and (not created or (changed and changed > created)):
+                if self._ack_covers_commit(ack, latest_commit):
+                    return {"state": "ack", "tooltip": f"{doc_type}: safe by existing user acknowledgement"}
+                return {"state": "bad", "tooltip": f"{doc_type}: newer commit needs review"}
+            return {"state": "ok", "tooltip": f"{doc_type}: current"}
+        legacy = self._legacy_doc_path(int(part_id), doc_type)
+        if legacy:
+            path = self._resolve_file_path(legacy)
+            if not path or not safe_exists(path):
+                return {"state": "bad", "tooltip": f"{doc_type}: file missing on disk"}
+            if latest_commit:
+                if self._ack_covers_commit(ack, latest_commit):
+                    return {"state": "ack", "tooltip": f"{doc_type}: legacy file safe by existing user acknowledgement"}
+                return {"state": "bad", "tooltip": f"{doc_type}: legacy file needs review after newer commit"}
+            return {"state": "ok", "tooltip": f"{doc_type}: legacy file exists"}
+        return {"state": "absent", "tooltip": f"{doc_type}: no attachment"}
+
     def _doc_indicator_state(self, part_id: int, doc_type: str, attachments: list | None = None, latest_commit=None) -> dict:
         doc_type = str(doc_type).upper()
+        if attachments is None:
+            attachments = self.part_file_service.list_attachments(int(part_id))
+        if not self._has_published_master_for_part(int(part_id)):
+            return self._legacy_doc_indicator_state(
+                int(part_id), doc_type, attachments, self._legacy_latest_change_commit_for_part(int(part_id))
+            )
         commits = self._part_change_commits(int(part_id))
         latest_commit = latest_commit if latest_commit is not None else self._master_change_commit_for_part(int(part_id))
         sources = {str(c.commit_id): c for c in commits}
-        if attachments is None:
-            attachments = self.part_file_service.list_attachments(int(part_id))
+        try:
+            ack = self.part_doc_ack_service.get_ack(int(part_id), doc_type)
+        except Exception:
+            ack = None
+        acknowledged_current = latest_commit and self._ack_covers_commit(ack, latest_commit)
         candidates = []
         for att in attachments or []:
             if str(getattr(att, "file_type", "") or "").upper() != doc_type:
@@ -19603,8 +19680,10 @@ class BomPage(QWidget):
                     continue
                 source = sources.get(str(getattr(version, "source_commit_id", "") or ""))
                 info = deliverable_provenance(doc_type, version, latest_commit, source)
+                if active and version.id == active.id and acknowledged_current:
+                    info = {"state": "ack", "tooltip": f"{doc_type}: safe by user acknowledgement for current master"}
                 # Keep the last validated deliverable visible even if a newer draft exists.
-                rank = {"ok": 3, "previous": 2, "unverified": 1}[info["state"]]
+                rank = {"ack": 4, "ok": 3, "previous": 2, "unverified": 1}[info["state"]]
                 source_order = (str(getattr(source, "committed_at", "") or ""),
                                 int(getattr(source, "id", 0) or 0))
                 candidates.append(((rank, source_order, int(version.id)), info))
@@ -19612,6 +19691,8 @@ class BomPage(QWidget):
             return max(candidates, key=lambda candidate: candidate[0])[1]
         legacy_path = self._legacy_doc_path(int(part_id), doc_type)
         if legacy_path and safe_exists(self._resolve_file_path(legacy_path)):
+            if acknowledged_current:
+                return {"state": "ack", "tooltip": f"{doc_type}: legacy file safe by user acknowledgement for current master"}
             return deliverable_provenance(doc_type, None, latest_commit, None)
         return {"state": "absent", "tooltip": f"{doc_type}: no available attachment"}
 

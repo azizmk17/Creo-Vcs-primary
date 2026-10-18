@@ -4,7 +4,7 @@
 > CAD Document, Item, association, CAD-to-EBOM build, supplier package, and
 > migration workflows.
 
-Nexus **4.0.6** introduces [shared master work and version-aware PDF/STEP status](docs/master_work_and_deliverables.md).
+Nexus **4.0.7** introduces [shared master work and version-aware PDF/STEP status](docs/master_work_and_deliverables.md).
 
 Users can [save personal BOM column layouts](docs/personal_bom_columns.md) with **Columns → Save for Me**.
 

@@ -111,14 +111,18 @@ class BomProvenanceIntegrationTests(unittest.TestCase):
         source = Path(__file__).resolve().parents[1] / "pages" / "bom_page.py"
         tree = ast.parse(source.read_text(encoding="utf-8"))
         page = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "BomPage")
-        names = {"_doc_indicator_state", "_latest_change_commit_for_part", "_parse_dt"}
+        names = {"_doc_indicator_state", "_latest_change_commit_for_part", "_parse_dt",
+                 "_ack_covers_commit", "_commit_ack_token", "_commit_effective_dt",
+                 "_legacy_doc_indicator_state", "_legacy_latest_change_commit_for_part",
+                 "_has_published_master_for_part"}
         methods = [node for node in page.body if isinstance(node, ast.FunctionDef) and node.name in names]
         namespace = {"datetime": datetime, "deliverable_provenance": deliverable_provenance,
-                     "safe_exists": os.path.exists}
+                     "safe_exists": os.path.exists, "os": os, "MasterWorkService": MasterWorkService}
         exec(compile(ast.Module(body=methods, type_ignores=[]), str(source), "exec"), namespace)
         stub = SimpleNamespace()
         for name in names:
             setattr(stub, name, MethodType(namespace[name], stub))
+        stub._has_published_master_for_part = lambda part_id: True
         return stub
 
     def test_bom_retains_previous_validated_export_over_active_draft(self):

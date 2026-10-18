@@ -1,4 +1,4 @@
-# Master work and deliverables — Nexus 4.0.6
+# Master work and deliverables — Nexus 4.0.7
 
 Each project's working directory contains a `master` folder. Checking in a
 native CAD submission leaves it Pending; it does not automatically publish it.
@@ -44,8 +44,9 @@ PDF and STEP badges use source-submission provenance:
 
 Hover over each badge for its source and current native submission identifiers.
 BOM exports include the readable status and provenance details. A newer draft
-export does not hide an available validated export. Filenames, timestamps, and
-manual acknowledgements do not establish validated export provenance.
+export does not hide an available validated export. Filenames and timestamps
+alone do not establish validated provenance. Manual acknowledgements retain
+their explicit user-confirmed status without creating validated provenance.
 
 Master publication serializes writers with `.publish.lock`, stages files, and
 restores overwritten files if publication raises an error. Readers should wait
@@ -86,3 +87,16 @@ restores the master files and manifest and leaves the commit Pending.
 Use **Review for Validation** in the integrated commit's history details to
 validate it later. Validation is a separate action; it returns the group to the
 Validated approval queue.
+
+
+## Existing database compatibility
+
+Upgrading to 4.0.7 preserves the original PDF/STEP status rules and stored manual
+acknowledgements for parts that have not been explicitly pushed through the new
+master workflow. The upgrade does not require re-marking existing files as up
+to date and does not rewrite acknowledgements or fabricate source-version links.
+Files still missing on disk or already needing review retain those conditions.
+
+The newer source-version indicators apply per part after an explicit master
+push; merely seeding another part into master does not change legacy indicators.
+Manual acknowledgements against the current master remain supported.
