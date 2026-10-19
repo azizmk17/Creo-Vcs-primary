@@ -6,7 +6,7 @@
 
 Nexus **4.0.10** introduces [shared master work and version-aware PDF/STEP status](docs/master_work_and_deliverables.md).
 
-Build the portable Windows folder with **build_exe.bat**. See the [folder build guide](README_BUILD_EXE.md) for PDF/OCC dependencies and distribution instructions.
+Build the portable Windows folder with **build_exe.bat**. Start with the [build steps below](#build-a-windows-exe-folder), or open the [complete build guide](README_BUILD_EXE.md) for new-computer setup and troubleshooting.
 
 Users can [save personal BOM column layouts](docs/personal_bom_columns.md) with **Columns → Save for Me**.
 
@@ -27,7 +27,50 @@ Detailed workflow: [Exact revisions, iterations, assembly bindings, and Creo beh
 
 ---
 
-## Quick start (Windows)
+## Build a Windows EXE folder
+
+Use these steps on any compatible **Windows x64 build PC**. Your Python
+environment must already contain the PDF, CAD/OCC, Qt and other app libraries.
+If it does not, follow [Create a new environment](README_BUILD_EXE.md#create-a-new-environment)
+first. The destination PCs running the finished app do not need those libraries
+installed.
+
+Open **Anaconda Prompt (CMD)**. Replace the example environment name and project
+folder with yours, then run each command in the same window:
+
+```bat
+conda activate creo-vcs-py312
+cd /d "D:\Projects\Creo-Vcs-primary"
+build_exe.bat --python "%CONDA_PREFIX%\python.exe" --check
+```
+
+When the check prints **`Build prerequisites OK`**, build:
+
+```bat
+build_exe.bat --python "%CONDA_PREFIX%\python.exe"
+```
+
+If only PyInstaller is missing, install it and check again before building:
+
+```bat
+build_exe.bat --python "%CONDA_PREFIX%\python.exe" --install-build-tools --check
+```
+
+Keep `--python` so the builder uses your chosen environment. Wait for
+**`BUILD SUCCESSFUL`**, then distribute the **entire `dist\Nexus` folder**,
+including `_internal`. It contains `Nexus.exe`, `CADViewer.exe`, and the shared
+PDF/OCC/Qt runtime. Users extract that folder and start `Nexus.exe`; workspace
+access and a valid license are still required.
+
+The [complete build guide](README_BUILD_EXE.md) includes prerequisite lists,
+fresh environment installation, full Python paths, PowerShell commands,
+license placement, logs, runtime checks, and troubleshooting. Python 3.10 was
+used for the reference build; other environments, including Python 3.12, must
+pass the checks with compatible libraries.
+
+---
+
+## Run from source (Windows)
 
 Run the app:
 
@@ -41,16 +84,10 @@ Or use the provided launcher:
 ./run.bat
 ```
 
-### Dependencies
-
-- Python 3.x
-- `PyQt5`
-
-If you don’t already have PyQt5 installed:
-
-```powershell
-python -m pip install PyQt5
-```
+Activate a Python environment with the [required app libraries](README_BUILD_EXE.md#required-libraries)
+before running from source. Installing PyQt5 alone does not provide PDF preview,
+CAD viewing, or the other app dependencies. A valid license and company workspace
+are also required for normal startup.
 
 ---
 
