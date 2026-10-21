@@ -74,6 +74,22 @@ class UpdateInstallTests(unittest.TestCase):
         self.assertNotIn(self.public, (self.root / "install.json").read_text())
         self.assertEqual(install.installed_root_for_executable(self.original), self.root)
 
+    def test_setup_is_copied_with_its_shared_runtime_and_preserves_download(self):
+        (self.source / "Setup.exe").write_bytes(b"setup uses the download runtime")
+        target = self.base / "new-install"
+        install.initial_install(self.source, target, str(self.feed), self.public)
+        self.assertTrue((self.source / "Setup.exe").is_file())
+        self.assertTrue((self.source / "Nexus.exe").is_file())
+        self.assertEqual((install.current_application(target).parent / "Setup.exe").read_bytes(),
+                         (self.source / "Setup.exe").read_bytes())
+
+    def test_updates_keep_setup_in_the_verified_application_inventory(self):
+        self.publish(version="4.2.0", extra={"Setup.exe": b"distribution installer"})
+        staged = self.stage()
+        self.assertEqual((self.root / staged["directory"] / "Setup.exe").read_bytes(), b"distribution installer")
+        activated = install.activate_staged(self.root, self.public)
+        self.assertEqual(activated["version"], "4.2.0")
+
     def test_manual_install_requires_matching_baked_key_and_explicit_schema(self):
         manifest_path = self.source / "build_manifest.json"
         manifest = json.loads(manifest_path.read_text())

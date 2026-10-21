@@ -167,13 +167,13 @@ def test_release(*, opengl=False):
     return reports
 
 
-def release_manifest(version, smoke_reports, public_key=None, bootstrap_reports=None):
+def release_manifest(version, smoke_reports, public_key=None, bootstrap_reports=None, setup_report=None):
     files = [path for path in RELEASE.rglob("*") if path.is_file()]
     unsafe = [path for path in files if path.suffix.lower() in {".db", ".lic", ".key"}
               or path.name.lower().startswith("trail.txt")]
     if unsafe:
         raise RuntimeError(f"Unexpected workspace files in release: {unsafe}")
-    for required in ("Nexus.exe", "CADViewer.exe", "_internal/occ-resources/Shaders",
+    for required in ("Nexus.exe", "CADViewer.exe", "Setup.exe", "_internal/occ-resources/Shaders",
                      "_internal/assets/pictures", "_internal/modern_theme.qss"):
         if not (RELEASE / required).exists():
             raise RuntimeError(f"Required release file is missing: {required}")
@@ -191,7 +191,7 @@ def release_manifest(version, smoke_reports, public_key=None, bootstrap_reports=
     manifest = {
         "app": "Nexus", "version": version, "built_at": datetime.now(timezone.utc).isoformat(),
         "mode": "onedir", "architecture": platform.machine(), "python": platform.python_version(),
-        "packages": versions, "executables": ["Nexus.exe", "CADViewer.exe"],
+        "packages": versions, "executables": ["Nexus.exe", "CADViewer.exe", "Setup.exe"],
         "shared_runtime": "_internal", "file_count": len(files),
         "size_mb": round(sum(path.stat().st_size for path in files) / 1024 ** 2, 1),
         "smoke_tests": smoke_reports,
@@ -199,6 +199,7 @@ def release_manifest(version, smoke_reports, public_key=None, bootstrap_reports=
         "build_id": uuid.uuid4().hex[:16],
         "supported_schema": {"min": latest_schema_version(), "max": latest_schema_version()},
         "updater_version": "1.0.0", "bootstrap_tests": bootstrap_reports or {},
+        "setup_test": setup_report or {},
     }
     (RELEASE / "build_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return manifest
@@ -250,7 +251,7 @@ def main(argv=None):
     env["NEXUS_VERSION_FILE"] = str(version_file)
     env["NEXUS_GENERATED_DIR"] = str(generated)
     env["PATH"] = os.pathsep.join(native_library_search_paths() + [env.get("PATH", "")])
-    print("Building Nexus and CADViewer; native DLLs are shared. See build/folder/logs/pyinstaller.log for progress.", flush=True)
+    print("Building Nexus, CADViewer and Setup; native DLLs are shared. See build/folder/logs/pyinstaller.log for progress.", flush=True)
     checked_run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
                  "--distpath", ROOT / "dist", "--workpath", BUILD / "pyinstaller",
                  ROOT / "tools" / "frozen_build" / "nexus_folder.spec"], BUILD / "logs" / "pyinstaller.log", env=env)
@@ -258,6 +259,15 @@ def main(argv=None):
     checked_run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
                  "--distpath", RELEASE, "--workpath", BUILD / "bootstrap",
                  ROOT / "tools/frozen_build/bootstrap.spec"], BUILD / "logs/bootstrap-build.log", env=env)
+    setup_path = BUILD / "logs/Setup-self-test.json"
+    setup_path.unlink(missing_ok=True)
+    checked_run([RELEASE / "Setup.exe", "--setup-self-test", setup_path],
+                BUILD / "logs/Setup-self-test.log", env=smoke_environment(), timeout=60)
+    setup_report = json.loads(setup_path.read_text(encoding="utf-8"))
+    if (setup_report.get("ok") is not True or setup_report.get("frozen") is not True
+            or setup_report.get("gui") is not True
+            or setup_report.get("release_public_key") != public_key):
+        raise RuntimeError(f"Setup GUI/trust check failed: {setup_path}")
     bootstrap_reports = {}
     for executable in ("NexusLauncher.exe", "NexusUpdater.exe"):
         report = BUILD / "logs" / (Path(executable).stem + "-self-test.json")
@@ -270,7 +280,7 @@ def main(argv=None):
             raise RuntimeError(f"Bootstrap trust check failed: {report}")
         bootstrap_reports[executable] = result
     reports = {} if args.no_smoke_test else test_release(opengl=args.smoke_opengl)
-    manifest = release_manifest(version, reports, public_key, bootstrap_reports)
+    manifest = release_manifest(version, reports, public_key, bootstrap_reports, setup_report)
     print(f"\nBUILD SUCCESSFUL: Nexus {version}\n{RELEASE / 'Nexus.exe'}\n"
           f"Distribute the entire folder ({manifest['size_mb']} MB).\nLogs: {BUILD / 'logs'}", flush=True)
     return 0

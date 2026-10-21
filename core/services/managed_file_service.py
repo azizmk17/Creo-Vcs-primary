@@ -213,8 +213,12 @@ class ManagedFileService:
         iteration_id: int,
         source_commit_id=None,
         inherit_from_iteration_id=None,
+        *, connection=None,
     ) -> list[dict]:
-        contexts = self.revision_repo.get_iteration_object_contexts([int(iteration_id)])
+        connection_args = {"connection": connection} if connection is not None else {}
+        contexts = self.revision_repo.get_iteration_object_contexts(
+            [int(iteration_id)], **connection_args
+        )
         context = contexts.get(int(iteration_id))
         if not context or int(context.get("bom_id") or 0) != int(bom_id):
             raise ValueError("The BOM iteration was not found.")
@@ -229,6 +233,7 @@ class ManagedFileService:
                 int(inherit_from_iteration_id),
                 int(iteration_id),
                 lifecycle_state=str(context.get("state") or "In Work"),
+                **connection_args,
             )
 
         captured = []
@@ -243,19 +248,19 @@ class ManagedFileService:
                 entry.pop("path", None)
             elif inherit_from_iteration_id is not None:
                 inherited = [
-                    item for item in self.repo.list_for_iteration(int(iteration_id))
+                    item for item in self.repo.list_for_iteration(int(iteration_id), **connection_args)
                     if str(item.get("file_role") or "") == role
                 ]
                 if inherited:
                     captured.extend(inherited)
                     continue
-            self.repo.upsert(entry)
+            self.repo.upsert(entry, **connection_args)
             captured.append(entry)
 
         attachments = self.part_file_service.list_attachments(int(bom_id))
         if str(context.get("state") or "").strip().lower() != "released":
             self.repo.prune_iteration_documents(
-                int(iteration_id), [part_file.id for part_file in attachments]
+                int(iteration_id), [part_file.id for part_file in attachments], **connection_args
             )
         for part_file in attachments:
             version = self.part_file_service.get_active_version(int(part_file.id))
@@ -282,7 +287,7 @@ class ManagedFileService:
                 "source_commit_id": source_commit_id or getattr(version, "source_commit_id", None),
                 "created_by": getattr(version, "created_by", None),
             }
-            self.repo.upsert(entry)
+            self.repo.upsert(entry, **connection_args)
             captured.append(entry)
         return captured
 

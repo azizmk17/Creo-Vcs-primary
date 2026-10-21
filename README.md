@@ -4,9 +4,9 @@
 > CAD Document, Item, association, CAD-to-EBOM build, supplier package, and
 > migration workflows.
 
-Nexus **4.1.0** adds [signed releases, managed updates, and workspace compatibility checks](README_RELEASE_UPDATES.md), alongside [shared master work and version-aware PDF/STEP status](docs/master_work_and_deliverables.md).
+Nexus **4.2.0** adds a graphical **Setup.exe**: users extract the complete folder, double-click Setup, and install without Command Prompt. It also retains the BOM checkout cleanup introduced in 4.1.1, including remaining drawings after a 3D-only push, and includes [signed releases, managed updates, and workspace compatibility checks](README_RELEASE_UPDATES.md), alongside [shared master work and version-aware PDF/STEP status](docs/master_work_and_deliverables.md).
 
-Build the portable Windows folder with **build_exe.bat**. Start with the [build steps below](#build-a-windows-exe-folder), or open the [complete build guide](README_BUILD_EXE.md) for new-computer setup and troubleshooting.
+Build the Windows folder, including its graphical setup, with **build_exe.bat**. Start with the [build steps below](#build-a-windows-exe-folder), or open the [complete build guide](README_BUILD_EXE.md) for new-computer setup and troubleshooting.
 
 Users can [save personal BOM column layouts](docs/personal_bom_columns.md) with **Columns → Save for Me**.
 
@@ -65,12 +65,14 @@ before building an update-enabled deployment. Update keys do not replace the
 separate key used to verify user licenses.
 Keep `--python` so the builder uses your chosen environment. Wait for
 **`BUILD SUCCESSFUL`**, then distribute the **entire `dist\Nexus` folder**,
-including `bootstrap` and both `_internal` folders. It contains `Nexus.exe`,
-`CADViewer.exe`, the shared PDF/OCC/Qt runtime, and the launcher/updater. Users
-extract that folder and can start the portable `Nexus.exe`; workspace
-access and a valid license are still required. For managed installations, users
-install `bootstrap\NexusLauncher.exe --install --feed "\\server\NexusReleases"`
-from the extracted folder, then use the installed launcher shortcut.
+including `bootstrap` and both `_internal` folders. It contains `Setup.exe`,
+`Nexus.exe`, `CADViewer.exe`, the shared PDF/OCC/Qt runtime, and the launcher/updater.
+Users extract the entire folder and double-click **Setup.exe**. Setup installs to
+`%LOCALAPPDATA%\Nexus` by default, lets them choose another destination and the
+company release folder, and creates a Start Menu shortcut with an optional Desktop
+shortcut. They can open Nexus when setup finishes. No command is needed.
+Workspace access and a valid license are still required. See the
+[first-installation steps](README_RELEASE_UPDATES.md#5-first-installation-on-a-users-pc).
 
 Follow the [release and update guide](README_RELEASE_UPDATES.md) for signing and
 publishing, first installation, Updates > Download/Restart, administrator-only

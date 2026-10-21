@@ -58,6 +58,10 @@ class UpdateWorkflowTests(unittest.TestCase):
             "bootstrap_tests": {name: {"ok": True, "frozen": True, "release_public_key": self.public}
                                 for name in ("NexusLauncher.exe", "NexusUpdater.exe")},
         }
+        if protocol.version_tuple(version) >= (4, 2, 0):
+            (source / "Setup.exe").write_bytes(b"fixture setup executable")
+            manifest["setup_test"] = {"ok": True, "frozen": True, "gui": True,
+                                      "release_public_key": self.public}
         (source / "build_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
         return source
 

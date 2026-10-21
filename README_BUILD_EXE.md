@@ -1,11 +1,12 @@
 # Build Nexus on another Windows computer
 
-Use **`build_exe.bat`** to create a folder containing `Nexus.exe`, `CADViewer.exe`,
-and their shared libraries. The build is not tied to a particular username,
+Use **`build_exe.bat`** to create a folder containing `Setup.exe`, `Nexus.exe`,
+`CADViewer.exe`, and their shared libraries. The build is not tied to a particular username,
 Anaconda installation folder, or environment name.
 
-Version 4.1.0 also builds a lightweight `bootstrap` folder containing the managed
-launcher and updater. Read [Release, installation, and updates](README_RELEASE_UPDATES.md)
+Version **4.2.0** adds a graphical **Setup.exe** for installation without Command
+Prompt. The build also includes the lightweight `bootstrap` folder containing
+the managed launcher and updater introduced in 4.1.0. Read [Release, installation, and updates](README_RELEASE_UPDATES.md)
 for release-key setup, first installation, signed publishing, and database maintenance.
 
 | Computer | What it needs |
@@ -98,7 +99,7 @@ build_exe.bat --python "%CONDA_PREFIX%\python.exe" --release-public-key "D:\Publ
 Replace the example public-key path with the release administrator's public hex
 key. The private signing key stays with the publisher and is never included.
 An explicit file, `NEXUS_RELEASE_PUBLIC_KEY_FILE`, or the local public-key files
-described in the release guide supply the trust compiled into all four EXEs.
+described in the release guide supply the trust compiled into the application, setup, launcher, and updater EXEs.
 The existing `tools\licensing\keys\ed25519_public.key` is a public key only:
 the publisher must hold its matching private key to sign updates for that build.
 If that private key is unavailable, follow [release-key setup](README_RELEASE_UPDATES.md#1-prepare-the-release-signing-key)
@@ -120,6 +121,7 @@ The output is inside the project folder:
 
 ```text
 dist\Nexus\
+    Setup.exe                    Double-click to install
     Nexus.exe
     CADViewer.exe
     build_manifest.json
@@ -136,26 +138,44 @@ dist\Nexus\
 
 **Copy the entire `dist\Nexus` folder, including both `_internal` folders and
 `bootstrap`. Do not copy only the EXE files.** You can zip the Nexus folder for transfer; extract the whole
-archive on the destination PC before starting `Nexus.exe`.
+archive on the destination PC, then double-click **Setup.exe**. Setup shares the
+application runtime in the root `_internal` folder; keep that folder beside Setup.
 
 Nexus and CADViewer share one copy of the large native libraries. The 4.0.10
-reference build was about **781 MB**; 4.1 also includes the separate bootstrap
-runtime. Check the current `build_manifest.json` for the actual size. Do not remove
+reference build was about **781 MB**; current builds also include the separate
+bootstrap runtime used by the launcher and updater. Setup shares the application
+runtime rather than adding another copy of Qt or the native libraries. Check the current `build_manifest.json` for the actual size. Do not remove
 DLLs to reduce the size. Native binaries are not compressed with UPX.
 
 ### 6. Set up the destination PC
 
 On each Windows account that will run Nexus:
 
-1. Press **Win + R**, enter `%APPDATA%`, and press Enter.
-2. Create a folder named **CreoVCS** if it does not exist.
-3. Copy the signed license into it and name it **creovcs.lic**. The final path is
-   `%APPDATA%\CreoVCS\creovcs.lic`.
-4. For managed updates, run `bootstrap\NexusLauncher.exe --install --feed "\\server\NexusReleases"`
-   from the extracted folder, replacing the feed with your company's release folder.
-   Then start `%LOCALAPPDATA%\Nexus\bootstrap\NexusLauncher.exe`. A portable `Nexus.exe`
-   can also run directly, but needs managed installation to activate updates.
-5. Select the company workspace containing `creo_vcs.db` when prompted.
+1. Extract the **whole Nexus folder**, then double-click **Setup.exe**.
+2. Keep the default destination `%LOCALAPPDATA%\Nexus`, or choose another local
+   writable folder. Choose the company release folder if your administrator
+   supplied one, for example `\\server\NexusReleases`.
+3. Choose whether to create a Desktop shortcut, then select **Install**. A Start
+   Menu shortcut is created automatically. Setup copies the files; it keeps the
+   extracted distribution available for another attempt.
+4. Install the administrator-provided signed license at
+   `%APPDATA%\CreoVCS\creovcs.lic` if it is not already installed. To open this
+   location, press **Win + R**, enter `%APPDATA%`, and create **CreoVCS** if needed.
+5. Choose **Open Nexus** when setup finishes, or use the Start Menu/Desktop
+   shortcut. Select the company workspace containing `creo_vcs.db` when prompted.
+
+No Python, Conda, Command Prompt, or administrator elevation is needed for the
+normal per-user installation. The large CAD/PDF runtime goes in **Local AppData**,
+not roaming `%APPDATA%`. Setup does not change company databases, workspaces, or
+existing licenses. An existing valid installation keeps its active version;
+Setup can open it or repair its shortcuts. It does not silently replace it.
+Installed versions retain `Setup.exe`, `Nexus.exe`, and `CADViewer.exe` sharing
+one `_internal` runtime. The shortcuts always target the stable installed
+launcher, which selects the active version.
+
+A portable `Nexus.exe` can still run directly, but managed installation is required
+to activate updates. The command-line installer is retained for
+[optional IT automation](README_RELEASE_UPDATES.md#installer-automation-for-it).
 
 The license must be signed with the key matching the app's embedded **license**
 public key. The release public key selected for updates does not replace it.

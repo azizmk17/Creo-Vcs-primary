@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from core.updates import settings as update_settings, trust as update_trust
 from tools.CAD.step_viewer import launcher
 from tools.frozen_build import entrypoint, runtime_hook, smoke
 
@@ -49,6 +50,52 @@ class FrozenRuntimeTests(unittest.TestCase):
             self.assertEqual(entrypoint.main(), 0)
         run.assert_called_once_with("result.json", require_opengl=False)
         run_module.assert_not_called()
+
+    def test_setup_dispatch_opens_wizard_without_starting_app_or_run_lease(self):
+        source = self.temporary_directory()
+        wizard = SimpleNamespace(run_setup=Mock(return_value=0))
+        with patch.object(sys, "argv", ["Setup.exe"]), \
+                patch.object(sys, "executable", str(source / "Setup.exe")), \
+                patch.dict(sys.modules, {"core.updates.setup_wizard": wizard}), \
+                patch.object(update_trust, "release_public_key", return_value="ab" * 32), \
+                patch.object(update_settings, "read_settings", return_value={"feed": "company-share"}), \
+                patch("core.updates.install.acquire_run_lease") as lease, \
+                patch.object(entrypoint.runpy, "run_module") as application:
+            self.assertEqual(entrypoint.main(), 0)
+        wizard.run_setup.assert_called_once_with(source, "ab" * 32, root=None, feed="company-share")
+        lease.assert_not_called()
+        application.assert_not_called()
+
+    def test_setup_self_test_dispatch_does_not_install_or_open_wizard(self):
+        diagnostic = SimpleNamespace(run_setup_smoke=Mock(return_value=0))
+        wizard = SimpleNamespace(run_setup=Mock())
+        with patch.object(sys, "argv", ["Setup.exe", "--setup-self-test", "result.json"]), \
+                patch.object(sys, "executable", str(Path("Setup.exe").resolve())), \
+                patch.dict(sys.modules, {"tools.frozen_build.setup_smoke": diagnostic,
+                                         "core.updates.setup_wizard": wizard}), \
+                patch.object(update_trust, "release_public_key", return_value="ab" * 32), \
+                patch.object(entrypoint.runpy, "run_module") as application:
+            self.assertEqual(entrypoint.main(), 0)
+        diagnostic.run_setup_smoke.assert_called_once_with("result.json", "ab" * 32)
+        wizard.run_setup.assert_not_called()
+        application.assert_not_called()
+
+    def test_setup_in_an_installed_version_reuses_its_custom_installation_root(self):
+        root = self.temporary_directory()
+        source = root / "versions/4.2.0-test"
+        source.mkdir(parents=True)
+        (root / "install.json").write_text("{}")
+        (root / "current.json").write_text("{}")
+        wizard = SimpleNamespace(run_setup=Mock(return_value=0))
+        with patch.object(sys, "argv", ["Setup.exe"]), \
+                patch.object(sys, "executable", str(source / "Setup.exe")), \
+                patch.dict(sys.modules, {"core.updates.setup_wizard": wizard}), \
+                patch.object(update_trust, "release_public_key", return_value="ab" * 32), \
+                patch.object(update_settings, "read_settings", return_value={}), \
+                patch("core.updates.install.acquire_run_lease") as lease:
+            self.assertEqual(entrypoint.main(), 0)
+        wizard.run_setup.assert_called_once_with(source, "ab" * 32, root=root, feed="")
+        lease.assert_not_called()
 
     def test_cad_viewer_executable_dispatches_viewer_not_main_app(self):
         viewer = SimpleNamespace(main=Mock(return_value=7))

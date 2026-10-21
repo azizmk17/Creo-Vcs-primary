@@ -419,11 +419,22 @@ Right-click an Item and select **Check Out Item**.
 - Item attributes, EBOM usages, associations, and Item delivery documents can
   be changed.
 - CAD geometry remains independently controlled.
-- Item check-in creates an Item iteration only; it does not check in associated
-  CAD Documents.
+- Item check-in creates an Item iteration only when Item data changed. It does
+  not create CAD iterations.
 
-An Item cannot be checked in or have its checkout undone while an associated
-CAD working copy is active. Close the related CAD working copies first.
+### Finishing an Item checkout from the BOM
+
+**Check In Item** and **Undo Item Checkout** also undo every related CAD
+reservation, including drawings left checked out after a 3D-only push. This
+cleanup applies across checkout owners, workspaces, and CAD lifecycle states.
+It also works when the Item or 3D model is already checked in but a related
+drawing still has a reservation.
+
+Saved CAD iterations, CAD/Item associations, and local files are preserved.
+Other Items' checkouts stay in place. The selected Item's ownership rules still
+apply: another user's active Item checkout requires Master/Admin permission.
+Item changes and CAD reservation cleanup share one database transaction; a
+failure leaves the checkout available for retry.
 
 ### Checking out a CAD Document
 

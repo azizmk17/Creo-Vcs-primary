@@ -718,13 +718,14 @@ class BomRevisionRepository:
             ).fetchone()
             return dict(row) if row else {}
 
-    def get_iteration_object_contexts(self, iteration_ids) -> dict[int, dict]:
+    def get_iteration_object_contexts(self, iteration_ids, *, connection=None) -> dict[int, dict]:
         """Load immutable object metadata for many selected iterations at once."""
         ids = sorted({int(value) for value in (iteration_ids or []) if value is not None})
         if not ids:
             return {}
         result = {}
-        with self.get_conn() as conn:
+        context = self.get_conn() if connection is None else nullcontext(connection)
+        with context as conn:
             for offset in range(0, len(ids), 800):
                 chunk = ids[offset:offset + 800]
                 placeholders = ",".join("?" for _ in chunk)
@@ -1329,9 +1330,10 @@ class BomRevisionRepository:
                 "UPDATE bom SET pending_revision_code=NULL WHERE id=?", (int(bom_id),)
             )
 
-    def restore_checked_in_state(self, bom_id: int) -> dict:
+    def restore_checked_in_state(self, bom_id: int, *, connection=None) -> dict:
         """Restore object attributes and direct structure from the current immutable iteration."""
-        with self.get_conn() as conn:
+        context = self.get_conn() if connection is None else nullcontext(connection)
+        with context as conn:
             current = self._ensure_bom_conn(conn, int(bom_id))
             raw_snapshot = current.get("object_data_json")
             try:

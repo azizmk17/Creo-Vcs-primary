@@ -1,8 +1,12 @@
-# Nexus 4.1 release, installation, and update guide
+# Nexus 4.2 release, installation, and update guide
 
 This guide is for the person publishing Nexus and the users installing it.
 Version **4.1.0** introduces a signed company release feed, a local launcher,
 a separate updater, and enforced workspace compatibility checks.
+The current version, **4.2.0**, adds graphical **Setup.exe** installation with
+shortcuts, so users do not need Command Prompt. It retains the 4.1.1 fix that
+releases all related CAD checkouts when a BOM Item is checked in or its checkout
+is undone.
 
 ## What goes where
 
@@ -10,9 +14,9 @@ a separate updater, and enforced workspace compatibility checks.
 | --- | --- |
 | Application version | `APP_VERSION` in `config.py`; embedded in the EXEs during build. |
 | Release signing private key | Kept by the release administrator, outside the release folder and source control. |
-| Release public key | Supplied to the builder and compiled into Nexus, the launcher, and updater. Never trusted from the update server. |
+| Release public key | Supplied to the builder and compiled into Nexus, Setup, the launcher, and updater. Never trusted from the update server. |
 | Published packages | A local/UNC company feed, for example `\\server\NexusReleases`. Users get read access; publishers get write access. |
-| Local installation | `%LOCALAPPDATA%\Nexus`, containing `bootstrap`, `versions`, `current.json`, and `install.json`. |
+| Local installation | `%LOCALAPPDATA%\Nexus` by default; another local folder can be chosen in Setup. Contains `bootstrap`, `versions`, `current.json`, and `install.json`. |
 | User license | `%APPDATA%\CreoVCS\creovcs.lic`. |
 | User settings | Existing workspace settings remain in `%APPDATA%\creovcs`; update preferences are in `%APPDATA%\Nexus`. |
 | Company data | The existing workspace containing `creo_vcs.db` and CAD working directories. Updates do not copy or restore it. |
@@ -94,9 +98,10 @@ Wait for **BUILD SUCCESSFUL**. Output:
 
 ```text
 dist\Nexus\
+    Setup.exe                     Graphical per-user installation
     Nexus.exe
     CADViewer.exe
-    _internal\                    Full PDF/CAD/Qt runtime
+    _internal\                    Application/Setup PDF/CAD/Qt runtime
     build_manifest.json           Version, build ID, pinned key, schema, test results
     bootstrap\
         NexusLauncher.exe
@@ -104,7 +109,10 @@ dist\Nexus\
         _internal\                Smaller independent launcher/updater runtime
 ```
 
-Distribute this whole folder for the first installation. Build instructions,
+Distribute this whole folder for the first installation. Users must extract all
+files before double-clicking **Setup.exe**; Setup shares the application runtime
+in the root `_internal` folder and is not a standalone EXE. It adds no separate installer-tool dependency to the
+build environment. Build instructions,
 Python environment setup, and troubleshooting are in [README_BUILD_EXE.md](README_BUILD_EXE.md).
 
 ## 3. Prepare a shared database when necessary
@@ -155,10 +163,10 @@ supported range in `dist\Nexus\build_manifest.json`; use that range when publish
 ## 4. Publish the tested package
 
 Run this on the publishing PC that holds the release private key. Replace paths
-and release notes. The example publishes 4.1.0 as release sequence 1:
+and release notes. The example publishes 4.2.0 as release sequence 1:
 
 ```bat
-python tools\licensing\update_version.py --package-dir "dist\Nexus" --feed-dir "\\server\NexusReleases" --release-key "D:\Secure\NexusReleaseKeys\release_private.key" --version 4.1.0 --sequence 1 --schema-min 49 --schema-max 49 --notes "Signed updates and workspace compatibility checks" --expires-days 90
+python tools\licensing\update_version.py --package-dir "dist\Nexus" --feed-dir "\\server\NexusReleases" --release-key "D:\Secure\NexusReleaseKeys\release_private.key" --version 4.2.0 --sequence 1 --schema-min 49 --schema-max 49 --notes "Graphical Setup and automatic application shortcuts" --expires-days 90
 ```
 
 Use a larger sequence on **every** subsequent announcement, including an
@@ -191,7 +199,7 @@ The existing command still works and only changes the signed version notice in
 the chosen shared database:
 
 ```bat
-python tools\licensing\update_version.py --version 4.1.0 --private-key "D:\Secure\LicenseKeys\ed25519_private.key" --db "\\server\Workspace\creo_vcs.db"
+python tools\licensing\update_version.py --version 4.2.0 --private-key "D:\Secure\LicenseKeys\ed25519_private.key" --db "\\server\Workspace\creo_vcs.db"
 ```
 
 Run it after the new package is available. Use the **license** key matching those
@@ -206,35 +214,50 @@ through that popup.
 
 ## 5. First installation on a user's PC
 
-No Python or Anaconda installation is needed on the destination PC.
-Extract the administrator-approved Nexus folder. Open **Command Prompt** in that
-folder, then run:
+No Python, Anaconda, or Command Prompt is needed on the destination PC.
 
-```bat
-bootstrap\NexusLauncher.exe --install --feed "\\server\NexusReleases"
-```
+1. Obtain the administrator-approved Nexus ZIP and **extract the entire folder**.
+   Do not run Setup from inside the ZIP or copy only its EXE.
+2. Open the extracted folder and double-click **Setup.exe**.
+3. Keep the default installation folder **`%LOCALAPPDATA%\Nexus`**, or choose a
+   different writable local folder. The large PDF/CAD libraries stay in Local
+   AppData rather than roaming `%APPDATA%`.
+4. If your administrator supplied a company release folder, choose it in Setup,
+   for example `\\server\NexusReleases`. It can be left blank for an installation
+   without a configured update feed.
+5. Choose whether to create a **Desktop shortcut**, then select **Install**.
+   A **Start Menu shortcut** is created automatically. Setup copies the bootstrap
+   and application files, shows progress, and leaves the extracted source intact.
+   The installed version includes `Setup.exe`, `Nexus.exe`, and `CADViewer.exe`
+   sharing one `_internal` runtime. Signed update packages retain that layout.
+6. Choose **Open Nexus** when setup finishes, or start Nexus later through its
+   Start Menu/Desktop shortcut.
 
-The installer copies bootstrap and application files into `%LOCALAPPDATA%\Nexus`.
-It does not open the database, install a license, or start another Nexus session.
-Create a desktop shortcut to:
+The shortcut runs the installed launcher at
+`%LOCALAPPDATA%\Nexus\bootstrap\NexusLauncher.exe` for the default destination.
+For a custom destination, Setup creates shortcuts to that folder's launcher.
+Shortcuts always target the stable launcher, which starts the active app version.
+Normal per-user installation does not require administrator elevation. Running
+Setup from an installed version opens the existing installation options,
+including opening Nexus and repairing shortcuts.
 
-```text
-%LOCALAPPDATA%\Nexus\bootstrap\NexusLauncher.exe
-```
+Setup uses the release public key compiled into its distribution and checks that
+it matches the package. It does not read a replacement trust key from the feed.
+If the selected destination already contains a valid installation, Setup keeps
+its active version and offers to open Nexus or repair shortcuts. Use the app's
+**Updates** window to install a newer release. An incomplete or unrelated
+installation is not silently overwritten; select a separate empty destination
+or ask the administrator to inspect it.
 
-Start Nexus through that shortcut. Install the signed license at
-`%APPDATA%\CreoVCS\creovcs.lic`, and select the existing company workspace when
-prompted. The launcher checks a previously selected workspace before starting
-Nexus; Nexus checks again before constructing login repositories.
+Setup does not change the company database, CAD workspaces, or existing licenses.
+If needed, install the administrator-provided signed license at
+`%APPDATA%\CreoVCS\creovcs.lic`, then select the existing company workspace when
+Nexus prompts for it. The launcher checks a previously selected workspace before
+starting Nexus; Nexus checks again before constructing login repositories.
 
-For a custom installation folder, append `--root "D:\NexusLocal"` to installation
-and use that folder's launcher afterward. An existing/incomplete installation
-is never silently overwritten. Use a separate empty destination when instructed
-by the administrator, keeping company data outside it.
-
-**One manual/IT-managed deployment is necessary to introduce the launcher and
-its trusted public key.** A version predating 4.1 cannot update itself into this
-new mechanism.
+**A one-time Setup or IT-managed deployment introduces the launcher and its
+trusted public key.** A version predating 4.1 cannot update itself into this
+mechanism. Users then receive normal updates through Nexus.
 
 ### Installer automation for IT
 
@@ -243,7 +266,9 @@ installation and preferences belong to that account; running as SYSTEM or anothe
 administrator installs into that account's profile. The default per-user folder
 does not require administrator elevation.
 
-In Command Prompt, from the extracted trusted distribution:
+Ordinary users use **Setup.exe** above. The existing command-line installer is
+retained for scripted IT deployments. In Command Prompt, from the extracted
+trusted distribution:
 
 ```bat
 start "" /wait "bootstrap\NexusLauncher.exe" --install --feed "\\server\NexusReleases" --quiet --result-json "%TEMP%\Nexus-install-result.json"
@@ -301,7 +326,7 @@ silently restore the shared database or promise an automatic application rollbac
 
 Portable copies can open Updates and select a release folder, but managed
 installation is required to activate an update. Their Download action opens the
-launcher installer when it is present. A managed installation uses the feed
+graphical Setup when it is present. A managed installation uses the feed
 chosen at installation, so ordinary users do not accidentally change its source.
 
 ## 7. Administrator rollback
@@ -336,7 +361,8 @@ coordinated administrator operation.
 | Publisher reports key mismatch | Build with the public key belonging to the publisher's release private key. Do not replace clients' trust from an unverified feed. |
 | No update appears | Check feed access, signature, expiry, version and sequence. Updates at/below the installed version are not offered as normal upgrades. |
 | A release requires a newer updater | Deploy an approved new bootstrap manually. Ordinary updates intentionally do not overwrite the running bootstrap. |
-| Installation says it already exists | Use the installed launcher/updater. First installation does not replace an existing managed root. |
+| Setup finds an existing installation | Open the installed app or repair its shortcuts in Setup. Use Updates for a new release; Setup keeps the active version. The IT first-install command refuses an existing managed root. |
+| Setup cannot find its libraries | Extract the entire distribution and keep the root `_internal` folder beside Setup. Run Setup from the extracted folder. |
 | Activation waits or refuses | Close all Nexus and CADViewer windows for that installation, then retry. No process is forcibly stopped. |
 | Workspace requires migration / is too new / is in maintenance | Contact the administrator. Do not bypass the compatibility gate or copy a database from another release. |
 | License signature fails | The license must match the separate license public key baked into Nexus. The release signing key cannot fix a license signature. |

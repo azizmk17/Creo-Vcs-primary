@@ -1,4 +1,4 @@
-"""Shared frozen entry point for Nexus.exe and CADViewer.exe.
+"""Shared frozen entry point for Nexus.exe, CADViewer.exe and Setup.exe.
 
 Keep imports here limited to the standard library until dispatch. In particular,
 the packaging diagnostic must not initialize a workspace, database, or license.
@@ -12,6 +12,23 @@ from pathlib import Path
 
 
 def main() -> int:
+    if Path(sys.executable).stem.casefold() == "setup":
+        from core.updates.trust import release_public_key
+        public = release_public_key()
+        if "--setup-self-test" in sys.argv[1:]:
+            index = sys.argv.index("--setup-self-test")
+            if index + 1 >= len(sys.argv) or sys.argv[index + 1].startswith("--"):
+                raise SystemExit("--setup-self-test requires a result JSON path")
+            from tools.frozen_build.setup_smoke import run_setup_smoke
+            return run_setup_smoke(sys.argv[index + 1], public)
+        from core.updates.setup_wizard import run_setup
+        from core.updates.settings import read_settings
+        from core.updates.install import installed_root_for_executable
+        return run_setup(
+            Path(sys.executable).resolve().parent, public,
+            root=installed_root_for_executable(),
+            feed=str(read_settings().get("feed") or ""),
+        )
     if "--packaging-smoke" in sys.argv[1:]:
         index = sys.argv.index("--packaging-smoke")
         if index + 1 >= len(sys.argv) or sys.argv[index + 1].startswith("--"):

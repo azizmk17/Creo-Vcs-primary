@@ -268,6 +268,14 @@ def _read_build_manifest(package_dir: Path, version: str, public_key_hex: str) -
             raise ValueError("Required release executable is missing: " + required)
     if not (package_dir / "_internal").is_dir() or not (package_dir / "bootstrap/_internal").is_dir():
         raise ValueError("Both application and bootstrap shared runtime folders are required.")
+    from core.updates.protocol import version_tuple
+    if version_tuple(version) >= (4, 2, 0):
+        report = manifest.get("setup_test") or {}
+        if (not (package_dir / "Setup.exe").is_file()
+                or report.get("ok") is not True or report.get("frozen") is not True
+                or report.get("gui") is not True
+                or report.get("release_public_key") != public_key_hex):
+            raise ValueError("Setup.exe must pass its packaged GUI and pinned-key self-test.")
     return manifest, str(manifest.get("build_id") or hash_file(path)[:16])
 
 

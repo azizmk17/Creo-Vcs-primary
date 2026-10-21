@@ -13955,7 +13955,8 @@ class BomPage(QWidget):
             lock_owner_id is None or self.session.user_id is None
             or int(lock_owner_id) == int(self.session.user_id)
         )
-        can_finish_checkout = lock_is_mine or self.perm.can("merge")
+        can_finish_checkout = not locked or lock_is_mine or self.perm.can("merge")
+        has_checkout = locked or bool(active_cad)
         checkout_action = menu.addAction("Check Out Item")
         if locked and checkout_origin == "CAD":
             checkout_action.setText("Make Item Checkout Explicit")
@@ -13964,14 +13965,14 @@ class BomPage(QWidget):
         )
         checkout_action.triggered.connect(lambda: self.checkout_part(item_id))
         checkin_action = menu.addAction("Check In Item...")
-        checkin_action.setEnabled(locked and can_finish_checkout)
+        checkin_action.setEnabled(has_checkout and can_finish_checkout)
         if active_cad:
-            checkin_action.setToolTip("Check in Item data only; associated CAD Documents stay checked out.")
+            checkin_action.setToolTip("Check in Item data and undo all related CAD checkouts.")
         checkin_action.triggered.connect(lambda: self.checkin_part(item_id))
         undo_action = menu.addAction("Undo Item Checkout")
-        undo_action.setEnabled(locked and can_finish_checkout)
+        undo_action.setEnabled(has_checkout and can_finish_checkout)
         if active_cad:
-            undo_action.setToolTip("Undo this Item checkout; associated CAD checkouts stay active.")
+            undo_action.setToolTip("Undo this Item checkout and all related CAD checkouts.")
         undo_action.triggered.connect(lambda: self.undo_checkout(item_id))
         menu.addSeparator()
         cad_menu = menu.addMenu("Associated CAD Documents")
@@ -19187,11 +19188,11 @@ class BomPage(QWidget):
                 "Check In",
                 (
                     f"Checkout completed as {context.get('version_label') or analysis.get('next_version')}.\n"
-                    "The Item iteration was created independently; associated CAD Documents were not checked in."
+                    "All related CAD checkouts were undone."
                     if created_iteration else
                     f"Checkout closed at {context.get('version_label') or analysis.get('current_version') or '-'}.\n"
                     "No Item data changes were detected, so no new Item iteration was created. "
-                    "Associated CAD Documents were not checked in."
+                    "All related CAD checkouts were undone."
                 ),
             )
             for affected_id in (result or {}).get("affected_part_ids") or [int(part_id)]:
@@ -19199,6 +19200,9 @@ class BomPage(QWidget):
                 self._invalidate_doc_indicator(int(affected_id))
             self._renumber_full_bom_tree_rows()
             self._sync_search_tree_row_numbers()
+            self._refresh_pdm_context_rows(
+                cad_ids=(result or {}).get("released_cad_ids") or [],
+            )
             self.display_details(int(part_id))
         except (ValueError, PermissionError) as exc:
             QMessageBox.warning(self, "Check In", str(exc))
@@ -19228,7 +19232,7 @@ class BomPage(QWidget):
             self,
             "Undo Checkout",
             "Discard the working Item attributes/structure and release this checkout?\n\n"
-            "Associated CAD Documents and other Items will stay checked out. "
+            "All related CAD checkouts, including drawings, will also be undone. "
             "CAD/Item associations will not be removed.\n\n"
             "This does not create an iteration and is not a check-in.",
             QMessageBox.Yes | QMessageBox.No,
@@ -19237,17 +19241,19 @@ class BomPage(QWidget):
         if answer != QMessageBox.Yes:
             return
         try:
-            self.bom_service.undo_item_checkout(int(part_id), as_user_id=actor_user_id)
-            QMessageBox.information(self, "Undo Checkout", "Checkout undone. No iteration was created.")
-            affected_cad_ids = []
             try:
                 affected_cad_ids = [
-                    int(row.get("id"))
-                    for row in (self.bom_service.list_item_cad_associations(int(part_id)) or [])
+                    int(row["id"])
+                    for row in self.bom_service.checked_out_cad_for_item(int(part_id)) or []
                     if row.get("id") is not None
                 ]
             except Exception:
                 affected_cad_ids = []
+            self.bom_service.undo_item_checkout(int(part_id), as_user_id=actor_user_id)
+            QMessageBox.information(
+                self, "Undo Checkout",
+                "Item checkout and all related CAD checkouts undone. No iteration was created.",
+            )
             self._refresh_pdm_context_rows(
                 item_ids=[int(part_id)],
                 cad_ids=affected_cad_ids,
@@ -21113,7 +21119,7 @@ class BomPage(QWidget):
         can_manage = self.perm.can("manage_parts")
         can_revision = self.perm.can("set_revision")
         # Item Structure is an engineering workspace, not a read-only report.
-        # Item locks remain independent from CAD Document locks.
+        # Finishing an Item checkout also closes any remaining related CAD checkouts.
         read_only_ebom = False
         try:
             active_cad = (
@@ -21131,27 +21137,24 @@ class BomPage(QWidget):
         can_promote_auto_checkout = bool(
             locked and checkout_origin == "CAD" and lock_is_mine
         )
-        can_finish_checkout = bool(lock_is_mine or self.perm.can("merge"))
+        can_finish_checkout = bool(not locked or lock_is_mine or self.perm.can("merge"))
+        has_checkout = locked or bool(active_cad)
         self.checkout_part_btn.setEnabled(
             has_item and (not locked or can_promote_auto_checkout)
             and not obsolete and not read_only_ebom
         )
         self.checkin_part_btn.setEnabled(
-            has_item and locked and can_finish_checkout and not read_only_ebom
+            has_item and has_checkout and can_finish_checkout and not read_only_ebom
         )
         self.undo_checkout_btn.setEnabled(
-            has_item and locked and can_finish_checkout and not read_only_ebom
+            has_item and has_checkout and can_finish_checkout and not read_only_ebom
         )
         if active_cad:
-            labels = ", ".join(
-                str(row.get("file_name") or row.get("name") or "CAD")
-                for row in active_cad[:3]
-            )
             self.checkin_part_btn.setToolTip(
-                f"Check in Item data only; associated CAD stays checked out: {labels}"
+                "Check in Item data and undo all related CAD checkouts, including drawings"
             )
             self.undo_checkout_btn.setToolTip(
-                f"Undo this Item checkout only; associated CAD stays checked out: {labels}"
+                "Undo this Item checkout and all related CAD checkouts, including drawings"
             )
         elif can_promote_auto_checkout:
             self.checkout_part_btn.setToolTip(

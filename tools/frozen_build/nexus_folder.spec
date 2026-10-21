@@ -1,4 +1,4 @@
-# Built by build_exe.bat. Both executables share one Analysis and native runtime.
+# Built by build_exe.bat. Setup and both apps share one Analysis and native runtime.
 import os
 from pathlib import Path
 import sys
@@ -17,6 +17,7 @@ datas += [
     (str(ROOT / 'integrations/creo_jlink/src/MiniJson.java'), 'integrations/creo_jlink/src'),
 ]
 hidden += ['main3', 'config', 'utils', 'nexus_release_trust', 'tools.frozen_build.smoke',
+           'tools.frozen_build.setup_smoke',
            'tools.CAD.step_viewer.main_window', 'tools.CAD.step_viewer.face_lifecycle',
            'tools.CAD.step_viewer.launcher', 'PyQt5.QtOpenGL', 'PyQt5.QtPrintSupport',
            'PyQt5.sip', 'openpyxl', 'cryptography.hazmat.primitives.asymmetric.ed25519']
@@ -39,5 +40,6 @@ options = dict(exclude_binaries=True, console=False, debug=False, strip=False, u
                version=os.environ.get('NEXUS_VERSION_FILE'))
 nexus = EXE(pyz, analysis.scripts, [], name='Nexus', **options)
 viewer = EXE(pyz, analysis.scripts, [], name='CADViewer', **options)
-release = COLLECT(nexus, viewer, analysis.binaries, analysis.datas,
+setup = EXE(pyz, analysis.scripts, [], name='Setup', **options)
+release = COLLECT(nexus, viewer, setup, analysis.binaries, analysis.datas,
                   strip=False, upx=False, name='Nexus')

@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import nullcontext
 from typing import Iterable
 
 from config import DB_NAME
@@ -62,7 +63,7 @@ class ManagedFileRepository:
                     "ADD COLUMN file_revision TEXT NOT NULL DEFAULT ''"
                 )
 
-    def upsert(self, entry: dict) -> int:
+    def upsert(self, entry: dict, *, connection=None) -> int:
         entry = dict(entry)
         entry["binding_key"] = (
             f"file:{int(entry['part_file_id'])}"
@@ -76,7 +77,8 @@ class ManagedFileRepository:
             "integrity_status", "lifecycle_state", "source_commit_id", "created_by",
         )
         values = [entry.get(column) for column in columns]
-        with self.get_conn() as conn:
+        context = self.get_conn() if connection is None else nullcontext(connection)
+        with context as conn:
             if entry.get("part_file_id") is not None:
                 conn.execute(
                     """
@@ -137,8 +139,9 @@ class ManagedFileRepository:
             ).fetchone()
             return int(row["id"])
 
-    def list_for_iteration(self, iteration_id: int) -> list[dict]:
-        with self.get_conn() as conn:
+    def list_for_iteration(self, iteration_id: int, *, connection=None) -> list[dict]:
+        context = self.get_conn() if connection is None else nullcontext(connection)
+        with context as conn:
             rows = conn.execute(
                 """
                 SELECT * FROM bom_iteration_files
@@ -183,9 +186,11 @@ class ManagedFileRepository:
         source_iteration_id: int,
         target_iteration_id: int,
         lifecycle_state: str = "In Work",
+        *, connection=None,
     ) -> None:
         """Bind the exact prior file manifest to a new object iteration."""
-        with self.get_conn() as conn:
+        context = self.get_conn() if connection is None else nullcontext(connection)
+        with context as conn:
             conn.execute(
                 """
                 INSERT OR IGNORE INTO bom_iteration_files(
@@ -237,9 +242,10 @@ class ManagedFileRepository:
                 (str(state or "In Work"), int(iteration_id)),
             )
 
-    def prune_iteration_documents(self, iteration_id: int, active_file_ids) -> None:
+    def prune_iteration_documents(self, iteration_id: int, active_file_ids, *, connection=None) -> None:
         ids = sorted({int(value) for value in (active_file_ids or []) if value is not None})
-        with self.get_conn() as conn:
+        context = self.get_conn() if connection is None else nullcontext(connection)
+        with context as conn:
             if not ids:
                 conn.execute(
                     "DELETE FROM bom_iteration_files WHERE iteration_id=? AND part_file_id IS NOT NULL",

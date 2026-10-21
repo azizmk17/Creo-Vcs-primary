@@ -30,19 +30,32 @@ def version_tuple(value: str) -> tuple[int, ...]:
     return tuple(int(component) for component in text.split("."))
 
 
-def readonly_connection(db_path: str | Path) -> sqlite3.Connection:
-    """Open an existing database without creating it or running write PRAGMAs.
 
-    config.py wraps sqlite3.connect with runtime PRAGMAs. Bypass that wrapper
-    here: startup checks must remain read-only, even for a WAL database.
-    """
+def readonly_connection(db_path: str | Path) -> sqlite3.Connection:
+    """Open an existing database safely in read-only mode."""
+
     path = Path(db_path).expanduser().resolve()
+
     if not path.is_file():
         raise CompatibilityError(
-            f"Workspace database does not exist: {path}", code="database_unavailable",
+            f"Workspace database does not exist: {path}",
+            code="database_unavailable",
         )
-    connect = getattr(sqlite3, "_nexus_original_connect", sqlite3.connect)
-    return connect(path.as_uri() + "?mode=ro", uri=True, timeout=5)
+
+    uri = path.as_uri()
+
+    # Fix Windows UNC network paths for SQLite
+    if str(path).startswith("\\\\") and uri.startswith("file://"):
+        uri = "file:////" + uri[len("file://"):]
+
+    connect = getattr(
+        sqlite3,
+        "_nexus_original_connect",
+        sqlite3.connect,
+    )
+
+    return connect(uri + "?mode=ro", uri=True, timeout=5)
+
 
 
 def latest_schema_version() -> int:

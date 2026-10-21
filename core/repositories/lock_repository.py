@@ -68,11 +68,14 @@ class LockRepository:
             ))
             return int(cur.lastrowid)
 
-    def undo_checkout(self, part_id, user_id, signature, object_iteration_id=None) -> int:
+    def undo_checkout(
+        self, part_id, user_id, signature, object_iteration_id=None, *, conn=None,
+    ) -> int:
         """Release a checkout without recording a check-in event."""
-        with self.get_conn() as conn:
-            conn.execute("DELETE FROM locks WHERE part_id = ?", (int(part_id),))
-            conn.execute(
+        context = self.get_conn() if conn is None else nullcontext(conn)
+        with context as active_conn:
+            active_conn.execute("DELETE FROM locks WHERE part_id = ?", (int(part_id),))
+            active_conn.execute(
                 """
                 INSERT INTO lock_logs (
                     part_id, user_id, action, timestamp, signature, object_iteration_id
@@ -83,7 +86,7 @@ class LockRepository:
                     signature, object_iteration_id,
                 ),
             )
-            return int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            return int(active_conn.execute("SELECT last_insert_rowid()").fetchone()[0])
         
     def checkout(
         self,

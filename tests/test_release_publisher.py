@@ -33,7 +33,7 @@ class SignedReleaseTests(unittest.TestCase):
         self.feed = self.directory / "feed"
         self.make_package()
 
-    def make_package(self, *, version="4.1.0", build_id="fixture-build", public_key=None):
+    def make_package(self, *, version="4.1.0", build_id="fixture-build", public_key=None, with_setup=None):
         for relative in ("Nexus.exe", "CADViewer.exe", "_internal/runtime.dll",
                          "bootstrap/NexusLauncher.exe", "bootstrap/NexusUpdater.exe", "bootstrap/_internal/runtime.dll"):
             path = self.package / relative
@@ -47,6 +47,12 @@ class SignedReleaseTests(unittest.TestCase):
                     "bootstrap_tests": {name: {"ok": True, "frozen": True, "release_public_key": self.public_hex}
                                         for name in ("NexusLauncher.exe", "NexusUpdater.exe")},
                     "smoke_tests": {name: deepcopy(report) for name in ("Nexus.exe", "CADViewer.exe")}}
+        if protocol.version_tuple(version) >= (4, 2, 0) and with_setup is not False:
+            (self.package / "Setup.exe").write_bytes(b"setup executable")
+            manifest["setup_test"] = {"ok": True, "frozen": True, "gui": True,
+                                      "release_public_key": self.public_hex}
+        else:
+            (self.package / "Setup.exe").unlink(missing_ok=True)
         (self.package / "build_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
     def payload(self):
@@ -128,6 +134,20 @@ class SignedReleaseTests(unittest.TestCase):
             self.assertFalse(any(name.startswith("Nexus/") for name in bundle.namelist()))
         self.assertFalse((self.feed / ".publish.lock").exists())
         self.assertFalse(list(self.feed.rglob("*.tmp")))
+
+    def test_new_releases_require_the_setup_executable_and_successful_gui_check(self):
+        self.make_package(version="4.2.0", with_setup=False)
+        with self.assertRaisesRegex(ValueError, "Setup.exe"):
+            self.publish(version="4.2.0")
+        (self.package / "Setup.exe").write_bytes(b"setup executable")
+        manifest_path = self.package / "build_manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["setup_test"] = {"ok": True, "frozen": True, "gui": True,
+                                  "release_public_key": self.public_hex}
+        manifest_path.write_text(json.dumps(manifest))
+        payload = self.publish(version="4.2.0")
+        with zipfile.ZipFile(self.feed / payload["package"]["path"]) as archive:
+            self.assertIn("Setup.exe", archive.namelist())
 
     def test_sequence_or_version_downgrade_preserves_existing_pointer_and_archive(self):
         payload = self.publish(sequence=10)

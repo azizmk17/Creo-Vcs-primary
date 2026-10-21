@@ -1,5 +1,6 @@
 from typing import List, Dict
 from collections import defaultdict
+from contextlib import closing
 import os
 import re
 import sqlite3
@@ -995,15 +996,123 @@ class BomService(BaseService):
     def undo_item_checkout(
         self, item_id: int, *, as_user_id: int | None = None
     ) -> bool:
-        return self.undo_checkout(
-            int(item_id), as_user_id=as_user_id, exact_item=True
-        )
+        self._finish_bom_item_checkout(int(item_id), as_user_id=as_user_id)
+        return True
 
     def checkin_item_data(self, item_id: int, note: str) -> Dict:
-        """Check in Item metadata/structure/documents without a CAD checkout."""
-        return self.checkin_non_cad_changes(
-            int(item_id), note, exact_item=True
+        """Check in Item data and undo every remaining related CAD reservation."""
+        return self._finish_bom_item_checkout(int(item_id), checkin=True, note=note)
+
+    def _finish_bom_item_checkout(
+        self, item_id: int, *, checkin: bool = False, note: str = "",
+        as_user_id: int | None = None,
+    ) -> Dict:
+        """Finish the selected EBOM reservation and its CAD locks together.
+
+        A partial CAD push may already have closed the Item or its 3D model.
+        Remaining drawings still belong to this BOM cleanup, regardless of
+        their checkout owner, workspace or lifecycle. No CAD content is checked
+        in here, and other Items' reservations are not closed.
+        """
+        item_id = int(item_id)
+        if not self.bom_repo.get_by_id(item_id):
+            raise ValueError("Part not found")
+        actor = int(self.user_id) if self.user_id is not None else None
+        if actor is None:
+            raise PermissionError("You must be logged in.")
+        effective_user = int(as_user_id) if as_user_id is not None else actor
+        note = str(note or "").strip()
+        if checkin and not note:
+            raise ValueError("A check-in comment is required.")
+
+        def assert_owner(lock):
+            if ((lock and int(lock.user_id) != actor) or effective_user != actor):
+                if not self.permission_repo.user_has_permission(
+                    actor, "merge", self.session.project_id
+                ):
+                    raise ValueError("Part is checked out by another user.")
+
+        initial_lock = self.lock_repo.get_by_part(item_id)
+        assert_owner(initial_lock)
+        if not initial_lock and not self.checked_out_cad_for_item(item_id):
+            raise ValueError("Part is not checked out.")
+        analysis = self.analyze_item_checkout(item_id) if checkin else {}
+        managed_files = None
+        if checkin and analysis.get("has_non_cad_changes"):
+            from core.services.managed_file_service import ManagedFileService
+            managed_files = ManagedFileService()
+
+        action = "checkin" if checkin else "undo_checkout"
+        cleanup_note = (
+            "Related CAD checkout undone by BOM Item check-in: " + note
+            if checkin else "Related CAD checkout undone by BOM Item undo checkout"
         )
+        with closing(self.bom_repo.get_conn()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            lock = self.lock_repo.get_by_part(item_id, conn=conn)
+            assert_owner(lock)
+            if (getattr(lock, "id", None), getattr(lock, "user_id", None)) != (
+                getattr(initial_lock, "id", None), getattr(initial_lock, "user_id", None)
+            ):
+                raise ValueError("The Item checkout changed. Refresh the BOM and try again.")
+            if lock:
+                if managed_files is not None:
+                    context = self.revision_repo.record_checkin(
+                        item_id, int(lock.user_id), note=note, source_commit_id=None,
+                        connection=conn,
+                    )
+                    managed_files.capture_iteration(
+                        item_id, int(context["current_iteration_id"]),
+                        inherit_from_iteration_id=int(analysis["current_iteration_id"]),
+                        connection=conn,
+                    )
+                else:
+                    context = self.revision_repo.restore_checked_in_state(
+                        item_id, connection=conn
+                    )
+                signature = self.signature_repo.add_signature(
+                    action, effective_user,
+                    note=note or "Checkout undone; working Item changes discarded",
+                    conn=conn,
+                )
+                finish_lock = self.lock_repo.checkin if checkin else self.lock_repo.undo_checkout
+                finish_lock(
+                    item_id, effective_user, signature,
+                    object_iteration_id=context.get("current_iteration_id"), conn=conn,
+                )
+            else:
+                context = self.revision_repo.get_current_context(item_id, connection=conn)
+            released_cad = self.pdm_service.undo_item_cad_checkouts(
+                item_id, actor, cleanup_note, connection=conn
+            )
+            self.bom_repo.checkin_bom(item_id, conn=conn)
+
+        # Workspaces are local UI manifests. Release each original workspace's
+        # reservation after the database transaction; never delete local files.
+        if released_cad:
+            try:
+                from core.services.cad_workspace_service import CadWorkspaceService
+                workspace_service = CadWorkspaceService()
+                for document in released_cad:
+                    try:
+                        workspace_service.release_cad_document(
+                            document.get("checkout_workspace_id"), int(document["id"])
+                        )
+                    except Exception:
+                        # An unavailable workspace must not prevent cleanup of
+                        # the other local reservations after global release.
+                        continue
+            except Exception:
+                pass
+        cad_ids = sorted({int(document["id"]) for document in released_cad})
+        self.emit_project_event(
+            "item." + action, entity_type="ITEM", entity_id=item_id,
+            payload={"item_ids": [item_id], "cad_document_ids": cad_ids,
+                     "non_cad": bool(checkin)}, actor_user_id=actor,
+        )
+        self._tree_dirty.add(int(self.session.project_id))
+        return {"context": context, "analysis": analysis,
+                "affected_part_ids": [item_id], "released_cad_ids": cad_ids}
 
     def checkin_by_part_id(
         self,
@@ -1085,6 +1194,21 @@ class BomService(BaseService):
 
     def analyze_item_checkout(self, item_id: int) -> Dict:
         """Analyze one Item working copy without treating associated CAD as Item data."""
+        if not self.lock_repo.get_by_part(int(item_id)):
+            if not self.checked_out_cad_for_item(int(item_id)):
+                raise ValueError("The selected item is not checked out.")
+            part = self.bom_repo.get_by_id(int(item_id))
+            context = self.revision_repo.get_current_context(int(item_id))
+            return {
+                "bom_id": int(item_id), "name": str(getattr(part, "name", "") or ""),
+                "aes_number": str(getattr(part, "aes_number", "") or ""),
+                "current_version": context.get("version_label"),
+                "next_version": context.get("version_label"),
+                "current_iteration_id": context.get("current_iteration_id"),
+                "native_cad": {}, "drawing": {}, "requires_commit": False,
+                "structure_requires_cad": False, "has_non_cad_changes": False,
+                "has_any_changes": False, "related_cad_only": True,
+            }
         analysis = dict(self.analyze_checkout(int(item_id)))
         analysis["requires_commit"] = False
         analysis["structure_requires_cad"] = False

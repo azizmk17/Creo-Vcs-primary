@@ -946,6 +946,13 @@ class PdmService:
             int(item_id), connection=connection
         )
 
+    def undo_item_cad_checkouts(
+        self, item_id: int, actor_id: int, note: str = "", *, connection=None,
+    ) -> list[dict]:
+        return self.repo.undo_item_cad_checkouts(
+            int(item_id), int(actor_id), note, connection=connection,
+        )
+
     def cad_checkout_history(self, cad_document_id: int) -> list[dict]:
         return self.repo.list_cad_checkout_history(int(cad_document_id))
 

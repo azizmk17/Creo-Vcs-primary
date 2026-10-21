@@ -174,6 +174,9 @@ Nexus will:
 - Restore the last checked-in direct-child structure, quantity, and order.
 - Discard working child bindings.
 - Release the lock.
+- When invoked on a BOM Item, also undo all related CAD and drawing checkouts,
+  even if the 3D model was already checked in. Saved CAD iterations and local
+  files are preserved.
 - Record an `undo_checkout` audit event.
 - Keep the current revision and iteration unchanged.
 

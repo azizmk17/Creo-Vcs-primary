@@ -105,6 +105,19 @@ class UpdateUiTests(unittest.TestCase):
         with patch.object(sys, "frozen", True, create=True), patch.dict(os.environ, {"NEXUS_RELEASE_PUBLIC_KEY": self.public}), patch.dict(sys.modules, {"nexus_release_trust": None}):
             self.assertEqual(trust.release_public_key(), "")
 
+    def test_portable_download_opens_graphical_setup_without_command_arguments(self):
+        self.publish()
+        self.controller.check()
+        self.wait()
+        source = self.base / "extracted app"
+        source.mkdir()
+        (source / "Setup.exe").write_bytes(b"setup executable")
+        with patch("core.updates.ui.sys.executable", str(source / "Nexus.exe")), patch(
+            "core.updates.ui.subprocess.Popen"
+        ) as launch, patch("core.updates.ui.QMessageBox.information"):
+            self.controller.download()
+        launch.assert_called_once_with([str(source / "Setup.exe")], cwd=str(source))
+
     def test_new_release_reenables_download_after_an_older_release_was_staged(self):
         payload = self.publish()
         self.controller.check()

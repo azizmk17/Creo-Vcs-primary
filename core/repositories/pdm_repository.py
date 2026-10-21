@@ -1483,14 +1483,29 @@ class PdmRepository:
     def list_checked_out_cad_for_item(self, item_id: int, *, connection=None) -> list[dict]:
         """Return every active CAD working copy associated with one Item.
 
-        The checkout link is authoritative for current working copies, while
-        the active association also covers CAD data created by older Nexus
-        versions before checkout links were persisted.
+        Include legacy checkout references and drawings owned by a directly
+        related model, even when that model has already been checked in.
+        Assembly children are deliberately outside this Item's cleanup scope.
         """
         context = self.get_conn() if connection is None else nullcontext(connection)
         with context as conn:
             rows = conn.execute(
                 """
+                WITH item_cad AS (
+                    SELECT related.id FROM cad_documents related
+                    WHERE related.checkout_item_id=?
+                       OR EXISTS (
+                           SELECT 1 FROM cad_document_checkout_items checkout_link
+                           WHERE checkout_link.cad_document_id=related.id
+                             AND checkout_link.item_id=?
+                       )
+                       OR EXISTS (
+                           SELECT 1 FROM cad_item_associations association_link
+                           WHERE association_link.cad_document_id=related.id
+                             AND association_link.item_id=?
+                             AND association_link.active=1
+                       )
+                )
                 SELECT d.*,
                        (
                            SELECT a.association_type
@@ -1509,25 +1524,81 @@ class PdmRepository:
                 FROM cad_documents d
                 WHERE d.checked_out_by IS NOT NULL
                   AND (
-                      EXISTS (
-                          SELECT 1
-                          FROM cad_document_checkout_items checkout_link
-                          WHERE checkout_link.cad_document_id=d.id
-                            AND checkout_link.item_id=?
-                      )
-                      OR EXISTS (
-                          SELECT 1
-                          FROM cad_item_associations association_link
-                          WHERE association_link.cad_document_id=d.id
-                            AND association_link.item_id=?
-                            AND association_link.active=1
+                      d.id IN (SELECT id FROM item_cad)
+                      OR (
+                          upper(d.category)='DRAWING'
+                          AND d.drawing_owner_cad_document_id IN (
+                              SELECT id FROM item_cad
+                          )
                       )
                   )
                 ORDER BY lower(d.file_name),d.id
                 """,
-                (int(item_id), int(item_id), int(item_id)),
+                (int(item_id), int(item_id), int(item_id), int(item_id)),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def undo_item_cad_checkouts(
+        self, item_id: int, actor_id: int, note: str = "", *, connection=None,
+    ) -> list[dict]:
+        """Release all CAD reservations when an authorized Item checkout ends.
+
+        Item-level authorization belongs to the caller. Unlike the standalone
+        CAD undo operation, finishing an Item also releases related drawings
+        held by another user or workspace and ignores CAD lifecycle state.
+        Return the original working-copy rows for subsequent lock cleanup.
+        """
+        context = self.get_conn() if connection is None else nullcontext(connection)
+        with context as conn:
+            released = self.list_checked_out_cad_for_item(
+                int(item_id), connection=conn,
+            )
+            for row in released:
+                cad_document_id = int(row["id"])
+                checkout_item_ids = [
+                    int(link["item_id"])
+                    for link in conn.execute(
+                        """
+                        SELECT item_id FROM cad_document_checkout_items
+                        WHERE cad_document_id=? ORDER BY item_id
+                        """,
+                        (cad_document_id,),
+                    ).fetchall()
+                ]
+                legacy_item_id = row.get("checkout_item_id")
+                if legacy_item_id is not None and int(legacy_item_id) not in checkout_item_ids:
+                    checkout_item_ids.append(int(legacy_item_id))
+                row["checkout_item_ids"] = checkout_item_ids
+                conn.execute(
+                    """
+                    UPDATE cad_documents
+                    SET checked_out_by=NULL,checked_out_at=NULL,checkout_item_id=NULL,
+                        checkout_workspace_id=NULL,checkout_workspace_name=NULL,
+                        checkout_workspace_machine_id=NULL,
+                        modified_at=datetime('now')
+                    WHERE id=?
+                    """,
+                    (cad_document_id,),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO cad_document_checkout_logs(
+                        cad_document_id,item_id,user_id,action,note,workspace_id,
+                        workspace_name,workspace_machine_id
+                    ) VALUES(?,?,?,'UNDO_CHECKOUT',?,?,?,?)
+                    """,
+                    (
+                        cad_document_id, int(item_id), int(actor_id),
+                        str(note or "").strip() or None,
+                        row["checkout_workspace_id"], row["checkout_workspace_name"],
+                        row["checkout_workspace_machine_id"],
+                    ),
+                )
+                conn.execute(
+                    "DELETE FROM cad_document_checkout_items WHERE cad_document_id=?",
+                    (cad_document_id,),
+                )
+            return released
 
     def list_cad_checkout_history(self, cad_document_id: int) -> list[dict]:
         with self.get_conn() as conn:

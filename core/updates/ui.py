@@ -123,12 +123,12 @@ class UpdateController(QObject):
         root = settings.managed_root()
         if root is None:
             source = Path(sys.executable).resolve().parent
-            installer = source / "bootstrap" / "NexusLauncher.exe"
+            installer = source / "Setup.exe"
             if not installer.is_file():
-                QMessageBox.information(self.window, "Install the launcher", "Ask your administrator to install this release with NexusLauncher before using managed updates.")
+                QMessageBox.information(self.window, "Install Nexus", "Open Setup.exe in the full extracted Nexus folder supplied by your administrator.")
                 return
-            subprocess.Popen([str(installer), "--install", "--source", str(source), "--feed", settings.update_feed()], cwd=str(source))
-            QMessageBox.information(self.window, "Launcher installation", "Complete the launcher installation, save your work and close this copy of Nexus. Start Nexus from the installed launcher to use updates.")
+            subprocess.Popen([str(installer)], cwd=str(source))
+            QMessageBox.information(self.window, "Nexus Setup", "Complete Setup, save your work and close this copy of Nexus. Start Nexus from its new shortcut to use managed updates.")
             return
         from core.updates.install import stage_release
         self.status = "Downloading and verifying the update. You can continue working."
