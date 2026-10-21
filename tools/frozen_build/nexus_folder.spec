@@ -16,7 +16,7 @@ datas += [
     (str(ROOT / 'integrations/creo_jlink/async/NexusStructureScan.java'), 'integrations/creo_jlink/async'),
     (str(ROOT / 'integrations/creo_jlink/src/MiniJson.java'), 'integrations/creo_jlink/src'),
 ]
-hidden += ['main3', 'config', 'utils', 'tools.frozen_build.smoke',
+hidden += ['main3', 'config', 'utils', 'nexus_release_trust', 'tools.frozen_build.smoke',
            'tools.CAD.step_viewer.main_window', 'tools.CAD.step_viewer.face_lifecycle',
            'tools.CAD.step_viewer.launcher', 'PyQt5.QtOpenGL', 'PyQt5.QtPrintSupport',
            'PyQt5.sip', 'openpyxl', 'cryptography.hazmat.primitives.asymmetric.ed25519']
@@ -24,7 +24,7 @@ for package in ('core', 'pages', 'setup', 'tools.CAD.step_diff_engine'):
     hidden += collect_submodules(package, filter=lambda name: not name.endswith('.step_diff_gui'))
 
 analysis = Analysis(
-    [str(ROOT / 'tools/frozen_build/entrypoint.py')], pathex=[str(ROOT)],
+    [str(ROOT / 'tools/frozen_build/entrypoint.py')], pathex=[os.environ.get('NEXUS_GENERATED_DIR', str(ROOT)), str(ROOT)],
     binaries=binaries, datas=datas, hiddenimports=sorted(set(hidden)),
     runtime_hooks=[str(ROOT / 'tools/frozen_build/runtime_hook.py')],
     excludes=['pytest', 'IPython', 'notebook', 'jupyter', 'matplotlib', 'scipy', 'pandas',

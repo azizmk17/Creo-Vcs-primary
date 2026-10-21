@@ -3,7 +3,7 @@ import sqlite3
 from pathlib import Path
 
 # Application version — bump this string with each release.
-APP_VERSION = "4.0.10"
+APP_VERSION = "4.1.0"
 
 # ---------------------------------------------------------------------------
 # Database path
@@ -120,7 +120,14 @@ def _install_sqlite_runtime_profile() -> None:
     def nexus_connect(database, *args, **kwargs):
         kwargs.setdefault("timeout", SQLITE_TIMEOUT_SECONDS)
         conn = original_connect(database, *args, **kwargs)
-        _configure_sqlite_connection(conn, database)
+        try:
+            from core.updates.compatibility import guard_connection
+
+            guard_connection(conn, database)
+            _configure_sqlite_connection(conn, database)
+        except Exception:
+            conn.close()
+            raise
         return conn
 
     sqlite3.connect = nexus_connect

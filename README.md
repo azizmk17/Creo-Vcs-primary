@@ -4,7 +4,7 @@
 > CAD Document, Item, association, CAD-to-EBOM build, supplier package, and
 > migration workflows.
 
-Nexus **4.0.10** introduces [shared master work and version-aware PDF/STEP status](docs/master_work_and_deliverables.md).
+Nexus **4.1.0** adds [signed releases, managed updates, and workspace compatibility checks](README_RELEASE_UPDATES.md), alongside [shared master work and version-aware PDF/STEP status](docs/master_work_and_deliverables.md).
 
 Build the portable Windows folder with **build_exe.bat**. Start with the [build steps below](#build-a-windows-exe-folder), or open the [complete build guide](README_BUILD_EXE.md) for new-computer setup and troubleshooting.
 
@@ -47,7 +47,7 @@ build_exe.bat --python "%CONDA_PREFIX%\python.exe" --check
 When the check prints **`Build prerequisites OK`**, build:
 
 ```bat
-build_exe.bat --python "%CONDA_PREFIX%\python.exe"
+build_exe.bat --python "%CONDA_PREFIX%\python.exe" --release-public-key "D:\PublicKeys\release_public.key"
 ```
 
 If only PyInstaller is missing, install it and check again before building:
@@ -56,11 +56,27 @@ If only PyInstaller is missing, install it and check again before building:
 build_exe.bat --python "%CONDA_PREFIX%\python.exe" --install-build-tools --check
 ```
 
+Replace the public-key path with the release administrator's public key. Keep
+the private signing key with the publisher; it is not needed on build/client PCs.
+The publisher needs the matching private key to sign updates. If only the
+existing `tools\licensing\keys\ed25519_public.key` is available, follow the
+[release-key setup](README_RELEASE_UPDATES.md#1-prepare-the-release-signing-key)
+before building an update-enabled deployment. Update keys do not replace the
+separate key used to verify user licenses.
 Keep `--python` so the builder uses your chosen environment. Wait for
 **`BUILD SUCCESSFUL`**, then distribute the **entire `dist\Nexus` folder**,
-including `_internal`. It contains `Nexus.exe`, `CADViewer.exe`, and the shared
-PDF/OCC/Qt runtime. Users extract that folder and start `Nexus.exe`; workspace
-access and a valid license are still required.
+including `bootstrap` and both `_internal` folders. It contains `Nexus.exe`,
+`CADViewer.exe`, the shared PDF/OCC/Qt runtime, and the launcher/updater. Users
+extract that folder and can start the portable `Nexus.exe`; workspace
+access and a valid license are still required. For managed installations, users
+install `bootstrap\NexusLauncher.exe --install --feed "\\server\NexusReleases"`
+from the extracted folder, then use the installed launcher shortcut.
+
+Follow the [release and update guide](README_RELEASE_UPDATES.md) for signing and
+publishing, first installation, Updates > Download/Restart, administrator-only
+database migrations with backups, [IT installer automation](README_RELEASE_UPDATES.md#installer-automation-for-it),
+and compatible rollback. Client startup no
+longer applies migrations automatically.
 
 The [complete build guide](README_BUILD_EXE.md) includes prerequisite lists,
 fresh environment installation, full Python paths, PowerShell commands,

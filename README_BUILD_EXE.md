@@ -4,6 +4,10 @@ Use **`build_exe.bat`** to create a folder containing `Nexus.exe`, `CADViewer.ex
 and their shared libraries. The build is not tied to a particular username,
 Anaconda installation folder, or environment name.
 
+Version 4.1.0 also builds a lightweight `bootstrap` folder containing the managed
+launcher and updater. Read [Release, installation, and updates](README_RELEASE_UPDATES.md)
+for release-key setup, first installation, signed publishing, and database maintenance.
+
 | Computer | What it needs |
 | --- | --- |
 | Computer **building** Nexus | Windows x64, the full project source, and a compatible Python environment containing the app libraries and PyInstaller. |
@@ -88,8 +92,19 @@ If another library is missing, fix that environment before continuing. See
 Once the check passes, run:
 
 ```bat
-build_exe.bat --python "%CONDA_PREFIX%\python.exe"
+build_exe.bat --python "%CONDA_PREFIX%\python.exe" --release-public-key "D:\PublicKeys\release_public.key"
 ```
+
+Replace the example public-key path with the release administrator's public hex
+key. The private signing key stays with the publisher and is never included.
+An explicit file, `NEXUS_RELEASE_PUBLIC_KEY_FILE`, or the local public-key files
+described in the release guide supply the trust compiled into all four EXEs.
+The existing `tools\licensing\keys\ed25519_public.key` is a public key only:
+the publisher must hold its matching private key to sign updates for that build.
+If that private key is unavailable, follow [release-key setup](README_RELEASE_UPDATES.md#1-prepare-the-release-signing-key)
+and supply the new release public key explicitly. This does not change the key
+used to verify user licenses. The library-only `--check` does not validate the
+release-key selection; the full build does.
 
 Wait until the prompt reports **`BUILD SUCCESSFUL`**. The build can take several
 minutes. During packaging the console may be quiet; progress is saved in
@@ -108,6 +123,10 @@ dist\Nexus\
     Nexus.exe
     CADViewer.exe
     build_manifest.json
+    bootstrap\
+        NexusLauncher.exe
+        NexusUpdater.exe
+        _internal\
     _internal\
         Python runtime, Qt plugins, PDF and OCC libraries
         occ-resources\
@@ -115,12 +134,13 @@ dist\Nexus\
         modern_theme.qss
 ```
 
-**Copy the entire `dist\Nexus` folder, including `_internal`. Do not copy only
-the EXE files.** You can zip the Nexus folder for transfer; extract the whole
+**Copy the entire `dist\Nexus` folder, including both `_internal` folders and
+`bootstrap`. Do not copy only the EXE files.** You can zip the Nexus folder for transfer; extract the whole
 archive on the destination PC before starting `Nexus.exe`.
 
-Nexus and CADViewer share one copy of the large native libraries. A reference
-build was about **781 MB**; size varies with your environment. Do not remove
+Nexus and CADViewer share one copy of the large native libraries. The 4.0.10
+reference build was about **781 MB**; 4.1 also includes the separate bootstrap
+runtime. Check the current `build_manifest.json` for the actual size. Do not remove
 DLLs to reduce the size. Native binaries are not compressed with UPX.
 
 ### 6. Set up the destination PC
@@ -131,10 +151,14 @@ On each Windows account that will run Nexus:
 2. Create a folder named **CreoVCS** if it does not exist.
 3. Copy the signed license into it and name it **creovcs.lic**. The final path is
    `%APPDATA%\CreoVCS\creovcs.lic`.
-4. Start `Nexus.exe` from the extracted Nexus folder.
+4. For managed updates, run `bootstrap\NexusLauncher.exe --install --feed "\\server\NexusReleases"`
+   from the extracted folder, replacing the feed with your company's release folder.
+   Then start `%LOCALAPPDATA%\Nexus\bootstrap\NexusLauncher.exe`. A portable `Nexus.exe`
+   can also run directly, but needs managed installation to activate updates.
 5. Select the company workspace containing `creo_vcs.db` when prompted.
 
-The license must be signed with the key matching the app's embedded public key.
+The license must be signed with the key matching the app's embedded **license**
+public key. The release public key selected for updates does not replace it.
 Moving the build to another computer does not require generating new signing
 keys. Distribute the signed `.lic` file; keep the private signing key with the
 license administrator.
@@ -143,6 +167,10 @@ The build does not distribute a local database or license. It also does not
 include Creo itself: Creo integration still needs the supported Creo installation.
 The CAD viewer needs compatible graphics support. Test the finished folder on a
 clean Windows x64 PC or VM before distributing it to the company.
+
+Clients check workspace compatibility before login and do not migrate the shared
+database automatically. If migration is required, the administrator follows the
+backup/maintenance procedure in the release guide.
 
 ## Required libraries
 
@@ -194,7 +222,7 @@ drive or the environment has a different name. Put `--python` first:
 
 ```bat
 build_exe.bat --python "E:\Anaconda\envs\my-cad-env\python.exe" --check
-build_exe.bat --python "E:\Anaconda\envs\my-cad-env\python.exe"
+build_exe.bat --python "E:\Anaconda\envs\my-cad-env\python.exe" --release-public-key "D:\PublicKeys\release_public.key"
 ```
 
 Replace the example path with the actual executable. An environment administrator
@@ -213,7 +241,7 @@ Set-Location "D:\Projects\Creo-Vcs-primary"
 After a successful check:
 
 ```powershell
-.\build_exe.bat --python "$env:CONDA_PREFIX\python.exe"
+.\build_exe.bat --python "$env:CONDA_PREFIX\python.exe" --release-public-key "D:\PublicKeys\release_public.key"
 ```
 
 PowerShell uses `$env:CONDA_PREFIX` and `Set-Location`. Anaconda Prompt / CMD uses
@@ -231,6 +259,8 @@ these diagnostics do not require a license or access your company database.
 | File | What it tells you |
 | --- | --- |
 | `build\folder\logs\pyinstaller.log` | Packaging progress and errors. |
+| `build\folder\logs\bootstrap-build.log` | Launcher/updater packaging progress and errors. |
+| `build\folder\logs\NexusLauncher-self-test.json` and `NexusUpdater-self-test.json` | Bootstrap verification-key self-test results. |
 | `build\folder\logs\Nexus-smoke.json` | Nexus runtime check results. |
 | `build\folder\logs\CADViewer-smoke.json` | CAD viewer runtime check results. |
 | `build\folder\logs\Nexus-smoke.log` and `CADViewer-smoke.log` | Diagnostic process output. |
@@ -239,13 +269,13 @@ these diagnostics do not require a license or access your company database.
 To also test a real 3D viewport on an interactive build PC:
 
 ```bat
-build_exe.bat --python "%CONDA_PREFIX%\python.exe" --smoke-opengl
+build_exe.bat --python "%CONDA_PREFIX%\python.exe" --release-public-key "D:\PublicKeys\release_public.key" --smoke-opengl
 ```
 
 To clear this builder's intermediate files and rebuild:
 
 ```bat
-build_exe.bat --python "%CONDA_PREFIX%\python.exe" --clean
+build_exe.bat --python "%CONDA_PREFIX%\python.exe" --release-public-key "D:\PublicKeys\release_public.key" --clean
 ```
 
 `--clean` clears `build\folder`, including its old logs, then builds again.
@@ -253,8 +283,10 @@ Other output directories, source files, workspace databases and licenses are
 left alone. Every full build replaces `dist\Nexus`.
 
 For a build session that cannot run GUI diagnostics, `--no-smoke-test` skips
-runtime checks and leaves their manifest report empty. It does not fix missing
-libraries. Test that output on a Windows desktop before distribution.
+application runtime checks and leaves their manifest report empty; bootstrap
+self-tests still run. It does not fix missing libraries. Such a build cannot be
+published to the signed release feed. Rebuild with the required checks on a
+Windows desktop before publishing.
 
 ## Troubleshooting
 

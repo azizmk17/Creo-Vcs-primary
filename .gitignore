@@ -32,6 +32,7 @@ MANIFEST
 *.manifest
 *.spec
 !tools/frozen_build/nexus_folder.spec
+!tools/frozen_build/bootstrap.spec
 
 # Installer logs
 pip-log.txt
@@ -221,6 +222,7 @@ __marimo__/
 #license
 .lic
 .key
+*.key
 
 # Nuitka build output
 dist_nuitka/

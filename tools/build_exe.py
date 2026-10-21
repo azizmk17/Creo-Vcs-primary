@@ -15,11 +15,29 @@ import struct
 import subprocess
 import sys
 import tempfile
+import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build" / "folder"
 RELEASE = ROOT / "dist" / "Nexus"
+
+
+def release_key_file(requested=None):
+    candidates = [requested or os.environ.get("NEXUS_RELEASE_PUBLIC_KEY_FILE")]
+    candidates += [ROOT / "tools/licensing/keys/release_public.key", ROOT / "tools/licensing/keys/ed25519_public.key"]
+    for candidate in candidates:
+        if candidate:
+            path = Path(candidate).resolve()
+            if not path.is_file():
+                if requested or os.environ.get("NEXUS_RELEASE_PUBLIC_KEY_FILE"):
+                    raise ValueError(f"Release public key not found: {path}")
+                continue
+            value = path.read_text(encoding="ascii").strip()
+            if len(bytes.fromhex(value)) != 32:
+                raise ValueError("Release public key must be 32 bytes encoded as 64 hex characters.")
+            return value.lower()
+    raise ValueError("Supply --release-public-key C:\\Secure\\release_public.key. Generate a dedicated update key pair with tools/licensing/update_version.py --keygen first.")
 
 
 def workspace_path(path):
@@ -149,7 +167,7 @@ def test_release(*, opengl=False):
     return reports
 
 
-def release_manifest(version, smoke_reports):
+def release_manifest(version, smoke_reports, public_key=None, bootstrap_reports=None):
     files = [path for path in RELEASE.rglob("*") if path.is_file()]
     unsafe = [path for path in files if path.suffix.lower() in {".db", ".lic", ".key"}
               or path.name.lower().startswith("trail.txt")]
@@ -169,6 +187,7 @@ def release_manifest(version, smoke_reports):
             versions[package] = "unknown"
     import OCC
     versions["pythonocc-core"] = getattr(OCC, "VERSION", "unknown")
+    from core.updates.compatibility import latest_schema_version
     manifest = {
         "app": "Nexus", "version": version, "built_at": datetime.now(timezone.utc).isoformat(),
         "mode": "onedir", "architecture": platform.machine(), "python": platform.python_version(),
@@ -176,6 +195,10 @@ def release_manifest(version, smoke_reports):
         "shared_runtime": "_internal", "file_count": len(files),
         "size_mb": round(sum(path.stat().st_size for path in files) / 1024 ** 2, 1),
         "smoke_tests": smoke_reports,
+        "release_public_key": public_key or "",
+        "build_id": uuid.uuid4().hex[:16],
+        "supported_schema": {"min": latest_schema_version(), "max": latest_schema_version()},
+        "updater_version": "1.0.0", "bootstrap_tests": bootstrap_reports or {},
     }
     (RELEASE / "build_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return manifest
@@ -184,6 +207,7 @@ def release_manifest(version, smoke_reports):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--python", help="Build with this pyoccenv python.exe")
+    parser.add_argument("--release-public-key", help="Public update verification key file (never the private key)")
     parser.add_argument("--check", action="store_true", help="Check prerequisites without building")
     parser.add_argument("--clean", action="store_true", help="Clear only this builder's intermediate files")
     parser.add_argument("--install-build-tools", action="store_true", help="Install PyInstaller 6 in the selected environment")
@@ -213,6 +237,10 @@ def main(argv=None):
         print("Build prerequisites OK. No executables were built.", flush=True)
         return 0
     version = app_version()
+    public_key = release_key_file(args.release_public_key)
+    generated = BUILD / "generated"
+    generated.mkdir(parents=True, exist_ok=True)
+    (generated / "nexus_release_trust.py").write_text(f"PUBLIC_KEY_HEX = {public_key!r}\n", encoding="utf-8")
     version_file = BUILD / "version_info.txt"
     write_version_file(version_file, version)
     env = os.environ.copy()
@@ -220,13 +248,29 @@ def main(argv=None):
     env["PYTHONUTF8"] = "1"
     env["PYINSTALLER_CONFIG_DIR"] = str(BUILD / "cache")
     env["NEXUS_VERSION_FILE"] = str(version_file)
+    env["NEXUS_GENERATED_DIR"] = str(generated)
     env["PATH"] = os.pathsep.join(native_library_search_paths() + [env.get("PATH", "")])
     print("Building Nexus and CADViewer; native DLLs are shared. See build/folder/logs/pyinstaller.log for progress.", flush=True)
     checked_run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
                  "--distpath", ROOT / "dist", "--workpath", BUILD / "pyinstaller",
                  ROOT / "tools" / "frozen_build" / "nexus_folder.spec"], BUILD / "logs" / "pyinstaller.log", env=env)
+    print("Building the lightweight local launcher and updater...", flush=True)
+    checked_run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
+                 "--distpath", RELEASE, "--workpath", BUILD / "bootstrap",
+                 ROOT / "tools/frozen_build/bootstrap.spec"], BUILD / "logs/bootstrap-build.log", env=env)
+    bootstrap_reports = {}
+    for executable in ("NexusLauncher.exe", "NexusUpdater.exe"):
+        report = BUILD / "logs" / (Path(executable).stem + "-self-test.json")
+        report.unlink(missing_ok=True)
+        checked_run([RELEASE / "bootstrap" / executable, "--updater-self-test", report],
+                    BUILD / "logs" / (Path(executable).stem + "-self-test.log"),
+                    env=smoke_environment(), timeout=60)
+        result = json.loads(report.read_text(encoding="utf-8"))
+        if not result.get("ok") or not result.get("frozen") or result.get("release_public_key") != public_key:
+            raise RuntimeError(f"Bootstrap trust check failed: {report}")
+        bootstrap_reports[executable] = result
     reports = {} if args.no_smoke_test else test_release(opengl=args.smoke_opengl)
-    manifest = release_manifest(version, reports)
+    manifest = release_manifest(version, reports, public_key, bootstrap_reports)
     print(f"\nBUILD SUCCESSFUL: Nexus {version}\n{RELEASE / 'Nexus.exe'}\n"
           f"Distribute the entire folder ({manifest['size_mb']} MB).\nLogs: {BUILD / 'logs'}", flush=True)
     return 0

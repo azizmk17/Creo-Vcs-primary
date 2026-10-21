@@ -6,6 +6,7 @@ the packaging diagnostic must not initialize a workspace, database, or license.
 from __future__ import annotations
 
 import runpy
+import os
 import sys
 from pathlib import Path
 
@@ -20,11 +21,29 @@ def main() -> int:
         return run_smoke(
             sys.argv[index + 1], require_opengl="--smoke-opengl" in sys.argv[1:]
         )
-    if Path(sys.executable).stem.casefold() == "cadviewer":
-        from tools.CAD.step_viewer.main_window import main as viewer_main
-
-        return viewer_main()
-    runpy.run_module("main3", run_name="__main__")
+    from contextlib import nullcontext
+    from core.updates.install import acquire_run_lease, installed_root_for_executable
+    root = installed_root_for_executable()
+    if root:
+        os.environ["NEXUS_INSTALL_ROOT"] = str(root)
+    # Portable builds never take an unrelated managed installation's lease.
+    else:
+        os.environ.pop("NEXUS_INSTALL_ROOT", None)
+    with acquire_run_lease(root) if root else nullcontext():
+        if Path(sys.executable).stem.casefold() == "cadviewer":
+            import argparse
+            parser = argparse.ArgumentParser(add_help=False)
+            parser.add_argument("--db-path")
+            viewer_arguments, _ = parser.parse_known_args(sys.argv[1:])
+            if viewer_arguments.db_path:
+                from core.updates.compatibility import assert_workspace_compatible, enable_runtime_guard
+                from config import APP_VERSION
+                database = viewer_arguments.db_path
+                assert_workspace_compatible(database, APP_VERSION)
+                enable_runtime_guard(database, APP_VERSION)
+            from tools.CAD.step_viewer.main_window import main as viewer_main
+            return viewer_main()
+        runpy.run_module("main3", run_name="__main__")
     return 0
 
 

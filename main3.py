@@ -99,9 +99,10 @@ PAGE_PRESENTATION = {
 
 
 def _run_migrations_safely():
-    from setup.migrations import migrate
-
-    migrate()
+    # Only an administrator migrates a shared workspace, using the backup tool.
+    from core.updates.compatibility import assert_workspace_compatible
+    from config import DB_NAME
+    assert_workspace_compatible(DB_NAME)
 
 
 
@@ -231,6 +232,9 @@ class StartupWindow(QMainWindow):
 
     def __init__(self, logo_path=None):
         super().__init__()
+        from core.updates.compatibility import assert_workspace_compatible
+        from config import DB_NAME
+        assert_workspace_compatible(DB_NAME)
         self.setWindowTitle(APP_NAME)
         self.resize(1400, 900)
         self.setWindowIcon(QIcon(_resource_path(APP_ICON_PATH)))
@@ -257,7 +261,7 @@ class StartupWindow(QMainWindow):
     def begin_loading(self):
         self.pages.setCurrentWidget(self.loader_page)
         self._startup_gate.reset()
-        self.loader_page.set_status("Checking database migrations...")
+        self.loader_page.set_status("Checking workspace compatibility...")
         QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
         # Measure the minimum from the first painted loader frame.
         self._minimum_loader_timer.start(MINIMUM_STARTUP_LOADER_MS)
@@ -278,8 +282,8 @@ class StartupWindow(QMainWindow):
             self._startup_gate.reset()
             QMessageBox.critical(
                 self,
-                "Database Migration Failed",
-                f"{APP_NAME} could not prepare its database and will not continue.\n\n{error}",
+                "Workspace Compatibility",
+                f"{APP_NAME} cannot use this workspace and will not continue.\n\n{error}",
             )
             self.close()
             return
@@ -608,6 +612,12 @@ class BomGUI(QMainWindow):
     def _check_version_notification(self):
         """Show a popup dialog if a newer Nexus version is available in the DB."""
         try:
+            from core.updates import settings
+            from core.updates.trust import release_public_key
+            controller = self._ensure_update_controller()
+            if settings.update_feed() and release_public_key():
+                controller.check()
+                return
             import os as _os
             from core.licensing.version_check import check_version_notification
             _pub_hex = _os.environ.get("CREOVCS_PUBLIC_KEY_HEX", _PRODUCTION_PUBLIC_KEY)
@@ -622,6 +632,16 @@ class BomGUI(QMainWindow):
                 )
         except Exception:
             pass  # Version check is non-critical — never block the user.
+
+    def _ensure_update_controller(self):
+        if not hasattr(self, "_update_controller"):
+            from core.updates.ui import UpdateController
+            from config import APP_VERSION, DB_NAME
+            self._update_controller = UpdateController(self, APP_VERSION, DB_NAME)
+        return self._update_controller
+
+    def open_update_center(self):
+        self._ensure_update_controller().open()
 
     def show_notification(self, title, message):
         # Display a Windows toast notification
@@ -810,6 +830,10 @@ class BomGUI(QMainWindow):
             "SP_DialogSaveButton",
             role="utility",
             tooltip="Export from the current workspace",
+        )
+        add_action(
+            toolbar, "Updates", self.open_update_center, "SP_BrowserReload",
+            role="utility", tooltip="Check, download and prepare a Nexus update",
         )
         toolbar.addSeparator()
         self.shell_user_label = QLabel(
@@ -1626,6 +1650,15 @@ if __name__ == "__main__":
 
     # Point every repository to the resolved database path.
     _cfg_mod.DB_NAME.set(str(_ws_result.db_path))
+    # This runs before LoginPage can construct repositories or configure SQL.
+    from core.updates.compatibility import assert_workspace_compatible, enable_runtime_guard, CompatibilityError
+    try:
+        assert_workspace_compatible(_ws_result.db_path, _cfg_mod.APP_VERSION)
+        enable_runtime_guard(_ws_result.db_path, _cfg_mod.APP_VERSION)
+    except CompatibilityError as _compatibility_error:
+        from core.updates.ui import show_compatibility_error
+        show_compatibility_error(str(_compatibility_error), _cfg_mod.APP_VERSION, _ws_result.db_path)
+        sys.exit(1)
     # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
