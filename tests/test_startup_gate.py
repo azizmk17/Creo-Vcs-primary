@@ -4,8 +4,8 @@ from core.startup_gate import MINIMUM_STARTUP_LOADER_MS, StartupGate
 
 
 class StartupGateTests(unittest.TestCase):
-    def test_loader_minimum_is_four_seconds(self):
-        self.assertEqual(MINIMUM_STARTUP_LOADER_MS, 4000)
+    def test_startup_has_no_artificial_minimum_delay(self):
+        self.assertEqual(MINIMUM_STARTUP_LOADER_MS, 0)
 
     def test_ready_before_minimum_releases_when_minimum_elapses(self):
         gate = StartupGate()

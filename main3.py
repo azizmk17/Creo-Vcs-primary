@@ -305,16 +305,9 @@ class StartupWindow(QMainWindow):
             self.login_page._set_busy(False)
             raise
 
-        self._set_loading_status("Loading the initial BOM...")
-        if not getattr(self.main_page.session, "project_id", None):
-            self._mark_page_ready()
-            return
-        bom_page = self.main_page.bom_page
-        bom_page.initial_tree_ready.connect(self._mark_page_ready)
-        # The page may have become ready while BomGUI was being built and
-        # processing startup events, before this signal was connected.
-        if bool(bom_page.initial_tree_is_ready):
-            self._mark_page_ready()
+        # Readiness means the shell is ready to display. Project queries and
+        # directory diagnostics start from the visible BOM page afterwards.
+        self._mark_page_ready()
 
     def _on_minimum_loader_elapsed(self):
         if self._startup_gate.mark_minimum_elapsed():
@@ -375,14 +368,23 @@ class BomGUI(QMainWindow):
         self._project_combo_initializing = False
         self._projects_for_user = []
         self._ensure_valid_current_project()
-        self._drain_cad_workspace_release_queue()
-        self._start_creo_bridge()
 
         # Persistent application shell
         self._configure_status_bar()
         self.init_toolbar()
 
         self._build_ui(startup_progress=startup_progress)
+        self._deferred_services_started = False
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._deferred_services_started:
+            self._deferred_services_started = True
+            QTimer.singleShot(50, self._start_deferred_services)
+
+    def _start_deferred_services(self):
+        threading.Thread(target=self._drain_cad_workspace_release_queue, daemon=True).start()
+        self._start_creo_bridge()
         self._start_project_event_sync()
 
     def _drain_cad_workspace_release_queue(self):
@@ -415,6 +417,18 @@ class BomGUI(QMainWindow):
             print(f"[creo-bridge] warning: {exc}")
 
     def closeEvent(self, event):
+        # A page can be replaced while its I/O finishes. Do not destroy an active
+        # QThread on application exit; cancel and let the event loop drain it.
+        from pages.bom_page import _PROJECT_LOAD_THREADS
+        running = [thread for thread in list(_PROJECT_LOAD_THREADS) if thread.isRunning()]
+        if running:
+            self.bom_page._cancel_background_work()
+            for thread in running:
+                thread._project_worker.cancel()
+            self.statusBar().showMessage("Finishing background work before closing…")
+            event.ignore()
+            QTimer.singleShot(100, self.close)
+            return
         bridge = getattr(self, "creo_bridge", None)
         if bridge is not None:
             try:
@@ -469,6 +483,10 @@ class BomGUI(QMainWindow):
                 pass
     
     def reload_main_window(self):
+
+        old_bom = getattr(self, "bom_page", None)
+        if old_bom is not None:
+            old_bom._cancel_background_work()
 
         # --- 1️⃣ Remove old central widget ---
         old_central = self.centralWidget()
@@ -540,15 +558,13 @@ class BomGUI(QMainWindow):
         startup_stage("Loading BOM workspace...")
         from pages.bom_page import BomPage
         self.bom_page = BomPage(self.bom_service)
-        startup_stage("Loading commit workspace...")
-        from pages.commit_page import CommitPage
-        self.commit_page = CommitPage(self.bom_service)
-        startup_stage("Loading engineering issues...")
-        from pages.issue_page import EngineeringIssuePage
-        self.issue_page = EngineeringIssuePage()
-        startup_stage("Preparing manager dashboard...")
-        from pages.dashboard_page import ManagerDashboardPage
-        self.dashboard_page = ManagerDashboardPage()
+        # These modules query project data in their constructors. Construct them
+        # on first navigation, so they cannot delay startup or a project switch.
+        self.commit_page = self._lazy_page_placeholder("Commit Workspace")
+        self.issue_page = self._lazy_page_placeholder("Issue Center")
+        self.dashboard_page = self._lazy_page_placeholder("Manager Dashboard")
+        self._commit_loaded = self._issue_loaded = self._dashboard_loaded = False
+        self._diag_loaded = self._admin_loaded = self._snap_loaded = self._cli_loaded = False
         startup_stage("Preparing secondary tools...")
         self.diag_page = self._lazy_page_placeholder("Diagnostic")
         self.admin_page = self._lazy_page_placeholder("Admin")
@@ -565,9 +581,6 @@ class BomGUI(QMainWindow):
         self.pages.addWidget(self.cli_page)
         self.bom_page.issue_requested.connect(self.open_issues_for_part)
         self.bom_page.create_issue_requested.connect(self.create_issue_for_part)
-        self.issue_page.issue_changed.connect(self.bom_page.refresh_issue_indicators)
-        self.issue_page.issue_changed.connect(lambda _part_ids: self.commit_page._refresh_resolved_issues())
-        self.issue_page.issue_changed.connect(lambda _part_ids: self.dashboard_page.refresh())
 
         
 
@@ -867,7 +880,7 @@ class BomGUI(QMainWindow):
 
         self.project_version_combo = QComboBox()
         self.project_version_combo.setObjectName("versionSelector")
-        self.project_version_combo.currentIndexChanged.connect(self.save_current_project)
+        self.project_version_combo.currentIndexChanged.connect(self._update_project_load_action)
         self.project_version_combo.setMinimumWidth(105)
         self.project_version_combo.setMaximumWidth(145)
 
@@ -880,6 +893,12 @@ class BomGUI(QMainWindow):
         version_caption.setObjectName("shellFieldCaption")
         context_toolbar.addWidget(version_caption)
         context_toolbar.addWidget(self.project_version_combo)
+
+        self.load_project_button = QPushButton("Load Project")
+        self.load_project_button.setObjectName("contextPrimaryAction")
+        self.load_project_button.setToolTip("Choose a product and version, then load them together.")
+        self.load_project_button.clicked.connect(self.save_current_project)
+        context_toolbar.addWidget(self.load_project_button)
 
         new_version_button = QPushButton("New Version...")
         new_version_button.setObjectName("contextPrimaryAction")
@@ -973,6 +992,7 @@ class BomGUI(QMainWindow):
                 self.project_combo.setEnabled(False)
                 self.project_version_combo.addItem("-", None)
                 self.project_version_combo.setEnabled(False)
+                self.load_project_button.setEnabled(False)
                 self.refresh_project_label()
                 return
 
@@ -1010,6 +1030,8 @@ class BomGUI(QMainWindow):
         finally:
             self._project_combo_initializing = False
 
+        self._update_project_load_action()
+
         if reload_on_change:
             self.reload_main_window()
 
@@ -1045,7 +1067,14 @@ class BomGUI(QMainWindow):
             self._populate_project_version_combo(root_id, None)
         finally:
             self._project_combo_initializing = False
-        self.save_current_project()
+        self._update_project_load_action()
+
+    def _update_project_load_action(self):
+        if getattr(self, "_project_combo_initializing", False):
+            return
+        pid = self.project_version_combo.currentData()
+        self.load_project_button.setEnabled(pid is not None and pid != self.session.project_id)
+        self.load_project_button.setText("Loaded" if pid is not None and pid == self.session.project_id else "Load Project")
 
     def show_new_version_dialog(self):
         if not self.session.project_id:
@@ -1163,6 +1192,9 @@ class BomGUI(QMainWindow):
             return
 
         pid = self.project_version_combo.currentData() if hasattr(self, "project_version_combo") else self.project_combo.currentData()
+        if pid == self.session.project_id:
+            self._update_project_load_action()
+            return
 
         # Placeholder / "no project"
         if pid is None:
@@ -1239,6 +1271,7 @@ class BomGUI(QMainWindow):
             pass
         self._reset_project_event_sync_cursor()
         self.refresh_project_label()
+        self._update_project_load_action()
         self.statusBar().showMessage(f"Project set to: {self.project_label.text().replace('Current: ', '')}")
         self.reload_main_window()
     
@@ -1282,6 +1315,33 @@ class BomGUI(QMainWindow):
         self.statusBar().showMessage(f"{title} ready")
 
     def _ensure_lazy_page(self, index):
+        if index in (1, 2, 6):
+            attributes = {
+                1: ("commit_page", "_commit_loaded"),
+                2: ("issue_page", "_issue_loaded"),
+                6: ("dashboard_page", "_dashboard_loaded"),
+            }
+            attribute, flag = attributes[index]
+            if getattr(self, flag, False):
+                return
+            if index == 1:
+                from pages.commit_page import CommitPage
+                page = CommitPage(self.bom_service)
+            elif index == 2:
+                from pages.issue_page import EngineeringIssuePage
+                page = EngineeringIssuePage()
+                page.issue_changed.connect(self.bom_page.refresh_issue_indicators)
+                page.issue_changed.connect(self._on_issue_changed)
+            else:
+                from pages.dashboard_page import ManagerDashboardPage
+                page = ManagerDashboardPage()
+            previous = getattr(self, attribute)
+            self.pages.removeWidget(previous)
+            previous.deleteLater()
+            setattr(self, attribute, page)
+            self.pages.insertWidget(index, page)
+            setattr(self, flag, True)
+            return
         if index == 3 and not getattr(self, "_diag_loaded", False):
             self.statusBar().showMessage("Loading Diagnostic page...")
             QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
@@ -1327,6 +1387,12 @@ class BomGUI(QMainWindow):
             except Exception:
                 pass
 
+    def _on_issue_changed(self, _part_ids):
+        if self._commit_loaded:
+            self.commit_page._refresh_resolved_issues()
+        if self._dashboard_loaded:
+            self.dashboard_page.refresh()
+
     def _engineer_cli_available(self):
         try:
             if UIPermissionHelper().can("admin_panel"):
@@ -1339,10 +1405,12 @@ class BomGUI(QMainWindow):
             return False
 
     def open_issues_for_part(self, part_id):
+        self._ensure_lazy_page(2)
         self.issue_page.open_for_part(int(part_id))
         self.switch_page(2)
 
     def create_issue_for_part(self, part_id):
+        self._ensure_lazy_page(2)
         self.issue_page.create_for_part(int(part_id))
         self.switch_page(2)
 
@@ -1544,13 +1612,13 @@ class BomGUI(QMainWindow):
             pass
 
         try:
-            if issue_changed and getattr(self, "issue_page", None):
+            if issue_changed and getattr(self, "_issue_loaded", False):
                 self.issue_page.refresh()
         except Exception:
             pass
 
         try:
-            if (commit_changed or item_list or cad_list) and getattr(self, "dashboard_page", None):
+            if (commit_changed or item_list or cad_list) and getattr(self, "_dashboard_loaded", False):
                 self.dashboard_page.refresh()
         except Exception:
             pass

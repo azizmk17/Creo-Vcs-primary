@@ -1,9 +1,12 @@
-# Nexus 4.2 release, installation, and update guide
+# Nexus release, installation, and update guide
 
 This guide is for the person publishing Nexus and the users installing it.
 Version **4.1.0** introduces a signed company release feed, a local launcher,
 a separate updater, and enforced workspace compatibility checks.
-The current version, **4.2.0**, adds graphical **Setup.exe** installation with
+The current source version, **4.3.0**, defers project processing until the shell
+is visible and lets users choose the product and version before loading. See
+[Startup and project loading](docs/project_loading.md).
+Version **4.2.0** added graphical **Setup.exe** installation with
 shortcuts, so users do not need Command Prompt. It retains the 4.1.1 fix that
 releases all related CAD checkouts when a BOM Item is checked in or its checkout
 is undone.

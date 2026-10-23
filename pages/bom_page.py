@@ -16,6 +16,8 @@ from collections import deque, Counter, defaultdict
 import time
 import json
 import re
+from copy import copy
+from types import SimpleNamespace
 
 import os
 import sys
@@ -2081,6 +2083,89 @@ class HistoryPanel(QWidget):
         QApplication.clipboard().setText("\n".join(lines))
 
 
+# Keep running threads alive independently of a page that may be replaced when
+# the user switches projects. Cancelled jobs still finish and release themselves.
+_PROJECT_LOAD_THREADS = set()
+
+
+def _start_project_worker(worker):
+    thread = QThread(QApplication.instance())
+    thread._project_worker = worker
+    _PROJECT_LOAD_THREADS.add(thread)
+    worker.moveToThread(thread)
+    thread.started.connect(worker.run)
+    worker.done.connect(thread.quit)
+    worker.done.connect(worker.deleteLater)
+    thread.finished.connect(lambda: _PROJECT_LOAD_THREADS.discard(thread))
+    thread.finished.connect(thread.deleteLater)
+    thread.start()
+    return thread
+
+
+class _ProjectStructureWorker(QObject):
+    finished = pyqtSignal(int, int, str, object)
+    failed = pyqtSignal(int, int, str, str)
+    done = pyqtSignal()
+
+    def __init__(self, seq, project_id, mode, bom_service, issue_service):
+        super().__init__()
+        self.seq, self.project_id, self.mode = int(seq), int(project_id), str(mode)
+        # Services read the singleton session by default. Each request must keep
+        # its original project even if the user switches while a query runs.
+        session = SimpleNamespace(**vars(bom_service.session))
+        session.project_id = self.project_id
+        self.service = copy(bom_service)
+        self.service.session = session
+        self.issues = copy(issue_service)
+        self.issues.session = session
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            if self._cancelled:
+                return
+            service = self.service
+            if self.mode == "ebom":
+                data = service.get_released_ebom_project(self.project_id) or {}
+                if self._cancelled:
+                    return
+                documents = service.list_pdm_cad_documents(
+                    self.project_id, include_related_drawings=False, include_legacy_fallback=False,
+                ) or []
+                folders = service.list_bom_folders() or []
+            else:
+                data = service.get_pdm_cad_structure() or {}
+                documents = []
+                folders = service.list_cad_folders() or []
+            if self._cancelled:
+                return
+            try:
+                health = self.issues.health_score()
+            except Exception:
+                health = None
+            try:
+                issue_summary = self.issues.part_summary() or {}
+            except Exception:
+                issue_summary = {}
+            try:
+                variants = service.list_product_variants() or []
+            except Exception:
+                variants = []
+            if not self._cancelled:
+                self.finished.emit(self.seq, self.project_id, self.mode, {
+                    "data": data, "documents": documents, "folders": folders,
+                    "health": health, "variants": variants, "issue_summary": issue_summary,
+                })
+        except Exception as exc:
+            if not self._cancelled:
+                self.failed.emit(self.seq, self.project_id, self.mode, str(exc))
+        finally:
+            self.done.emit()
+
+
 class _TreeLoadWorker(QObject):
     finished = pyqtSignal(int, object, object)  # seq, tree_data, missing_map
     failed = pyqtSignal(int, str)
@@ -2184,11 +2269,14 @@ class _SearchWorker(QObject):
 class _InitialDiagWorker(QObject):
     finished = pyqtSignal(object, object)  # missing_files, working_result
     failed = pyqtSignal(str)
+    done = pyqtSignal()
 
     def __init__(self, working_dir: str):
         super().__init__()
         self._working_dir = str(working_dir or "")
         self._cancelled = False
+        self._service = DiagService()
+        self._service.session = SimpleNamespace(**vars(self._service.session))
 
     def cancel(self):
         self._cancelled = True
@@ -2197,19 +2285,26 @@ class _InitialDiagWorker(QObject):
         try:
             if self._cancelled:
                 return
-            diag_service = DiagService()
+            diag_service = self._service
             missing_files = []
             working_result = None
             if self._working_dir and os.path.isdir(self._working_dir):
-                missing_files = diag_service.sync_bom_files(self._working_dir) or []
+                missing_files = diag_service.sync_bom_files(
+                    self._working_dir, cancel_cb=lambda: self._cancelled,
+                ) or []
                 if self._cancelled:
                     return
-                working_result = diag_service.check_working_directory(self._working_dir)
+                working_result = diag_service.check_working_directory(
+                    self._working_dir, cancel_cb=lambda: self._cancelled,
+                )
             if self._cancelled:
                 return
             self.finished.emit(missing_files, working_result)
         except Exception as e:
-            self.failed.emit(str(e))
+            if not self._cancelled:
+                self.failed.emit(str(e))
+        finally:
+            self.done.emit()
 
 
 class _ExportWorker(QObject):
@@ -2704,6 +2799,14 @@ class BomPage(QWidget):
         self._search_worker = None
         self._diag_thread = None
         self._diag_worker = None
+        self._structure_load_seq = 0
+        self._structure_worker = None
+        self._project_load_cancelled = False
+        self._initial_load_scheduled = False
+        self._structure_loading = False
+        self._structure_error = None
+        self._diagnostics_finished = False
+        self._diagnostics_result = None
         self._lazy_level_request_seq = 0
         self._lazy_level_requests = {}
         self._retired_lazy_level_requests = []
@@ -2776,21 +2879,29 @@ class BomPage(QWidget):
         self._search_timer.setInterval(250)
         self._search_timer.timeout.connect(self._perform_search_now)
 
-        # Start initial diagnostics and first tree load without blocking UI thread.
-        if self.session.project_id and self.working_dir and os.path.isdir(self.working_dir):
-            QTimer.singleShot(0, self._start_initial_diagnostics_and_load)
+        # Do not enqueue project processing during shell construction: startup
+        # progress pumps events while this page is still hidden.
+        if self.session.project_id:
+            self._set_tree_loading(True)
         else:
             try:
-                self.show_alert("No project loaded. Select a project from the toolbar to begin.", "error")
+                self.show_alert("Choose a product and version, then click Load Project to begin.", "info")
             except Exception:
                 pass
-            self.load_tree()
-            self._load_released_ebom_tree()
+            self._set_tree_loading(False)
+            self._mark_initial_tree_ready()
 
         try:
             self.destroyed.connect(lambda *_: self._cancel_background_work())
         except Exception:
             pass
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._initial_load_scheduled and not self._project_load_cancelled:
+            self._initial_load_scheduled = True
+            # Allow the shell and the BOM loader to paint before starting I/O.
+            QTimer.singleShot(50, self._start_initial_diagnostics_and_load)
 
     def _install_undo_shortcuts(self) -> None:
         shortcut = QShortcut(QKeySequence("Ctrl+Z"), self)
@@ -2838,6 +2949,13 @@ class BomPage(QWidget):
         self.load_tree()
 
     def _cancel_background_work(self) -> None:
+        self._project_load_cancelled = True
+        self._structure_load_seq += 1
+        try:
+            if self._structure_worker is not None:
+                self._structure_worker.cancel()
+        except RuntimeError:
+            pass
         self._cancel_lazy_level_requests(wait=True)
         for worker in (getattr(self, "_tree_worker", None), getattr(self, "_search_worker", None), getattr(self, "_diag_worker", None)):
             try:
@@ -2942,6 +3060,7 @@ class BomPage(QWidget):
                 return
             if loading:
                 stack.setCurrentIndex(0)
+                self._tree_loading_label.setText("Loading project structure…")
             elif getattr(self, "_bom_mode", "cad") == "ebom":
                 target_tree = (
                     getattr(self, "_ebom_filter_tree", None)
@@ -3601,6 +3720,9 @@ class BomPage(QWidget):
             QMessageBox.warning(self, "Validate CAD Structure", str(exc))
 
     def _load_pdm_cad_tree(self) -> None:
+        self._start_structure_load("cad")
+
+    def _apply_pdm_cad_tree(self, payload: dict) -> None:
         tree = getattr(self, "_cad_tree", None)
         if tree is None:
             return
@@ -3608,14 +3730,11 @@ class BomPage(QWidget):
         try:
             self._pdm_cad_working_file_index = {}
             self._pdm_cad_working_file_index_ready = False
-            data = (
-                self.bom_service.get_pdm_cad_structure()
-                if self.session.project_id else {"roots": [], "document_count": 0}
-            )
+            data = payload.get("data") or {}
             roots = list(data.get("roots") or [])
             self._pdm_cad_roots = roots
             self._rebuild_cad_path_index()
-            self._pdm_folders("CAD", refresh=True)
+            self._cad_folders_cache = [dict(folder, scope="CAD") for folder in payload.get("folders") or []]
             self._pdm_cad_scope_path, render_roots = self._pdm_roots_for_reload_scope(
                 "cad", roots, getattr(self, "_pdm_cad_scope_path", []) or []
             )
@@ -3651,7 +3770,7 @@ class BomPage(QWidget):
             )
         except Exception as exc:
             tree.clear()
-            self.show_alert(f"CAD Structure could not be loaded: {exc}", "error")
+            raise
         finally:
             try:
                 tree.setUpdatesEnabled(True)
@@ -3848,18 +3967,84 @@ class BomPage(QWidget):
         return False
 
     def _load_released_ebom_tree(self) -> None:
+        self._start_structure_load("ebom")
+
+    def _start_structure_load(self, mode: str) -> None:
+        if self._project_load_cancelled:
+            return
+        self._structure_load_seq += 1
+        try:
+            if self._structure_worker is not None:
+                self._structure_worker.cancel()
+        except RuntimeError:
+            pass
+        pid = self.session.project_id
+        if not pid:
+            self._ebom_tree.clear()
+            self._cad_tree.clear()
+            self._set_tree_loading(False)
+            self._mark_initial_tree_ready()
+            return
+        self._structure_loading = True
+        self._structure_error = None
+        self._set_tree_loading(True)
+        self.setEnabled(False)
+        self.bom_mode_selector.setEnabled(False)
+        worker = _ProjectStructureWorker(
+            self._structure_load_seq, pid, mode, self.bom_service, self.issue_service,
+        )
+        worker.finished.connect(self._on_structure_loaded)
+        worker.failed.connect(self._on_structure_failed)
+        self._structure_worker = worker
+        self._structure_thread = _start_project_worker(worker)
+
+    def _structure_result_is_current(self, seq, project_id):
+        return (
+            not self._project_load_cancelled
+            and int(seq) == self._structure_load_seq
+            and project_id == self.session.project_id
+        )
+
+    def _on_structure_loaded(self, seq: int, project_id: int, mode: str, payload: object):
+        if not self._structure_result_is_current(seq, project_id):
+            return
+        try:
+            self._issue_summary_cache = dict(payload.get("issue_summary") or {})
+            if mode == "ebom":
+                self._apply_released_ebom_tree(payload)
+            else:
+                self._apply_pdm_cad_tree(payload)
+            self._refresh_variant_selector(payload.get("variants") or [])
+            if self._diagnostics_finished:
+                self._apply_project_diagnostics_alert(self._diagnostics_result)
+        except Exception as exc:
+            self._on_structure_failed(seq, project_id, mode, str(exc))
+        finally:
+            self._structure_loading = False
+            self.setEnabled(True)
+            self.bom_mode_selector.setEnabled(True)
+            self._set_tree_loading(False)
+            self._mark_initial_tree_ready()
+
+    def _on_structure_failed(self, seq: int, project_id: int, mode: str, error: str):
+        if not self._structure_result_is_current(seq, project_id):
+            return
+        self._structure_loading = False
+        self._structure_error = str(error)
+        self.setEnabled(True)
+        self.bom_mode_selector.setEnabled(True)
+        (self._ebom_tree if mode == "ebom" else self._cad_tree).clear()
+        self._set_tree_loading(False)
+        self.show_alert(f"Project structure could not be loaded: {error}. Click Refresh to retry.", "error")
+        self._mark_initial_tree_ready()
+
+    def _apply_released_ebom_tree(self, payload: dict) -> None:
         self._set_tree_loading(True)
         try:
-            QApplication.processEvents()
-            data = self.bom_service.get_released_ebom_project(
-                int(self.session.project_id)
-            ) if self.session.project_id else {"roots": []}
+            data = payload.get("data") or {}
             associations_by_item = defaultdict(list)
             if self.session.project_id:
-                for document in self.bom_service.list_pdm_cad_documents(
-                    include_related_drawings=False,
-                    include_legacy_fallback=False,
-                ) or []:
+                for document in payload.get("documents") or []:
                     if str(document.get("category") or "").upper() == "DRAWING":
                         continue
                     for association in self._pdm_document_associations(document):
@@ -3886,7 +4071,7 @@ class BomPage(QWidget):
             excluded_roots = list(data.get("excluded_roots") or [])
             flattened_roots = list(data.get("flattened_roots") or [])
             self._pdm_ebom_roots = visible_roots
-            self._pdm_folders("EBOM", refresh=True)
+            self._bom_folders_cache = [dict(folder, scope="EBOM") for folder in payload.get("folders") or []]
             # Status/type choices for Advanced Filter are derived lazily from
             # these cached payloads. Reset the lightweight choice cache when
             # the EBOM payload changes; do not materialize every Qt tree row
@@ -3899,7 +4084,7 @@ class BomPage(QWidget):
             try:
                 score = max(
                     0,
-                    self.issue_service.health_score()
+                    int(payload["health"])
                     - len(getattr(self, "missing_ids", set()) or set()),
                 )
                 color = "#2e7d32" if score >= 85 else ("#a16207" if score >= 65 else "#b91c1c")
@@ -3930,7 +4115,7 @@ class BomPage(QWidget):
                 self.hide_alert()
         except Exception as exc:
             self._ebom_tree.clear()
-            self.show_alert(f"Item Structure could not be loaded: {exc}", "error")
+            raise
         finally:
             self._ebom_tree.setUpdatesEnabled(True)
             self._set_tree_loading(False)
@@ -7515,15 +7700,16 @@ class BomPage(QWidget):
         self._refresh_loaded_part_branch(int(parent_id))
         self._refresh_part_in_tree(int(child["id"]))
 
-    def _refresh_variant_selector(self) -> None:
+    def _refresh_variant_selector(self, variants=None) -> None:
         combo = getattr(self, "variant_selector", None)
         if combo is None:
             return
         previous_id = getattr(self, "_active_variant_id", None)
-        try:
-            variants = self.bom_service.list_product_variants() or []
-        except Exception:
-            variants = []
+        if variants is None:
+            try:
+                variants = self.bom_service.list_product_variants() or []
+            except Exception:
+                variants = []
         self._product_variants_cache = list(variants)
         self._loading_variant_selector = True
         try:
@@ -8406,9 +8592,10 @@ class BomPage(QWidget):
             self.hide_alert()
 
     def _start_initial_diagnostics_and_load(self) -> None:
+        if self._project_load_cancelled or not self.session.project_id:
+            return
         # Display the lazy root level immediately. Diagnostics are independent and
         # update badges later; disk scanning must never gate BOM navigation.
-        self.load_tree()
         self._load_released_ebom_tree()
         try:
             if self._diag_worker is not None:
@@ -8417,20 +8604,18 @@ class BomPage(QWidget):
             pass
 
         worker = _InitialDiagWorker(str(self.working_dir or ""))
-        thread = QThread(self)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
         worker.finished.connect(self._on_initial_diag_finished)
         worker.failed.connect(self._on_initial_diag_failed)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
         self._diag_worker = worker
-        self._diag_thread = thread
-        thread.start()
+        self._diagnostic_status_label.setText("Checking project files in the background…")
+        self._diag_thread = _start_project_worker(worker)
 
     def _on_initial_diag_finished(self, missing_files: object, working_result: object) -> None:
+        if self._project_load_cancelled:
+            return
+        self._diagnostic_status_label.setText("Project file check complete")
+        self._diagnostics_finished = True
+        self._diagnostics_result = working_result
         try:
             self.missing_files = list(missing_files or [])
         except Exception:
@@ -8448,7 +8633,13 @@ class BomPage(QWidget):
         except Exception:
             self.missing_ids = set()
 
-        # Apply integrity banner result (same behavior as auto_check_wd).
+        self._apply_project_diagnostics_alert(working_result)
+        self._refresh_loaded_integrity_indicators()
+
+    def _apply_project_diagnostics_alert(self, working_result) -> None:
+        # A late file-check result must not erase a structure-load failure.
+        if self._structure_error:
+            return
         try:
             if working_result == "error_no_snapshot":
                 self.show_alert("⚠️ No snapshots found for this project. Please create a snapshot to enable integrity checks.", "error")
@@ -8459,9 +8650,11 @@ class BomPage(QWidget):
         except Exception:
             pass
 
-        self._refresh_loaded_integrity_indicators()
-
     def _on_initial_diag_failed(self, _err: str) -> None:
+        if self._project_load_cancelled:
+            return
+        self._diagnostic_status_label.setText("Project file check failed. Open Diagnostics to retry.")
+        self._diagnostic_status_label.setToolTip(str(_err))
         try:
             self.missing_files = []
             self.missing_ids = set()
@@ -9077,6 +9270,9 @@ class BomPage(QWidget):
         _loading_layout.setContentsMargins(0, 0, 0, 0)
         _loading_layout.setAlignment(Qt.AlignCenter)
         _loading_layout.addWidget(InlineSpinner(size=48))
+        self._tree_loading_label = QLabel("Loading project structure…")
+        self._tree_loading_label.setAlignment(Qt.AlignCenter)
+        _loading_layout.addWidget(self._tree_loading_label)
         self._tree_stack.addWidget(self._tree_loading_widget)  # index 0
         self._tree_stack.addWidget(self.tree)                  # index 1
 
@@ -9294,6 +9490,9 @@ class BomPage(QWidget):
         self._tree_stack.setCurrentWidget(self._ebom_tree)
 
         tree_layout.addWidget(self._tree_stack)
+        self._diagnostic_status_label = QLabel("")
+        self._diagnostic_status_label.setWordWrap(True)
+        tree_layout.addWidget(self._diagnostic_status_label)
         left_layout.addWidget(tree_group)
 
         # Right panel
@@ -17253,6 +17452,8 @@ class BomPage(QWidget):
         self._perform_search_now()
 
     def _perform_search_now(self):
+        if getattr(self, "_structure_loading", False):
+            return
         query = self.search_input.text().strip()
         if getattr(self, "_bom_mode", "cad") == "cad":
             visible = self._refresh_pdm_cad_filter()

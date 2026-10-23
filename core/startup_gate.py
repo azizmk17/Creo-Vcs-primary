@@ -1,7 +1,7 @@
 """Pure startup-loader timing state used by the Qt startup window."""
 
 
-MINIMUM_STARTUP_LOADER_MS = 4000
+MINIMUM_STARTUP_LOADER_MS = 0
 
 
 class StartupGate:

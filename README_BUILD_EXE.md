@@ -4,7 +4,8 @@ Use **`build_exe.bat`** to create a folder containing `Setup.exe`, `Nexus.exe`,
 `CADViewer.exe`, and their shared libraries. The build is not tied to a particular username,
 Anaconda installation folder, or environment name.
 
-Version **4.2.0** adds a graphical **Setup.exe** for installation without Command
+The current source version is **4.3.0**; see [Startup and project loading](docs/project_loading.md).
+Version **4.2.0** introduced a graphical **Setup.exe** for installation without Command
 Prompt. The build also includes the lightweight `bootstrap` folder containing
 the managed launcher and updater introduced in 4.1.0. Read [Release, installation, and updates](README_RELEASE_UPDATES.md)
 for release-key setup, first installation, signed publishing, and database maintenance.

@@ -4,7 +4,9 @@
 > CAD Document, Item, association, CAD-to-EBOM build, supplier package, and
 > migration workflows.
 
-Nexus **4.2.0** adds a graphical **Setup.exe**: users extract the complete folder, double-click Setup, and install without Command Prompt. It also retains the BOM checkout cleanup introduced in 4.1.1, including remaining drawings after a 3D-only push, and includes [signed releases, managed updates, and workspace compatibility checks](README_RELEASE_UPDATES.md), alongside [shared master work and version-aware PDF/STEP status](docs/master_work_and_deliverables.md).
+Nexus **4.3.0** opens the application shell before loading project structures and checking project files. Choose a **product** and **version**, then click **Load Project**; changing either selector does not load an intermediate version. The BOM panel displays a loader during structure queries and a separate status for background file checks. See [Startup and project loading](docs/project_loading.md) for the workflow and the proposed next performance improvements.
+
+The graphical **Setup.exe** introduced in 4.2.0 remains included: users extract the complete folder, double-click Setup, and install without Command Prompt. Nexus also retains the BOM checkout cleanup introduced in 4.1.1, including remaining drawings after a 3D-only push, and includes [signed releases, managed updates, and workspace compatibility checks](README_RELEASE_UPDATES.md), alongside [shared master work and version-aware PDF/STEP status](docs/master_work_and_deliverables.md).
 
 Build the Windows folder, including its graphical setup, with **build_exe.bat**. Start with the [build steps below](#build-a-windows-exe-folder), or open the [complete build guide](README_BUILD_EXE.md) for new-computer setup and troubleshooting.
 

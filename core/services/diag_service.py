@@ -248,7 +248,7 @@ class DiagService:
         }
 
 
-    def check_working_directory(self, working_dir):
+    def check_working_directory(self, working_dir, *, cancel_cb=None):
         if not working_dir or not os.path.isdir(working_dir):
             return []
         working_files = self.list_working_parts(working_dir)
@@ -280,6 +280,8 @@ class DiagService:
         results = []
 
         for part in working_files:
+            if cancel_cb and cancel_cb():
+                return []
             if self.pdm_repo.normalize_base(
                 self._creo_base_name(part)
             ) in managed_cad_bases:
@@ -563,7 +565,7 @@ class DiagService:
         return self._sync_bom_record(working_dir, bom, files_in_dir, force_integrated_filenames)
 
     # everytime the app refreshed the bom page check if the filename and drawing exists in the working directory and check if the update the base_file_name and base_drw_name columns in the commit table regarding to the filename and drawing columns in the bom table
-    def sync_bom_files(self, working_dir):
+    def sync_bom_files(self, working_dir, *, cancel_cb=None):
         try:
             force_integrated_filenames = set(self.repo.get_forced_integrated_filenames(self.session.project_id) or [])
         except Exception:
@@ -575,6 +577,8 @@ class DiagService:
         result = []
         boms = self.bom_repo.get_all(self.session.project_id)
         for bom in boms:
+            if cancel_cb and cancel_cb():
+                return []
             result.extend(self._sync_bom_record(working_dir, bom, files_in_dir, force_integrated_filenames))
 
         return result

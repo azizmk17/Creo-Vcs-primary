@@ -414,11 +414,6 @@ class LoginPage(QWidget):
                 if project_id(project) == int(last_pid) and working_directory_exists(project):
                     return int(last_pid)
 
-        for project in projects:
-            try:
-                if int(project.get("is_current") or 0) == 1 and working_directory_exists(project):
-                    return project_id(project)
-            except Exception:
-                continue
-
+        # A first login has no explicit product/version selection yet. Let the
+        # user choose both in the shell before loading any project data.
         return None
