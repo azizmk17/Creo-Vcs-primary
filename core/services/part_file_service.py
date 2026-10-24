@@ -7,6 +7,8 @@ from core.repositories.bom_revision_repository import BomRevisionRepository
 from core.repositories.lock_repository import LockRepository
 from core.repositories.part_file_repository import PartFileRepository
 from core.session_manager import SessionManager
+from core.service_resources import ServiceResources
+from config import DB_NAME
 from core.services.project_service import ProjectService
 from core.models.part_file_model import PartFile
 from core.models.part_file_version_model import PartFileVersion
@@ -14,11 +16,13 @@ from utils import ensure_dir_exists, safe_copy2, safe_exists, safe_getsize, safe
 
 
 class PartFileService:
-    def __init__(self, repo: Optional[PartFileRepository] = None):
-        self.repo = repo or PartFileRepository()
-        self.bom_repo = BomRepository()
-        self.revision_repo = BomRevisionRepository()
-        self.lock_repo = LockRepository()
+    def __init__(self, repo: Optional[PartFileRepository] = None, *, resources=None):
+        self.resources = resources or ServiceResources(getattr(repo, "db_name", DB_NAME))
+        repository = self.resources.repository
+        self.repo = repo or repository(PartFileRepository)
+        self.bom_repo = repository(BomRepository)
+        self.revision_repo = repository(BomRevisionRepository)
+        self.lock_repo = repository(LockRepository)
         self.session = SessionManager()
         self.project_service = ProjectService()
 

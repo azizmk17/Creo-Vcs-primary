@@ -1,3 +1,6 @@
+from core.startup_profile import mark as _startup_mark
+_startup_mark("main_module_entered")
+
 import sys
 from PyQt5.QtWidgets import (
     QAction,
@@ -113,17 +116,13 @@ from pages.dialogs.progress_dialog import ProgressDialog
 import threading
 
 #import services and repositories
-from core.services.bom_service import BomService
-from core.repositories.bom_repository import BomRepository
-from core.repositories.bom_children_repository import BomChildrenRepository
-from core.repositories.lock_repository import LockRepository
-from core.repositories.signature_repository import SignatureRepository
 from core.repositories.user_repository import UserRepository
 from core.services.project_service import ProjectService
 from core.services.ui_permission import UIPermissionHelper
 from core.session_manager import SessionManager
 from core.repositories.project_event_repository import ProjectEventRepository
 from core.startup_gate import MINIMUM_STARTUP_LOADER_MS, StartupGate
+_startup_mark("main_imports_ready")
 
 
 class AdvancedSpinner(QWidget):
@@ -259,6 +258,7 @@ class StartupWindow(QMainWindow):
         self.login_page.login_succeeded.connect(self.begin_loading)
 
     def begin_loading(self):
+        _startup_mark("login_authenticated")
         self.pages.setCurrentWidget(self.loader_page)
         self._startup_gate.reset()
         self.loader_page.set_status("Checking workspace compatibility...")
@@ -294,6 +294,7 @@ class StartupWindow(QMainWindow):
         QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
 
     def _build_main_window(self):
+        _startup_mark("shell_construction_started")
         self._set_loading_status("Preparing application services...")
         try:
             self.main_page = BomGUI(startup_progress=self._set_loading_status)
@@ -308,6 +309,7 @@ class StartupWindow(QMainWindow):
         # Readiness means the shell is ready to display. Project queries and
         # directory diagnostics start from the visible BOM page afterwards.
         self._mark_page_ready()
+        _startup_mark("shell_constructed", flush=True)
 
     def _on_minimum_loader_elapsed(self):
         if self._startup_gate.mark_minimum_elapsed():
@@ -349,6 +351,12 @@ class BomGUI(QMainWindow):
 
     def __init__(self, startup_progress=None):
         super().__init__()
+        # Login needs no BOM service graph or PDM migration imports.
+        from core.services.bom_service import BomService
+        from core.repositories.bom_repository import BomRepository
+        from core.repositories.bom_children_repository import BomChildrenRepository
+        from core.repositories.lock_repository import LockRepository
+        from core.repositories.signature_repository import SignatureRepository
         self.setObjectName("nexusMainWindow")
         self.setWindowTitle(f"{APP_NAME} PDM — Product Development")
         self.resize(1400, 900)
@@ -381,6 +389,12 @@ class BomGUI(QMainWindow):
         if not self._deferred_services_started:
             self._deferred_services_started = True
             QTimer.singleShot(50, self._start_deferred_services)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not getattr(self, "_startup_paint_logged", False):
+            self._startup_paint_logged = True
+            _startup_mark("shell_painted", flush=True)
 
     def _start_deferred_services(self):
         threading.Thread(target=self._drain_cad_workspace_release_queue, daemon=True).start()
@@ -1688,6 +1702,7 @@ class BomGUI(QMainWindow):
 if __name__ == "__main__":
 
     app = QApplication(sys.argv)
+    _startup_mark("qt_application_ready")
     logo_path = _resource_path(APP_LOADER_LOGO_PATH)
     app.setStyle("Fusion")
     # Keep standard controls at the compact density used by desktop CAD tools.
@@ -1718,11 +1733,13 @@ if __name__ == "__main__":
 
     # Point every repository to the resolved database path.
     _cfg_mod.DB_NAME.set(str(_ws_result.db_path))
+    _startup_mark("workspace_resolved")
     # This runs before LoginPage can construct repositories or configure SQL.
     from core.updates.compatibility import assert_workspace_compatible, enable_runtime_guard, CompatibilityError
     try:
         assert_workspace_compatible(_ws_result.db_path, _cfg_mod.APP_VERSION)
         enable_runtime_guard(_ws_result.db_path, _cfg_mod.APP_VERSION)
+        _startup_mark("workspace_compatible")
     except CompatibilityError as _compatibility_error:
         from core.updates.ui import show_compatibility_error
         show_compatibility_error(str(_compatibility_error), _cfg_mod.APP_VERSION, _ws_result.db_path)
@@ -1763,6 +1780,7 @@ if __name__ == "__main__":
             bytes.fromhex(_pub_key_hex),
             revocation_path=_revocation_path,
         )
+        _startup_mark("license_verified")
     except _LicenseError as _lic_exc:
         QMessageBox.critical(
             None,
@@ -1774,6 +1792,7 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
 
     startup_window = StartupWindow(logo_path)
+    _startup_mark("login_constructed")
     startup_window.showMaximized()
     sys.exit(app.exec_())
 

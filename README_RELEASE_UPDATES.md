@@ -3,9 +3,12 @@
 This guide is for the person publishing Nexus and the users installing it.
 Version **4.1.0** introduces a signed company release feed, a local launcher,
 a separate updater, and enforced workspace compatibility checks.
-The current source version, **4.3.0**, defers project processing until the shell
-is visible and lets users choose the product and version before loading. See
-[Startup and project loading](docs/project_loading.md).
+The current source version, **4.5.0**, reuses repositories during BOM setup,
+defers diagnostics and optional services, and opens the PDF engine only when a
+PDF is viewed. Version 4.4.0 added paged EBOM branch queries and indexed
+background file checks. Users choose the product and version before loading. See
+[Startup and project loading](docs/project_loading.md) and the
+[packaged startup measurements](docs/packaged_startup.md).
 Version **4.2.0** added graphical **Setup.exe** installation with
 shortcuts, so users do not need Command Prompt. It retains the 4.1.1 fix that
 releases all related CAD checkouts when a BOM Item is checked in or its checkout

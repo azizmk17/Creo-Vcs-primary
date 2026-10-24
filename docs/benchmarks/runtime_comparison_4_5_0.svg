@@ -1,0 +1,152 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2200" height="1460" viewBox="0 0 2200 1460">
+<rect width="100%" height="100%" fill="#fbfcfe"/>
+<style>text{font-family:"Segoe UI",Arial,sans-serif}</style>
+<text x="70" y="54" fill="#101828" font-size="40" text-anchor="start" dominant-baseline="hanging">Nexus 4.5.0 · Native Python vs frozen EXE</text>
+<text x="72" y="113" fill="#475467" font-size="18" text-anchor="start" dominant-baseline="hanging">Python 3.10.19  ·  10,000 parts + 1,000 assemblies  ·  local warm-cache runs  ·  medians with min–max ranges</text>
+<circle cx="88" cy="176" r="8" fill="#2864dc"/>
+<text x="110" y="164" fill="#2864dc" font-size="20" text-anchor="start" dominant-baseline="hanging">Native Python</text>
+<rect x="292" y="168" width="16" height="16" fill="#d35b26"/>
+<text x="322" y="164" fill="#d35b26" font-size="20" text-anchor="start" dominant-baseline="hanging">Frozen EXE</text>
+<line x1="520" y1="176" x2="575" y2="176" stroke="#475467" stroke-width="3"/>
+<line x1="520" y1="169" x2="520" y2="183" stroke="#475467" stroke-width="2"/>
+<line x1="575" y1="169" x2="575" y2="183" stroke="#475467" stroke-width="2"/>
+<text x="590" y="164" fill="#475467" font-size="20" text-anchor="start" dominant-baseline="hanging">min–max range; marker is median</text>
+<text x="70" y="230" fill="#101828" font-size="30" text-anchor="start" dominant-baseline="hanging">Startup, project checks and BOM GUI</text>
+<text x="1545" y="236" fill="#2864dc" font-size="16" text-anchor="start" dominant-baseline="hanging">NATIVE · MEDIAN [RANGE]</text>
+<text x="1865" y="236" fill="#d35b26" font-size="16" text-anchor="start" dominant-baseline="hanging">FROZEN · MEDIAN [RANGE]</text>
+<line x1="535.0" y1="282" x2="535.0" y2="888" stroke="#d8dee8" stroke-width="1"/>
+<text x="535.0" y="899" fill="#475467" font-size="16" text-anchor="start" dominant-baseline="middle">0.0</text>
+<line x1="775.0" y1="282" x2="775.0" y2="888" stroke="#d8dee8" stroke-width="1"/>
+<text x="775.0" y="899" fill="#475467" font-size="16" text-anchor="start" dominant-baseline="middle">0.4</text>
+<line x1="1015.0" y1="282" x2="1015.0" y2="888" stroke="#d8dee8" stroke-width="1"/>
+<text x="1015.0" y="899" fill="#475467" font-size="16" text-anchor="start" dominant-baseline="middle">0.8</text>
+<line x1="1255.0" y1="282" x2="1255.0" y2="888" stroke="#d8dee8" stroke-width="1"/>
+<text x="1255.0" y="899" fill="#475467" font-size="16" text-anchor="start" dominant-baseline="middle">1.2</text>
+<line x1="1495.0" y1="282" x2="1495.0" y2="888" stroke="#d8dee8" stroke-width="1"/>
+<text x="1495.0" y="899" fill="#475467" font-size="16" text-anchor="start" dominant-baseline="middle">1.6</text>
+<line x1="65" y1="324" x2="2115" y2="324" stroke="#e8ecf2" stroke-width="1"/>
+<text x="70" y="280" fill="#101828" font-size="18" text-anchor="start" dominant-baseline="hanging">First login paint</text>
+<line x1="798.6268" y1="284" x2="881.6884" y2="284" stroke="#2864dc" stroke-width="3"/>
+<line x1="798.6268" y1="277" x2="798.6268" y2="291" stroke="#2864dc" stroke-width="2"/>
+<line x1="881.6884" y1="277" x2="881.6884" y2="291" stroke="#2864dc" stroke-width="2"/>
+<circle cx="847.8825999999999" cy="284" r="8" fill="#2864dc"/>
+<line x1="767.6662" y1="305" x2="826.519" y2="305" stroke="#d35b26" stroke-width="3"/>
+<line x1="767.6662" y1="298" x2="767.6662" y2="312" stroke="#d35b26" stroke-width="2"/>
+<line x1="826.519" y1="298" x2="826.519" y2="312" stroke="#d35b26" stroke-width="2"/>
+<rect x="765.2096" y="297" width="16" height="16" fill="#d35b26"/>
+<text x="1545" y="274" fill="#2864dc" font-size="16" text-anchor="start" dominant-baseline="hanging">0.521s  [0.439–0.578]</text>
+<text x="1865" y="295" fill="#d35b26" font-size="16" text-anchor="start" dominant-baseline="hanging">0.397s  [0.388–0.486]</text>
+<line x1="65" y1="399" x2="2115" y2="399" stroke="#e8ecf2" stroke-width="1"/>
+<text x="70" y="355" fill="#101828" font-size="18" text-anchor="start" dominant-baseline="hanging">Service setup</text>
+<line x1="655.0823200400919" y1="359" x2="689.5824999688193" y2="359" stroke="#2864dc" stroke-width="3"/>
+<line x1="655.0823200400919" y1="352" x2="655.0823200400919" y2="366" stroke="#2864dc" stroke-width="2"/>
+<line x1="689.5824999688193" y1="352" x2="689.5824999688193" y2="366" stroke="#2864dc" stroke-width="2"/>
+<circle cx="658.2176199555397" cy="359" r="8" fill="#2864dc"/>
+<line x1="657.9217600077391" y1="380" x2="708.7066000234336" y2="380" stroke="#d35b26" stroke-width="3"/>
+<line x1="657.9217600077391" y1="373" x2="657.9217600077391" y2="387" stroke="#d35b26" stroke-width="2"/>
+<line x1="708.7066000234336" y1="373" x2="708.7066000234336" y2="387" stroke="#d35b26" stroke-width="2"/>
+<rect x="656.7911599976942" y="372" width="16" height="16" fill="#d35b26"/>
+<text x="1545" y="349" fill="#2864dc" font-size="16" text-anchor="start" dominant-baseline="hanging">0.205s  [0.200–0.258]</text>
+<text x="1865" y="370" fill="#d35b26" font-size="16" text-anchor="start" dominant-baseline="hanging">0.216s  [0.205–0.290]</text>
+<line x1="65" y1="474" x2="2115" y2="474" stroke="#e8ecf2" stroke-width="1"/>
+<text x="70" y="430" fill="#101828" font-size="18" text-anchor="start" dominant-baseline="hanging">EBOM structure worker</text>
+<line x1="642.6949000125751" y1="434" x2="653.1675399886444" y2="434" stroke="#2864dc" stroke-width="3"/>
+<line x1="642.6949000125751" y1="427" x2="642.6949000125751" y2="441" stroke="#2864dc" stroke-width="2"/>
+<line x1="653.1675399886444" y1="427" x2="653.1675399886444" y2="441" stroke="#2864dc" stroke-width="2"/>
+<circle cx="644.4966999720782" cy="434" r="8" fill="#2864dc"/>
+<line x1="645.2859399747103" y1="455" x2="662.1100599784404" y2="455" stroke="#d35b26" stroke-width="3"/>
+<line x1="645.2859399747103" y1="448" x2="645.2859399747103" y2="462" stroke="#d35b26" stroke-width="2"/>
+<line x1="662.1100599784404" y1="448" x2="662.1100599784404" y2="462" stroke="#d35b26" stroke-width="2"/>
+<rect x="639.2006599558517" y="447" width="16" height="16" fill="#d35b26"/>
+<text x="1545" y="424" fill="#2864dc" font-size="16" text-anchor="start" dominant-baseline="hanging">0.182s  [0.179–0.197]</text>
+<text x="1865" y="445" fill="#d35b26" font-size="16" text-anchor="start" dominant-baseline="hanging">0.187s  [0.184–0.212]</text>
+<line x1="65" y1="549" x2="2115" y2="549" stroke="#e8ecf2" stroke-width="1"/>
+<text x="70" y="505" fill="#101828" font-size="18" text-anchor="start" dominant-baseline="hanging">BOM widget setup</text>
+<line x1="699.8183199577034" y1="509" x2="835.6667200475931" y2="509" stroke="#2864dc" stroke-width="3"/>
+<line x1="699.8183199577034" y1="502" x2="699.8183199577034" y2="516" stroke="#2864dc" stroke-width="2"/>
+<line x1="835.6667200475931" y1="502" x2="835.6667200475931" y2="516" stroke="#2864dc" stroke-width="2"/>
+<circle cx="703.204899970442" cy="509" r="8" fill="#2864dc"/>
+<line x1="703.1993799982592" y1="530" x2="712.759419940412" y2="530" stroke="#d35b26" stroke-width="3"/>
+<line x1="703.1993799982592" y1="523" x2="703.1993799982592" y2="537" stroke="#d35b26" stroke-width="2"/>
+<line x1="712.759419940412" y1="523" x2="712.759419940412" y2="537" stroke="#d35b26" stroke-width="2"/>
+<rect x="698.6998999705538" y="522" width="16" height="16" fill="#d35b26"/>
+<text x="1545" y="499" fill="#2864dc" font-size="16" text-anchor="start" dominant-baseline="hanging">0.280s  [0.275–0.501]</text>
+<text x="1865" y="520" fill="#d35b26" font-size="16" text-anchor="start" dominant-baseline="hanging">0.286s  [0.280–0.296]</text>
+<line x1="65" y1="624" x2="2115" y2="624" stroke="#e8ecf2" stroke-width="1"/>
+<text x="70" y="580" fill="#101828" font-size="18" text-anchor="start" dominant-baseline="hanging">Initial BOM row rendering</text>
+<line x1="791.8830400472507" y1="584" x2="808.3558599604294" y2="584" stroke="#2864dc" stroke-width="3"/>
+<line x1="791.8830400472507" y1="577" x2="791.8830400472507" y2="591" stroke="#2864dc" stroke-width="2"/>
+<line x1="808.3558599604294" y1="577" x2="808.3558599604294" y2="591" stroke="#2864dc" stroke-width="2"/>
+<circle cx="796.0421200050041" cy="584" r="8" fill="#2864dc"/>
+<line x1="799.3856800394133" y1="605" x2="819.7516600508243" y2="605" stroke="#d35b26" stroke-width="3"/>
+<line x1="799.3856800394133" y1="598" x2="799.3856800394133" y2="612" stroke="#d35b26" stroke-width="2"/>
+<line x1="819.7516600508243" y1="598" x2="819.7516600508243" y2="612" stroke="#d35b26" stroke-width="2"/>
+<rect x="794.5829600077122" y="597" width="16" height="16" fill="#d35b26"/>
+<text x="1545" y="574" fill="#2864dc" font-size="16" text-anchor="start" dominant-baseline="hanging">0.435s  [0.428–0.456]</text>
+<text x="1865" y="595" fill="#d35b26" font-size="16" text-anchor="start" dominant-baseline="hanging">0.446s  [0.441–0.475]</text>
+<line x1="65" y1="699" x2="2115" y2="699" stroke="#e8ecf2" stroke-width="1"/>
+<text x="70" y="655" fill="#101828" font-size="18" text-anchor="start" dominant-baseline="hanging">BOM refresh rendering</text>
+<line x1="588.3889000071213" y1="659" x2="595.3711600182578" y2="659" stroke="#2864dc" stroke-width="3"/>
+<line x1="588.3889000071213" y1="652" x2="588.3889000071213" y2="666" stroke="#2864dc" stroke-width="2"/>
+<line x1="595.3711600182578" y1="652" x2="595.3711600182578" y2="666" stroke="#2864dc" stroke-width="2"/>
+<circle cx="590.7044800370932" cy="659" r="8" fill="#2864dc"/>
+<line x1="588.8342200452462" y1="680" x2="602.8685199702159" y2="680" stroke="#d35b26" stroke-width="3"/>
+<line x1="588.8342200452462" y1="673" x2="588.8342200452462" y2="687" stroke="#d35b26" stroke-width="2"/>
+<line x1="602.8685199702159" y1="673" x2="602.8685199702159" y2="687" stroke="#d35b26" stroke-width="2"/>
+<rect x="583.0997600434348" y="672" width="16" height="16" fill="#d35b26"/>
+<text x="1545" y="649" fill="#2864dc" font-size="16" text-anchor="start" dominant-baseline="hanging">0.093s  [0.089–0.101]</text>
+<text x="1865" y="670" fill="#d35b26" font-size="16" text-anchor="start" dominant-baseline="hanging">0.093s  [0.090–0.113]</text>
+<line x1="65" y1="774" x2="2115" y2="774" stroke="#e8ecf2" stroke-width="1"/>
+<text x="70" y="730" fill="#101828" font-size="18" text-anchor="start" dominant-baseline="hanging">File sync · 11,000 Items</text>
+<line x1="1342.6294599566609" y1="734" x2="1454.0408799797297" y2="734" stroke="#2864dc" stroke-width="3"/>
+<line x1="1342.6294599566609" y1="727" x2="1342.6294599566609" y2="741" stroke="#2864dc" stroke-width="2"/>
+<line x1="1454.0408799797297" y1="727" x2="1454.0408799797297" y2="741" stroke="#2864dc" stroke-width="2"/>
+<circle cx="1366.6029399866238" cy="734" r="8" fill="#2864dc"/>
+<line x1="1337.9363799840212" y1="755" x2="1413.5378200234845" y2="755" stroke="#d35b26" stroke-width="3"/>
+<line x1="1337.9363799840212" y1="748" x2="1337.9363799840212" y2="762" stroke="#d35b26" stroke-width="2"/>
+<line x1="1413.5378200234845" y1="748" x2="1413.5378200234845" y2="762" stroke="#d35b26" stroke-width="2"/>
+<rect x="1366.0370600158349" y="747" width="16" height="16" fill="#d35b26"/>
+<text x="1545" y="724" fill="#2864dc" font-size="16" text-anchor="start" dominant-baseline="hanging">1.386s  [1.346–1.532]</text>
+<text x="1865" y="745" fill="#d35b26" font-size="16" text-anchor="start" dominant-baseline="hanging">1.398s  [1.338–1.464]</text>
+<line x1="65" y1="849" x2="2115" y2="849" stroke="#e8ecf2" stroke-width="1"/>
+<text x="70" y="805" fill="#101828" font-size="18" text-anchor="start" dominant-baseline="hanging">Working-directory check</text>
+<line x1="1220.8085199492052" y1="809" x2="1294.5968200126663" y2="809" stroke="#2864dc" stroke-width="3"/>
+<line x1="1220.8085199492052" y1="802" x2="1220.8085199492052" y2="816" stroke="#2864dc" stroke-width="2"/>
+<line x1="1294.5968200126663" y1="802" x2="1294.5968200126663" y2="816" stroke="#2864dc" stroke-width="2"/>
+<circle cx="1246.6937200073153" cy="809" r="8" fill="#2864dc"/>
+<line x1="1215.520119983703" y1="830" x2="1253.1942399824038" y2="830" stroke="#d35b26" stroke-width="3"/>
+<line x1="1215.520119983703" y1="823" x2="1215.520119983703" y2="837" stroke="#d35b26" stroke-width="2"/>
+<line x1="1253.1942399824038" y1="823" x2="1253.1942399824038" y2="837" stroke="#d35b26" stroke-width="2"/>
+<rect x="1225.5205400036648" y="822" width="16" height="16" fill="#d35b26"/>
+<text x="1545" y="799" fill="#2864dc" font-size="16" text-anchor="start" dominant-baseline="hanging">1.186s  [1.143–1.266]</text>
+<text x="1865" y="820" fill="#d35b26" font-size="16" text-anchor="start" dominant-baseline="hanging">1.164s  [1.134–1.197]</text>
+<text x="1015.0" y="924" fill="#475467" font-size="16" text-anchor="start" dominant-baseline="middle">Elapsed time (seconds) · lower is faster</text>
+<text x="70" y="1010" fill="#101828" font-size="30" text-anchor="start" dominant-baseline="hanging">Forced metadata update · 11,000 rows · disposable database</text>
+<text x="1545" y="1017" fill="#2864dc" font-size="16" text-anchor="start" dominant-baseline="hanging">NATIVE · MEDIAN [RANGE]</text>
+<text x="1865" y="1017" fill="#d35b26" font-size="16" text-anchor="start" dominant-baseline="hanging">FROZEN · MEDIAN [RANGE]</text>
+<line x1="535.0" y1="1086" x2="535.0" y2="1230" stroke="#d8dee8" stroke-width="1"/>
+<text x="535.0" y="1238" fill="#475467" font-size="16" text-anchor="start" dominant-baseline="middle">0</text>
+<line x1="763.5714285714286" y1="1086" x2="763.5714285714286" y2="1230" stroke="#d8dee8" stroke-width="1"/>
+<text x="763.5714285714286" y="1238" fill="#475467" font-size="16" text-anchor="start" dominant-baseline="middle">5</text>
+<line x1="992.1428571428571" y1="1086" x2="992.1428571428571" y2="1230" stroke="#d8dee8" stroke-width="1"/>
+<text x="992.1428571428571" y="1238" fill="#475467" font-size="16" text-anchor="start" dominant-baseline="middle">10</text>
+<line x1="1220.7142857142858" y1="1086" x2="1220.7142857142858" y2="1230" stroke="#d8dee8" stroke-width="1"/>
+<text x="1220.7142857142858" y="1238" fill="#475467" font-size="16" text-anchor="start" dominant-baseline="middle">15</text>
+<line x1="1449.2857142857142" y1="1086" x2="1449.2857142857142" y2="1230" stroke="#d8dee8" stroke-width="1"/>
+<text x="1449.2857142857142" y="1238" fill="#475467" font-size="16" text-anchor="start" dominant-baseline="middle">20</text>
+<text x="70" y="1096" fill="#2864dc" font-size="18" text-anchor="start" dominant-baseline="hanging">Native Python</text>
+<line x1="617.5729417162282" y1="1106" x2="1449.1379062831402" y2="1106" stroke="#2864dc" stroke-width="3"/>
+<line x1="617.5729417162282" y1="1099" x2="617.5729417162282" y2="1113" stroke="#2864dc" stroke-width="2"/>
+<line x1="1449.1379062831402" y1="1099" x2="1449.1379062831402" y2="1113" stroke="#2864dc" stroke-width="2"/>
+<circle cx="620.4003794331636" cy="1106" r="8" fill="#2864dc"/>
+<text x="1545" y="1096" fill="#2864dc" font-size="16" text-anchor="start" dominant-baseline="hanging">1.868s  [1.806–19.997]</text>
+<text x="70" y="1158" fill="#d35b26" font-size="18" text-anchor="start" dominant-baseline="hanging">Frozen EXE</text>
+<line x1="619.5520091429353" y1="1168" x2="828.617965712079" y2="1168" stroke="#d35b26" stroke-width="3"/>
+<line x1="619.5520091429353" y1="1161" x2="619.5520091429353" y2="1175" stroke="#d35b26" stroke-width="2"/>
+<line x1="828.617965712079" y1="1161" x2="828.617965712079" y2="1175" stroke="#d35b26" stroke-width="2"/>
+<rect x="711.1874514254076" y="1160" width="16" height="16" fill="#d35b26"/>
+<text x="1865" y="1158" fill="#d35b26" font-size="16" text-anchor="start" dominant-baseline="hanging">4.029s  [1.850–6.423]</text>
+<text x="1015.0" y="1262" fill="#475467" font-size="16" text-anchor="start" dominant-baseline="middle">Elapsed time (seconds) · lower is faster</text>
+<text x="70" y="1390" fill="#475467" font-size="18" text-anchor="start" dominant-baseline="hanging">Normal sync: 11,000 checked · 0 writes. Forced-write runs varied substantially; ranges are shown.</text>
+<text x="70" y="1420" fill="#475467" font-size="16" text-anchor="start" dominant-baseline="hanging">Bundle: 898.5 MB  ·  Fixture: 849daff07622434d9a714642b2fece70  ·  Native runs: 9  ·  Frozen runs: 7</text>
+</svg>

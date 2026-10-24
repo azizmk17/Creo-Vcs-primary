@@ -1,0 +1,210 @@
+{
+  "app_version": "4.5.0",
+  "platform": "Windows-10-10.0.26200-SP0",
+  "python_version": "3.10.19",
+  "dataset_id": "849daff07622434d9a714642b2fece70",
+  "project_id": 8,
+  "fixture": "BENCHMARK - Company 11000, 10,000 parts + 1,000 assemblies",
+  "startup_to_first_login_paint": {
+    "native_python": {
+      "median_seconds": 0.521471,
+      "range_seconds": [
+        0.439378,
+        0.577814
+      ],
+      "runs": 3
+    },
+    "frozen_exe": {
+      "median_seconds": 0.397016,
+      "range_seconds": [
+        0.387777,
+        0.485865
+      ],
+      "runs": 3
+    },
+    "measurement": "Real app process through workspace and license verification to first offscreen login paint; no authentication or BOM project session."
+  },
+  "project_load_components": {
+    "service_setup_seconds": {
+      "native_python": {
+        "median_seconds": 0.2053626999258995,
+        "range_seconds": [
+          0.2001372000668198,
+          0.2576374999480322
+        ],
+        "runs": 9
+      },
+      "frozen_exe": {
+        "median_seconds": 0.216318599996157,
+        "range_seconds": [
+          0.20486960001289845,
+          0.28951100003905594
+        ],
+        "runs": 7
+      },
+      "exe_to_native_median_ratio": 1.0533490262555503
+    },
+    "structure_worker_seconds": {
+      "native_python": {
+        "median_seconds": 0.18249449995346367,
+        "range_seconds": [
+          0.17949150002095848,
+          0.19694589998107404
+        ],
+        "runs": 9
+      },
+      "frozen_exe": {
+        "median_seconds": 0.18700109992641956,
+        "range_seconds": [
+          0.18380989995785058,
+          0.21185009996406734
+        ],
+        "runs": 7
+      },
+      "exe_to_native_median_ratio": 1.0246944427043285
+    },
+    "bom_widget_setup_seconds": {
+      "native_python": {
+        "median_seconds": 0.28034149995073676,
+        "range_seconds": [
+          0.2746971999295056,
+          0.5011112000793219
+        ],
+        "runs": 9
+      },
+      "frozen_exe": {
+        "median_seconds": 0.286166499950923,
+        "range_seconds": [
+          0.28033229999709874,
+          0.29626569990068674
+        ],
+        "runs": 7
+      },
+      "exe_to_native_median_ratio": 1.0207782294138037
+    },
+    "initial_row_creation_seconds": {
+      "native_python": {
+        "median_seconds": 0.4350702000083402,
+        "range_seconds": [
+          0.42813840007875115,
+          0.45559309993404895
+        ],
+        "runs": 9
+      },
+      "frozen_exe": {
+        "median_seconds": 0.44597160001285374,
+        "range_seconds": [
+          0.4406428000656888,
+          0.47458610008470714
+        ],
+        "runs": 7
+      },
+      "exe_to_native_median_ratio": 1.0250566460408104
+    },
+    "bom_refresh_update_seconds": {
+      "native_python": {
+        "median_seconds": 0.09284080006182194,
+        "range_seconds": [
+          0.08898150001186877,
+          0.10061860003042966
+        ],
+        "runs": 9
+      },
+      "frozen_exe": {
+        "median_seconds": 0.09349960007239133,
+        "range_seconds": [
+          0.0897237000754103,
+          0.11311419995035976
+        ],
+        "runs": 7
+      },
+      "exe_to_native_median_ratio": 1.0070960182390791
+    },
+    "file_sync_seconds": {
+      "native_python": {
+        "median_seconds": 1.3860048999777064,
+        "range_seconds": [
+          1.3460490999277681,
+          1.531734799966216
+        ],
+        "runs": 9
+      },
+      "frozen_exe": {
+        "median_seconds": 1.3983951000263914,
+        "range_seconds": [
+          1.3382272999733686,
+          1.4642297000391409
+        ],
+        "runs": 7
+      },
+      "exe_to_native_median_ratio": 1.0089395066704918
+    },
+    "working_directory_check_seconds": {
+      "native_python": {
+        "median_seconds": 1.1861562000121921,
+        "range_seconds": [
+          1.143014199915342,
+          1.2659947000211105
+        ],
+        "runs": 9
+      },
+      "frozen_exe": {
+        "median_seconds": 1.164200900006108,
+        "range_seconds": [
+          1.1342001999728382,
+          1.196990399970673
+        ],
+        "runs": 7
+      },
+      "exe_to_native_median_ratio": 0.9814903804356808
+    },
+    "metadata_update_seconds": {
+      "native_python": {
+        "median_seconds": 1.8681333001004532,
+        "range_seconds": [
+          1.8062831000424922,
+          19.99676669994369
+        ],
+        "runs": 9
+      },
+      "frozen_exe": {
+        "median_seconds": 4.029100499930792,
+        "range_seconds": [
+          1.8495752000017092,
+          6.422892999951728
+        ],
+        "runs": 7
+      },
+      "exe_to_native_median_ratio": 2.1567521438187196
+    }
+  },
+  "metadata_update_test": {
+    "normal_sync_updates": 0,
+    "forced_update_rows": 11000,
+    "method": "Clear derived CAD base-name fields only in a second disposable DB copy, then run the normal synchronization."
+  },
+  "safety": "The source SQLite database is opened read-only and backed up to temporary copies; the CAD working directory is read-only.",
+  "source_reports": [
+    "company_11000_source_full_2.json",
+    "company_11000_source_full_3.json",
+    "company_11000_source_full_4.json",
+    "company_11000_source_full_5.json",
+    "company_11000_source_full_6.json",
+    "company_11000_source_full_7.json",
+    "company_11000_source_full_8.json",
+    "company_11000_source_full_9.json",
+    "company_11000_source_full_10.json",
+    "startup_comparison_native.json"
+  ],
+  "frozen_reports": [
+    "company_11000_frozen_full_2.json",
+    "company_11000_frozen_full_3.json",
+    "company_11000_frozen_full_4.json",
+    "company_11000_frozen_full_5.json",
+    "company_11000_frozen_full_6.json",
+    "company_11000_frozen_full_7.json",
+    "company_11000_frozen_full_8.json",
+    "startup_comparison_exe.json"
+  ],
+  "limitations": "Local warm-cache component measurements. Repeated forced SQLite writes showed high timing variability; ranges are included. Not a network-share performance guarantee."
+}

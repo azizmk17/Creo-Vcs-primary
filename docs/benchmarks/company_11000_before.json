@@ -1,0 +1,18 @@
+{
+  "app_version": "4.3.0",
+  "project_id": 8,
+  "service_setup_seconds": 0.6518918999936432,
+  "structure_worker_seconds": 2.286162000033073,
+  "initial_payload_item_occurrences": 12942,
+  "initial_payload_documents": 13750,
+  "bom_widget_setup_seconds": 1.5704471999779344,
+  "initial_row_creation_seconds": 2.356121499906294,
+  "initial_root_rows": 10,
+  "file_sync_seconds": 120.01625489990693,
+  "file_sync_rows_checked": 9140,
+  "file_sync_write_calls": 9140,
+  "file_sync_findings": 0,
+  "file_sync_timed_out": true,
+  "working_directory_check_seconds": 3.2067739999620244,
+  "measurement_scope": "Disposable DB copy; local warm-cache component timings; hidden Qt widget row creation, not complete interactive startup."
+}

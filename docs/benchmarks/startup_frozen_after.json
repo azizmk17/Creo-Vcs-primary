@@ -1,0 +1,153 @@
+{
+  "version": "4.5.0",
+  "frozen": true,
+  "runs": [
+    {
+      "version": "4.5.0",
+      "frozen": true,
+      "events": [
+        {
+          "stage": "frozen_entry",
+          "seconds": 0.253986
+        },
+        {
+          "stage": "main_module_entered",
+          "seconds": 0.277492
+        },
+        {
+          "stage": "main_imports_ready",
+          "seconds": 0.351896
+        },
+        {
+          "stage": "qt_application_ready",
+          "seconds": 0.378643
+        },
+        {
+          "stage": "workspace_resolved",
+          "seconds": 0.500605
+        },
+        {
+          "stage": "workspace_compatible",
+          "seconds": 0.538029
+        },
+        {
+          "stage": "license_verified",
+          "seconds": 0.72808
+        },
+        {
+          "stage": "login_constructed",
+          "seconds": 0.946374
+        },
+        {
+          "stage": "login_painted",
+          "seconds": 0.966368
+        }
+      ],
+      "loaded_optional_modules": [],
+      "process_lifetime_seconds": 1.046171800000593
+    },
+    {
+      "version": "4.5.0",
+      "frozen": true,
+      "events": [
+        {
+          "stage": "frozen_entry",
+          "seconds": 0.287201
+        },
+        {
+          "stage": "main_module_entered",
+          "seconds": 0.312531
+        },
+        {
+          "stage": "main_imports_ready",
+          "seconds": 0.412085
+        },
+        {
+          "stage": "qt_application_ready",
+          "seconds": 0.432404
+        },
+        {
+          "stage": "workspace_resolved",
+          "seconds": 0.447047
+        },
+        {
+          "stage": "workspace_compatible",
+          "seconds": 0.470952
+        },
+        {
+          "stage": "license_verified",
+          "seconds": 0.510265
+        },
+        {
+          "stage": "login_constructed",
+          "seconds": 0.656014
+        },
+        {
+          "stage": "login_painted",
+          "seconds": 0.664234
+        }
+      ],
+      "loaded_optional_modules": [],
+      "process_lifetime_seconds": 0.7476366999326274
+    },
+    {
+      "version": "4.5.0",
+      "frozen": true,
+      "events": [
+        {
+          "stage": "frozen_entry",
+          "seconds": 0.293755
+        },
+        {
+          "stage": "main_module_entered",
+          "seconds": 0.318406
+        },
+        {
+          "stage": "main_imports_ready",
+          "seconds": 0.392783
+        },
+        {
+          "stage": "qt_application_ready",
+          "seconds": 0.412471
+        },
+        {
+          "stage": "workspace_resolved",
+          "seconds": 0.426665
+        },
+        {
+          "stage": "workspace_compatible",
+          "seconds": 0.444699
+        },
+        {
+          "stage": "license_verified",
+          "seconds": 0.480453
+        },
+        {
+          "stage": "login_constructed",
+          "seconds": 0.616735
+        },
+        {
+          "stage": "login_painted",
+          "seconds": 0.625401
+        }
+      ],
+      "loaded_optional_modules": [],
+      "process_lifetime_seconds": 0.6997457999968901
+    }
+  ],
+  "platform": "Windows-10-10.0.26200-SP0",
+  "python": "3.10.19",
+  "source_database_unchanged": true,
+  "scope": "Real process launch through normal workspace/license checks to first offscreen login paint; warm cache; no authentication or BOM session.",
+  "stage_medians": {
+    "license_verified": 0.510265,
+    "frozen_entry": 0.287201,
+    "main_module_entered": 0.312531,
+    "login_constructed": 0.656014,
+    "main_imports_ready": 0.392783,
+    "workspace_resolved": 0.447047,
+    "workspace_compatible": 0.470952,
+    "qt_application_ready": 0.412471,
+    "login_painted": 0.664234
+  }
+}

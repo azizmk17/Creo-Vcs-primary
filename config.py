@@ -3,7 +3,7 @@ import sqlite3
 from pathlib import Path
 
 # Application version — bump this string with each release.
-APP_VERSION = "4.3.0"
+APP_VERSION = "4.5.0"
 
 # ---------------------------------------------------------------------------
 # Database path

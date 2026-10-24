@@ -1,6 +1,8 @@
 """Reusable embedded and expanded PDF viewer based on PyMuPDF."""
 
 import os
+import importlib
+import importlib.util
 
 from PyQt5.QtCore import QPoint, Qt
 from PyQt5.QtGui import QImage, QKeySequence, QPixmap
@@ -19,13 +21,19 @@ from PyQt5.QtWidgets import (
 )
 from utils import safe_startfile
 
-try:
-    import fitz
+fitz = None
+HAS_FITZ = importlib.util.find_spec("fitz") is not None
 
-    HAS_FITZ = True
-except ImportError:
-    fitz = None
-    HAS_FITZ = False
+
+def load_pdf_engine():
+    """Resolve the native PDF runtime only when a PDF is actually opened."""
+    global fitz, HAS_FITZ
+    if fitz is None and HAS_FITZ:
+        try:
+            fitz = importlib.import_module("fitz")
+        except (ImportError, OSError):
+            HAS_FITZ = False
+    return fitz
 
 
 class PanScrollArea(QScrollArea):
@@ -215,7 +223,7 @@ class PdfViewerWidget(QWidget):
         return self._current_path
 
     def load_pdf(self, file_path: str, page_index=0, zoom_index=None):
-        if not HAS_FITZ:
+        if load_pdf_engine() is None:
             self.show_error("PDF preview requires PyMuPDF. Install the PyMuPDF package.")
             return False
         file_path = os.path.abspath(os.path.normpath(str(file_path or "").strip()))

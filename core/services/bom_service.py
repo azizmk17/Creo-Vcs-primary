@@ -15,6 +15,8 @@ from core.repositories.bom_folder_repository import BomFolderRepository
 from core.repositories.bom_filter_repository import BomFilterRepository
 from core.repositories.bom_revision_repository import BomRevisionRepository
 from core.repositories.part_file_repository import PartFileRepository
+from core.repositories.pdm_repository import PdmRepository
+from core.service_resources import ServiceResources
 from core.session_manager import SessionManager
 from config import DB_NAME
 
@@ -47,15 +49,21 @@ class BomService(BaseService):
         self.children_repo = children_repo
         self.lock_repo = lock_repo
         self.signature_repo = signature_repo
-        self.permission_repo = PermissionRepository()
-        self.folder_repo = BomFolderRepository()
-        self.filter_repo = BomFilterRepository()
-        self.revision_repo = BomRevisionRepository()
-        self.ebom_service = EbomService()
+        self.resources = ServiceResources(
+            db_name=getattr(bom_repo, "db_name", DB_NAME),
+            repositories={BomRepository: bom_repo, BomChildrenRepository: children_repo,
+                          LockRepository: lock_repo, SignatureRepository: signature_repo},
+        )
+        repository = self.resources.repository
+        self.permission_repo = repository(PermissionRepository)
+        self.folder_repo = repository(BomFolderRepository)
+        self.filter_repo = repository(BomFilterRepository)
+        self.revision_repo = repository(BomRevisionRepository)
+        self.ebom_service = EbomService(db_name=self.resources.db_name, revision_repo=self.revision_repo)
         self.ebom_export_service = EbomExportService(self.ebom_service)
-        self.release_validation_service = ReleaseValidationService()
-        self.pdm_service = PdmService()
-        self.part_file_repo = PartFileRepository()
+        self.release_validation_service = ReleaseValidationService(db_name=self.resources.db_name, revision_repo=self.revision_repo)
+        self.pdm_service = PdmService(db_name=self.resources.db_name, repository=repository(PdmRepository))
+        self.part_file_repo = repository(PartFileRepository)
         self.session = SessionManager()
         self._tree_cache: dict = {}    # project_id -> tree dict
         self._tree_dirty: set = set()  # project_ids that need re-fetch
@@ -3055,6 +3063,21 @@ class BomService(BaseService):
                 collect(row.get("children") or [])
 
         collect(structure.get("roots") or [])
+        self._enrich_ebom_rows(nodes, project_id)
+        return structure
+
+    def get_released_ebom_roots(self, project_id=None, *, offset=0):
+        project_id = int(project_id or self.session.project_id)
+        return self.get_released_ebom_level(project_id, offset=offset)
+
+    def get_released_ebom_level(self, project_id, parent=None, *, offset=0):
+        structure = self.pdm_service.get_item_structure_level(
+            int(project_id), parent, offset=offset,
+        )
+        self._enrich_ebom_rows(structure["roots"], int(project_id))
+        return structure
+
+    def _enrich_ebom_rows(self, nodes, project_id):
         item_ids = {
             int(row.get("bom_id") or row.get("id"))
             for row in nodes
@@ -3100,7 +3123,7 @@ class BomService(BaseService):
             row["category_names"] = list(category_map.get(item_id, []))
             row["variant_names"] = list(variant_map.get(item_id, []))
             row["drw_revision"] = drw_revision_map.get(item_id, "")
-        return structure
+        return nodes
 
     # -------------------------------
     # PDM CAD DOCUMENT / ITEM DOMAIN

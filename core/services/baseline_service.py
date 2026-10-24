@@ -24,13 +24,14 @@ class BaselineService(BaseService):
         bom_repo: Optional[BomRepository] = None,
         bom_children_repo: Optional[BomChildrenRepository] = None,
         part_file_service: Optional[PartFileService] = None,
+        revision_repo: Optional[BomRevisionRepository] = None,
     ):
         super().__init__()
         self.baseline_repo = baseline_repo or BaselineRepository()
         self.baseline_file_repo = baseline_file_repo or BaselineFileRepository()
         self.bom_repo = bom_repo or BomRepository()
         self.children_repo = bom_children_repo or BomChildrenRepository()
-        self.revision_repo = BomRevisionRepository()
+        self.revision_repo = revision_repo or BomRevisionRepository()
         self.part_file_service = part_file_service or PartFileService()
         self.ebom_service = EbomService(
             db_name=getattr(self.revision_repo, "db_name", DB_NAME)

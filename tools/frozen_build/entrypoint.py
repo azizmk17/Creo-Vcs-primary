@@ -12,6 +12,8 @@ from pathlib import Path
 
 
 def main() -> int:
+    from core.startup_profile import mark
+    mark("frozen_entry")
     if Path(sys.executable).stem.casefold() == "setup":
         from core.updates.trust import release_public_key
         public = release_public_key()
@@ -29,6 +31,17 @@ def main() -> int:
             root=installed_root_for_executable(),
             feed=str(read_settings().get("feed") or ""),
         )
+    if "--performance-benchmark" in sys.argv[1:]:
+        if os.environ.get("NEXUS_ENABLE_PERF_BENCHMARK") != "1":
+            raise SystemExit(
+                "Performance benchmark mode is disabled. Set "
+                "NEXUS_ENABLE_PERF_BENCHMARK=1 for an isolated benchmark run."
+            )
+        index = sys.argv.index("--performance-benchmark")
+        sys.argv = [sys.argv[0], *sys.argv[index + 1:]]
+        from tools.benchmark_project_loading import main as benchmark_main
+        benchmark_main()
+        return 0
     if "--packaging-smoke" in sys.argv[1:]:
         index = sys.argv.index("--packaging-smoke")
         if index + 1 >= len(sys.argv) or sys.argv[index + 1].startswith("--"):

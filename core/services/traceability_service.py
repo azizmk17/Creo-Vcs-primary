@@ -11,16 +11,18 @@ from core.repositories.issue_repository import IssueRepository
 from core.repositories.traceability_repository import TraceabilityRepository
 from core.services.base_service import BaseService
 from core.services.part_file_service import PartFileService
+from core.service_resources import ServiceResources
 
 
 class TraceabilityService(BaseService):
     """Application service for engineering traceability links and reports."""
 
-    def __init__(self, repo: Optional[TraceabilityRepository] = None):
+    def __init__(self, repo: Optional[TraceabilityRepository] = None, *, resources=None):
         super().__init__()
-        self.repo = repo or TraceabilityRepository()
-        self.issue_repo = IssueRepository()
-        self.part_file_service = PartFileService()
+        self.resources = resources or ServiceResources()
+        self.repo = repo or self.resources.repository(TraceabilityRepository)
+        self.issue_repo = self.resources.repository(IssueRepository)
+        self.part_file_service = PartFileService(resources=self.resources)
 
     def link_jira(self, issue_id: int, jira_key: str = "", jira_url: str = "",
                   jira_summary: str = "", jira_status: str = "") -> int:

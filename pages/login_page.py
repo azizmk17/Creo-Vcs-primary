@@ -1,7 +1,7 @@
 import os
 import sys
 
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import (
     QFormLayout,
@@ -12,6 +12,7 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QVBoxLayout,
     QWidget,
+    QApplication,
 )
 
 from core.repositories.user_repository import UserRepository
@@ -37,6 +38,15 @@ class LoginPage(QWidget):
         self.project_service = ProjectService()
         self.session = SessionManager()
         self.init_ui()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not getattr(self, "_startup_paint_logged", False):
+            self._startup_paint_logged = True
+            from core.startup_profile import mark, stop_at_login
+            mark("login_painted", flush=True)
+            if stop_at_login():
+                QTimer.singleShot(0, QApplication.instance().quit)
 
     def init_ui(self):
         self.setObjectName("loginPage")

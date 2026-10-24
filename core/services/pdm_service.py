@@ -507,6 +507,74 @@ class PdmService:
                 })
         return {"root": root, "status": "COMPARED", "rows": rows}
 
+    @staticmethod
+    def _visible_item_sql(alias):
+        return (f"{alias}.represented_part_id IS NULL AND {alias}.deleted_at IS NULL "
+                f"AND lower(COALESCE({alias}.status,''))<>'deleted' "
+                f"AND lower(COALESCE({alias}.lifecycle_state,''))<>'deleted'")
+
+    def get_item_structure_level(self, project_id, parent=None, *, offset=0, limit=200):
+        """Read a bounded level; keep the complete-tree API for exports/reports.
+
+        Parent context describes one occurrence, so reused assemblies retain their
+        own effective quantities and ancestor paths. Every relationship is scoped
+        through live Items belonging to this project.
+        """
+        project_id, offset, limit = int(project_id), max(0, int(offset)), min(500, max(1, int(limit)))
+        visible = self._visible_item_sql("b")
+        has_children = (
+            "EXISTS(SELECT 1 FROM item_usages kids JOIN bom kid ON kid.id=kids.child_item_id "
+            "WHERE kids.parent_item_id=b.id AND kids.project_id=b.project_id "
+            "AND kid.project_id=b.project_id AND " + self._visible_item_sql("kid") + ") AS _has_children"
+        )
+        with self.repo.get_conn() as conn:
+            if parent is None:
+                rows = conn.execute(
+                    f"""SELECT b.*,{has_children} FROM bom b
+                        WHERE b.project_id=? AND {visible} AND NOT EXISTS(
+                          SELECT 1 FROM item_usages u JOIN bom p ON p.id=u.parent_item_id
+                          WHERE u.child_item_id=b.id AND u.project_id=b.project_id
+                            AND p.project_id=b.project_id AND {self._visible_item_sql('p')})
+                        ORDER BY COALESCE(b.sort_order,b.id),b.id LIMIT ? OFFSET ?""",
+                    (project_id, limit + 1, offset),
+                ).fetchall()
+            else:
+                parent_id = int(parent.get("bom_id") or parent.get("id"))
+                rows = conn.execute(
+                    f"""SELECT b.*,{has_children},u.id AS item_usage_id,
+                               u.parent_item_id AS effective_parent_bom_id,
+                               u.quantity AS source_quantity,u.source AS usage_source
+                        FROM item_usages u JOIN bom b ON b.id=u.child_item_id
+                        JOIN bom p ON p.id=u.parent_item_id
+                        WHERE u.project_id=? AND u.parent_item_id=?
+                          AND b.project_id=u.project_id AND p.project_id=u.project_id
+                          AND {visible} AND {self._visible_item_sql('p')}
+                        ORDER BY COALESCE(u.sort_order,u.id),u.id LIMIT ? OFFSET ?""",
+                    (project_id, parent_id, limit + 1, offset),
+                ).fetchall()
+        nodes = []
+        ancestors = list((parent or {}).get("_ancestor_ids") or [])
+        if parent is not None:
+            ancestors.append(int(parent.get("bom_id") or parent.get("id")))
+        for row in rows[:limit]:
+            item = dict(row)
+            if int(item["id"]) in ancestors:
+                raise ValueError("Circular persisted Item structure detected.")
+            quantity = max(1, int(item.get("source_quantity") or 1))
+            item.update(
+                bom_id=int(item["id"]), children=[], _children_deferred=bool(item["_has_children"]),
+                _ancestor_ids=ancestors, source_quantity=quantity,
+                effective_quantity=quantity * int((parent or {}).get("effective_quantity") or 1),
+                level=int(parent.get("level") or 0) + 1 if parent is not None else 0,
+                state=str(item.get("lifecycle_state") or item.get("status") or ""),
+                version_label=str(item.get("revision") or "A"),
+                source=item.get("usage_source") or "ROOT",
+            )
+            nodes.append(item)
+        return {"project_id": project_id, "roots": nodes, "has_more": len(rows) > limit,
+                "next_offset": offset + len(nodes), "paged": True,
+                "source": "PERSISTED_ITEM_STRUCTURE"}
+
     def get_item_structure_project(self, project_id: int) -> dict:
         """Return persisted EBOM in the shape consumed by the existing tree UI."""
         with self.repo.get_conn() as conn:

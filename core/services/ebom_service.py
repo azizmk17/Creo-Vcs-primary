@@ -23,11 +23,11 @@ class EbomResolver:
 
     MAX_DEPTH = 100
 
-    def __init__(self, db_name=DB_NAME):
+    def __init__(self, db_name=DB_NAME, revision_repo=None):
         self.db_name = db_name
         # Keep direct use in tests/tools compatible with databases opened before
         # the application migration runner.
-        self.revision_repo = BomRevisionRepository(db_name)
+        self.revision_repo = revision_repo or BomRevisionRepository(db_name)
 
     def get_conn(self):
         conn = sqlite3.connect(self.db_name)
@@ -715,8 +715,8 @@ class EbomResolver:
 
 
 class EbomService:
-    def __init__(self, resolver=None, db_name=DB_NAME):
-        self.resolver = resolver or EbomResolver(db_name)
+    def __init__(self, resolver=None, db_name=DB_NAME, revision_repo=None):
+        self.resolver = resolver or EbomResolver(db_name, revision_repo=revision_repo)
 
     def resolve_iteration(self, iteration_id: int) -> dict:
         return self.resolver.resolve_iteration(int(iteration_id))

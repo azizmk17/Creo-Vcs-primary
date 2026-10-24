@@ -1,0 +1,170 @@
+{
+  "comparison": "4.4.0 vs 4.5.0, both native Python",
+  "python_version": "3.10.19",
+  "dataset_id": "849daff07622434d9a714642b2fece70",
+  "project_id": 8,
+  "fixture": "BENCHMARK - Company 11000 (10,000 parts, 1,000 assemblies)",
+  "metrics": {
+    "startup_to_login_paint_seconds": {
+      "label": "first login paint",
+      "4.4.0": {
+        "median_seconds": 0.818183,
+        "range_seconds": [
+          0.663733,
+          1.681429
+        ],
+        "runs": 3
+      },
+      "4.5.0": {
+        "median_seconds": 0.521471,
+        "range_seconds": [
+          0.439378,
+          0.577814
+        ],
+        "runs": 3
+      },
+      "4.5_vs_4.4_speed_change_percent": 36.26474761758677
+    },
+    "service_setup_seconds": {
+      "label": "service setup",
+      "4.4.0": {
+        "median_seconds": 0.6901159000117332,
+        "range_seconds": [
+          0.6609700999688357,
+          0.9787726999493316
+        ],
+        "runs": 3
+      },
+      "4.5.0": {
+        "median_seconds": 0.2053626999258995,
+        "range_seconds": [
+          0.2001372000668198,
+          0.2576374999480322
+        ],
+        "runs": 9
+      },
+      "4.5_vs_4.4_speed_change_percent": 70.24228829934103
+    },
+    "structure_worker_seconds": {
+      "label": "EBOM structure worker",
+      "4.4.0": {
+        "median_seconds": 0.2690269999438897,
+        "range_seconds": [
+          0.23931169998832047,
+          0.28660300001502037
+        ],
+        "runs": 3
+      },
+      "4.5.0": {
+        "median_seconds": 0.18249449995346367,
+        "range_seconds": [
+          0.17949150002095848,
+          0.19694589998107404
+        ],
+        "runs": 9
+      },
+      "4.5_vs_4.4_speed_change_percent": 32.164987160572686
+    },
+    "bom_widget_setup_seconds": {
+      "label": "BOM widget setup",
+      "4.4.0": {
+        "median_seconds": 1.8427578000118956,
+        "range_seconds": [
+          1.7826183999422938,
+          1.9307181999320164
+        ],
+        "runs": 3
+      },
+      "4.5.0": {
+        "median_seconds": 0.28034149995073676,
+        "range_seconds": [
+          0.2746971999295056,
+          0.5011112000793219
+        ],
+        "runs": 9
+      },
+      "4.5_vs_4.4_speed_change_percent": 84.78685045050808
+    },
+    "initial_row_creation_seconds": {
+      "label": "initial BOM row rendering",
+      "4.4.0": {
+        "median_seconds": 0.5221691000042483,
+        "range_seconds": [
+          0.5005240000318736,
+          0.5431128999916837
+        ],
+        "runs": 3
+      },
+      "4.5.0": {
+        "median_seconds": 0.4350702000083402,
+        "range_seconds": [
+          0.42813840007875115,
+          0.45559309993404895
+        ],
+        "runs": 9
+      },
+      "4.5_vs_4.4_speed_change_percent": 16.680209532735564
+    },
+    "file_sync_seconds": {
+      "label": "file synchronization",
+      "4.4.0": {
+        "median_seconds": 1.6890732999891043,
+        "range_seconds": [
+          1.6790170000167564,
+          2.4713698000414297
+        ],
+        "runs": 3
+      },
+      "4.5.0": {
+        "median_seconds": 1.3860048999777064,
+        "range_seconds": [
+          1.3460490999277681,
+          1.531734799966216
+        ],
+        "runs": 9
+      },
+      "4.5_vs_4.4_speed_change_percent": 17.94288027721194
+    },
+    "working_directory_check_seconds": {
+      "label": "working-directory integrity check",
+      "4.4.0": {
+        "median_seconds": 0.38012550002895296,
+        "range_seconds": [
+          0.3764607000630349,
+          0.38231929996982217
+        ],
+        "runs": 3
+      },
+      "4.5.0": {
+        "median_seconds": 1.1861562000121921,
+        "range_seconds": [
+          1.143014199915342,
+          1.2659947000211105
+        ],
+        "runs": 9
+      },
+      "4.5_vs_4.4_speed_change_percent": -212.04331199086783
+    }
+  },
+  "source_reports": {
+    "4.4.0": [
+      "company_11000_after_1.json",
+      "company_11000_after_2.json",
+      "company_11000_after_3.json",
+      "startup_source_before.json"
+    ],
+    "4.5.0": [
+      "company_11000_source_full_2.json",
+      "company_11000_source_full_3.json",
+      "company_11000_source_full_4.json",
+      "company_11000_source_full_5.json",
+      "company_11000_source_full_6.json",
+      "company_11000_source_full_7.json",
+      "company_11000_source_full_8.json",
+      "company_11000_source_full_9.json",
+      "company_11000_source_full_10.json",
+      "startup_comparison_native.json"
+    ]
+  },
+  "notes": "Calculated only from existing raw reports; no tests or benchmarks were run for this comparison. Ratios compare elapsed time only; measurement scripts and warm-cache state differed between the saved test batches. Positive percentages mean the 4.5.0 median was faster."
+}

@@ -1,0 +1,56 @@
+{
+  "app_version": "4.4.0",
+  "dataset_id": "849daff07622434d9a714642b2fece70",
+  "runs": 3,
+  "scope": "Disposable DB copy; local warm-cache component timings; hidden Qt widget row creation, not complete interactive startup.",
+  "company_database_unchanged": true,
+  "initial_payload_item_occurrences": 10,
+  "initial_payload_documents": 0,
+  "timings": {
+    "service_setup_seconds": {
+      "median": 0.6901159000117332,
+      "min": 0.6609700999688357,
+      "max": 0.9787726999493316
+    },
+    "bom_widget_setup_seconds": {
+      "median": 1.8427578000118956,
+      "min": 1.7826183999422938,
+      "max": 1.9307181999320164
+    },
+    "structure_worker_seconds": {
+      "median": 0.2690269999438897,
+      "min": 0.23931169998832047,
+      "max": 0.28660300001502037
+    },
+    "initial_row_creation_seconds": {
+      "median": 0.5221691000042483,
+      "min": 0.5005240000318736,
+      "max": 0.5431128999916837
+    },
+    "file_sync_seconds": {
+      "median": 1.6890732999891043,
+      "min": 1.6790170000167564,
+      "max": 2.4713698000414297
+    },
+    "working_directory_check_seconds": {
+      "median": 0.38012550002895296,
+      "min": 0.3764607000630349,
+      "max": 0.38231929996982217
+    }
+  },
+  "file_sync_rows_checked": [
+    11000,
+    11000,
+    11000
+  ],
+  "file_sync_write_calls": [
+    0,
+    0,
+    0
+  ],
+  "file_sync_timed_out": [
+    false,
+    false,
+    false
+  ]
+}

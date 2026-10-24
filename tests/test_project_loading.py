@@ -233,7 +233,7 @@ class ProjectShellIntegrationTests(unittest.TestCase):
             release.wait(5)
             return {"roots": []}
 
-        with patch.object(page.bom_service, "get_released_ebom_project", side_effect=slow_ebom) as query, \
+        with patch.object(page.bom_service, "get_released_ebom_roots", side_effect=slow_ebom) as query, \
                 patch("pages.bom_page.DiagService.sync_bom_files", return_value=[]), \
                 patch("pages.bom_page.DiagService.check_working_directory", return_value=[]):
             self.app.processEvents()
@@ -260,7 +260,7 @@ class ProjectShellIntegrationTests(unittest.TestCase):
         self.session.update_project(13)
         self.window = BomGUI()
         page = self.window.bom_page
-        with patch.object(page.bom_service, "get_released_ebom_project", side_effect=OSError("share unavailable")), \
+        with patch.object(page.bom_service, "get_released_ebom_roots", side_effect=OSError("share unavailable")), \
                 patch("pages.bom_page.DiagService.sync_bom_files", return_value=[]), \
                 patch("pages.bom_page.DiagService.check_working_directory", return_value=[]), \
                 patch.object(page, "show_alert") as alert:
@@ -300,7 +300,7 @@ class ProjectShellIntegrationTests(unittest.TestCase):
                 return {"roots": [{"id": 101, "bom_id": 101, "name": "Old Item"}]}
             return {"roots": []}
 
-        with patch.object(self.window.bom_service, "get_released_ebom_project", side_effect=slow_ebom), \
+        with patch.object(self.window.bom_service, "get_released_ebom_roots", side_effect=slow_ebom), \
                 patch("pages.bom_page.DiagService.sync_bom_files", return_value=[]), \
                 patch("pages.bom_page.DiagService.check_working_directory", return_value=[]):
             self.window.show()
@@ -322,13 +322,13 @@ class ProjectShellIntegrationTests(unittest.TestCase):
         self.session.update_project(13)
         self.window = BomGUI()
         page = self.window.bom_page
-        with patch.object(page.bom_service, "get_released_ebom_project", side_effect=OSError("share unavailable")), \
+        with patch.object(page.bom_service, "get_released_ebom_roots", side_effect=OSError("share unavailable")), \
                 patch("pages.bom_page.DiagService.sync_bom_files", return_value=[]), \
                 patch("pages.bom_page.DiagService.check_working_directory", return_value=[]):
             self.window.show()
             self.wait_until(lambda: page.initial_tree_is_ready)
             self.assertEqual(page._structure_error, "share unavailable")
-        with patch.object(page.bom_service, "get_released_ebom_project", return_value={"roots": []}):
+        with patch.object(page.bom_service, "get_released_ebom_roots", return_value={"roots": []}):
             page._load_released_ebom_tree()
             self.wait_until(lambda: not page._structure_loading)
             self.assertIsNone(page._structure_error)
@@ -372,7 +372,7 @@ class ProjectShellIntegrationTests(unittest.TestCase):
             release.wait(5)
             return {"roots": []}
 
-        with patch.object(self.window.bom_service, "get_released_ebom_project", side_effect=slow_ebom), \
+        with patch.object(self.window.bom_service, "get_released_ebom_roots", side_effect=slow_ebom), \
                 patch("pages.bom_page.DiagService.sync_bom_files", return_value=[]), \
                 patch("pages.bom_page.DiagService.check_working_directory", return_value=[]):
             self.window.show()

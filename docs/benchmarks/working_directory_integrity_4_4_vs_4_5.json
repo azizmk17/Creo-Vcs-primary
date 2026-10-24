@@ -1,0 +1,68 @@
+{
+  "app_version": "4.5.0",
+  "runtime": "native Python",
+  "python_version": "3.10.19",
+  "project_id": 8,
+  "dataset_id": "849daff07622434d9a714642b2fece70",
+  "fixture": "BENCHMARK - Company 11000",
+  "scope": "Integrity check only; no file synchronization, BOM GUI, or metadata updates. Each run uses the same disposable SQLite copy and reads the same working directory.",
+  "4.4.0_saved_baseline": {
+    "runs": 3,
+    "median_seconds": 0.38012550002895296,
+    "range_seconds": [
+      0.3764607000630349,
+      0.38231929996982217
+    ],
+    "source_reports": [
+      "company_11000_after_1.json",
+      "company_11000_after_2.json",
+      "company_11000_after_3.json"
+    ]
+  },
+  "4.5.0_integrity_only": {
+    "runs": 5,
+    "standalone_total_including_index_median_seconds": 1.2135372000047937,
+    "standalone_total_including_index_range_seconds": [
+      1.1756046999944374,
+      1.2799355000024661
+    ],
+    "inventory_build_median_seconds": 0.27579929993953556,
+    "inventory_build_range_seconds": [
+      0.26566880010068417,
+      0.3036605999805033
+    ],
+    "check_with_reused_inventory_median_seconds": 0.8887094999663532,
+    "check_with_reused_inventory_range_seconds": [
+      0.8592109000310302,
+      1.3032246000366285
+    ],
+    "app_style_combined_pass_median_seconds": 1.1629630998941138,
+    "app_style_combined_pass_range_seconds": [
+      1.1248797001317143,
+      1.579023899976164
+    ],
+    "standalone_samples_seconds": [
+      1.2799355000024661,
+      1.2135372000047937,
+      1.1765883000334725,
+      1.1756046999944374,
+      1.2344848000211641
+    ],
+    "inventory_samples_seconds": [
+      0.27579929993953556,
+      0.2925608999794349,
+      0.3036605999805033,
+      0.26566880010068417,
+      0.27425359992776066
+    ],
+    "reused_check_samples_seconds": [
+      1.3032246000366285,
+      0.8612155000446364,
+      1.0125102999154478,
+      0.8592109000310302,
+      0.8887094999663532
+    ]
+  },
+  "source_database_sha256_unchanged": true,
+  "measurement_note": "4.4.0 source is not present in the workspace, so its existing native-Python measurements are reused rather than rerun."
+}

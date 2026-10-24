@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import struct
 import subprocess
@@ -206,6 +207,7 @@ def release_manifest(version, smoke_reports, public_key=None, bootstrap_reports=
 
 
 def main(argv=None):
+    global BUILD, RELEASE
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--python", help="Build with this pyoccenv python.exe")
     parser.add_argument("--release-public-key", help="Public update verification key file (never the private key)")
@@ -214,7 +216,13 @@ def main(argv=None):
     parser.add_argument("--install-build-tools", action="store_true", help="Install PyInstaller 6 in the selected environment")
     parser.add_argument("--no-smoke-test", action="store_true", help="Skip packaged PDF/STEP/Qt checks")
     parser.add_argument("--smoke-opengl", action="store_true", help="Also exercise a real OCC OpenGL viewport")
+    parser.add_argument("--profile-build", help="Isolated build under build/profiles/NAME; leaves dist/Nexus untouched")
     args = parser.parse_args(argv)
+    if args.profile_build:
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,48}", args.profile_build):
+            parser.error("Profile build name must contain only letters, digits, underscores and hyphens")
+        BUILD = workspace_path(ROOT / "build" / "profiles" / args.profile_build)
+        RELEASE = BUILD / "dist" / "Nexus"
     if args.python:
         requested = Path(args.python).resolve()
         if not requested.is_file():
@@ -251,9 +259,13 @@ def main(argv=None):
     env["NEXUS_VERSION_FILE"] = str(version_file)
     env["NEXUS_GENERATED_DIR"] = str(generated)
     env["PATH"] = os.pathsep.join(native_library_search_paths() + [env.get("PATH", "")])
-    print("Building Nexus, CADViewer and Setup; native DLLs are shared. See build/folder/logs/pyinstaller.log for progress.", flush=True)
+    print(
+        "Building Nexus, CADViewer and Setup; native DLLs are shared. "
+        f"See {BUILD / 'logs' / 'pyinstaller.log'} for progress.",
+        flush=True,
+    )
     checked_run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
-                 "--distpath", ROOT / "dist", "--workpath", BUILD / "pyinstaller",
+                 "--distpath", RELEASE.parent, "--workpath", BUILD / "pyinstaller",
                  ROOT / "tools" / "frozen_build" / "nexus_folder.spec"], BUILD / "logs" / "pyinstaller.log", env=env)
     print("Building the lightweight local launcher and updater...", flush=True)
     checked_run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",

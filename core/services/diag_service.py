@@ -6,6 +6,8 @@ from core.repositories.snapshot_repository import SnapshotRepository
 from core.repositories.bom_repository import BomRepository
 from core.repositories.pdm_repository import PdmRepository
 from core.services.pdm_service import PdmService
+from core.working_directory_inventory import WorkingDirectoryInventory
+from core.service_resources import ServiceResources
 
 import re
 import json
@@ -16,14 +18,16 @@ from utils import (
 from core.services.permission_decorators import require_permission
 
 class DiagService:
-    def __init__(self):
+    def __init__(self, *, resources=None):
 
         self.session = SessionManager()
-        self.repo = CommitRepository()
-        self.snap_repo = SnapshotRepository()
-        self.bom_repo = BomRepository()
-        self.pdm_repo = PdmRepository()
-        self.pdm_service = PdmService(repository=self.pdm_repo)
+        self.resources = resources or ServiceResources()
+        repository = self.resources.repository
+        self.repo = repository(CommitRepository)
+        self.snap_repo = repository(SnapshotRepository)
+        self.bom_repo = repository(BomRepository)
+        self.pdm_repo = repository(PdmRepository)
+        self.pdm_service = PdmService(db_name=self.resources.db_name, repository=self.pdm_repo)
 
     @staticmethod
     def _creo_base_name(filename: str) -> str:
@@ -53,15 +57,12 @@ class DiagService:
             db_name = getattr(self.bom_repo, "db_name", None)
             pdm_repo = PdmRepository(db_name) if db_name else PdmRepository()
             self.pdm_repo = pdm_repo
-        return {
-            pdm_repo.normalize_base(
-                row.get("file_name") or row.get("base_file_name")
-            )
-            for row in pdm_repo.list_cad_documents(
-                int(self.session.project_id)
-            )
-            if row.get("file_name") or row.get("base_file_name")
-        }
+        with pdm_repo.get_conn() as conn:
+            rows = conn.execute(
+                "SELECT file_name,base_file_name FROM cad_documents WHERE project_id=?",
+                (int(self.session.project_id),),
+            ).fetchall()
+        return {pdm_repo.normalize_base(row[0] or row[1]) for row in rows if row[0] or row[1]}
 
     @require_permission("merge")
     def assign_cad_dependencies(self, owner_bom_id: int, filenames) -> int:
@@ -248,10 +249,14 @@ class DiagService:
         }
 
 
-    def check_working_directory(self, working_dir, *, cancel_cb=None):
+    def check_working_directory(self, working_dir, *, cancel_cb=None, inventory=None):
         if not working_dir or not os.path.isdir(working_dir):
             return []
-        working_files = self.list_working_parts(working_dir)
+        try:
+            inventory = inventory or WorkingDirectoryInventory(working_dir, cancel_cb=cancel_cb)
+        except InterruptedError:
+            return []
+        working_files = [name for name in inventory.names if is_creo_file(name)]
         approved_commits = self.repo.get_by_status("Approved",self.session.project_id)
         
 
@@ -259,13 +264,15 @@ class DiagService:
 
 
         last_snapshot = self.snap_repo.get_last_snapshot(self.session.project_id)
-        print(f'last snapshot: {last_snapshot}')
         if not last_snapshot:
             return "error_no_snapshot"
         last_snapshot_data_files = json.loads(last_snapshot['snapshot_data'])['files']
-        snap_files = []
-        for item in last_snapshot_data_files:
-            snap_files.append(item['filename'])
+        snap_files = {item['filename'] for item in last_snapshot_data_files}
+        approved_files = {
+            str(c.base_file_name) + "." + str(c.approved_version)
+            for c in approved_commits
+            if c.last_snapshot == "None" or c.last_snapshot != last_snapshot_id
+        }
 
         # NEW: allow files that were force-integrated (treated as "legal" in working dir)
         try:
@@ -298,13 +305,7 @@ class DiagService:
             if part in snap_files:
                 continue
             else:
-                is_committed = False
-                for c in approved_commits:
-                    approved_filename = c.base_file_name + "." + c.approved_version
-                    #print(f"‼️ approved filename to be tested : {approved_filename}")
-                    if approved_filename == part and (c.last_snapshot == "None" or c.last_snapshot != last_snapshot_id):
-                        is_committed = True
-                        break
+                is_committed = part in approved_files
                 if is_committed:
                     print(f'part : {part} Matches approved commit')
                     #results.append((part, "✅ Up-to-date", "Matches approved commit"))
@@ -494,13 +495,15 @@ class DiagService:
         return results
     
 
-    def _sync_bom_record(self, working_dir, bom, files_in_dir=None, force_integrated_filenames=None):
+    def _sync_bom_record(self, working_dir, bom, files_in_dir=None, force_integrated_filenames=None,
+                         *, inventory=None, metadata_updates=None):
         """Check missing/outdated files for one BOM row and keep base names in sync."""
-        if not bom or not working_dir or not os.path.isdir(working_dir):
+        if not bom or not working_dir:
             return []
-
-        if files_in_dir is None:
-            files_in_dir = os.listdir(working_dir)
+        if inventory is None:
+            if not os.path.isdir(working_dir):
+                return []
+            inventory = WorkingDirectoryInventory(working_dir)
         if force_integrated_filenames is None:
             try:
                 force_integrated_filenames = set(self.repo.get_forced_integrated_filenames(self.session.project_id) or [])
@@ -512,41 +515,39 @@ class DiagService:
         base_drw_name = None
 
         if bom.filename:
-            base_file_name = os.path.splitext(bom.filename)[0]
-            filename_path = os.path.join(working_dir, bom.filename)
-            if not os.path.exists(filename_path):
-                print(f' Filename {bom.filename} does not exist in working directory.')
+            base_file_name = self._creo_base_name(bom.filename)
+            if not inventory.exists(bom.filename):
                 result.append((bom.id, 'missing_file', bom.filename))
             else:
-                matching_files = [f for f in files_in_dir if f.startswith(base_file_name + ".")]
-                if matching_files:
-                    versions = [f.split(".")[-1] for f in matching_files]
-                    last_version = sorted(versions)[-1]
-                    if bom.filename.split(".")[-1] < last_version and bom.filename not in force_integrated_filenames:
-                        print(f' Filename {bom.filename} is not the latest version in working directory.')
-                        result.append((bom.id, 'outdated_file', bom.filename))
+                suffix = bom.filename.rsplit(".", 1)[-1]
+                if (suffix.isdigit() and int(suffix) < inventory.latest_version(base_file_name)
+                        and bom.filename not in force_integrated_filenames):
+                    result.append((bom.id, 'outdated_file', bom.filename))
 
         if bom.drawing:
-            base_drw_name = os.path.splitext(bom.drawing)[0]
-            drawing_path = os.path.join(working_dir, bom.drawing)
-            if not os.path.exists(drawing_path):
-                print(f' Drawing {bom.drawing} does not exist in working directory.')
+            base_drw_name = self._creo_base_name(bom.drawing)
+            if not inventory.exists(bom.drawing):
                 result.append((bom.id, 'missing_drawing', bom.drawing))
 
         if getattr(bom, "pdf_path", None):
             pdf_path = bom.pdf_path
-            pdf_full_path = pdf_path if os.path.isabs(pdf_path) else os.path.join(working_dir, pdf_path)
-            if not os.path.exists(pdf_full_path):
+            if not inventory.exists(pdf_path):
                 result.append((bom.id, 'missing_pdf', pdf_path))
 
         if getattr(bom, "step_path", None):
             step_path = bom.step_path
-            step_full_path = step_path if os.path.isabs(step_path) else os.path.join(working_dir, step_path)
-            if not os.path.exists(step_full_path):
+            if not inventory.exists(step_path):
                 result.append((bom.id, 'missing_step', step_path))
 
-        if base_file_name or base_drw_name:
-            self.bom_repo.update_bom_file_names(bom.id, base_file_name, base_drw_name, self.session.project_id)
+        if ((base_file_name or base_drw_name)
+                and (base_file_name != bom.base_file_name or base_drw_name != bom.base_drw_name)):
+            if metadata_updates is None:
+                self.bom_repo.update_bom_file_names_batch(
+                    [(bom.id, bom.filename, bom.drawing, base_file_name, base_drw_name)],
+                    self.session.project_id,
+                )
+            else:
+                metadata_updates.append((bom.id, bom.filename, bom.drawing, base_file_name, base_drw_name))
 
         return result
 
@@ -557,29 +558,40 @@ class DiagService:
         bom = self.bom_repo.get_by_id(int(bom_id))
         if not bom:
             return []
-        files_in_dir = os.listdir(working_dir)
         try:
             force_integrated_filenames = set(self.repo.get_forced_integrated_filenames(self.session.project_id) or [])
         except Exception:
             force_integrated_filenames = set()
-        return self._sync_bom_record(working_dir, bom, files_in_dir, force_integrated_filenames)
+        return self._sync_bom_record(working_dir, bom, force_integrated_filenames=force_integrated_filenames)
 
     # everytime the app refreshed the bom page check if the filename and drawing exists in the working directory and check if the update the base_file_name and base_drw_name columns in the commit table regarding to the filename and drawing columns in the bom table
-    def sync_bom_files(self, working_dir, *, cancel_cb=None):
+    def sync_bom_files(self, working_dir, *, cancel_cb=None, inventory=None):
+        if not working_dir or not os.path.isdir(working_dir):
+            return []
         try:
             force_integrated_filenames = set(self.repo.get_forced_integrated_filenames(self.session.project_id) or [])
         except Exception:
             force_integrated_filenames = set()
 
         #if the filname or the drawing name not exists in the working directory return a list or map of bom id with missing files
-        files_in_dir = os.listdir(working_dir)
+        try:
+            inventory = inventory or WorkingDirectoryInventory(working_dir, cancel_cb=cancel_cb)
+        except InterruptedError:
+            return []
 
         result = []
+        metadata_updates = []
         boms = self.bom_repo.get_all(self.session.project_id)
         for bom in boms:
             if cancel_cb and cancel_cb():
                 return []
-            result.extend(self._sync_bom_record(working_dir, bom, files_in_dir, force_integrated_filenames))
+            result.extend(self._sync_bom_record(
+                working_dir, bom, force_integrated_filenames=force_integrated_filenames,
+                inventory=inventory, metadata_updates=metadata_updates,
+            ))
+
+        if metadata_updates and not (cancel_cb and cancel_cb()):
+            self.bom_repo.update_bom_file_names_batch(metadata_updates, self.session.project_id)
 
         return result
 

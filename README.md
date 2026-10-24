@@ -4,7 +4,9 @@
 > CAD Document, Item, association, CAD-to-EBOM build, supplier package, and
 > migration workflows.
 
-Nexus **4.3.0** opens the application shell before loading project structures and checking project files. Choose a **product** and **version**, then click **Load Project**; changing either selector does not load an intermediate version. The BOM panel displays a loader during structure queries and a separate status for background file checks. See [Startup and project loading](docs/project_loading.md) for the workflow and the proposed next performance improvements.
+Nexus **4.5.0** reuses repository initialization within a BOM service graph, defers diagnostics and optional BOM services until they are used, and loads the PDF engine only when opening a PDF. EBOM roots are loaded first and children are queried as you expand branches, in pages of 200 items. Choose a **product** and **version**, then click **Load Project**. See [Startup and project loading](docs/project_loading.md) and the [startup benchmark guide](docs/packaged_startup.md).
+
+For repeatable loading measurements, see the [large benchmark project guide](tools/README_benchmark_project.md). It describes the isolated 10,000-part / 1,000-assembly dataset, disk limits, and its synthetic CAD limitations.
 
 The graphical **Setup.exe** introduced in 4.2.0 remains included: users extract the complete folder, double-click Setup, and install without Command Prompt. Nexus also retains the BOM checkout cleanup introduced in 4.1.1, including remaining drawings after a 3D-only push, and includes [signed releases, managed updates, and workspace compatibility checks](README_RELEASE_UPDATES.md), alongside [shared master work and version-aware PDF/STEP status](docs/master_work_and_deliverables.md).
 

@@ -1,0 +1,21 @@
+{
+  "app_version": "4.4.0",
+  "project_id": 8,
+  "service_setup_seconds": 0.9787726999493316,
+  "python_version": "3.10.19",
+  "platform": "Windows-10-10.0.26200-SP0",
+  "dataset_id": "849daff07622434d9a714642b2fece70",
+  "structure_worker_seconds": 0.28660300001502037,
+  "initial_payload_item_occurrences": 10,
+  "initial_payload_documents": 0,
+  "bom_widget_setup_seconds": 1.8427578000118956,
+  "initial_row_creation_seconds": 0.5431128999916837,
+  "initial_root_rows": 10,
+  "file_sync_seconds": 1.6890732999891043,
+  "file_sync_rows_checked": 11000,
+  "file_sync_write_calls": 0,
+  "file_sync_findings": 0,
+  "file_sync_timed_out": false,
+  "working_directory_check_seconds": 0.38012550002895296,
+  "measurement_scope": "Disposable DB copy; local warm-cache component timings; hidden Qt widget row creation, not complete interactive startup."
+}

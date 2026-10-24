@@ -1356,6 +1356,26 @@ class BomRepository:
                 base_file_name, base_drw_name, id, project_id
             ))
 
+    def update_bom_file_names_batch(self, rows, project_id):
+        """Update changed metadata only; never overwrite a concurrent CAD change.
+
+        Rows contain id, source filename/drawing, and the two computed bases.
+        Short batches keep the shared SQLite writer available to other users.
+        """
+        rows = list(rows)
+        changed = 0
+        for offset in range(0, len(rows), 250):
+            with self.get_conn() as conn:
+                for item_id, filename, drawing, base_file, base_drawing in rows[offset:offset + 250]:
+                    changed += conn.execute(
+                        """UPDATE bom SET base_file_name=?,base_drw_name=?
+                           WHERE id=? AND project_id=? AND filename IS ? AND drawing IS ?
+                           AND (base_file_name IS NOT ? OR base_drw_name IS NOT ?)""",
+                        (base_file, base_drawing, item_id, int(project_id), filename,
+                         drawing, base_file, base_drawing),
+                    ).rowcount
+        return changed
+
     def clear_legacy_cad_links(self, bom_id: int) -> bool:
         """Clear legacy Item CAD fallback fields after PDM associations are removed."""
         with self.get_conn() as conn:

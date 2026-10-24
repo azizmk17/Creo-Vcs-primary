@@ -1,107 +1,155 @@
-# Startup and project loading — Nexus 4.3.0
+# Startup and project loading — Nexus 4.4.0
 
-## Choose the project and version together
+## Open a project
 
-1. Sign in. On the first login, Nexus opens without loading a default project.
-2. Select the **PRODUCT** in the top toolbar.
-3. Select the desired **VERSION**.
-4. Click **Load Project**.
+1. Sign in. The application shell opens before project structures/file checks.
+2. Select the **PRODUCT** and **VERSION** in the toolbar.
+3. Click **Load Project**. Selecting a dropdown alone starts no load.
+4. The BOM loader remains visible until the first root page is ready.
+5. Expand an assembly to fetch its direct children. A branch spinner shows while
+   that query runs. Expand **Load next 200 items…** for another page of roots or
+   children in a large level. A failed branch can be expanded again to retry.
 
-Selecting either dropdown only prepares the selection. It does not change the
-active project, scan its files, or load its first version. The header and current
-project label continue to describe the active project until Load Project is
-clicked. The button reads **Loaded** when the selectors match the active version.
+First login does not load a default version. Later logins can restore a valid,
+explicitly saved project/version. Commit Workspace, Issue Center and Manager
+Dashboard are still constructed on first use, as introduced in 4.3.0.
 
-On later logins, a valid, explicitly saved last project/version is restored.
-Nexus no longer chooses the project's `is_current` version as a first-login
-fallback. If the saved project is unavailable, choose an accessible project and
-version in the toolbar.
+## What changed in 4.4.0
 
-## What happens during startup
+The EBOM worker reads a maximum of 200 live roots and their display metadata.
+It does not read every descendant or every CAD Document before presenting the
+first page. A branch expansion queries only its next 200 direct children using
+the existing Item/usage indexes. Separate occurrences of reused subassemblies
+retain their own ancestor paths, levels and effective quantities. Circular
+structures are rejected during expansion.
 
-Workspace compatibility and sign-in remain required before opening the shell.
-There is no artificial four-second startup delay, and opening the shell no longer
-waits for the first BOM result.
+Each asynchronous request captures its project. Refreshing, switching projects,
+or closing cancels obsolete work and discards late results. CAD associations
+and drawings remain available through the existing Show CAD action. Opening
+the CAD Structure view still loads its complete structure in a worker.
 
-After the BOM panel becomes visible, its loader shows **Loading project
-structure…** while a worker fetches the structure, CAD associations, folders,
-variants, and health summary. Qt rows are created on the UI thread when the
-results arrive. The CAD Structure view uses the same background query mechanism.
+Search and advanced filters query the complete project in SQL, including
+unloaded branches. Status/type filter choices also come from the database.
+Exports, comparisons, variant navigation and explicit whole-tree actions retain
+the complete-structure API; an action requiring the complete tree can take
+longer than opening a single branch. Large filter/search result rendering and
+the CAD Structure view are not paged by this change.
 
-Directory diagnostics run separately and display **Checking project files in
-the background…** below the BOM. The structure can be used before the file check
-finishes. Existing diagnostic findings and deliverable status rules still apply;
-moving the checks does not reset saved PDF/STEP status.
+Opening an organizational folder loads a complete data snapshot so folder
+members on unloaded pages are included. It materializes the visible ancestor
+chain, rather than creating every Qt row in the project.
 
-Commit Workspace, Issue Center, and Manager Dashboard are constructed when first
-opened. They do not start project queries during shell startup. CAD approval
-cleanup is also deferred until the shell is visible.
+Background directory checks now build a filename/version index in one pass.
+The initial diagnostic worker shares that index between BOM-file checks and
+unexpected-file checks. Exact base-name lookups replace repeated directory-list
+searches for every Item. Creo suffixes compare as integers, so `.10` is newer
+than `.9`. Forced-integration exemptions retain their existing behavior.
 
-Switching projects cancels obsolete requests and ignores their results. Each
-worker keeps the project it started with, including diagnostics that synchronize
-file metadata. A failed structure query stops the loader and provides a
-**Refresh** retry message. Closing waits for cancelled workers to finish safely;
-an in-progress filesystem or database call may need to return first.
+The synchronizer writes only changed base filenames, in batches of at most 250.
+Each update checks that the source native filename/drawing has not changed since
+it was read, so a concurrent check-in is not overwritten by a stale diagnostic.
+Snapshot/approval allowlists use sets instead of repeated nested searches.
+Reading a PDF/STEP badge's legacy path no longer loads full Item details and
+assembly binding calculations.
 
-## Large-project performance: discussion proposal only
+These are filesystem observations and metadata repairs. They do not write Item
+lifecycle, PDF/STEP acknowledgements, validation states, or release approvals.
+A missing file can still produce a diagnostic warning under the existing rules.
 
-The changes above improve when work starts and keep database queries off the UI
-thread. They do not guarantee that a huge project's complete load or directory
-check finishes quickly. The following optimizations have **not** been implemented.
+## Benchmark and reproducibility
 
-Start by measuring shell construction, structure queries, Qt row creation,
-directory enumeration, and per-file checks separately on a representative copy
-of the company project. Record first usable BOM time separately from the time
-needed to finish all checks. Compare local storage with the company share before
-choosing the next change.
+The fixture **BENCHMARK - Company 11000**, version **A**, has 10,000 parts,
+1,000 assemblies, 2,750 drawings, 35,750 copied files and 12,942 expanded Item
+occurrences. It occupies about 2.51 GB of file content. See the
+[dataset guide](../tools/README_benchmark_project.md) for its synthetic CAD
+limitations and disk protections.
 
-The current code reveals two concrete candidates:
+The [4.3.0 baseline](benchmarks/company_11000_before.json) demonstrates the two
+original costs: 12,942 Item occurrences and 13,750 CAD Documents in the initial
+payload, and 9,140 unchanged-metadata writes before the file check was cancelled
+at 120 seconds. The baseline did **not** finish all 11,000 Items, so 120 seconds
+is a lower bound, not a full-scan time. Updated raw measurements are saved beside
+it in `docs/benchmarks/`.
 
-- `DiagService.sync_bom_files` lists files once, but `_sync_bom_record` repeatedly
-  searches that list for each part and can write base filenames for each BOM row.
-  Large parts/files counts and many separate writes can make this expensive.
-- `PdmService.get_item_structure_project` reads all project Items/usages and
-  recursively assembles a full structure payload. Collapsed UI branches avoid
-  creating all Qt rows immediately, but their data has already been fetched.
+Three serial 4.4.0 runs produced these local component results:
 
-Recommended order:
+| Component | 4.3.0 baseline | 4.4.0 median (range) |
+| --- | ---: | ---: |
+| EBOM structure worker | 2.286 s | 0.269 s (0.239–0.287) |
+| Initial Qt row construction | 2.356 s | 0.522 s (0.501–0.543) |
+| BOM file synchronization | Unfinished at 120 s; 9,140 items checked | 1.689 s (1.679–2.471); all 11,000 checked |
+| Working-directory check | 3.207 s | 0.380 s (0.376–0.382) |
+| Initial Item occurrences / CAD Documents | 12,942 / 13,750 | 10 / 0 |
+| Metadata write attempts in file synchronization | 9,140 before cancellation | 0 |
 
-| Next improvement | Intended behavior | Important constraint |
-| --- | --- | --- |
-| Load the first visible BOM level from indexed database queries | Show roots first; fetch children when a branch is expanded; page large root lists and search results. | Search and exports must still cover the complete project, including unloaded branches. |
-| Incremental file verification | Reuse the last scan result; recheck files affected by check-in, merge, associations, or external changes. Build one filename index per scan; compare size/modified time before hashing. | Preserve saved validation/deliverable states. Show a separate last-checked time; external changes still need periodic or manual reconciliation. |
-| Reduce database round trips and writes | Batch metadata reads; update only changed base names in short transactions; review query plans and existing indexes. | Keep ownership, revision binding, and multi-user consistency rules. |
-| Optional local read cache | Show a cached structure promptly, then refresh using the project's event/change counter. | Clearly identify stale data; revalidate locks and permissions against the authoritative database before changes. |
+See the [three-run summary](benchmarks/company_11000_summary.json) and individual
+`company_11000_after_1.json` through `company_11000_after_3.json` reports. The
+source company database's SHA-256 was unchanged across all three runs. These
+component times are not whole-application startup times.
 
-My first recommendation is **database-backed loading of roots and expanded
-branches, followed by incremental file checks**. Moving the full scan to a worker
-alone cannot remove its total cost. Qt's
-[fetch-more model support](https://doc.qt.io/qt-6/qabstractitemmodel.html#fetchMore)
-provides a path for larger tree models, and SQLite's
-[query-planning guide](https://www.sqlite.org/queryplanner.html) explains how
-indexes support selective reads.
+Three 4.5.0 runs on the same fixture measured service setup at **0.394 s**
+(0.329–0.455) and BOM widget setup at **0.436 s** (0.435–0.649). The structure
+worker measured 0.313 s (0.285–0.565), initial row creation 0.799 s
+(0.712–1.125), file synchronization 2.500 s (2.478–2.643), and the working
+directory check 0.539 s (0.493–0.574). File synchronization checked all 11,000
+Items with zero metadata writes. Timing varied by component and run; compare the
+raw 4.5.0 reports (`company_11000_optimized_graph_2.json` through
+`company_11000_optimized_graph_4.json`) and repeat on the target computer before
+using these local measurements to estimate deployment performance.
 
-If measurements show that many clients accessing the shared SQLite file are the
-main bottleneck, consider a server/API next: keep the database beside the server
-and exchange query results with clients. This is a larger architecture decision;
-SQLite documents the extra file traffic and latency of direct
-[network filesystem access](https://www.sqlite.org/useovernet.html).
+Run the following from the repository root in the normal app Python environment:
 
-## Build status
+```powershell
+python tools/benchmark_project_loading.py `
+  --database 'C:\Users\mkazi\shared_folder(I)\creo_vcs.db' `
+  --project 8 `
+  --output docs/benchmarks/company_11000_after.json
+```
 
-`config.APP_VERSION` is **4.3.0**. No schema migration is required for these
-startup changes. Updating source does not update an already built EXE folder:
-build and publish 4.3.0 using the normal build/release workflow. The existing
-4.2.0 distribution remains the previous build until that is done.
+Replace Python, database path, project ID and output path on another computer.
+The tool opens the supplied database read-only and backs it up to a temporary
+database. All measured operations, including metadata updates, target that copy.
+The native working directory is read in place. Each output records component
+times, payload counts and write attempts; the file check has a 120-second limit
+by default (`--max-scan-seconds`). Temporary database files are removed afterward.
 
-## Verification
+These are local, warm-cache component measurements with a hidden Qt widget.
+They measure database worker work, row construction and diagnostics separately;
+they do not measure login, first painted frame, network latency, or Creo geometry.
+Do not treat immediate post-generation runs as cold-cache results. Use several
+serial runs and record median/range. Repeat on the actual company share before
+making network deployment claims.
 
-Fixture tests exercise the real toolbar and BOM panel, a deliberately delayed
-structure query with a running GUI timer, stale-result suppression, project
-switching during a load, failure/retry, deferred module creation, and closing
-during a load. All database work in these tests uses a temporary fixture.
-These checks are not a timing benchmark of the company project.
+## Remaining performance work
 
-A wider run also found seven existing `test_pdm_tree_ui` errors caused by missing
-helpers in its test harness. The same seven errors were reproduced using the
-unchanged HEAD version of `pages/bom_page.py`; they are not fixed by this change.
+Directory enumeration is still fresh for each diagnostic pass. There is no
+persistent inventory/read cache and no cached result that could hide external
+file changes across application runs. Full-file hashing is not part of these
+routine presence/version checks.
+
+Measure the new path on the company share before adding persistent per-workspace
+inventory, changed-file scheduling, or a shared scan coordinator. Any future
+cache needs workspace/project/version/user/machine scope, visible freshness,
+event invalidation and periodic reconciliation. Lock and permission checks must
+continue to use the authoritative database before changes.
+
+If shared SQLite network traffic remains dominant after selective reads, a
+server/API colocated with the database is a separate architecture option.
+
+## Version, build and verification
+
+The source version is **4.5.0**. The startup optimizations do not require a
+database schema migration. See [Packaged startup measurements](packaged_startup.md)
+for the login and BOM initialization measurements and isolated build procedure.
+
+Fixture tests cover root/child pagination, reused-component quantities, search
+through unloaded branches, branch retry, stale-result suppression, cycle
+detection, numeric Creo versions, external deletions, unchanged-metadata scans,
+cancelled scans and concurrent filename changes. Existing startup/selector,
+PDF/STEP acknowledgement and PDM workflow checks remain applicable.
+
+A wider 90-test run passed 87 checks and exposed three pre-existing PDM service
+test failures: migration association-count idempotence, CAD member-removal build
+expectations, and an export test expecting `source` instead of `usage_source`.
+All three reproduce when the unchanged HEAD `PdmService` implementation is used.
+The six new GUI loading cases and four inventory/metadata cases pass separately.

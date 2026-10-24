@@ -27,6 +27,7 @@ from datetime import datetime
 
 from core.session_manager import SessionManager
 from core.services.diag_service import DiagService
+from core.working_directory_inventory import WorkingDirectoryInventory
 from core.services.project_service import ProjectService
 from core.services.part_file_service import PartFileService
 from core.services.master_work_service import (
@@ -47,6 +48,8 @@ from core.bom_filter import (
     split_bom_filter_terms,
 )
 from core.repositories.commit_repository import CommitRepository
+from core.repositories.bom_revision_repository import BomRevisionRepository
+from core.service_resources import ServiceResources, DeferredService
 from core.repositories.user_repository import UserRepository
 from core.services.commit_service import CommitService
 from pages.dialogs.package_parts_dialog import PackagePartsDialog
@@ -2129,10 +2132,11 @@ class _ProjectStructureWorker(QObject):
                 return
             service = self.service
             if self.mode == "ebom":
-                data = service.get_released_ebom_project(self.project_id) or {}
+                roots_query = getattr(service, "get_released_ebom_roots", None) or service.get_released_ebom_project
+                data = roots_query(self.project_id) or {}
                 if self._cancelled:
                     return
-                documents = service.list_pdm_cad_documents(
+                documents = [] if data.get("paged") else service.list_pdm_cad_documents(
                     self.project_id, include_related_drawings=False, include_legacy_fallback=False,
                 ) or []
                 folders = service.list_bom_folders() or []
@@ -2205,6 +2209,38 @@ class _TreeLoadWorker(QObject):
             self.failed.emit(self._seq, str(e))
 
 
+class _PdmLevelWorker(QObject):
+    finished = pyqtSignal(int, object)
+    failed = pyqtSignal(int, str)
+    done = pyqtSignal()
+
+    def __init__(self, request_id, service, project_id, parent, offset):
+        super().__init__()
+        self.request_id = request_id
+        self.service = copy(service)
+        self.service.session = SimpleNamespace(**vars(service.session))
+        self.service.session.project_id = int(project_id)
+        self.project_id, self.parent_context, self.offset = int(project_id), parent, offset
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+    def run(self):
+        try:
+            if not self.cancelled:
+                result = self.service.get_released_ebom_level(
+                    self.project_id, self.parent_context, offset=self.offset,
+                )
+                if not self.cancelled:
+                    self.finished.emit(self.request_id, result)
+        except Exception as exc:
+            if not self.cancelled:
+                self.failed.emit(self.request_id, str(exc))
+        finally:
+            self.done.emit()
+
+
 class _LazyChildrenWorker(QObject):
     finished = pyqtSignal(int, object)
     failed = pyqtSignal(int, str)
@@ -2271,11 +2307,11 @@ class _InitialDiagWorker(QObject):
     failed = pyqtSignal(str)
     done = pyqtSignal()
 
-    def __init__(self, working_dir: str):
+    def __init__(self, working_dir: str, *, resources=None):
         super().__init__()
         self._working_dir = str(working_dir or "")
         self._cancelled = False
-        self._service = DiagService()
+        self._service = DiagService(resources=resources)
         self._service.session = SimpleNamespace(**vars(self._service.session))
 
     def cancel(self):
@@ -2289,13 +2325,16 @@ class _InitialDiagWorker(QObject):
             missing_files = []
             working_result = None
             if self._working_dir and os.path.isdir(self._working_dir):
-                missing_files = diag_service.sync_bom_files(
+                inventory = WorkingDirectoryInventory(
                     self._working_dir, cancel_cb=lambda: self._cancelled,
+                )
+                missing_files = diag_service.sync_bom_files(
+                    self._working_dir, cancel_cb=lambda: self._cancelled, inventory=inventory,
                 ) or []
                 if self._cancelled:
                     return
                 working_result = diag_service.check_working_directory(
-                    self._working_dir, cancel_cb=lambda: self._cancelled,
+                    self._working_dir, cancel_cb=lambda: self._cancelled, inventory=inventory,
                 )
             if self._cancelled:
                 return
@@ -2759,25 +2798,49 @@ class BomPage(QWidget):
     issue_requested = pyqtSignal(int)
     create_issue_requested = pyqtSignal(int)
 
+    diag_service = DeferredService(lambda page: DiagService(resources=page.resources))
+    issue_service = DeferredService(lambda page: IssueService(resources=page.resources))
+    package_export_service = DeferredService(
+        lambda page: PackageExportService(
+            bom_repo=page.bom_service.bom_repo,
+            bom_children_repo=page.bom_service.children_repo,
+            part_file_service=page.part_file_service,
+        )
+    )
+    baseline_service = DeferredService(
+        lambda page: BaselineService(
+            bom_repo=page.bom_service.bom_repo,
+            bom_children_repo=page.bom_service.children_repo,
+            part_file_service=page.part_file_service,
+            revision_repo=page.resources.repository(BomRevisionRepository),
+        )
+    )
+    traceability_service = DeferredService(
+        lambda page: TraceabilityService(resources=page.resources)
+    )
+    assembly_configuration_service = DeferredService(
+        lambda page: AssemblyConfigurationService(
+            revision_repo=page.bom_service.revision_repo,
+            bom_repo=page.bom_service.bom_repo,
+            project_service=page.project_service,
+        )
+    )
+
     def __init__(self, bom_service):
         super().__init__()
         self.setFont(QFont("Segoe UI", 8))
         self.bom_service = bom_service
-        self.diag_service = DiagService()
+        resources = getattr(bom_service, "resources", None)
+        self.resources = resources if hasattr(resources, "repository") else ServiceResources()
         self.project_service = ProjectService()
         self.session = SessionManager()
         self.perm = UIPermissionHelper()
-        self.part_file_service = PartFileService()
+        self.part_file_service = PartFileService(resources=self.resources)
         self.managed_file_service = ManagedFileService(
             part_file_service=self.part_file_service
         )
         self.part_doc_ack_service = PartDocAckService()
-        self.package_export_service = PackageExportService()
-        self.baseline_service = BaselineService()
-        self.commit_repo = CommitRepository()
-        self.issue_service = IssueService()
-        self.traceability_service = TraceabilityService()
-        self.assembly_configuration_service = AssemblyConfigurationService()
+        self.commit_repo = self.resources.repository(CommitRepository)
         self.undo_service = UndoService()
         self._issue_summary_cache = {}
 
@@ -2994,7 +3057,7 @@ class BomPage(QWidget):
         for request in requests:
             item = request.get("item")
             try:
-                self.tree.setItemLoading(item, False)
+                request.get("tree", self.tree).setItemLoading(item, False)
             except Exception:
                 pass
             try:
@@ -3036,7 +3099,7 @@ class BomPage(QWidget):
                 continue
             self._lazy_level_requests.pop(int(request_id), None)
             try:
-                self.tree.setItemLoading(request.get("item"), False)
+                request.get("tree", self.tree).setItemLoading(request.get("item"), False)
             except Exception:
                 pass
             try:
@@ -3902,7 +3965,7 @@ class BomPage(QWidget):
         payload["relation_parent_id"] = payload.get("effective_parent_bom_id")
         payload["usage_id"] = payload.get("item_usage_id") or payload.get("usage_id")
         payload["quantity"] = int(payload.get("source_quantity") or 1)
-        payload["_has_children"] = bool(payload.get("children"))
+        payload["_has_children"] = bool(payload.get("children") or payload.get("_children_deferred"))
         item = QTreeWidgetItem([""] * self._ebom_tree.columnCount())
         self._apply_tree_item_data(item, payload)
         item.setText(BOM_COL_AES, str(payload.get("part_number") or ""))
@@ -3919,8 +3982,8 @@ class BomPage(QWidget):
         item.setData(0, PDM_NODE_PAYLOAD_ROLE, dict(payload))
         child_payloads = list(payload.get("children") or [])
         item.setData(0, PDM_CHILDREN_PAYLOAD_ROLE, child_payloads)
-        item.setData(0, BOM_TREE_CHILDREN_LOADED_ROLE, not bool(child_payloads))
-        item.setData(0, BOM_TREE_IS_ASSEMBLY_ROLE, bool(child_payloads))
+        item.setData(0, BOM_TREE_CHILDREN_LOADED_ROLE, not payload["_has_children"])
+        item.setData(0, BOM_TREE_IS_ASSEMBLY_ROLE, payload["_has_children"])
         item.setData(
             0,
             PDM_EBOM_ASSOCIATIONS_ROLE,
@@ -3973,6 +4036,7 @@ class BomPage(QWidget):
         if self._project_load_cancelled:
             return
         self._structure_load_seq += 1
+        self._cancel_lazy_level_requests()
         try:
             if self._structure_worker is not None:
                 self._structure_worker.cancel()
@@ -4042,6 +4106,7 @@ class BomPage(QWidget):
         self._set_tree_loading(True)
         try:
             data = payload.get("data") or {}
+            self._ebom_root_page = data
             associations_by_item = defaultdict(list)
             if self.session.project_id:
                 for document in payload.get("documents") or []:
@@ -7761,6 +7826,7 @@ class BomPage(QWidget):
         if payload is None:
             try:
                 data = self.bom_service.get_released_ebom_project(int(self.session.project_id)) or {}
+                self._ebom_root_page = data
                 self._pdm_ebom_roots = list(data.get("roots") or [])
             except Exception:
                 pass
@@ -8603,7 +8669,9 @@ class BomPage(QWidget):
         except Exception:
             pass
 
-        worker = _InitialDiagWorker(str(self.working_dir or ""))
+        worker = _InitialDiagWorker(
+            str(self.working_dir or ""), resources=self.resources,
+        )
         worker.finished.connect(self._on_initial_diag_finished)
         worker.failed.connect(self._on_initial_diag_failed)
         self._diag_worker = worker
@@ -10366,12 +10434,128 @@ class BomPage(QWidget):
             tree.collapseAll()
             # Preserve the expansions created by search/advanced filtering.
             self._refresh_ebom_filters()
+            page = getattr(self, "_ebom_root_page", {}) or {}
+            if not getattr(self, "_pdm_ebom_scope_path", []) and page.get("has_more"):
+                self._add_ebom_page_row(None, page)
         finally:
             tree.setUpdatesEnabled(True)
         self._update_pdm_scope_bar()
         self._sync_visual_action_states()
 
+    def _add_ebom_page_row(self, parent, page):
+        row = QTreeWidgetItem([""] * self._ebom_tree.columnCount())
+        row.setText(BOM_COL_NAME, "Load next 200 items…")
+        row.setToolTip(BOM_COL_NAME, "Expand this row to load the next page.")
+        context = parent.data(0, PDM_NODE_PAYLOAD_ROLE) if parent is not None else None
+        if context is not None:
+            context = {key: context.get(key) for key in (
+                "id", "bom_id", "level", "effective_quantity", "_ancestor_ids", "item_usage_id", "usage_id",
+            )}
+        row.setData(0, PDM_NODE_PAYLOAD_ROLE, {
+            "_load_more": True, "parent": context, "offset": page["next_offset"],
+        })
+        row.setData(0, BOM_TREE_PLACEHOLDER_ROLE, True)
+        row.addChild(QTreeWidgetItem([""] * self._ebom_tree.columnCount()))
+        if parent is None:
+            self._ebom_tree.addTopLevelItem(row)
+        else:
+            parent.addChild(row)
+
+    def _start_pdm_level_load(self, item):
+        tree = item.treeWidget()
+        payload = item.data(0, PDM_NODE_PAYLOAD_ROLE) or {}
+        more = bool(payload.get("_load_more"))
+        parent_context = payload.get("parent") if more else payload
+        self._lazy_level_request_seq += 1
+        request_id = self._lazy_level_request_seq
+        worker = _PdmLevelWorker(request_id, self.bom_service, self.session.project_id,
+                                 parent_context, payload.get("offset", 0) if more else 0)
+        self._lazy_level_requests[request_id] = {
+            "worker": worker, "item": item, "tree": tree, "part_id": (parent_context or {}).get("id"),
+            "project_id": self.session.project_id, "seq": self._structure_load_seq,
+            "parent": parent_context, "more": more,
+        }
+        signals = tree.blockSignals(True)
+        item.setExpanded(False)
+        tree.blockSignals(signals)
+        tree.setItemLoading(item, True)
+        worker.finished.connect(self._on_pdm_level_loaded)
+        worker.failed.connect(self._on_pdm_level_failed)
+        self._lazy_level_requests[request_id]["thread"] = _start_project_worker(worker)
+
+    def _on_pdm_level_failed(self, request_id, error):
+        request = self._lazy_level_requests.pop(request_id, None)
+        if request is None or not self._structure_result_is_current(request["seq"], request["project_id"]):
+            return
+        try:
+            request["tree"].setItemLoading(request["item"], False)
+            self.show_alert(f"Could not load this branch: {error}. Expand it again to retry.", "warning")
+        except RuntimeError:
+            pass
+
+    def _on_pdm_level_loaded(self, request_id, page):
+        request = self._lazy_level_requests.pop(request_id, None)
+        if request is None or not self._structure_result_is_current(request["seq"], request["project_id"]):
+            return
+        item, tree, context = request["item"], request["tree"], request["parent"]
+        try:
+            if item.treeWidget() is not tree:
+                return
+            tree.setItemLoading(item, False)
+            parent = item.parent() if request["more"] else item
+            if request["more"]:
+                if parent is None:
+                    tree.takeTopLevelItem(tree.indexOfTopLevelItem(item))
+                else:
+                    parent.takeChild(parent.indexOfChild(item))
+            else:
+                self._remove_pdm_lazy_placeholders(parent)
+            nodes = page.get("roots") or []
+            if parent is None:
+                self._pdm_ebom_roots.extend(nodes)
+                self._ebom_root_page = page
+            else:
+                payload = parent.data(0, PDM_NODE_PAYLOAD_ROLE) or {}
+                payload["children"] = list(payload.get("children") or []) + nodes
+                payload["_children_deferred"] = False
+                parent.setData(0, PDM_NODE_PAYLOAD_ROLE, payload)
+                parent.setData(0, PDM_CHILDREN_PAYLOAD_ROLE, payload["children"])
+                parent.setData(0, BOM_TREE_CHILDREN_LOADED_ROLE, True)
+                stack = list(self._pdm_ebom_roots)
+                while stack:
+                    cached = stack.pop()
+                    if (int(cached.get("bom_id") or cached.get("id")) == int(context.get("bom_id") or context["id"])
+                            and cached.get("_ancestor_ids", []) == context.get("_ancestor_ids", [])
+                            and cached.get("item_usage_id") == context.get("item_usage_id")):
+                        cached["children"] = payload["children"]
+                        cached["_children_deferred"] = False
+                        break
+                    stack.extend(cached.get("children") or [])
+            tree.setUpdatesEnabled(False)
+            try:
+                for node in nodes:
+                    self._add_released_ebom_node(node, parent, self._ebom_associations_by_item)
+                if page.get("has_more"):
+                    self._add_ebom_page_row(parent, page)
+                self._render_pdm_folder_context("EBOM", context.get("bom_id") if context else None,
+                                                [parent] if parent is not None else [tree])
+                self._renumber_tree_rows(tree)
+                if parent is not None:
+                    parent.setExpanded(True)
+                self._refresh_ebom_filters()
+            finally:
+                tree.setUpdatesEnabled(True)
+        except RuntimeError:
+            # The project/branch may have been removed while the worker ran.
+            return
+
     def _on_pdm_tree_item_expanded(self, item: QTreeWidgetItem) -> None:
+        if item is not None and item.treeWidget() is getattr(self, "_ebom_tree", None):
+            payload = item.data(0, PDM_NODE_PAYLOAD_ROLE) or {}
+            if ((payload.get("_children_deferred") or payload.get("_load_more"))
+                    and not item.data(0, BOM_TREE_LOADING_ROLE)):
+                self._start_pdm_level_load(item)
+                return
         if (
             item is None
             or self._is_lazy_placeholder(item)
@@ -10436,6 +10620,18 @@ class BomPage(QWidget):
         mode = self._pdm_mode_for_tree(tree)
         if mode not in {"cad", "ebom"}:
             return
+        payload = item.data(0, PDM_NODE_PAYLOAD_ROLE) or {}
+        if mode == "ebom" and payload.get("_children_deferred"):
+            nodes, offset = [], 0
+            while True:
+                page = self.bom_service.get_released_ebom_level(self.session.project_id, payload, offset=offset)
+                nodes.extend(page["roots"])
+                if not page["has_more"]:
+                    break
+                offset = page["next_offset"]
+            item.setData(0, PDM_CHILDREN_PAYLOAD_ROLE, nodes)
+            payload.update(children=nodes, _children_deferred=False)
+            item.setData(0, PDM_NODE_PAYLOAD_ROLE, payload)
         children = list(item.data(0, PDM_CHILDREN_PAYLOAD_ROLE) or [])
         tree.setUpdatesEnabled(False)
         try:
@@ -10478,6 +10674,11 @@ class BomPage(QWidget):
         mode = self._pdm_mode_for_tree(tree)
         if tree is None or mode not in {"cad", "ebom"}:
             return
+        if mode == "ebom" and (getattr(self, "_ebom_root_page", {}) or {}).get("paged"):
+            # Explicit whole-tree actions use a complete DB snapshot, including
+            # unloaded pages. Ordinary search uses its existing SQL projection.
+            data = self.bom_service.get_released_ebom_project(self.session.project_id)
+            self._apply_released_ebom_tree({"data": data, "folders": self._bom_folders_cache})
 
         def visit(item: QTreeWidgetItem) -> None:
             if self._is_lazy_placeholder(item):
@@ -10972,6 +11173,34 @@ class BomPage(QWidget):
         if mode not in {"cad", "ebom"}:
             return
         folder_id = item.data(0, BOM_TREE_FOLDER_ROLE)
+        if mode == "ebom" and (getattr(self, "_ebom_root_page", {}) or {}).get("paged"):
+            # Opening a folder must include its members on unloaded pages.
+            # Fetch the full data snapshot, then materialize only the already
+            # visible ancestor chain, rather than every Qt row in the project.
+            ancestors = []
+            ancestor = item.parent()
+            while ancestor is not None:
+                if not self._is_folder_tree_item(ancestor):
+                    ancestors.insert(0, ancestor.data(0, Qt.UserRole))
+                ancestor = ancestor.parent()
+            health_text, health_style = self.bom_health_label.text(), self.bom_health_label.styleSheet()
+            try:
+                data = self.bom_service.get_released_ebom_project(self.session.project_id)
+            except Exception as exc:
+                self.show_alert(f"Could not open this folder: {exc}. Open it again to retry.", "warning")
+                return
+            self._apply_released_ebom_tree({"data": data, "folders": self._bom_folders_cache})
+            self.bom_health_label.setText(health_text)
+            self.bom_health_label.setStyleSheet(health_style)
+            for ancestor_id in ancestors:
+                for row in self._find_tree_items(int(ancestor_id), tree):
+                    if not row.data(0, BOM_TREE_CHILDREN_LOADED_ROLE):
+                        self._load_pdm_lazy_children_for_item(row)
+                        break
+            item = next((row for row in self._iter_tree_items(tree)
+                         if row.data(0, BOM_TREE_FOLDER_ROLE) == folder_id), None)
+            if item is None:
+                return
         label = item.text(self._pdm_name_column_for_tree(tree)) or "Folder"
         entry = {
             "label": str(label),
@@ -11186,10 +11415,14 @@ class BomPage(QWidget):
                 continue
 
             def add_folder(folder: dict, display_parent) -> None:
-                folder_item = self._make_pdm_folder_tree_item(
-                    folder, tree, scope
-                )
-                self._container_add(display_parent, folder_item)
+                folder_item = next((self._container_item(display_parent, index)
+                                    for index in range(self._container_count(display_parent))
+                                    if self._container_item(display_parent, index).data(0, BOM_TREE_FOLDER_ROLE)
+                                    == int(folder["id"])), None)
+                new_folder = folder_item is None
+                if new_folder:
+                    folder_item = self._make_pdm_folder_tree_item(folder, tree, scope)
+                    self._container_add(display_parent, folder_item)
                 assigned = {
                     int(value)
                     for value in (
@@ -11215,7 +11448,8 @@ class BomPage(QWidget):
                     int(folder["id"]), []
                 ):
                     add_folder(child_folder, folder_item)
-                folder_item.setExpanded(False)
+                if new_folder:
+                    folder_item.setExpanded(False)
 
             for folder in roots:
                 add_folder(folder, container)
@@ -11983,6 +12217,7 @@ class BomPage(QWidget):
             return
         try:
             data = self.bom_service.get_released_ebom_project(int(self.session.project_id)) or {}
+            self._ebom_root_page = data
             roots = list(data.get("roots") or [])
             self._pdm_ebom_roots = roots
             associations_by_item = defaultdict(list)
@@ -12033,7 +12268,7 @@ class BomPage(QWidget):
                 payload["relation_parent_id"] = payload.get("effective_parent_bom_id")
                 payload["usage_id"] = payload.get("item_usage_id") or payload.get("usage_id")
                 payload["quantity"] = int(payload.get("source_quantity") or 1)
-                payload["_has_children"] = bool(payload.get("children"))
+                payload["_has_children"] = bool(payload.get("children") or payload.get("_children_deferred"))
                 self._apply_tree_item_data(item, payload)
                 item.setText(BOM_COL_AES, str(payload.get("part_number") or ""))
                 item.setData(0, PDM_OBJECT_KIND_ROLE, PDM_OBJECT_ITEM)
@@ -14928,6 +15163,20 @@ class BomPage(QWidget):
             cache = getattr(self, "_ebom_filter_choice_cache", {}) or {}
             if column in cache:
                 return list(cache[column])
+
+            if (getattr(self, "_ebom_root_page", {}) or {}).get("paged"):
+                field = {BOM_COL_STATUS: "status", BOM_COL_TYPE: "type"}.get(column)
+                if field:
+                    with self.bom_service.bom_repo.get_conn() as conn:
+                        rows = conn.execute(
+                            f"SELECT DISTINCT {field} FROM bom b WHERE b.project_id=? AND "
+                            + self.bom_service.pdm_service._visible_item_sql("b"),
+                            (int(self.session.project_id),),
+                        ).fetchall()
+                    result = sorted({str(row[0]).strip() for row in rows if str(row[0] or "").strip()}, key=str.casefold)
+                    cache[column] = tuple(result)
+                    self._ebom_filter_choice_cache = cache
+                    return result
 
             # The EBOM payload already contains the complete lazy structure.
             # Reading these two fields from dictionaries is substantially
@@ -19839,12 +20088,18 @@ class BomPage(QWidget):
         return datetime.now().isoformat(sep=" ")
 
     def _legacy_doc_path(self, part_id: int, doc_type: str) -> str:
-        try:
-            details = self.bom_service.get_part_details(int(part_id)) or {}
-        except Exception:
-            details = {}
         key = "pdf_path" if str(doc_type).upper() == "PDF" else "step_path"
-        return str(details.get(key) or "").strip()
+        try:
+            # Rendering a badge needs only the stored path. Loading full Item
+            # details also computes assembly bindings, revisions and categories.
+            with self.bom_service.bom_repo.get_conn() as conn:
+                row = conn.execute(
+                    f"SELECT {key} FROM bom WHERE id=? AND project_id=? AND deleted_at IS NULL",
+                    (int(part_id), int(self.session.project_id)),
+                ).fetchone()
+            return str(row[0] or "").strip() if row else ""
+        except Exception:
+            return ""
 
     def _has_published_master_for_part(self, part_id):
         project = self.project_service.get_project_by_id(int(self.session.project_id)) or {}

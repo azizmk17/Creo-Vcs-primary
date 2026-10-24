@@ -15,15 +15,18 @@ from core.repositories.bom_repository import BomRepository
 from core.repositories.issue_repository import IssueRepository
 from core.services.base_service import BaseService
 from core.services.traceability_service import TraceabilityService
+from core.service_resources import ServiceResources, DeferredService
 
 
 class IssueService(BaseService):
-    def __init__(self, repo: Optional[IssueRepository] = None):
+    traceability = DeferredService(lambda self: TraceabilityService(resources=self.resources))
+
+    def __init__(self, repo: Optional[IssueRepository] = None, *, resources=None):
         super().__init__()
-        self.repo = repo or IssueRepository()
-        self.bom_repo = BomRepository()
-        self.children_repo = BomChildrenRepository()
-        self.traceability = TraceabilityService()
+        self.resources = resources or ServiceResources()
+        self.repo = repo or self.resources.repository(IssueRepository)
+        self.bom_repo = self.resources.repository(BomRepository)
+        self.children_repo = self.resources.repository(BomChildrenRepository)
 
     def create_issue(self, data: dict, part_ids: Iterable[int]) -> dict:
         title = (data.get("title") or "").strip()
