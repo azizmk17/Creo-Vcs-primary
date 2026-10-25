@@ -213,6 +213,7 @@ class CommitRepository:
         object_iteration_id=None,
         cad_document_id=None,
         creo_file_version=None,
+        nexus_branch_id=None,
     ) -> int:
         with self.get_conn() as conn:
             cur = conn.cursor()
@@ -222,9 +223,9 @@ class CommitRepository:
                     committed_by, status, committed_at, signature, project_id, title, commit_id,
                     step_compare_enabled, step_file_path, step_prev_file_path, step_diff_path,
                     step_diff_summary, step_diff_status, step_error, step_face_map_path,
-                    object_iteration_id, cad_document_id, creo_file_version
+                    object_iteration_id, cad_document_id, creo_file_version, nexus_branch_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 part_id,
                 part_type,
@@ -251,6 +252,7 @@ class CommitRepository:
                 object_iteration_id,
                 cad_document_id,
                 creo_file_version,
+                nexus_branch_id,
             ))
             return cur.lastrowid
 

@@ -3118,6 +3118,8 @@ class CommitPage(QWidget):
 
         branch_target_combo = QComboBox()
         branch_target_combo.addItem("Select branch…", None)
+        bound_branch_id = next((str(row.get("nexus_branch_id")) for row in (group_details.get("files") or [])
+                                if row.get("nexus_branch_id")), None)
         try:
             from core.services.nexus_history_service import NexusHistoryService
             group_item_ids = sorted({int(row["part_id"]) for row in (group_details.get("files") or [])
@@ -3128,10 +3130,17 @@ class CommitPage(QWidget):
             )
             for branch in branch_service.branch_choices(group_item_ids):
                 branch_target_combo.addItem(branch["name"], str(branch["id"]))
+            if bound_branch_id:
+                selected_index = branch_target_combo.findData(bound_branch_id)
+                if selected_index >= 0:
+                    branch_target_combo.setCurrentIndex(selected_index)
         except Exception:
             pass
-        branch_target_combo.setEnabled(branch_target_combo.count() > 1)
-        branch_target_combo.setToolTip("Choose the Nexus Branch that will receive this checked-in commit.")
+        branch_target_combo.setEnabled(branch_target_combo.count() > 1 and not bound_branch_id)
+        branch_target_combo.setToolTip(
+            "This commit is tied to its checked-out Nexus branch." if bound_branch_id
+            else "Choose the Nexus Branch that will receive this checked-in commit."
+        )
         push_branch_btn = QPushButton("Push to Branch")
         push_branch_btn.setObjectName("neutral")
         push_branch_btn.setCursor(Qt.PointingHandCursor)

@@ -106,15 +106,16 @@ class BomColumnUiTests(unittest.TestCase):
         page.session.user_id = 1
         page._restore_saved_bom_columns()
         self.assertEqual(page._ebom_tree.columnWidth(BOM_COL_NAME), 390)
-        self.assertEqual(page._visible_bom_column_keys(), {"material"})
+        self.assertEqual(page._visible_bom_column_keys(), {"active_branch", "material"})
 
     def test_all_optional_columns_can_remain_hidden_after_reopen(self):
         page = self.page()
         page._save_personal_bom_columns(page._ebom_tree, set())
         reopened = self.page()
-        self.assertEqual(reopened._visible_bom_column_keys(), set())
+        self.assertEqual(reopened._visible_bom_column_keys(), {"active_branch"})
         for offset in range(len(BOM_EXTRA_COLUMN_SPECS)):
-            self.assertTrue(reopened._ebom_tree.isColumnHidden(BOM_COL_EXTRA_START + offset))
+            hidden = BOM_EXTRA_COLUMN_SPECS[offset][0] != "active_branch"
+            self.assertEqual(reopened._ebom_tree.isColumnHidden(BOM_COL_EXTRA_START + offset), hidden)
 
     def test_cad_layout_is_saved_separately_from_ebom(self):
         page = self.page()
@@ -143,7 +144,7 @@ class BomColumnUiTests(unittest.TestCase):
 
         QTimer.singleShot(0, save)
         page.show_bom_column_dialog(tree=page._ebom_tree)
-        self.assertEqual(self.repo.get_bom_column_preferences(1)["visible_extra_columns"], ["material"])
+        self.assertEqual(self.repo.get_bom_column_preferences(1)["visible_extra_columns"], ["active_branch", "material"])
 
     def test_cancel_does_not_overwrite_saved_preferences(self):
         page = self.page()
@@ -162,7 +163,7 @@ class BomColumnUiTests(unittest.TestCase):
         self.repo.set_bom_column_preferences(1, prefs)
         reopened = self.page()
         self.assertEqual(reopened._ebom_tree.columnWidth(BOM_COL_NAME), 260)
-        self.assertEqual(reopened._visible_bom_column_keys(), {"material"})
+        self.assertEqual(reopened._visible_bom_column_keys(), {"active_branch", "material"})
 
     def assert_compact_columns(self, tree):
         header = tree.header()
@@ -226,6 +227,53 @@ class BomColumnUiTests(unittest.TestCase):
         self.assertEqual(page._ebom_tree.headerItem().text(column), "Active Branch")
         self.assertEqual(row.text(column), "fix-gap")
         self.assertEqual(page._ebom_tree.columnCount(), BOM_TREE_COLUMN_COUNT)
+
+    def test_existing_hidden_branch_column_moves_to_front_without_losing_other_preferences(self):
+        from pages.bom_page import BOM_COL_ACTIVE_BRANCH
+        page = self.page()
+        tree = page._ebom_tree
+        tree.setColumnWidth(BOM_COL_NAME, 402)
+        tree.header().moveSection(tree.header().visualIndex(BOM_COL_ACTIVE_BRANCH), tree.columnCount() - 1)
+        tree.setColumnHidden(BOM_COL_ACTIVE_BRANCH, True)
+        self.repo.set_bom_column_preferences(1, {
+            "visible_extra_columns": ["material"],
+            "layouts": {"ebom": {"headers": page._bom_tree_headers(True),
+                                   "state": bytes(tree.header().saveState().toBase64()).decode("ascii")}},
+        })
+        reopened = self.page()
+        for name in ("tree", "_search_tree", "_ebom_tree", "_ebom_filter_tree"):
+            tree = getattr(reopened, name)
+            self.assertFalse(tree.isColumnHidden(BOM_COL_ACTIVE_BRANCH))
+            self.assertEqual(tree.header().visualIndex(BOM_COL_ACTIVE_BRANCH), 1)
+        self.assertEqual(reopened._ebom_tree.columnWidth(BOM_COL_NAME), 402)
+        self.assertFalse(reopened._ebom_tree.isColumnHidden(self.column("material")))
+        self.assert_compact_columns(reopened._ebom_tree)
+
+    def test_branch_badges_render_distinct_master_active_and_paused_states(self):
+        from pages.bom_page import BOM_COL_ACTIVE_BRANCH, _set_active_branch_badge, BOM_TREE_BRANCH_ROLE
+        page = self.page()
+        tree = page._ebom_tree
+        tree.resize(690, 210)
+        long_name = "Clearance improvement for manufacturing prototype"
+        rows = []
+        for number, active in enumerate((None, {"branch_id": "active", "name": long_name, "state": "Active"},
+                                          {"branch_id": "paused", "name": "Weight study", "state": "Paused"}), 1):
+            row = QTreeWidgetItem(tree)
+            row.setText(0, str(number))
+            row.setText(BOM_COL_NAME, "CASE TETRA")
+            _set_active_branch_badge(row, active)
+            rows.append(row)
+        tree.show()
+        self.app.processEvents()
+        image = tree.viewport().grab().toImage()
+        x = tree.header().sectionViewportPosition(BOM_COL_ACTIVE_BRANCH) + 32
+        for row, color in zip(rows, ("#e5f3eb", "#eee7ff", "#fff3db")):
+            rect = tree.visualItemRect(row)
+            self.assertEqual(image.pixelColor(x, rect.center().y() + 6).name(), color)
+        self.assertIn(long_name, rows[1].toolTip(BOM_COL_ACTIVE_BRANCH))
+        _set_active_branch_badge(rows[1], None)
+        self.assertEqual(rows[1].text(BOM_COL_ACTIVE_BRANCH), "Master")
+        self.assertIsNone(rows[1].data(BOM_COL_ACTIVE_BRANCH, BOM_TREE_BRANCH_ROLE)["branch_id"])
 
     def test_item_parameter_editor_uses_distinct_status_label_without_changing_value(self):
         from pages.part_dialog import PartDialog

@@ -388,6 +388,7 @@ BOM_TREE_AES_NUMBER_ROLE = Qt.UserRole + 51
 BOM_TREE_FOLDER_SCOPE_ROLE = Qt.UserRole + 52
 BOM_TREE_VARIANT_ROLE = Qt.UserRole + 53
 BOM_TREE_PRODUCT_ROLE = Qt.UserRole + 54
+BOM_TREE_BRANCH_ROLE = Qt.UserRole + 55
 STRUCTURE_CURRENT_ITERATION_ROLE = Qt.UserRole + 60
 STRUCTURE_BOUND_ITERATION_ROLE = Qt.UserRole + 61
 STRUCTURE_LATEST_ITERATION_ROLE = Qt.UserRole + 62
@@ -579,10 +580,13 @@ BOM_EXTRA_COLUMN_SPECS = [
     ("modified", "Modified", 125, False, ("modified", "modified_at")),
     ("notes", "Notes", 180, False, ("notes",)),
     ("item_status", "Item Status", 145, True, ("item_status", "status")),
-    ("active_branch", "Active Branch", 125, True, ("active_branch",)),
+    ("active_branch", "Active Branch", 170, True, ("active_branch",)),
 ]
 BOM_COL_ITEM_STATUS = BOM_COL_EXTRA_START + next(
     index for index, spec in enumerate(BOM_EXTRA_COLUMN_SPECS) if spec[0] == "item_status"
+)
+BOM_COL_ACTIVE_BRANCH = BOM_COL_EXTRA_START + next(
+    index for index, spec in enumerate(BOM_EXTRA_COLUMN_SPECS) if spec[0] == "active_branch"
 )
 BOM_TREE_COLUMN_COUNT = BOM_COL_EXTRA_START + len(BOM_EXTRA_COLUMN_SPECS)
 
@@ -1121,6 +1125,87 @@ class _BomTreeFilesDelegate(QStyledItemDelegate):
             QToolTip.showText(event.globalPos(), tip, view)
             return True
         return super().helpEvent(event, view, option, index)
+
+
+def _set_active_branch_badge(item, active):
+    name = str(active["name"]) if active else "Master"
+    state = str(active.get("state") or "Active") if active else "Master"
+    branch_id = (active.get("branch_id") or active.get("id")) if active else None
+    item.setText(BOM_COL_ACTIVE_BRANCH, name)
+    item.setData(BOM_COL_ACTIVE_BRANCH, BOM_TREE_BRANCH_ROLE, {"branch_id": branch_id, "state": state})
+    tooltip = (f"Your active Nexus branch: {name}\nBranch state: {state}" if active else
+               "Your active branch: Master\nWork is directed to the shared Master branch.")
+    item.setToolTip(BOM_COL_ACTIVE_BRANCH, tooltip + "\nUse Active Branch to switch selected Items.")
+
+
+class _BomTreeBranchDelegate(QStyledItemDelegate):
+    """Paint a branch icon and readable pill without adding widgets per BOM row."""
+    def __init__(self, tree, parent=None):
+        super().__init__(parent)
+        self._tree = tree
+
+    def paint(self, painter, option, index):
+        item = self._tree.itemFromIndex(index)
+        if item is None:
+            return super().paint(painter, option, index)
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        product = _apply_product_row_option(opt, item)
+        label = str(opt.text or "").strip()
+        opt.text = ""
+        widget = opt.widget or self._tree
+        painter.save()
+        if product:
+            painter.fillRect(opt.rect, opt.backgroundBrush)
+        else:
+            widget.style().drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
+        if not label or item.data(0, BOM_TREE_FOLDER_ROLE) or item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+            painter.restore()
+            return
+        payload = item.data(BOM_COL_ACTIVE_BRANCH, BOM_TREE_BRANCH_ROLE) or {}
+        is_branch = bool(payload.get("branch_id"))
+        paused = is_branch and payload.get("state") == "Paused"
+        bg, fg = (("#fff3db", "#925400") if paused else
+                  ("#eee7ff", "#6433b5") if is_branch else ("#e5f3eb", "#216345"))
+        if paused:
+            label += " · Paused"
+        font = QFont(opt.font)
+        font.setPixelSize(11)
+        font.setBold(True)
+        fm = QFontMetrics(font)
+        height = min(24, opt.rect.height() - 4)
+        width = min(opt.rect.width() - 12, fm.horizontalAdvance(label) + 42)
+        if height < 8 or width < 30:
+            painter.restore()
+            return
+        pill = QRectF(opt.rect.left() + 6, opt.rect.center().y() - height / 2, width, height)
+        painter.setClipRect(opt.rect)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        border = QColor(fg)
+        border.setAlpha(65)
+        painter.setPen(QPen(border, 1))
+        painter.setBrush(QColor(bg))
+        painter.drawRoundedRect(pill, 8, 8)
+        painter.setPen(QPen(QColor(fg), 1.6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        painter.setBrush(QColor(bg))
+        x, y = pill.left() + 11, pill.center().y()
+        painter.drawLine(QPointF(x, y - 5), QPointF(x, y + 5))
+        if is_branch:
+            painter.drawLine(QPointF(x, y + 2), QPointF(x + 8, y - 3))
+            painter.drawEllipse(QPointF(x + 8, y - 4), 2, 2)
+        painter.drawEllipse(QPointF(x, y - 5), 2, 2)
+        painter.drawEllipse(QPointF(x, y + 5), 2, 2)
+        text_rect = pill.adjusted(29, 0, -8, 0)
+        painter.setPen(QColor(fg))
+        painter.setFont(font)
+        painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft,
+                         fm.elidedText(label, Qt.ElideRight, int(text_rect.width())))
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        size = super().sizeHint(option, index)
+        size.setHeight(max(size.height(), 28))
+        return size
 
 
 class _BomTreeStatusDelegate(QStyledItemDelegate):
@@ -2849,6 +2934,7 @@ class BomPage(QWidget):
         self.undo_service = UndoService()
         self._issue_summary_cache = {}
         self._active_branch_names = {}
+        self._active_branch_checkouts = {}
 
         self.working_dir = None
         self.commits_dir = None
@@ -7886,12 +7972,15 @@ class BomPage(QWidget):
     def _load_active_branch_names(self):
         try:
             from core.services.nexus_history_service import NexusHistoryService
-            self._active_branch_names = NexusHistoryService(
+            nexus = NexusHistoryService(
                 getattr(self.bom_service.bom_repo, "db_name", DB_NAME),
                 user_id=int(self.session.user_id), project_id=int(self.session.project_id),
-            ).active_branch_map()
+            )
+            self._active_branch_names = nexus.active_branch_map()
+            self._active_branch_checkouts = nexus.active_branch_checkout_map()
         except Exception:
             self._active_branch_names = {}
+            self._active_branch_checkouts = {}
 
     def activate_branch_for_selection(self):
         if str(getattr(self, "_bom_mode", "ebom")) != "ebom":
@@ -7919,16 +8008,11 @@ class BomPage(QWidget):
                               if branch["name"] == chosen), None)
             service.activate_branch(item_ids, branch_id)
             self._load_active_branch_names()
-            column = next(BOM_COL_EXTRA_START + index
-                          for index, spec in enumerate(BOM_EXTRA_COLUMN_SPECS)
-                          if spec[0] == "active_branch")
             for item_id in item_ids:
                 branch = self._active_branch_names.get(int(item_id))
-                value = branch["name"] if branch else "Master"
                 for tree in (self.tree, self._search_tree, self._ebom_tree, self._ebom_filter_tree):
                     for row in self._find_tree_items(int(item_id), tree):
-                        row.setText(column, value)
-                        row.setToolTip(column, "Active branch for you: " + value)
+                        _set_active_branch_badge(row, branch)
             if getattr(self, "current_part_id", None) in item_ids and hasattr(self, "timeline_panel"):
                 self.timeline_panel.refresh()
             try:
@@ -8852,14 +8936,7 @@ class BomPage(QWidget):
             return self._default_visible_bom_column_keys()
         allowed = {spec[0] for spec in BOM_EXTRA_COLUMN_SPECS}
         visible = {str(key) for key in loaded if str(key) in allowed}
-        if "active_branch" not in visible:
-            layouts = self._bom_column_preferences().get("layouts")
-            layouts = layouts if isinstance(layouts, dict) else {}
-            legacy_headers = (self._bom_tree_headers(False)[:-1], self._bom_tree_headers(True)[:-1])
-            if any((layout or {}).get("headers") in legacy_headers
-                   for layout in layouts.values() if isinstance(layout, dict)):
-                visible.add("active_branch")
-        return visible
+        return visible | {"active_branch"}
 
     def _bom_column_preferences(self) -> dict:
         if self.session.user_id is None:
@@ -8872,7 +8949,7 @@ class BomPage(QWidget):
         if self.session.user_id is None:
             raise ValueError("Log in to save a personal column layout.")
         preferences = self._bom_column_preferences()
-        preferences["visible_extra_columns"] = sorted(keys)
+        preferences["visible_extra_columns"] = sorted(set(keys) | {"active_branch"})
         self._bom_column_repo.set_bom_column_preferences(int(self.session.user_id), preferences)
 
     def _bom_column_tree_kind(self, tree):
@@ -8946,7 +9023,7 @@ class BomPage(QWidget):
         if kind == "cad":
             preferences["cad_visible_columns"] = sorted({CAD_COL_NUMBER, *selected})
         else:
-            preferences["visible_extra_columns"] = sorted(selected)
+            preferences["visible_extra_columns"] = sorted(set(selected) | {"active_branch"})
         layouts = preferences.get("layouts")
         layouts = dict(layouts) if isinstance(layouts, dict) else {}
         layouts[kind] = {
@@ -8961,6 +9038,12 @@ class BomPage(QWidget):
         if tree is None:
             return
         tree.setHeaderLabels(self._bom_tree_headers(ebom=ebom))
+        tree.setItemDelegateForColumn(BOM_COL_ACTIVE_BRANCH, _BomTreeBranchDelegate(tree, tree))
+        tree.headerItem().setToolTip(
+            BOM_COL_ACTIVE_BRANCH,
+            "Your active branch for each Item. Green Master badge or purple Nexus branch badge. "
+            "Use Active Branch to switch selected Items.",
+        )
         tree.headerItem().setToolTip(
             BOM_COL_STATUS,
             "Master native work and validation state. Independent of the user-controlled Item Status parameter.",
@@ -9025,6 +9108,13 @@ class BomPage(QWidget):
                     target_tree.setColumnHidden(BOM_COL_EXTRA_START + offset, key not in visible_keys)
                 except Exception:
                     pass
+            # Keep the work destination in view, including for older saved layouts.
+            target_tree.setColumnHidden(BOM_COL_ACTIVE_BRANCH, False)
+            if target_tree.columnWidth(BOM_COL_ACTIVE_BRANCH) < 150:
+                target_tree.setColumnWidth(BOM_COL_ACTIVE_BRANCH, 150)
+            header = target_tree.header()
+            header.moveSection(header.visualIndex(BOM_COL_ROW), 0)
+            header.moveSection(header.visualIndex(BOM_COL_ACTIVE_BRANCH), 1)
 
     def _extra_bom_column_value(self, info: dict, spec: tuple) -> str:
         key, _label, _width, _default, aliases = spec
@@ -9057,7 +9147,8 @@ class BomPage(QWidget):
                     except (TypeError, ValueError):
                         part_id = None
                     active = (getattr(self, "_active_branch_names", {}) or {}).get(part_id)
-                    value = str(active["name"]) if active else "Master"
+                    _set_active_branch_badge(item, active)
+                    continue
                 else:
                     value = self._extra_bom_column_value(info or {}, spec)
                 item.setText(column, value)
@@ -9099,6 +9190,10 @@ class BomPage(QWidget):
             item.setCheckState(Qt.Checked if key in visible else Qt.Unchecked)
             if key == "aes_number":
                 item.setToolTip("AES delivery reference. Kept available even when Item Number is the primary PLM number.")
+            elif key == "active_branch":
+                item.setCheckState(Qt.Checked)
+                item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
+                item.setToolTip("Always visible at the beginning of the row so the work destination is clear.")
             list_widget.addItem(item)
         layout.addWidget(list_widget, 1)
 
@@ -9118,7 +9213,8 @@ class BomPage(QWidget):
 
         def set_all(state):
             for row in range(list_widget.count()):
-                list_widget.item(row).setCheckState(state)
+                item = list_widget.item(row)
+                item.setCheckState(Qt.Checked if item.data(Qt.UserRole) == "active_branch" else state)
 
         select_all.clicked.connect(lambda: set_all(Qt.Checked))
         clear_all.clicked.connect(lambda: set_all(Qt.Unchecked))
@@ -14475,13 +14571,15 @@ class BomPage(QWidget):
         )
         menu.addSeparator()
         details = self.bom_service.get_part_details(item_id) or {}
-        locked = bool(details.get("locked"))
+        in_branch = bool(details.get("active_branch_id"))
+        branch_checkout = details.get("branch_checkout") if in_branch else None
+        locked = bool(branch_checkout) if in_branch else bool(details.get("locked"))
         try:
-            active_cad = self.bom_service.checked_out_cad_for_item(item_id) or []
+            active_cad = (self.bom_service.checked_out_cad_for_item(item_id) or []) if not in_branch else []
         except Exception:
             active_cad = []
         checkout_origin = str(details.get("checkout_origin") or "ITEM").upper()
-        lock_owner_id = details.get("locked_by_user_id")
+        lock_owner_id = (branch_checkout.get("user_id") if branch_checkout else None) if in_branch else details.get("locked_by_user_id")
         lock_is_mine = (
             lock_owner_id is None or self.session.user_id is None
             or int(lock_owner_id) == int(self.session.user_id)
@@ -14489,10 +14587,11 @@ class BomPage(QWidget):
         can_finish_checkout = not locked or lock_is_mine or self.perm.can("merge")
         has_checkout = locked or bool(active_cad)
         checkout_action = menu.addAction("Check Out Item")
-        if locked and checkout_origin == "CAD":
+        if not in_branch and locked and checkout_origin == "CAD":
             checkout_action.setText("Make Item Checkout Explicit")
         checkout_action.setEnabled(
-            not locked or (checkout_origin == "CAD" and can_finish_checkout)
+            (not locked or (checkout_origin == "CAD" and can_finish_checkout))
+            and (not in_branch or details.get("active_branch_state") == "Active")
         )
         checkout_action.triggered.connect(lambda: self.checkout_part(item_id))
         checkin_action = menu.addAction("Check In Item...")
@@ -18209,9 +18308,18 @@ class BomPage(QWidget):
         existing_is_assembly = bool(item.data(0, BOM_TREE_IS_ASSEMBLY_ROLE))
         issues = self._issues_for_part(part_id)
         locked_txt = ""
+        try:
+            branch_checkout = (getattr(self, "_active_branch_checkouts", {}) or {}).get(int(part_id))
+        except (TypeError, ValueError):
+            branch_checkout = None
+        if branch_checkout:
+            who = str(branch_checkout.get("checked_out_by") or "").strip()
+            branch_name = str(branch_checkout.get("branch_name") or "branch")
+            locked_txt = f"Branch {branch_name} In Work ({who})" if who else f"Branch {branch_name} In Work"
         if info.get("locked"):
             who = str(info.get("locked_by_username") or "").strip()
-            locked_txt = f"In Work ({who})" if who else "In Work"
+            master_lock_text = f"Master In Work ({who})" if who else "Master In Work"
+            locked_txt = (locked_txt + " · " + master_lock_text) if locked_txt else master_lock_text
 
         row_text = str(info.get("_tree_row_text") or info.get("_tree_row_number") or "").strip()
         if not row_text:
@@ -19650,6 +19758,29 @@ class BomPage(QWidget):
         except Exception:
             pass
 
+    def _nexus_checkout_service(self):
+        from core.services.nexus_history_service import NexusHistoryService
+        if not self.session.user_id or not self.session.project_id:
+            raise PermissionError("Select a project and sign in before using a Nexus branch checkout.")
+        return NexusHistoryService(
+            getattr(self.bom_service.bom_repo, "db_name", DB_NAME),
+            user_id=int(self.session.user_id), project_id=int(self.session.project_id),
+        )
+
+    def _refresh_branch_checkout_item(self, part_id: int):
+        self._refresh_branch_checkout_items([int(part_id)])
+
+    def _refresh_branch_checkout_items(self, part_ids):
+        ids = sorted({int(value) for value in (part_ids or []) if value is not None})
+        if not ids:
+            return
+        self._load_active_branch_names()
+        for part_id in ids:
+            self._refresh_current_tree_item_lock_state(part_id)
+        self._refresh_pdm_context_rows(item_ids=ids)
+        if getattr(self, "current_part_id", None) in ids:
+            self.display_details(int(self.current_part_id))
+
     def _refresh_loaded_part_branch(self, part_id: int) -> None:
         self._refresh_part_in_tree(int(part_id))
         try:
@@ -19697,6 +19828,43 @@ class BomPage(QWidget):
         part_id = part_id or getattr(self, "current_part_id", None)
         if not part_id:
             QMessageBox.warning(self, "Check In", "Select a checked-out BOM item.")
+            return
+        try:
+            nexus = self._nexus_checkout_service()
+            active_branch = nexus.active_branch_map([int(part_id)]).get(int(part_id))
+            if active_branch:
+                checkout = nexus.branch_checkout_for_item(
+                    int(part_id), branch_id=active_branch["branch_id"]
+                )
+                if checkout:
+                    if (int(checkout["user_id"]) != int(self.session.user_id)
+                            and not self.perm.can("merge")):
+                        QMessageBox.warning(
+                            self, "Branch Check In",
+                            f"The branch workspace is checked out by {checkout.get('checked_out_by') or 'another user'}.",
+                        )
+                        return
+                    note, accepted = QInputDialog.getText(
+                        self, "Check In Branch Workspace",
+                        f"Describe the changes for branch '{checkout['branch_name']}':",
+                        QLineEdit.Normal, "Branch workspace check-in",
+                    )
+                    if not accepted or not str(note).strip():
+                        return
+                    result = nexus.checkin_branch_item(
+                        int(part_id), active_branch["branch_id"], str(note).strip()
+                    )
+                    message = ("Branch workspace check-in saved as a new snapshot."
+                               if result.get("changed") else
+                               "No branch changes were found. The branch checkout was released.")
+                    QMessageBox.information(self, "Branch Check In", message)
+                    self._refresh_branch_checkout_items(result.get("item_ids") or [int(part_id)])
+                    return
+        except (ValueError, PermissionError) as exc:
+            QMessageBox.warning(self, "Branch Check In", str(exc))
+            return
+        except Exception as exc:
+            QMessageBox.critical(self, "Branch Check In", f"Could not check in the branch workspace:\n{exc}")
             return
         try:
             analysis = self.bom_service.analyze_item_checkout(int(part_id))
@@ -19768,6 +19936,43 @@ class BomPage(QWidget):
                 QMessageBox.warning(self, "No Selection", "Please select a checked-out item.")
                 return
             part_id = self.current_part_id
+        try:
+            nexus = self._nexus_checkout_service()
+            active_branch = nexus.active_branch_map([int(part_id)]).get(int(part_id))
+            if active_branch:
+                checkout = nexus.branch_checkout_for_item(
+                    int(part_id), branch_id=active_branch["branch_id"]
+                )
+                if checkout:
+                    if (int(checkout["user_id"]) != int(self.session.user_id)
+                            and not self.perm.can("merge")):
+                        QMessageBox.warning(
+                            self, "Undo Branch Checkout",
+                            f"The branch workspace is checked out by {checkout.get('checked_out_by') or 'another user'}.",
+                        )
+                        return
+                    answer = QMessageBox.question(
+                        self, "Undo Branch Checkout",
+                        f"Discard the current workspace edits in branch '{checkout['branch_name']}' "
+                        "and restore its latest checked-in snapshot? This also releases the checkout "
+                        "owner's other Item checkouts in this branch workspace. Master is not affected.",
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                    )
+                    if answer != QMessageBox.Yes:
+                        return
+                    result = nexus.undo_branch_checkout(int(part_id), active_branch["branch_id"])
+                    QMessageBox.information(
+                        self, "Undo Branch Checkout",
+                        "Branch workspace changes were discarded. The latest branch snapshot was restored.",
+                    )
+                    self._refresh_branch_checkout_items(result.get("item_ids") or [int(part_id)])
+                    return
+        except (ValueError, PermissionError) as exc:
+            QMessageBox.warning(self, "Undo Branch Checkout", str(exc))
+            return
+        except Exception as exc:
+            QMessageBox.critical(self, "Undo Branch Checkout", f"Could not undo branch checkout:\n{exc}")
+            return
         details = self.bom_service.get_part_details(int(part_id)) or {}
         actor_user_id = self._prompt_actor_user_id(
             "Undo Item Checkout As",
@@ -19830,6 +20035,34 @@ class BomPage(QWidget):
                 QMessageBox.warning(self, "No Selection", "Please select a part to check out.")
                 return
             part_id = self.current_part_id
+
+        try:
+            nexus = self._nexus_checkout_service()
+            active_branch = nexus.active_branch_map([int(part_id)]).get(int(part_id))
+            if active_branch:
+                if QMessageBox.question(
+                    self, "Check Out in Nexus Branch",
+                    f"Check out this Item in branch '{active_branch['name']}'?\n\n"
+                    "The branch has its own CAD and deliverable workspace. Master checkout status "
+                    "will not be changed.",
+                    QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Yes,
+                ) != QMessageBox.Yes:
+                    return
+                checkout = nexus.checkout_branch_item(int(part_id), active_branch["branch_id"])
+                QMessageBox.information(
+                    self, "Branch Checkout",
+                    f"The Item is checked out in branch '{checkout['branch_name']}'.\n\n"
+                    "Commit CAD files from your working directory. The app manages the branch workspace "
+                    "and puts the committed files there when you push to this branch.",
+                )
+                self._refresh_branch_checkout_item(int(part_id))
+                return
+        except (ValueError, PermissionError) as exc:
+            QMessageBox.warning(self, "Branch Checkout", str(exc))
+            return
+        except Exception as exc:
+            QMessageBox.critical(self, "Branch Checkout", f"Could not check out the branch workspace:\n{exc}")
+            return
 
         details = self.bom_service.get_part_details(int(part_id)) or {}
         checkout_origin = str(details.get("checkout_origin") or "ITEM").upper()
@@ -21492,11 +21725,15 @@ class BomPage(QWidget):
     def _on_nexus_history_changed(self, result):
         result = result if isinstance(result, dict) else {}
         ids = [int(value) for value in result.get("item_ids", []) if value is not None]
-        if result.get("commit_id"):
+        if result.get("branch_id") or result.get("commit_id"):
             self._load_active_branch_names()
             self.bom_service._tree_dirty.add(int(self.session.project_id))
             for item_id in ids:
                 self._refresh_part_in_tree(item_id)
+                active = self._active_branch_names.get(item_id)
+                for tree in (self.tree, self._search_tree, self._ebom_tree, self._ebom_filter_tree):
+                    for row in self._find_tree_items(item_id, tree):
+                        _set_active_branch_badge(row, active)
             if getattr(self, "current_part_id", None) in ids:
                 self.display_details(int(self.current_part_id))
 
@@ -21679,7 +21916,10 @@ class BomPage(QWidget):
 
     def _update_lifecycle_action_states(self, details: dict) -> None:
         has_item = bool(details and getattr(self, "current_part_id", None))
-        locked = bool(details.get("locked")) if has_item else False
+        master_locked = bool(details.get("locked")) if has_item else False
+        in_branch = bool(details.get("active_branch_id")) if has_item else False
+        branch_checkout = details.get("branch_checkout") if in_branch else None
+        locked = bool(branch_checkout) if in_branch else master_locked
         state = str(
             details.get("revision_state") or details.get("lifecycle_state") or ""
         ).strip().lower()
@@ -21696,23 +21936,27 @@ class BomPage(QWidget):
         try:
             active_cad = (
                 self.bom_service.checked_out_cad_for_item(int(self.current_part_id))
-                if has_item else []
+                if has_item and not in_branch else []
             )
         except Exception:
             active_cad = []
         checkout_origin = str(details.get("checkout_origin") or "ITEM").upper()
         lock_is_mine = (
+            (int(branch_checkout["user_id"]) == int(self.session.user_id))
+            if branch_checkout and self.session.user_id else (
             details.get("locked_by_user_id") is None
             or self.session.user_id is None
             or int(details.get("locked_by_user_id")) == int(self.session.user_id)
+            )
         )
         can_promote_auto_checkout = bool(
-            locked and checkout_origin == "CAD" and lock_is_mine
+            not in_branch and locked and checkout_origin == "CAD" and lock_is_mine
         )
         can_finish_checkout = bool(not locked or lock_is_mine or self.perm.can("merge"))
         has_checkout = locked or bool(active_cad)
         self.checkout_part_btn.setEnabled(
             has_item and (not locked or can_promote_auto_checkout)
+            and (not in_branch or details.get("active_branch_state") == "Active")
             and not obsolete and not read_only_ebom
         )
         self.checkin_part_btn.setEnabled(
@@ -21732,31 +21976,36 @@ class BomPage(QWidget):
             self.checkout_part_btn.setToolTip(
                 "Convert the automatic CAD-origin reservation into an explicit Item checkout"
             )
+        elif in_branch:
+            branch_name = str(details.get("active_branch_name") or "Nexus branch")
+            self.checkout_part_btn.setToolTip("Check out this Item in branch: " + branch_name)
+            self.checkin_part_btn.setToolTip("Save changes to the branch snapshot: " + branch_name)
+            self.undo_checkout_btn.setToolTip("Discard branch workspace edits and restore the latest snapshot")
         self.edit_part_btn.setEnabled(
             has_item and locked and can_finish_checkout and can_manage
-            and editable_checkout and not read_only_ebom
+            and editable_checkout and not read_only_ebom and not in_branch
         )
         self.delete_part_btn.setEnabled(
-            has_item and can_manage and editable_checkout and not read_only_ebom
+            has_item and can_manage and editable_checkout and not read_only_ebom and not in_branch
         )
         self.add_child_btn.setEnabled(
             has_item and locked and can_finish_checkout and can_manage and is_assembly
-            and editable_checkout and not read_only_ebom
+            and editable_checkout and not read_only_ebom and not in_branch
         )
         self.compare_iterations_btn.setEnabled(has_item and is_assembly)
         self.create_configuration_btn.setEnabled(
-            has_item and is_assembly and not read_only_ebom
+            has_item and is_assembly and not read_only_ebom and not in_branch
         )
         self.update_child_versions_btn.setEnabled(
             has_item and locked and can_finish_checkout and is_assembly
-            and editable_checkout and not read_only_ebom
+            and editable_checkout and not read_only_ebom and not in_branch
         )
         self.set_revision_btn.setEnabled(
             has_item and not locked and released and not pending_revision
-            and can_revision and not read_only_ebom
+            and can_revision and not read_only_ebom and not in_branch
         )
         self.release_revision_btn.setEnabled(
-            has_item and not locked and not released and can_revision and not read_only_ebom
+            has_item and not locked and not released and can_revision and not read_only_ebom and not in_branch
         )
         self._sync_action_ribbon_menus()
 

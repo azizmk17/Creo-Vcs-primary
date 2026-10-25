@@ -203,20 +203,106 @@ class NexusHistoryService:
             return filename
         return f"{match[1]}.{int(match[2] or 0) + 1}"
 
-    @staticmethod
-    def _archive_merged_branch(root, branch_id, branch_name):
-        """Move the disposable branch workspace to a user-managed archive folder."""
-        source = root / ".nexus" / "branches" / str(branch_id)
-        if not source.exists():
-            return ""
+    @classmethod
+    def _merged_archive_path(cls, root, branch_id, branch_name):
         safe_name = re.sub(r"[^A-Za-z0-9._ -]", "_", str(branch_name)).strip(" .") or "branch"
-        archive_root = root / "Merged Branch Archives"
-        archive_root.mkdir(parents=True, exist_ok=True)
-        destination = archive_root / f"{safe_name}__{str(branch_id)[:8]}"
-        if destination.exists():
-            destination = archive_root / f"{safe_name}__{str(branch_id)[:8]}_{uuid.uuid4().hex[:6]}"
-        source.rename(destination)
-        return str(destination)
+        archive_root = cls._safe_path(root, "Merged Branch Archives")
+        return cls._safe_path(archive_root, f"{safe_name}__{str(branch_id)}")
+
+    @classmethod
+    def _archive_merged_branch(cls, root, branch_id, branch_name):
+        """Archive by renaming; handle locked Windows directories without copying large files."""
+        root = Path(root).resolve()
+        branches = cls._safe_path(root, ".nexus/branches")
+        source = cls._safe_path(branches, str(branch_id))
+        if source.parent != branches or source == branches:
+            raise ValueError("Invalid branch workspace path.")
+        destination = cls._merged_archive_path(root, branch_id, branch_name)
+        if not source.exists():
+            return str(destination) if destination.is_dir() else ""
+        lock_root = cls._safe_path(root, ".nexus/branch-cleanup")
+        lock_root.mkdir(parents=True, exist_ok=True)
+        lock = cls._safe_path(lock_root, str(branch_id) + ".lock")
+        try:
+            descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError as exc:
+            raise OSError("Another operation is cleaning up this branch workspace.") from exc
+        os.close(descriptor)
+
+        def move_tree(current, target):
+            # Every directory we remove must remain inside this branch workspace.
+            if not current.resolve().is_relative_to(source):
+                raise ValueError("A branch workspace entry points outside its managed directory.")
+            if not target.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    current.rename(target)
+                    return
+                except OSError:
+                    # A process may hold the directory open while its files remain movable.
+                    pass
+            target.mkdir(parents=True, exist_ok=True)
+            failures = []
+            for entry in list(current.iterdir()):
+                try:
+                    output = cls._safe_path(target, entry.name)
+                    reparse = bool(getattr(entry.lstat(), "st_file_attributes", 0) & 0x400)
+                    if entry.is_dir() and not entry.is_symlink() and not reparse:
+                        move_tree(entry, output)
+                    else:
+                        if output.exists() or output.is_symlink():
+                            raise FileExistsError("An archived file already exists; the remaining workspace file was preserved: "
+                                                  + entry.name)
+                        entry.rename(output)
+                except (OSError, ValueError) as exc:
+                    failures.append(exc)
+            if failures:
+                raise OSError(str(failures[0]))
+            current.rmdir()
+
+        try:
+            move_tree(source, destination)
+            return str(destination)
+        finally:
+            lock.unlink(missing_ok=True)
+
+    def _complete_merge_cleanup(self, root, branch):
+        """A disposable workspace cleanup must not invalidate a committed Master merge."""
+        try:
+            archive_path = self._archive_merged_branch(root, branch["id"], branch["name"])
+            return {"cleanup_pending": False, "cleanup_warning": "", "archive_path": archive_path}
+        except (OSError, ValueError) as exc:
+            archive_path = ""
+            try:
+                destination = self._merged_archive_path(root, branch["id"], branch["name"])
+                if destination.is_dir():
+                    archive_path = str(destination)
+            except (OSError, ValueError):
+                pass
+            return {
+                "cleanup_pending": True,
+                "cleanup_warning": "The merge is complete. Windows or the shared folder blocked workspace cleanup. "
+                    "Close files or folders using this branch, then select Retry Workspace Cleanup. "
+                    "Any files that could not be moved have been kept in the branch workspace.",
+                "cleanup_error": str(exc),
+                "cleanup_path": str(Path(root) / ".nexus/branches" / branch["id"]),
+                "archive_path": archive_path,
+            }
+
+    def cleanup_merged_branch(self, branch_id):
+        """Retry archiving a closed branch without publishing or creating another commit."""
+        self._require("merge")
+        with self.repo.connection() as conn:
+            branch = self._branch_access(conn, branch_id)
+            if branch["state"] != "Merged":
+                raise ValueError("Only a successfully merged branch can have its workspace removed.")
+            root = self._root(conn)
+            ids = [int(row[0]) for row in conn.execute(
+                "SELECT bom_id FROM nexus_branch_items WHERE branch_id=?", (str(branch_id),)
+            )]
+        return {"branch_id": str(branch_id), "commit_id": branch.get("merge_commit_id"),
+                "item_ids": ids, "merge_completed": True,
+                **self._complete_merge_cleanup(root, branch)}
 
     def _scope(self, conn, item_ids, include_children):
         tables = self.repo.tables(conn)
@@ -469,6 +555,156 @@ class NexusHistoryService:
         return fingerprint({"items": manifest["items"],
                             "files": {k: v["sha256"] for k, v in manifest["files"].items()}})
 
+    @staticmethod
+    def _item_state_token(item):
+        return fingerprint({"attributes": item.get("attributes") or {}, "structure": item.get("structure") or {}})
+
+    def _branch_validation_receipts(self, conn, branch_id, head):
+        receipts = dict(head.get("validation_receipts") or {})
+        # Older branch pushes kept the checker but changed status to Branched.
+        # Recover evidence from the immutable snapshot at that exact push.
+        events = conn.execute("""
+            WITH RECURSIVE lineage(id,parent_id) AS (
+                SELECT id,parent_id FROM nexus_branch_snapshots WHERE id=? AND branch_id=?
+                UNION ALL SELECT s.id,s.parent_id FROM nexus_branch_snapshots s
+                JOIN lineage p ON s.id=p.parent_id WHERE s.branch_id=?
+            )
+            SELECT DISTINCT e.id,e.snapshot_id,e.payload_json FROM nexus_item_events e
+            JOIN lineage s ON s.id=e.snapshot_id WHERE e.branch_id=? AND e.event_type='BRANCH_COMMIT'
+            ORDER BY e.id
+        """, (self.repo.branch(conn, branch_id, self.project_id)["head_snapshot_id"],
+              str(branch_id), str(branch_id), str(branch_id))).fetchall()
+        for event in events:
+            source_id = str(json.loads(event["payload_json"] or "{}").get("source_commit_id") or "")
+            if not source_id or source_id in receipts:
+                continue
+            rows = conn.execute("SELECT status,checked_by,part_id,filename FROM commits WHERE project_id=? AND commit_id=?",
+                                (self.project_id, source_id)).fetchall()
+            validated = bool(rows) and all(row["checked_by"] is not None and
+                str(row["status"]).casefold() in {"validated", "approved", "branched"} for row in rows)
+            if not rows:
+                continue
+            saved = self._snapshot(conn, event["snapshot_id"])
+            names = {logical_name(row["filename"]) for row in rows}
+            receipts[source_id] = {
+                "validated": validated, "checked_by": rows[0]["checked_by"] if validated else None,
+                "files": {key: value["sha256"] for key, value in saved["files"].items()
+                          if logical_name(value["filename"]) in names or value.get("source_commit_id") == source_id},
+                "items": {str(row["part_id"]): self._item_state_token(saved["items"][str(row["part_id"])])
+                          for row in rows if str(row["part_id"]) in saved["items"]},
+            }
+            for document in self._commit_documents(conn, self._root(conn), source_id, allow_missing=True):
+                if not Path(document["path"]).is_file():
+                    continue
+                key, entry = self._branch_document_entry(saved, document, source_id)
+                digest = file_hash(document["path"])
+                if entry["sha256"] and entry["sha256"] != digest:
+                    raise ValueError("A validated commit attachment failed its integrity check: " + entry["filename"])
+                receipts[source_id]["files"][key] = digest
+        return receipts
+
+    def _merge_validation(self, conn, branch_id, head, master, publication, selected, item_ids):
+        receipts = self._branch_validation_receipts(conn, branch_id, head)
+        statuses, checkers, anchors = {}, {}, {}
+        for item_id in item_ids:
+            effective = json.loads(canonical(master["items"][str(item_id)]))
+            for change in selected:
+                if change.get("item_id") != item_id:
+                    continue
+                if change["kind"] == "attribute":
+                    effective["attributes"][change["key"]] = change["branch"]
+                elif change["kind"] == "usage":
+                    effective["structure"][change["key"]] = change["branch"]
+            natives = [(key, value) for key, value in head["files"].items()
+                       if item_id in value["item_ids"] and NATIVE.fullmatch(value["filename"])]
+            anchor = next(((key, value) for key, value in natives if value["role"] == "native_cad"), None)
+            source_id = str(anchor[1].get("source_commit_id") or "") if anchor else ""
+            receipt = receipts.get(source_id) or {}
+            if anchor and not receipt and not head.get("validation_receipts"):
+                matches = [(key, evidence) for key, evidence in receipts.items()
+                           if evidence.get("files", {}).get(anchor[0]) == anchor[1]["sha256"]]
+                if matches:
+                    source_id, receipt = matches[-1]
+            valid = bool(anchor and receipt.get("validated")
+                         and receipt.get("files", {}).get(anchor[0]) == anchor[1]["sha256"]
+                         and receipt.get("items", {}).get(str(item_id)) == self._item_state_token(effective))
+            for key, value in natives:
+                final_file = publication.get(key) or master["files"].get(key) or {}
+                if final_file.get("sha256") != value["sha256"]:
+                    valid = False
+            for change in selected:
+                if change["kind"] != "file":
+                    continue
+                entry = head["files"][change["key"]]
+                if item_id not in entry["item_ids"]:
+                    continue
+                evidence = receipts.get(str(entry.get("source_commit_id") or "")) or {}
+                if not evidence and not head.get("validation_receipts"):
+                    matches = [value for value in receipts.values()
+                               if value.get("files", {}).get(change["key"]) == entry["sha256"]]
+                    if matches:
+                        evidence = matches[-1]
+                if not evidence.get("validated") or evidence.get("files", {}).get(change["key"]) != entry["sha256"]:
+                    valid = False
+            statuses[item_id] = "Validated" if valid else "Integrated"
+            checkers[item_id] = receipt.get("checked_by") if valid else None
+            anchors[item_id] = source_id
+        return statuses, checkers, anchors, receipts
+
+    def _register_merged_document(self, conn, root, item_id, iteration_id, entry, commit_id,
+                                  source_id, validated, note):
+        picked = dict(entry)
+        digest, filename = picked["sha256"], Path(picked["filename"]).name
+        vault_rel = (Path(".nexus/vault/blobs") / digest[:2] / digest / filename).as_posix()
+        vault_path = self._safe_path(root, vault_rel)
+        if not vault_path.is_file():
+            vault_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(self._blob(root, picked), vault_path)
+        if file_hash(vault_path) != digest:
+            raise ValueError("A branch deliverable failed its vault integrity check: " + filename)
+        kind = str(picked.get("file_type") or "").upper()
+        kind = "STEP" if kind == "STP" else kind
+        role = "generated_pdf" if kind == "PDF" else "generated_step" if kind == "STEP" else "document"
+        file_row = conn.execute("SELECT id FROM part_files WHERE id=? AND part_id=? AND deleted_at IS NULL",
+                                (picked.get("part_file_id"), item_id)).fetchone()
+        if not file_row and kind in {"PDF", "STEP"}:
+            file_row = conn.execute("SELECT id FROM part_files WHERE part_id=? AND upper(file_type)=? "
+                                    "AND deleted_at IS NULL ORDER BY id LIMIT 1", (item_id, kind)).fetchone()
+        if file_row:
+            file_id = int(file_row[0])
+        else:
+            cursor = conn.execute("""INSERT INTO part_files(part_id,file_type,display_name,description,created_by,file_role)
+                VALUES(?,?,?,?,?,?)""", (item_id, kind, Path(filename).stem, "Merged from Nexus branch", self.user_id, "document"))
+            file_id = int(cursor.lastrowid)
+        version_no = int(conn.execute("SELECT COALESCE(MAX(version_no),0)+1 FROM part_file_versions WHERE file_id=?",
+                                      (file_id,)).fetchone()[0])
+        project = self._project(conn)
+        values = {
+            "file_id": file_id, "version_no": version_no, "original_filename": filename,
+            "vault_rel_path": vault_rel, "sha256": digest, "size_bytes": int(picked.get("size_bytes") or 0),
+            "note": "Nexus branch merge: " + str(note).strip(), "revision": str(picked.get("file_revision") or ""),
+            "created_by": self.user_id, "lifecycle_state": "Validated" if validated else "WIP",
+            "root_project_id": project.get("root_project_id") or self.project_id,
+            "project_version_label": project.get("version_label"), "object_iteration_id": iteration_id,
+            "storage_scheme": "managed_blob", "source_kind": "nexus_branch", "source_commit_id": source_id,
+            "integrity_status": "Verified", "derived_from_version_id": picked.get("part_file_version_id"),
+        }
+        available_columns = self.repo.columns(conn, "part_file_versions")
+        columns = [key for key in values if key in available_columns]
+        cursor = conn.execute(f"INSERT INTO part_file_versions ({', '.join(columns)}) "
+                              f"VALUES ({', '.join('?' for _ in columns)})", [values[key] for key in columns])
+        version_id = int(cursor.lastrowid)
+        conn.execute("UPDATE part_files SET active_version_id=? WHERE id=?", (version_id, file_id))
+        if "commit_engineering_file_links" in self.repo.tables(conn):
+            conn.execute("""INSERT OR IGNORE INTO commit_engineering_file_links
+                (commit_id,project_id,part_id,part_file_id,part_file_version_id,file_role,linked_by,note)
+                VALUES(?,?,?,?,?,?,?,?)""", (commit_id, self.project_id, item_id, file_id, version_id,
+                "exported_pdf" if kind == "PDF" else "exported_step" if kind == "STEP" else "other",
+                self.user_id, str(note).strip()))
+        picked.update(part_file_id=file_id, part_file_version_id=version_id, blob_path=vault_rel,
+                      vault_rel_path=vault_rel, source_commit_id=source_id, role=role, file_type=kind)
+        return picked
+
     def _save_snapshot(self, conn, branch_id, parent_id, manifest, note, stamp):
         snapshot_id, encoded = uuid.uuid4().hex, canonical(manifest)
         conn.execute("""
@@ -526,6 +762,158 @@ class NexusHistoryService:
             branch["manifest"] = self._snapshot(conn, branch["head_snapshot_id"])
             return branch
 
+    def _commit_documents(self, conn, root, commit_id, *, allow_missing=False):
+        """Read a commit's attached documents from its managed submission store."""
+        row = conn.execute("""
+            SELECT c.title,u.username FROM commits c LEFT JOIN users u ON u.id=c.designer
+            WHERE c.project_id=? AND c.commit_id=? ORDER BY c.id LIMIT 1
+        """, (self.project_id, str(commit_id))).fetchone()
+        if not row or not row["username"] or not row["title"]:
+            return []
+        title = str(row["title"])
+        titles = list(dict.fromkeys((title, re.sub(r'[<>:"/\\|?*]', '_', title))))
+        commits_root = self._safe_path(root, "commits")
+        for title in titles:
+            base = self._safe_path(commits_root, Path(row["username"]) / (title + "_" + str(commit_id)))
+            metadata = base / "_engineering_attachments" / "manifest.json"
+            if not metadata.is_file():
+                continue
+            manifest = json.loads(metadata.read_text(encoding="utf-8"))
+            if str(manifest.get("commit_id") or "") != str(commit_id):
+                raise ValueError("The attached documents belong to a different commit.")
+            documents = []
+            for value in manifest.get("attachments") or []:
+                source = self._safe_path(base, value.get("stored_rel_path") or "")
+                if not source.is_file() and not allow_missing:
+                    raise ValueError("A commit attachment is missing: " + str(value.get("filename") or source.name))
+                documents.append({**value, "path": str(source), "source_commit_id": str(commit_id)})
+            return documents
+        return []
+
+    @staticmethod
+    def _branch_document_entry(manifest, document, commit_id):
+        item_id = int(document["part_id"])
+        if str(item_id) not in manifest["items"]:
+            raise ValueError("A commit attachment is associated with an Item outside this branch.")
+        filename = Path(str(document.get("filename") or Path(document["path"]).name)).name
+        if not filename or NATIVE.fullmatch(filename):
+            raise ValueError("A commit document must be an associated non-native file.")
+        kind = str(document.get("file_type") or Path(filename).suffix.lstrip(".")).upper()
+        role = str(document.get("file_role") or "document")
+        candidates = [(key, entry) for key, entry in manifest["files"].items()
+                      if item_id in entry.get("item_ids", []) and not NATIVE.fullmatch(entry["filename"])
+                      and str(entry.get("file_type") or "").upper() == kind]
+        exact = [(key, entry) for key, entry in candidates if entry["filename"].casefold() == filename.casefold()]
+        slots = exact or (candidates if kind in {"PDF", "STEP", "STP"} and len(candidates) == 1 else [])
+        key, prior = slots[0] if slots else (
+            f"{item_id}/commit-document/{fingerprint(role + ':' + filename.casefold())[:20]}", {}
+        )
+        return key, {
+            "key": key, "filename": filename, "file_type": kind, "role": role,
+            "file_revision": str(document.get("revision") or ""), "item_ids": [item_id],
+            "part_file_id": prior.get("part_file_id"), "part_file_version_id": None,
+            "path": str(document["path"]), "sha256": str(document.get("sha256") or ""),
+            "source_commit_id": str(commit_id), "note": str(document.get("note") or ""),
+        }
+
+    def list_branch_files(self, item_id, branch_id, *, snapshot_id=None):
+        """List an item's exact branch files, including older commit attachments."""
+        item_id = int(item_id)
+        with self.repo.connection() as conn:
+            branch = self._branch_access(conn, branch_id)
+            snapshot_id = str(snapshot_id or branch["head_snapshot_id"])
+            if not conn.execute("SELECT 1 FROM nexus_branch_snapshots WHERE id=? AND branch_id=?",
+                                (snapshot_id, str(branch_id))).fetchone():
+                raise ValueError("The selected snapshot does not belong to this Nexus branch.")
+            manifest = self._snapshot(conn, snapshot_id)
+            if str(item_id) not in manifest["items"]:
+                raise ValueError("The selected Item is not part of this branch snapshot.")
+            root = self._root(conn)
+            events = conn.execute("""
+                WITH RECURSIVE lineage(id,parent_id) AS (
+                    SELECT id,parent_id FROM nexus_branch_snapshots WHERE id=? AND branch_id=?
+                    UNION ALL
+                    SELECT s.id,s.parent_id FROM nexus_branch_snapshots s
+                    JOIN lineage p ON s.id=p.parent_id WHERE s.branch_id=?
+                )
+                SELECT e.payload_json FROM nexus_item_events e JOIN lineage s ON s.id=e.snapshot_id
+                WHERE e.project_id=? AND e.branch_id=? AND e.bom_id=? AND e.event_type='BRANCH_COMMIT'
+                ORDER BY e.id
+            """, (snapshot_id, str(branch_id), str(branch_id), self.project_id, str(branch_id), item_id)).fetchall()
+            commits = list(dict.fromkeys(str(json.loads(row[0] or "{}").get("source_commit_id") or "")
+                                        for row in events))
+            order = {value: index for index, value in enumerate(commits) if value}
+            # Older app versions left commit documents outside the branch manifest.
+            # Read them without rewriting any immutable snapshot or release record.
+            for commit_id in commits:
+                if not commit_id:
+                    continue
+                for document in self._commit_documents(conn, root, commit_id, allow_missing=True):
+                    if int(document["part_id"]) != item_id:
+                        continue
+                    key, entry = self._branch_document_entry(manifest, document, commit_id)
+                    prior = manifest["files"].get(key) or {}
+                    if order.get(str(prior.get("source_commit_id") or ""), -1) >= order[commit_id]:
+                        continue
+                    source = Path(entry["path"])
+                    entry["size_bytes"] = source.stat().st_size if source.is_file() else 0
+                    if not entry["sha256"] and source.is_file():
+                        entry["sha256"] = file_hash(source)
+                    manifest["files"][key] = entry
+
+            files = []
+            for key, entry in manifest["files"].items():
+                if item_id not in entry.get("item_ids", []):
+                    continue
+                source = self._safe_path(root, entry["blob_path"]) if entry.get("blob_path") else Path(entry["path"])
+                files.append({**entry, "key": key, "available": source.is_file(),
+                              "storage": "Branch snapshot" if entry.get("blob_path") else "Commit attachment"})
+            files.sort(key=lambda entry: (str(entry.get("file_type") or ""), entry["filename"].casefold()))
+            return {"branch_id": str(branch_id), "branch_name": branch["name"],
+                    "snapshot_id": snapshot_id, "item_id": item_id, "files": files}
+
+    def _merge_head_manifest(self, conn, branch, *, freeze=False):
+        """Include documents from older branch pushes without rewriting their saved history."""
+        head = self._snapshot(conn, branch["head_snapshot_id"])
+        root = self._root(conn)
+        for item_id in head["items"]:
+            listing = self.list_branch_files(int(item_id), branch["id"], snapshot_id=branch["head_snapshot_id"])
+            for entry in listing["files"]:
+                if entry.get("blob_path"):
+                    continue
+                if not entry["available"]:
+                    raise ValueError("A branch commit document is missing: " + entry["filename"])
+                value = {key: data for key, data in entry.items() if key not in {"available", "storage"}}
+                head["files"][entry["key"]] = self._freeze(root, value) if freeze else value
+        return head
+
+    def export_branch_file(self, item_id, branch_id, key, destination, *, snapshot_id=None,
+                           expected_sha256=None):
+        data = self.list_branch_files(item_id, branch_id, snapshot_id=snapshot_id)
+        entry = next((value for value in data["files"] if value["key"] == key), None)
+        if not entry or not entry["available"]:
+            raise ValueError("The selected branch file is no longer available.")
+        if expected_sha256 and entry["sha256"] != expected_sha256:
+            raise ValueError("The commit attachment changed. Reload its file list before exporting.")
+        with self.repo.connection() as conn:
+            root = self._root(conn)
+        destination = Path(destination).resolve()
+        for protected in (".nexus", "master", "commits", "vault"):
+            if destination.is_relative_to((root / protected).resolve()):
+                raise ValueError("Save the copy outside managed project storage.")
+        source = self._blob(root, entry) if entry.get("blob_path") else Path(entry["path"])
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".branch-file-", dir=destination.parent)
+        os.close(fd)
+        try:
+            shutil.copyfile(source, temporary)
+            if file_hash(temporary) != entry["sha256"]:
+                raise ValueError("The selected branch file failed its integrity check.")
+            os.replace(temporary, destination)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+        return str(destination)
+
     def active_branch_map(self, item_ids=None):
         """Return this user's active branch name and ID by item; absent means Master."""
         with self.repo.connection() as conn:
@@ -544,6 +932,167 @@ class NexusHistoryService:
                 JOIN nexus_branches b ON b.id=a.branch_id
                 WHERE a.user_id=? AND a.project_id=?
             """ + filter_sql, params)}
+
+    def branch_checkout_for_item(self, item_id, *, branch_id=None, user_id=None):
+        """Read the branch workspace lease covering an item, if any."""
+        with self.repo.connection() as conn:
+            clauses = ["i.bom_id=?", "b.project_id=?"]
+            params = [int(item_id), self.project_id]
+            if branch_id is not None:
+                clauses.append("b.id=?")
+                params.append(str(branch_id))
+            if user_id is not None:
+                clauses.append("c.user_id=?")
+                params.append(int(user_id))
+            row = conn.execute("""
+                SELECT c.*,b.name AS branch_name,b.state AS branch_state,
+                       u.username AS checked_out_by
+                FROM nexus_branch_checkouts c
+                JOIN nexus_branches b ON b.id=c.branch_id
+                JOIN nexus_branch_items i ON i.branch_id=b.id AND i.bom_id=c.bom_id
+                LEFT JOIN users u ON u.id=c.user_id
+                WHERE """ + " AND ".join(clauses) + " ORDER BY c.checked_out_at DESC LIMIT 1",
+                params,
+            ).fetchone()
+            return dict(row) if row else None
+
+    def active_branch_checkout_map(self, item_ids=None):
+        """Return workspace checkout owners for this user's active branches."""
+        with self.repo.connection() as conn:
+            params = [self.user_id, self.project_id]
+            filter_sql = ""
+            ids = sorted({int(value) for value in (item_ids or [])})
+            if ids:
+                filter_sql = " AND i.bom_id IN (" + ",".join("?" for _ in ids) + ")"
+                params.extend(ids)
+            rows = conn.execute("""
+                SELECT i.bom_id,c.branch_id,b.name AS branch_name,c.user_id,
+                       u.username AS checked_out_by,c.checked_out_at
+                FROM nexus_active_branches a
+                JOIN nexus_branch_checkouts c ON c.branch_id=a.branch_id AND c.bom_id=a.bom_id
+                JOIN nexus_branch_items i ON i.branch_id=a.branch_id AND i.bom_id=a.bom_id
+                JOIN nexus_branches b ON b.id=c.branch_id
+                LEFT JOIN users u ON u.id=c.user_id
+                WHERE a.user_id=? AND a.project_id=?
+            """ + filter_sql, params).fetchall()
+            return {int(row["bom_id"]): dict(row) for row in rows}
+
+    def checkout_branch_item(self, item_id, branch_id):
+        """Reserve the isolated branch workspace without taking a master Item lock."""
+        self._require("commit")
+        item_id, branch_id = int(item_id), str(branch_id)
+        with self.repo.connection() as conn:
+            branch = self._branch_access(conn, branch_id, editable=True)
+            if not conn.execute("SELECT 1 FROM nexus_branch_items WHERE branch_id=? AND bom_id=?",
+                                (branch_id, item_id)).fetchone():
+                raise ValueError("The selected Item is not included in this Nexus branch.")
+            root = self._root(conn)
+        workspace_path = self.workspace(branch_id)
+        marker_path = Path(workspace_path) / ".nexus-workspace.json"
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        with self._branch_lock(root, branch_id):
+            with self.repo.connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                branch = self._branch_access(conn, branch_id, editable=True)
+                if marker.get("head_snapshot_id") != branch["head_snapshot_id"]:
+                    raise ValueError("The branch advanced while opening its workspace. Refresh and retry.")
+                existing = conn.execute("""
+                    SELECT c.*,u.username FROM nexus_branch_checkouts c
+                    LEFT JOIN users u ON u.id=c.user_id WHERE c.branch_id=? AND c.bom_id=?
+                """, (branch_id, item_id)).fetchone()
+                if existing:
+                    if int(existing["user_id"]) == self.user_id:
+                        if str(existing["head_snapshot_id"]) != str(branch["head_snapshot_id"]):
+                            raise ValueError("The branch advanced during your checkout. Undo or refresh the workspace first.")
+                        conn.commit()
+                        return {"branch_id": branch_id, "item_id": item_id,
+                                "branch_name": branch["name"],
+                                "head_snapshot_id": branch["head_snapshot_id"],
+                                "workspace_path": str(existing["workspace_path"])}
+                    raise ValueError("This branch workspace is checked out by "
+                                     + str(existing["username"] or "another user") + ".")
+                conn.execute("""
+                    INSERT INTO nexus_branch_checkouts(
+                        branch_id,project_id,bom_id,user_id,head_snapshot_id,workspace_path,checked_out_at
+                    ) VALUES(?,?,?,?,?,?,?)
+                """, (branch_id, self.project_id, item_id, self.user_id,
+                      branch["head_snapshot_id"], str(workspace_path), now()))
+                conn.commit()
+        return {"branch_id": branch_id, "item_id": item_id,
+                "branch_name": branch["name"], "head_snapshot_id": branch["head_snapshot_id"],
+                "workspace_path": str(workspace_path)}
+
+    def checkin_branch_item(self, item_id, branch_id, note, *, attributes=None, quantities=None):
+        """Snapshot branch workspace changes and release its workspace lease."""
+        self._require("commit")
+        item_id, branch_id = int(item_id), str(branch_id)
+        with self.repo.connection() as conn:
+            checkout = conn.execute("""
+                SELECT c.*,b.name AS branch_name FROM nexus_branch_checkouts c
+                JOIN nexus_branches b ON b.id=c.branch_id
+                WHERE c.branch_id=? AND c.bom_id=? AND b.project_id=?
+            """, (branch_id, item_id, self.project_id)).fetchone()
+            if not checkout:
+                raise ValueError("This Item has no checkout in the selected Nexus branch.")
+            if int(checkout["user_id"]) != self.user_id and not self.can("merge"):
+                raise PermissionError("Only the branch checkout owner or Master/Admin can finish it.")
+            expected_head = str(checkout["head_snapshot_id"])
+            branch_name = str(checkout["branch_name"])
+        snapshot_id = self.check_in(
+            branch_id, expected_head, str(note).strip(), allow_noop=True,
+            attributes=attributes, quantities=quantities,
+            checkout_item_id=item_id, workspace_user_id=int(checkout["user_id"]),
+        )
+        with self.repo.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            item_ids = [int(row[0]) for row in conn.execute(
+                "SELECT bom_id FROM nexus_branch_checkouts WHERE branch_id=? AND user_id=?",
+                (branch_id, int(checkout["user_id"])),
+            )]
+            deleted = conn.execute("DELETE FROM nexus_branch_checkouts WHERE branch_id=? AND user_id=?",
+                                   (branch_id, int(checkout["user_id"]))).rowcount
+            if not deleted:
+                raise ValueError("The branch checkout changed while checking in. Refresh the BOM.")
+            conn.commit()
+        return {"branch_id": branch_id, "item_ids": item_ids or [item_id],
+                "branch_name": branch_name, "snapshot_id": snapshot_id,
+                "changed": snapshot_id != expected_head}
+
+    def undo_branch_checkout(self, item_id, branch_id):
+        """Discard this user's branch workspace edits and reopen the branch head."""
+        self._require("commit")
+        item_id, branch_id = int(item_id), str(branch_id)
+        with self.repo.connection() as conn:
+            checkout = conn.execute("""
+                SELECT c.*,b.name AS branch_name FROM nexus_branch_checkouts c
+                JOIN nexus_branches b ON b.id=c.branch_id
+                WHERE c.branch_id=? AND c.bom_id=? AND b.project_id=?
+            """, (branch_id, item_id, self.project_id)).fetchone()
+            if not checkout:
+                raise ValueError("This Item has no checkout in the selected Nexus branch.")
+            if int(checkout["user_id"]) != self.user_id and not self.can("merge"):
+                raise PermissionError("Only the branch checkout owner or Master/Admin can undo it.")
+            root = self._root(conn)
+            checkout_owner = int(checkout["user_id"])
+            branch_name = str(checkout["branch_name"])
+        with self._branch_lock(root, branch_id):
+            folder = self._safe_path(
+                root, Path(".nexus/branches") / branch_id / "workspaces" / str(checkout_owner)
+            )
+            if folder.exists():
+                shutil.rmtree(folder)
+            with self.repo.connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                item_ids = [int(row[0]) for row in conn.execute(
+                    "SELECT bom_id FROM nexus_branch_checkouts WHERE branch_id=? AND user_id=?",
+                    (branch_id, checkout_owner),
+                )]
+                conn.execute("DELETE FROM nexus_branch_checkouts WHERE branch_id=? AND user_id=?",
+                             (branch_id, checkout_owner))
+                conn.commit()
+        workspace_path = self.workspace(branch_id)
+        return {"branch_id": branch_id, "item_ids": item_ids or [item_id],
+                "branch_name": branch_name, "workspace_path": workspace_path}
 
     def branch_choices(self, item_ids=None):
         """Active branches available for the given item set; empty means all project branches."""
@@ -590,6 +1139,16 @@ class NexusHistoryService:
                 current = self._branch_access(conn, branch_id)
                 if current["state"] != "Active":
                     raise ValueError("Resume the branch before activating it.")
+            marks = ",".join("?" for _ in ids)
+            checkout = conn.execute(f"""
+                SELECT c.branch_id,b.name FROM nexus_branch_checkouts c
+                JOIN nexus_branches b ON b.id=c.branch_id
+                WHERE c.user_id=? AND c.bom_id IN ({marks}) AND c.branch_id<>?
+                LIMIT 1
+            """, (self.user_id, *ids, str(branch_id or ""))).fetchone()
+            if checkout:
+                raise ValueError("Finish or undo your checkout in branch '" + str(checkout["name"])
+                                 + "' before switching these Items to another branch or Master.")
             for item_id in ids:
                 if branch_id:
                     conn.execute("""
@@ -606,9 +1165,48 @@ class NexusHistoryService:
         details = self.branch_details(branch_id)
         if details["head_snapshot_id"] != expected_head:
             raise ValueError("The branch advanced. Refresh before pushing this commit.")
+        with self.repo.connection() as conn:
+            checkout_rows = conn.execute("""
+                SELECT c.*,u.username FROM nexus_branch_checkouts c
+                LEFT JOIN users u ON u.id=c.user_id WHERE c.branch_id=?
+            """, (str(branch_id),)).fetchall()
+            root = self._root(conn)
+            documents = self._commit_documents(conn, root, source_commit_id)
+        own_checkouts = [row for row in checkout_rows if int(row["user_id"]) == self.user_id]
+        checkout_scope = {int(row["bom_id"]) for row in own_checkouts}
+        if checkout_rows and not own_checkouts:
+            raise ValueError("This branch workspace is checked out by "
+                             + str(checkout_rows[0]["username"] or "another user")
+                             + ". Finish or undo that checkout before pushing a commit.")
         folder = Path(self.workspace(branch_id))
         known = list(details["manifest"]["files"].values())
+        for document in documents:
+            self._branch_document_entry(details["manifest"], document, source_commit_id)
+            if checkout_scope and int(document["part_id"]) not in checkout_scope:
+                raise ValueError("Check out the Item associated with " + str(document["filename"])
+                                 + " before pushing its branch documents.")
+            digest = file_hash(document["path"])
+            if document.get("sha256") and document["sha256"] != digest:
+                raise ValueError("A commit attachment changed after submission: " + str(document["filename"]))
+            document["sha256"] = digest
+        if checkout_scope:
+            # The branch workspace is app-managed. Keep it clean while a pending
+            # Commit is prepared elsewhere so the push cannot overwrite local edits.
+            for entry in known:
+                target = self._workspace_target(folder, entry)
+                if NATIVE.fullmatch(entry["filename"]):
+                    candidates = [path for path in folder.iterdir()
+                                  if path.is_file() and NATIVE.fullmatch(path.name)
+                                  and logical_name(path.name) == logical_name(entry["filename"])]
+                    target = max(candidates, key=lambda path: int((NATIVE.fullmatch(path.name)[2] or 0)),
+                                 default=target)
+                if not target.is_file() or file_hash(target) != entry["sha256"]:
+                    raise ValueError(
+                        "The app-managed branch workspace contains uncommitted changes. "
+                        "Check in or undo them before pushing this Commit."
+                    )
         plans, targets_seen = [], set()
+        checked_out_item_id = None
         for source_entry in files:
             source = Path(source_entry["path"]).resolve()
             filename = Path(str(source_entry.get("filename") or source.name)).name
@@ -618,6 +1216,17 @@ class NexusHistoryService:
             matches = [entry for entry in known if logical_name(entry["filename"]) == logical]
             if not matches:
                 raise ValueError("This commit contains a file not associated with the branch: " + filename)
+            matched_item_ids = {int(item_id) for entry in matches
+                                for item_id in entry.get("item_ids", [])}
+            if checkout_scope:
+                eligible = matched_item_ids.intersection(checkout_scope)
+                if not eligible:
+                    raise ValueError(
+                        "This commit contains " + filename
+                        + ", which is not associated with an Item checked out by you in this branch."
+                    )
+                if checked_out_item_id is None:
+                    checked_out_item_id = min(eligible)
             targets = {str(self._workspace_target(folder, entry)) for entry in matches}
             if len(targets) != 1:
                 raise ValueError("The file maps to multiple branch Items: " + filename)
@@ -650,9 +1259,28 @@ class NexusHistoryService:
             installed.append(filename)
         if not installed:
             raise ValueError("The commit contains no files for this branch.")
-        snapshot_id = self.check_in(branch_id, expected_head, str(note).strip(),
-                                    source_commit_id=str(source_commit_id),
-                                    source_commit_title=str(note).strip())
+        snapshot_id = self.check_in(
+            branch_id, expected_head, str(note).strip(),
+            source_commit_id=str(source_commit_id), source_commit_title=str(note).strip(),
+            checkout_item_id=checked_out_item_id,
+            workspace_user_id=self.user_id if checked_out_item_id is not None else None,
+            documents=documents,
+            committed_files={logical_name(item["filename"]) for item in files},
+        )
+        # Materialize the newly frozen documents in the app-managed workspace too.
+        with self.repo.connection() as conn:
+            saved = self._snapshot(conn, snapshot_id)
+        for entry in saved["files"].values():
+            if entry.get("source_commit_id") == str(source_commit_id) and not NATIVE.fullmatch(entry["filename"]):
+                target = self._workspace_target(folder, entry)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(self._blob(root, entry), target)
+        if checked_out_item_id is not None:
+            with self.repo.connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("DELETE FROM nexus_branch_checkouts WHERE branch_id=? AND user_id=?",
+                             (str(branch_id), self.user_id))
+                conn.commit()
         # Keep one current Creo file per logical name in this user's branch
         # workspace. The snapshot retains the exact iteration filename and bytes.
         native_targets = {logical_name(target.name): target for _, filename, target, _ in plans
@@ -695,6 +1323,11 @@ class NexusHistoryService:
                 except Exception as exc:
                     raise ValueError("The partial workspace has been preserved. Use Refresh Workspace "
                                      "to keep those files and prepare a clean copy. " + str(exc)) from exc
+                conn.execute("""
+                    UPDATE nexus_branch_checkouts
+                    SET head_snapshot_id=?,workspace_path=?
+                    WHERE branch_id=? AND user_id=?
+                """, (branch["head_snapshot_id"], str(folder), str(branch_id), self.user_id))
             return str(folder)
 
     @staticmethod
@@ -705,7 +1338,8 @@ class NexusHistoryService:
         return folder / "documents" / hashlib.sha256(entry["key"].encode()).hexdigest()[:12] / safe
 
     def check_in(self, branch_id, expected_head, note, *, attributes=None, quantities=None,
-                 source_commit_id=None, source_commit_title=None):
+                 source_commit_id=None, source_commit_title=None, allow_noop=False,
+                 checkout_item_id=None, workspace_user_id=None, documents=None, committed_files=None):
         if not str(note).strip():
             raise ValueError("Describe the branch changes before checking in.")
         with self.repo.connection() as conn:
@@ -714,9 +1348,33 @@ class NexusHistoryService:
             with self._branch_lock(root, branch_id):
                 if branch["head_snapshot_id"] != expected_head:
                     raise ValueError("The branch advanced. Refresh before checking in.")
+                checkout = (conn.execute(
+                    "SELECT * FROM nexus_branch_checkouts WHERE branch_id=? AND bom_id=?",
+                    (str(branch_id), int(checkout_item_id)),
+                ).fetchone() if checkout_item_id is not None else conn.execute(
+                    "SELECT * FROM nexus_branch_checkouts WHERE branch_id=? LIMIT 1",
+                    (str(branch_id),),
+                ).fetchone())
+                workspace_owner = int(workspace_user_id) if workspace_user_id is not None else self.user_id
+                checkout_scope = set()
+                if checkout:
+                    if checkout_item_id is None or int(checkout["user_id"]) != workspace_owner:
+                        raise ValueError("This branch workspace is checked out. Use its BOM check-in or undo action.")
+                    if str(checkout["head_snapshot_id"]) != str(expected_head):
+                        raise ValueError("The branch changed after checkout. Refresh the branch workspace before checking in.")
+                    checkout_scope = {int(row[0]) for row in conn.execute(
+                        "SELECT bom_id FROM nexus_branch_checkouts WHERE branch_id=? AND user_id=?",
+                        (str(branch_id), workspace_owner),
+                    )}
+                elif checkout_item_id is not None:
+                    raise ValueError("This branch checkout is no longer active. Refresh the BOM and retry.")
                 manifest = self._snapshot(conn, expected_head)
+                if checkout_scope:
+                    for item_id in set((attributes or {})) | set((quantities or {})):
+                        if int(item_id) not in checkout_scope:
+                            raise ValueError("Check out this Item in the branch before changing its parameters or BOM quantities.")
                 old = canonical(manifest)
-                folder = root / ".nexus/branches" / branch_id / "workspaces" / str(self.user_id)
+                folder = root / ".nexus/branches" / branch_id / "workspaces" / str(workspace_owner)
                 marker = folder / ".nexus-workspace.json"
                 if not marker.is_file() or json.loads(marker.read_text()).get("head_snapshot_id") != expected_head:
                     raise ValueError("Open the current branch workspace before checking in.")
@@ -734,12 +1392,28 @@ class NexusHistoryService:
                                      default=target)
                     if not target.is_file():
                         raise ValueError("A workspace file is missing; check-in will not silently delete it: " + target.name)
-                    if file_hash(target) != entry["sha256"]:
+                    file_changed = file_hash(target) != entry["sha256"]
+                    committed_native = bool(source_commit_id and NATIVE.fullmatch(entry["filename"])
+                        and (committed_files is None or logical_name(entry["filename"]) in committed_files))
+                    commit_iteration = committed_native
+                    if file_changed or commit_iteration:
+                        if (checkout_scope and not set(map(int, entry.get("item_ids") or [])).intersection(checkout_scope)):
+                            raise ValueError("Check out the Item associated with " + target.name + " before changing this branch file.")
                         if entry.get("readonly_dependency"):
                             raise ValueError("This CAD dependency needs an Item association before branch editing: " + target.name)
+                        next_filename = (self._next_native_iteration(entry)
+                                         if NATIVE.fullmatch(entry["filename"]) else target.name)
                         manifest["files"][key] = self._freeze(root, {
-                            **entry, "filename": target.name, "path": str(target), "sha256": "",
+                            **entry, "filename": next_filename, "path": str(target), "sha256": "",
+                            "source_commit_id": str(source_commit_id) if committed_native else None,
                         })
+                for document in documents or []:
+                    if not source_commit_id:
+                        raise ValueError("Attached branch documents require a source commit.")
+                    if checkout_scope and int(document["part_id"]) not in checkout_scope:
+                        raise ValueError("Check out this Item before changing its branch documents.")
+                    key, entry = self._branch_document_entry(manifest, document, source_commit_id)
+                    manifest["files"][key] = self._freeze(root, entry)
                 for item_id, changes in (attributes or {}).items():
                     if str(item_id) not in manifest["items"]:
                         raise ValueError("Cannot edit an item outside this branch.")
@@ -759,25 +1433,42 @@ class NexusHistoryService:
                             raise ValueError("CAD-driven quantities must be changed through the CAD structure workflow.")
                         usage["quantity"] = int(value)
                 if canonical(manifest) == old and not source_commit_id:
+                    if allow_noop:
+                        return expected_head
                     raise ValueError("No changes were detected in the branch workspace or item parameters.")
                 stamp = now()
                 conn.execute("BEGIN IMMEDIATE")
                 latest = self._branch_access(conn, branch_id, editable=True)
                 if latest["head_snapshot_id"] != expected_head:
                     raise ValueError("The branch advanced during check-in. Refresh and retry.")
+                source_validated = False
+                if source_commit_id:
+                    if "nexus_branch_id" not in self.repo.columns(conn, "commits"):
+                        raise ValueError("Database migration 51 is required before pushing commits to a branch.")
+                    rows = conn.execute("SELECT id,status,checked_by,part_id FROM commits WHERE project_id=? AND commit_id=?",
+                                        (self.project_id, str(source_commit_id))).fetchall()
+                    if not rows or any(str(row["status"]).casefold() not in {"pending", "validated"} for row in rows):
+                        raise ValueError("Only a complete Pending or Validated commit can be pushed to a branch.")
+                    source_validated = all(str(row["status"]).casefold() == "validated" and row["checked_by"] is not None
+                                           for row in rows)
+                    item_ids = {str(row["part_id"]) for row in rows if row["part_id"] is not None}
+                    manifest.setdefault("validation_receipts", {})[str(source_commit_id)] = {
+                        "validated": source_validated,
+                        "checked_by": next((row["checked_by"] for row in rows if row["checked_by"] is not None), None),
+                        "files": {key: entry["sha256"] for key, entry in manifest["files"].items()
+                                  if entry.get("source_commit_id") == str(source_commit_id)},
+                        "items": {key: self._item_state_token(manifest["items"][key]) for key in item_ids
+                                  if key in manifest["items"]},
+                    }
                 snapshot_id = self._save_snapshot(conn, branch_id, expected_head, manifest, str(note).strip(), stamp)
                 event_type = "BRANCH_COMMIT" if source_commit_id else "BRANCH_CHECKIN"
                 title = ("Commit · " + str(source_commit_title or branch["name"])) if source_commit_id else "Branch check-in · " + branch["name"]
                 self.repo.event(conn, self.project_id, manifest["items"], self.user_id, stamp,
                     event_type, title, str(note).strip(), branch_id, snapshot_id,
-                    payload={"source_commit_id": str(source_commit_id)} if source_commit_id else None)
+                    payload={"source_commit_id": str(source_commit_id),
+                             "validation_status": "Validated" if source_validated else "Under development"}
+                            if source_commit_id else None)
                 if source_commit_id:
-                    if "nexus_branch_id" not in self.repo.columns(conn, "commits"):
-                        raise ValueError("Database migration 51 is required before pushing commits to a branch.")
-                    rows = conn.execute("SELECT id,status FROM commits WHERE project_id=? AND commit_id=?",
-                                        (self.project_id, str(source_commit_id))).fetchall()
-                    if not rows or any(str(row["status"]).casefold() not in {"pending", "validated"} for row in rows):
-                        raise ValueError("Only a complete Pending or Validated commit can be pushed to a branch.")
                     conn.execute("UPDATE commits SET status='Branched',nexus_branch_id=? "
                                  "WHERE project_id=? AND commit_id=?",
                                  (str(branch_id), self.project_id, str(source_commit_id)))
@@ -801,6 +1492,10 @@ class NexusHistoryService:
                     raise ValueError("A merged branch cannot be resumed.")
                 if state == branch["state"]:
                     return
+                if state == "Paused" and conn.execute(
+                    "SELECT 1 FROM nexus_branch_checkouts WHERE branch_id=?", (str(branch_id),)
+                ).fetchone():
+                    raise ValueError("Finish or undo the branch workspace checkout before pausing it.")
                 stamp = now()
                 conn.execute("UPDATE nexus_branches SET state=?,updated_at=? WHERE id=?", (state, stamp, branch_id))
                 ids = [r[0] for r in conn.execute("SELECT bom_id FROM nexus_branch_items WHERE branch_id=?", (branch_id,))]
@@ -961,19 +1656,23 @@ class NexusHistoryService:
                 raise ValueError("Only an active branch can be merged.")
             first = conn.execute("SELECT * FROM nexus_branch_snapshots WHERE branch_id=? "
                                  "AND parent_id IS NULL", (branch_id,)).fetchone()
-            base, head = self._verified_manifest(first), self._snapshot(conn, branch["head_snapshot_id"])
+            base, head = self._verified_manifest(first), self._merge_head_manifest(conn, branch)
             master = self._capture(conn, head["items"])
             changes = []
             for key, entry in head["files"].items():
                 before = base["files"].get(key, {}).get("sha256")
                 after = entry["sha256"]
                 latest = master["files"].get(key, {}).get("sha256")
-                if before == after or latest == after:
+                native = bool(NATIVE.fullmatch(entry["filename"]))
+                source_changed = bool(not native and entry.get("source_commit_id")
+                    and entry.get("source_commit_id") != base["files"].get(key, {}).get("source_commit_id")
+                    and entry.get("source_commit_id") != master["files"].get(key, {}).get("source_commit_id"))
+                if (before == after or latest == after) and not source_changed:
                     continue
                 changes.append({"id": "file:" + key, "kind": "file", "key": key,
-                    "label": entry["filename"], "conflict": latest != before,
+                    "label": entry["filename"], "conflict": latest != before and latest != after,
                     "base": before, "master": latest, "branch": after,
-                    "native": bool(NATIVE.fullmatch(entry["filename"]))})
+                    "source_commit_id": entry.get("source_commit_id"), "native": native})
             for item_id, value in head["items"].items():
                 for field, after in value["attributes"].items():
                     before = base["items"][item_id]["attributes"].get(field)
@@ -989,9 +1688,36 @@ class NexusHistoryService:
                         changes.append({"id": f"usage:{item_id}:{usage_id}", "kind": "usage",
                             "item_id": int(item_id), "key": usage_id, "label": f"Item {item_id} · usage {usage_id}",
                             "conflict": latest != before, "base": before, "master": latest, "branch": usage})
+            publication = {change["key"]: head["files"][change["key"]] for change in changes
+                           if change["kind"] == "file" and change["native"]}
+            validation, _, _, _ = self._merge_validation(
+                conn, branch_id, head, master, publication, changes, {int(key) for key in head["items"]}
+            )
+            master_records = MasterWorkService.read_manifest(self._root(conn)).get("files", {})
+            for item_id, status in validation.items():
+                if status != "Validated":
+                    continue
+                covered = any(change.get("item_id") == item_id or (change["kind"] == "file"
+                    and item_id in head["files"][change["key"]]["item_ids"]) for change in changes)
+                if covered:
+                    continue
+                sources = {value.get("source_commit_id") for value in master_records.values()
+                           if item_id in value.get("part_ids", []) and value.get("source_commit_id")}
+                statuses = [str(row[0]).casefold() for source in sources for row in conn.execute(
+                    "SELECT status FROM commits WHERE project_id=? AND commit_id=? AND part_id=?",
+                    (self.project_id, str(source), item_id))]
+                if statuses and not all(value in {"validated", "approved"} for value in statuses):
+                    changes.append({"id": f"validation:{item_id}", "kind": "validation", "item_id": item_id,
+                                    "key": "validation", "label": f"Item {item_id} · Validated branch state",
+                                    "conflict": False, "base": "", "master": "Under development", "branch": "Validated"})
+            affected = {change["item_id"] for change in changes if change["kind"] != "file"}
+            affected.update(item_id for change in changes if change["kind"] == "file"
+                            for item_id in head["files"][change["key"]]["item_ids"])
             return {"branch_id": branch_id, "branch_name": branch["name"],
                     "head": branch["head_snapshot_id"], "master_token": self._master_token(master),
-                    "changes": changes, "plan_token": fingerprint(changes)}
+                    "changes": changes, "plan_token": fingerprint(changes),
+                    "native_state": "Validated" if affected and all(validation.get(key) == "Validated" for key in affected)
+                                    else "Under development"}
 
     def merge(self, preview, decisions, note):
         """Recheck a three-way review under the master lock, then publish atomically."""
@@ -999,14 +1725,22 @@ class NexusHistoryService:
         if not str(note).strip():
             raise ValueError("Enter a merge note.")
         branch_id = str(preview["branch_id"])
+        with self.repo.connection() as conn:
+            already_merged = self._branch_access(conn, branch_id)["state"] == "Merged"
+        if already_merged:
+            # Recover after a previous app version committed the merge but raised
+            # while moving its workspace. Never publish the same merge twice.
+            return self.cleanup_merged_branch(branch_id)
         # Initialize established schema adapters before holding the write transaction.
         from core.repositories.commit_repository import CommitRepository
         from core.repositories.bom_revision_repository import BomRevisionRepository
         from core.repositories.managed_file_repository import ManagedFileRepository
+        from core.repositories.part_file_repository import PartFileRepository
         from core.services.commit_snapshot_service import CommitSnapshotService
         CommitRepository(self.repo.db_name)
         revisions = BomRevisionRepository(self.repo.db_name)
         managed = ManagedFileRepository(self.repo.db_name)
+        PartFileRepository(self.repo.db_name)
         current_preview = self.preview_merge(branch_id)
         if any(current_preview[key] != preview[key] for key in ("head", "master_token", "plan_token")):
             raise ValueError("Master or branch changed after review. Open a new merge preview.")
@@ -1029,6 +1763,9 @@ class NexusHistoryService:
                     fresh = self._branch_access(conn, branch_id, editable=True)
                     if fresh["head_snapshot_id"] != preview["head"]:
                         raise ValueError("The branch changed after merge review.")
+                    if conn.execute("SELECT 1 FROM nexus_branch_checkouts WHERE branch_id=?",
+                                    (branch_id,)).fetchone():
+                        raise ValueError("Finish or undo the branch workspace checkout before merging.")
                     if self._master_token(self._capture(conn, self._snapshot(conn, fresh["head_snapshot_id"])["items"])) != preview["master_token"]:
                         raise ValueError("Master changed after merge review. Review the differences again.")
                     item_ids = sorted(int(value) for value in
@@ -1045,14 +1782,14 @@ class NexusHistoryService:
                         payload={"commit_id": None, "no_changes_published": True,
                                  "decisions": decisions, "base_master_token": preview["master_token"]})
                     conn.commit()
-                archive_path = self._archive_merged_branch(root, branch_id, branch["name"])
+                cleanup = self._complete_merge_cleanup(root, branch)
             return {"branch_id": branch_id, "commit_id": None,
-                    "item_ids": item_ids, "archive_path": archive_path}
+                    "item_ids": item_ids, "merge_completed": True, **cleanup}
         with self.repo.connection() as conn:
             branch = self._branch_access(conn, branch_id)
             root = self._root(conn)
             with self._branch_lock(root, branch_id):
-                head = self._snapshot(conn, branch["head_snapshot_id"])
+                head = self._merge_head_manifest(conn, branch, freeze=True)
                 native_changes = [c for c in chosen if c["kind"] == "file" and c["native"]]
                 affected = set()
                 branch_document_entries = {}
@@ -1089,6 +1826,10 @@ class NexusHistoryService:
                     publication_entries[entry["key"]] = entry
                 for entry in publication_entries.values():
                     affected.update(entry["item_ids"])
+                validation, checkers, anchors, receipts = self._merge_validation(
+                    conn, branch_id, head, latest_master, publication_entries, chosen, affected
+                )
+                native_state = "Validated" if all(value == "Validated" for value in validation.values()) else "Under development"
                 # Check in changed children before their parents capture bindings.
                 item_order, visiting, visited = [], set(), set()
                 def order_item(item_id):
@@ -1109,6 +1850,25 @@ class NexusHistoryService:
                 # Native files remain frozen in the branch and are also sealed using
                 # the existing submission store so normal validation still works.
                 commit_id, stamp = "NB-" + uuid.uuid4().hex[:20], now()
+                deliverables, document_sources, document_paths = [], {}, {}
+                for key, entry in branch_document_entries.items():
+                    for item_id in set(entry["item_ids"]) & affected:
+                        source_id = str(entry.get("source_commit_id") or "")
+                        evidence = receipts.get(source_id) or {}
+                        document_sources[(key, item_id)] = (source_id if evidence.get("validated")
+                            and source_id != anchors.get(item_id) else commit_id)
+                        label = str(head["items"][str(item_id)]["attributes"].get("part_number")
+                                    or head["items"][str(item_id)]["attributes"].get("name") or "Item")
+                        label = re.sub(r'[^A-Za-z0-9._ -]', '_', label).strip(" .")[:70] or "Item"
+                        filename = re.sub(r'[<>:"/\\|?*]', '_', Path(entry["filename"]).name).strip(" .")
+                        kind = str(entry.get("file_type") or "Documents").upper()
+                        kind = "STEP" if kind == "STP" else kind
+                        relative = Path("deliverables") / re.sub(r'[^A-Za-z0-9_-]', '_', kind) / f"{label}__{item_id}" / filename
+                        document_paths[(key, item_id)] = root / "master" / relative
+                        deliverables.append({"key": f"{item_id}:{key}", "relative_path": relative.as_posix(),
+                            "filename": filename, "dest_path": str(self._blob(root, entry)), "sha256": entry["sha256"],
+                            "file_type": kind, "file_revision": entry.get("file_revision") or "", "part_ids": [item_id],
+                            "source_commit_id": document_sources[(key, item_id)]})
                 items, sealed_files = [], []
                 for entry in publication_entries.values():
                     source = self._blob(root, entry)
@@ -1150,6 +1910,9 @@ class NexusHistoryService:
                     fresh = self._branch_access(conn, branch_id, editable=True)
                     if fresh["head_snapshot_id"] != preview["head"]:
                         raise ValueError("The branch changed after merge review.")
+                    if conn.execute("SELECT 1 FROM nexus_branch_checkouts WHERE branch_id=?",
+                                    (branch_id,)).fetchone():
+                        raise ValueError("Finish or undo the branch workspace checkout before merging.")
                     if self._master_token(self._capture(conn, head["items"])) != preview["master_token"]:
                         raise ValueError("Master changed after merge review. Review the differences again.")
                     # A new Item may have been associated with the same native CAD
@@ -1213,21 +1976,35 @@ class NexusHistoryService:
                             if item_id not in contexts:
                                 continue
                             iteration_id = contexts[item_id]["current_iteration_id"]
+                            from core.repositories.signature_repository import SignatureRepository
+                            signature_id = SignatureRepository(self.repo.db_name).add_signature(
+                                "commit", self.user_id,
+                                "Nexus branch merge: " + str(note).strip(), conn=conn,
+                            )
+                            if int(signature_id or 0) <= 0:
+                                raise ValueError("Could not record the merge signature. The branch was not merged.")
                             cursor = conn.execute("""
                                 INSERT INTO commits(part_id,type,filename,file_path,base_file_name,
-                                    designer,committed_by,message,status,committed_at,project_id,title,
+                                    designer,committed_by,message,status,checked_by,committed_at,signature,project_id,title,
                                     commit_id,object_iteration_id,cad_document_id)
-                                VALUES(?,?,?,?,?,?,?,?, 'Integrated',?,?,?,?,?,?)
-                            """, (item_id, Path(logical_name(entry["filename"])).suffix.lstrip("."),
+                                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                            """, (item_id, "Drw" if logical_name(entry["filename"]).endswith(".drw") else "Cad",
                                   entry["filename"], str(root / "commits" / sealed["blob_path"]),
-                                  logical_name(entry["filename"]).rsplit(".", 1)[0], branch["owner_id"],
-                                  self.user_id, str(note).strip(), stamp, self.project_id,
+                                  logical_name(entry["filename"]), branch["owner_id"],
+                                  self.user_id, str(note).strip(), "Approved" if validation[item_id] == "Validated" else "Integrated",
+                                  checkers[item_id], stamp, int(signature_id), self.project_id,
                                   "Nexus Branch " + branch["name"], commit_id, iteration_id,
                                   entry.get("cad_document_id")))
+                            native_match = NATIVE.fullmatch(entry["filename"])
+                            number = int(native_match[2] or 0) if native_match else None
+                            conn.execute("""UPDATE commits SET creo_file_version=?,approved_version=?,merged_by=?,
+                                merged_at=?,merge_message=?,pr_path=? WHERE id=?""",
+                                (number, number if validation[item_id] == "Validated" else None,
+                                 self.user_id, stamp, str(note).strip(),
+                                 str(root / "commits" / sealed["blob_path"]), int(cursor.lastrowid)))
                             row_ids.append(int(cursor.lastrowid))
                         publish_item["source_order"] = max(row_ids, default=0)
-                    # Bind all the new iteration's files, keeping previous validated
-                    # exports attached until the normal export/validation workflow.
+                    # Bind native and deliverable versions to the same Master iteration.
                     document_version_cache = {}
                     for item_id in item_order:
                         current = self._capture(conn, [item_id])
@@ -1241,54 +2018,15 @@ class NexusHistoryService:
                                 cache_key = (key, item_id)
                                 picked = document_version_cache.get(cache_key)
                                 if picked is None:
-                                    picked = dict(branch_document)
-                                    part_file_id = picked.get("part_file_id")
-                                    if part_file_id and "part_files" in self.repo.tables(conn) and "part_file_versions" in self.repo.tables(conn):
-                                        file_row = conn.execute(
-                                            "SELECT * FROM part_files WHERE id=? AND part_id=? AND deleted_at IS NULL",
-                                            (int(part_file_id), int(item_id)),
-                                        ).fetchone()
-                                        if file_row:
-                                            digest = picked["sha256"]
-                                            filename = Path(picked["filename"]).name
-                                            vault_rel = (Path(".nexus/vault/blobs") / digest[:2] / digest / filename).as_posix()
-                                            vault_path = self._safe_path(root, vault_rel)
-                                            if not vault_path.is_file():
-                                                vault_path.parent.mkdir(parents=True, exist_ok=True)
-                                                shutil.copyfile(self._blob(root, picked), vault_path)
-                                            if file_hash(vault_path) != digest:
-                                                raise ValueError("A branch deliverable failed its vault integrity check: " + filename)
-                                            version_no = int(conn.execute(
-                                                "SELECT COALESCE(MAX(version_no),0)+1 FROM part_file_versions WHERE file_id=?",
-                                                (int(part_file_id),),
-                                            ).fetchone()[0])
-                                            version_columns = self.repo.columns(conn, "part_file_versions")
-                                            version_values = {
-                                                "file_id": int(part_file_id), "version_no": version_no,
-                                                "original_filename": filename, "vault_rel_path": vault_rel,
-                                                "sha256": digest, "size_bytes": int(picked.get("size_bytes") or 0),
-                                                "note": "Nexus branch merge: " + str(note).strip(),
-                                                "revision": str(picked.get("file_revision") or ""),
-                                                "created_by": self.user_id, "lifecycle_state": "WIP",
-                                                "root_project_id": self._project(conn).get("root_project_id"),
-                                                "project_version_label": self._project(conn).get("version_label"),
-                                                "object_iteration_id": iteration_id,
-                                                "storage_scheme": "managed_blob", "source_kind": "nexus_branch",
-                                                "source_commit_id": commit_id, "integrity_status": "Verified",
-                                                "derived_from_version_id": picked.get("part_file_version_id"),
-                                            }
-                                            columns = [name for name in version_values if name in version_columns]
-                                            cursor = conn.execute(
-                                                f"INSERT INTO part_file_versions ({', '.join(columns)}) "
-                                                f"VALUES ({', '.join('?' for _ in columns)})",
-                                                [version_values[name] for name in columns],
-                                            )
-                                            new_version_id = int(cursor.lastrowid)
-                                            conn.execute("UPDATE part_files SET active_version_id=? WHERE id=?",
-                                                         (new_version_id, int(part_file_id)))
-                                            picked.update(part_file_version_id=new_version_id,
-                                                          vault_rel_path=vault_rel,
-                                                          blob_path=vault_rel)
+                                    picked = self._register_merged_document(
+                                        conn, root, item_id, iteration_id, branch_document, commit_id,
+                                        document_sources[(key, item_id)],
+                                        validation[item_id] == "Validated", note,
+                                    )
+                                    field = "pdf_path" if picked["file_type"] == "PDF" else "step_path" if picked["file_type"] == "STEP" else None
+                                    if field:
+                                        conn.execute(f"UPDATE bom SET {field}=? WHERE id=? AND project_id=?",
+                                            (str(document_paths[(key, item_id)]), item_id, self.project_id))
                                     document_version_cache[cache_key] = picked
                             if picked:
                                 entry = picked
@@ -1306,8 +2044,10 @@ class NexusHistoryService:
                                 "filename": entry["filename"], "file_revision": entry.get("file_revision") or "",
                                 "storage_scheme": "managed_blob", "vault_rel_path": entry["blob_path"],
                                 "sha256": entry["sha256"], "size_bytes": entry["size_bytes"],
-                                "integrity_status": "Verified", "lifecycle_state": "In Work",
-                                "source_commit_id": commit_id if picked else entry.get("source_commit_id"),
+                                "integrity_status": "Verified",
+                                "lifecycle_state": "Validated" if validation[item_id] == "Validated" else "In Work",
+                                "source_commit_id": (entry.get("source_commit_id") if branch_document else commit_id)
+                                                     if picked else entry.get("source_commit_id"),
                                 "created_by": self.user_id,
                             }, connection=conn)
                     if sealed_files:
@@ -1322,17 +2062,21 @@ class NexusHistoryService:
                     self.repo.event(conn, self.project_id, head["items"], self.user_id, stamp,
                         "BRANCH_MERGED", "Merged to master · " + branch["name"], str(note).strip(),
                         branch_id, branch["head_snapshot_id"],
-                        payload={"commit_id": commit_id, "native_state": "Under development",
+                        payload={"commit_id": commit_id, "native_state": native_state,
+                                 "item_states": {str(key): "Validated" if value == "Validated" else "Under development"
+                                                 for key, value in validation.items()},
                                  "decisions": decisions, "base_master_token": preview["master_token"]})
                     conn.commit()
 
                 # One publisher lock protects both stale-review detection and bytes.
                 # If the DB callback raises, MasterWorkService restores master files.
                 MasterWorkService.publish(root, commit_id, items, actor_user_id=self.user_id,
-                    before_publish=preflight, on_published=publish_records)
-            archive_path = self._archive_merged_branch(root, branch_id, branch["name"])
+                    before_publish=preflight, on_published=publish_records, deliverables=deliverables)
+            cleanup = self._complete_merge_cleanup(root, branch)
             return {"branch_id": branch_id, "commit_id": commit_id,
-                    "item_ids": sorted(affected), "archive_path": archive_path}
+                    "item_ids": sorted(affected), "merge_completed": True, "native_state": native_state,
+                    "item_states": {str(key): "Validated" if value == "Validated" else "Under development"
+                                    for key, value in validation.items()}, **cleanup}
 
     def timeline(self, item_id, legacy_history=None, limit=200):
         """Read only selected-item metadata; never scan or hash the CAD directory."""
@@ -1342,6 +2086,9 @@ class NexusHistoryService:
                 SELECT b.* FROM nexus_branches b JOIN nexus_branch_items i ON i.branch_id=b.id
                 WHERE b.project_id=? AND i.bom_id=? ORDER BY b.created_at,b.id
             """, (self.project_id, int(item_id)))]
+            for branch in branches:
+                branch["cleanup_pending"] = bool(branch["state"] == "Merged" and project.get("working_directory")
+                    and (Path(project["working_directory"]) / ".nexus/branches" / branch["id"]).exists())
             rows = [dict(row) for row in conn.execute("""
                 SELECT e.*,u.username AS actor FROM nexus_item_events e
                 LEFT JOIN users u ON u.id=e.actor_id
@@ -1427,8 +2174,8 @@ class NexusHistoryService:
                     source_id = str(max(records, key=lambda r: r.get("published_at") or "").get("source_commit_id") or "")
                     if source_id and "commits" in self.repo.tables(conn):
                         statuses = {str(r[0]).casefold() for r in conn.execute(
-                            "SELECT status FROM commits WHERE project_id=? AND commit_id=?",
-                            (self.project_id, source_id))}
+                            "SELECT status FROM commits WHERE project_id=? AND commit_id=? AND (part_id=? OR part_id IS NULL)",
+                            (self.project_id, source_id, int(item_id)))}
                         state = "Validated" if statuses and statuses <= {"validated", "approved"} else "Under development"
             return {"item": item, "cad_revision": str(project.get("version_label") or ""),
                     "master_state": state or "Not published", "master_source": source_id,

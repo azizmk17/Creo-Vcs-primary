@@ -55,18 +55,51 @@ branch for them. A branch appears in the selector only when it contains every
 selected Item. The active branch is saved per user, so each teammate can choose
 their own branch for the same Item. The BOM's **Active Branch** column shows
 your selection; **Master** means no personal branch is active.
+The branch column is always visible immediately after the row number. It uses
+an icon and a green **Master**, purple **Nexus branch**, or amber **Paused**
+badge. Hover over a shortened branch name to read its full name and state.
 
-The branch gets a separate workspace under the project's `.nexus/branches`
-folder for each user. Saving CAD changes there, checking in branch
-parameters/quantities, pausing, and resuming do not change master. A paused
-branch retains its workspace. Refreshing a workspace preserves the prior local
-folder as a saved copy before materializing the latest branch snapshot.
+The app manages a separate workspace under the project's `.nexus/branches`
+folder for each user. Continue editing CAD in your own working directory;
+the app copies committed CAD and documents into its branch workspace when you
+push to that branch. Branch parameter changes, pausing, and resuming do not
+change master. A paused branch retains its workspace. Refreshing a workspace
+preserves the prior folder before materializing the latest branch snapshot.
 
 From a Pending or Validated commit's details in **Commit Workspace**, choose an
 active branch and click **Push to Branch**. The app verifies the sealed commit
 files, copies them to that branch's separate workspace, and records a branch
 snapshot. The commit leaves the review queue as **Branched**. **Push to Master**
 remains a separate action and publishes to the project master directory.
+
+### Access PDFs, STEP files, and other branch documents
+
+Commit PDFs, STEP exports, and other associated documents together with the CAD
+files. **Push to Branch** freezes those attachments in the branch snapshot and
+copies them into the workspace managed by the app. Users can stage their source
+files from any working directory; branch checkout does not open a folder.
+
+In the Item's **Timeline & Branches** tab, select a branch and click **View Branch
+Files** to see its latest files. To retrieve an earlier commit's files, select its
+timeline event and click **View Commit Files**. The list shows the original
+filename, document revision, source commit, and availability. Select a PDF, STEP,
+or CAD file and choose **Open** or **Save a Copy**. Opening uses a verified copy,
+so it does not edit the stored branch snapshot.
+
+The file viewer also works for paused and merged branches after workspace
+cleanup. New snapshots retain their documents independently of the commit
+attachment folder. For commits pushed by older app versions, the viewer reads
+the original stored commit attachments where they are still available; existing
+history and frozen releases are not rewritten.
+
+If Windows or shared-folder permissions block workspace archiving after a
+merge, the app reports **Merge complete — workspace cleanup pending**. The
+branch stays closed and the BOM returns to Master. Unlocked workspace contents
+are moved into the optional archive; any locked files are preserved in their
+original location. This fallback moves files without making another large
+copy. Close applications using those branch files or folders, select the merged
+branch in **Timeline & Branches**, and click **Retry Workspace Cleanup**. Retrying
+only completes cleanup; it does not repeat the merge or create another commit.
 
 Users with project commit permission can work in separate workspaces on an
 active branch; only a master user can merge it. Review compares the branch's base, current
@@ -78,12 +111,25 @@ normal CAD/Item workflow.
 ## Merge and validation
 
 Merge publishes selected native CAD and Item changes through the existing
-master publication transaction. New master commits are **Integrated / Under
-development**. Normal validation remains a separate action. The merge does not
-change item lifecycle to Released and does not replace active validated PDF or
-STEP exports. Document-only changes stay in the branch snapshot and can be
-frozen as a release package; they are not used to silently overwrite master
-deliverables.
+master publication transaction. An unchanged **Validated** branch commit keeps
+its validation when merged: the BOM development state becomes **Validated**,
+and the completed Master commit is recorded as approved. Pending branch work,
+edits after validation, or a combination of Master and branch changes that was
+not validated becomes **Integrated / Under development**. Validation is evaluated
+separately for each affected Item. Merging does not set Item Status to Released.
+
+Selected PDF, STEP, and other documents are published under
+`master/deliverables/<type>/<item>/` and registered as active document versions in
+**Managed Files**, including when the Item previously had no PDF or STEP record.
+The app updates the development state and PDF/STEP badges immediately after
+merge. Exports from the same validated native state are current; an older
+validated export stays identified as belonging to earlier native work. New
+unvalidated outputs do not become validated just because they were merged.
+
+Native CAD, document publication, document bindings, and validation status are
+updated together. If a publication or database operation fails, the previous
+Master files and database versions are restored. Previously frozen release
+packages keep their exact original files.
 
 Merges are rejected if the reviewed master changed, the branch head changed,
 the item needs a new lifecycle revision, a master checkout is active, or the

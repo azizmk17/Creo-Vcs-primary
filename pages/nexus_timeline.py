@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import re
+import tempfile
 
 from PyQt5.QtCore import Qt, QThread, QTimer, QPointF, QUrl, pyqtSignal
 from PyQt5.QtGui import QColor, QPainterPath, QPen, QPolygonF, QDesktopServices
@@ -310,8 +311,9 @@ class _MergeDialog(QDialog):
                        "the branch started. Choose ‘Use branch’ to overwrite the current master value, or "
                        "‘Keep master’ to leave it unchanged; either choice lets you continue the merge. "
                        "File rows show SHA-256 identifiers so you can see which exact file versions differ. "
-                       "Selected PDF/STEP changes become new work-in-progress deliverables; existing "
-                       "validated master exports remain preserved.")
+                       "Selected PDF/STEP files are published to Master and Managed Files. Validation "
+                       "is retained for unchanged validated branch work; later unchecked changes "
+                       "remain under development. Existing document versions stay in history.")
         label.setWordWrap(True)
         layout.addWidget(label)
         table = QTableWidget(len(preview["changes"]), 5)
@@ -360,12 +362,124 @@ class _MergeDialog(QDialog):
         if not self.note.toPlainText().strip() or any(not v for v in self.decisions().values()):
             QMessageBox.warning(self, "Merge review", "Enter a merge note and resolve every conflict.")
             return
-        if QMessageBox.warning(self, "Push without validation",
-                "This publishes the selected branch native files and item changes to master as "
-                "Under development. Validation and release require separate actions. Proceed?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+        validated = self.preview.get("native_state") == "Validated" and all(
+            value == "branch" for value in self.decisions().values()
+        )
+        prompt = ("Publish the validated branch work and its PDF/STEP files to Master, preserving validation?"
+                  if validated else "Publish the selected branch work and deliverables to Master? "
+                  "Any work not covered by an unchanged validated commit will be marked Under development.")
+        confirm = QMessageBox.question if validated else QMessageBox.warning
+        if confirm(self, "Merge validated work" if validated else "Merge work to Master", prompt,
+                   QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
         super().accept()
+
+
+class _BranchFilesDialog(QDialog):
+    """Read-only access to files at a selected branch snapshot."""
+    def __init__(self, data, service, parent=None):
+        super().__init__(parent)
+        self.data, self.service, self._worker = data, service, None
+        self.setWindowTitle("Files — " + data["branch_name"])
+        self.resize(970, 430)
+        layout = QVBoxLayout(self)
+        label = QLabel("Branch: " + data["branch_name"]
+                       + "\nFiles at the selected point in the timeline, including attached PDF and STEP documents.")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["Type", "Filename", "Document revision", "Source commit", "Stored in", "Availability"])
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.setRowCount(len(data["files"]))
+        for row, entry in enumerate(data["files"]):
+            values = [entry.get("file_type"), entry["filename"], entry.get("file_revision"),
+                      entry.get("source_commit_id") or "Branch base", entry["storage"],
+                      "Available" if entry["available"] else "Missing"]
+            for column, value in enumerate(values):
+                cell = QTableWidgetItem(str(value or ""))
+                if column == 0:
+                    cell.setData(Qt.UserRole, entry)
+                self.table.setItem(row, column, cell)
+        layout.addWidget(self.table)
+        self.status = QLabel("" if data["files"] else "No files are associated with this Item in this snapshot.")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        actions = QHBoxLayout()
+        self.open_button, self.save_button, self.close_button = (
+            QPushButton("Open"), QPushButton("Save a Copy…"), QPushButton("Close")
+        )
+        for button in (self.open_button, self.save_button, self.close_button):
+            actions.addWidget(button)
+        layout.addLayout(actions)
+        self.open_button.clicked.connect(lambda: self._export(True))
+        self.save_button.clicked.connect(lambda: self._export(False))
+        self.close_button.clicked.connect(self.reject)
+        self.table.itemSelectionChanged.connect(self._buttons)
+        self.table.itemDoubleClicked.connect(lambda *_: self._export(True))
+        if self.table.rowCount():
+            self.table.selectRow(0)
+        self._buttons()
+        if QApplication.instance():
+            QApplication.instance().aboutToQuit.connect(self._shutdown)
+
+    def _shutdown(self):
+        if self._worker is not None:
+            self._worker.wait()
+
+    def _entry(self):
+        cell = self.table.item(self.table.currentRow(), 0)
+        return cell.data(Qt.UserRole) if cell else None
+
+    def _buttons(self):
+        entry = self._entry() or {}
+        enabled = self._worker is None and bool(entry.get("available"))
+        self.open_button.setEnabled(enabled)
+        self.save_button.setEnabled(enabled)
+        self.close_button.setEnabled(self._worker is None)
+
+    def reject(self):
+        if self._worker is None:
+            super().reject()
+
+    def _export(self, preview):
+        entry = self._entry()
+        if self._worker is not None or not entry or not entry["available"]:
+            return
+        if preview:
+            filename = re.sub(r'[<>:"/\\|?*]', "_", entry["filename"]).strip(" .") or "file"
+            cache_key = re.sub(r"[^0-9a-fA-F]", "", str(entry["sha256"])) or "file"
+            destination = str(Path(tempfile.gettempdir()) / "Nexus-branch-previews"
+                              / cache_key / filename)
+        else:
+            destination, _ = QFileDialog.getSaveFileName(self, "Save Branch File", entry["filename"])
+            if not destination:
+                return
+        worker = _Task(lambda: self.service.export_branch_file(
+            self.data["item_id"], self.data["branch_id"], entry["key"], destination,
+            snapshot_id=self.data["snapshot_id"], expected_sha256=entry["sha256"],
+        ), self)
+        self._worker = worker
+        results, errors = [], []
+        worker.result.connect(results.append)
+        worker.error.connect(errors.append)
+        def finished():
+            self._worker = None
+            worker.deleteLater()
+            self._buttons()
+            if errors:
+                self.status.setText(errors[0])
+            elif results:
+                self.status.setText("Saved copy: " + results[0])
+                if preview and not QDesktopServices.openUrl(QUrl.fromLocalFile(results[0])):
+                    self.status.setText("Saved copy. Choose an application to open: " + results[0])
+        worker.finished.connect(finished)
+        self.status.setText("Verifying and copying the selected file…")
+        self._buttons()
+        worker.start()
 
 
 class NexusTimelinePanel(QWidget):
@@ -391,6 +505,7 @@ class NexusTimelinePanel(QWidget):
         self.create_button = QPushButton("New Nexus Branch…")
         self.release_button = QPushButton("Freeze Release Package…")
         self.export_button = QPushButton("Export Selected Release…")
+        self.files_button = QPushButton("View Branch Files…")
         for button in (self.create_button, self.release_button, self.export_button):
             actions.addWidget(button)
         layout.addLayout(actions)
@@ -413,6 +528,7 @@ class NexusTimelinePanel(QWidget):
         self.branch_combo = QComboBox()
         self.branch_combo.setMinimumWidth(150)
         branch_row.addWidget(self.branch_combo, 1)
+        branch_row.addWidget(self.files_button)
         self.more_button = QPushButton("Load more history")
         branch_row.addWidget(self.more_button)
         layout.addLayout(branch_row)
@@ -422,18 +538,21 @@ class NexusTimelinePanel(QWidget):
         self.checkin_button = QPushButton("Check in / Parameters…")
         self.pause_button = QPushButton("Pause")
         self.merge_button = QPushButton("Merge Review…")
+        self.cleanup_button = QPushButton("Retry Workspace Cleanup")
         for button in (self.workspace_button, self.refresh_workspace_button,
-                       self.checkin_button, self.pause_button, self.merge_button):
+                       self.checkin_button, self.pause_button, self.merge_button, self.cleanup_button):
             branch_actions.addWidget(button)
         layout.addLayout(branch_actions)
         self.create_button.clicked.connect(self._create)
         self.release_button.clicked.connect(self._release)
         self.export_button.clicked.connect(self._export)
+        self.files_button.clicked.connect(self._files)
         self.workspace_button.clicked.connect(lambda: self._workspace(False))
         self.refresh_workspace_button.clicked.connect(lambda: self._workspace(True))
         self.checkin_button.clicked.connect(self._checkin)
         self.pause_button.clicked.connect(self._pause)
         self.merge_button.clicked.connect(self._merge)
+        self.cleanup_button.clicked.connect(self._retry_cleanup)
         self.more_button.clicked.connect(self._more)
         self.branch_combo.currentIndexChanged.connect(self._render)
         self.graph.currentItemChanged.connect(self._selected)
@@ -551,6 +670,8 @@ class NexusTimelinePanel(QWidget):
         self.release_button.setEnabled(not busy and self._data.get("can_release", False))
         event = self.graph.currentItem().data(0, EVENT_ROLE) if self.graph.currentItem() else {}
         self.export_button.setEnabled(not busy and bool(event.get("release_id")))
+        self.files_button.setEnabled(not busy and bool(event.get("snapshot_id") or branch))
+        self.files_button.setText("View Commit Files…" if event.get("snapshot_id") else "View Branch Files…")
         active = bool(branch and branch["state"] == "Active")
         own = bool(branch and self._service and (branch["owner_id"] == self._service.user_id or self._data.get("can_merge")))
         can_work = bool(self._data.get("can_branch"))
@@ -559,6 +680,12 @@ class NexusTimelinePanel(QWidget):
         self.pause_button.setEnabled(not busy and own and branch["state"] in {"Active", "Paused"})
         self.pause_button.setText("Resume" if branch and branch["state"] == "Paused" else "Pause")
         self.merge_button.setEnabled(not busy and active and self._data.get("can_merge", False))
+        merged = bool(branch and branch["state"] == "Merged")
+        for button in (self.workspace_button, self.refresh_workspace_button, self.checkin_button,
+                       self.pause_button, self.merge_button):
+            button.setVisible(not merged)
+        self.cleanup_button.setVisible(bool(merged and branch.get("cleanup_pending") and self._data.get("can_merge")))
+        self.cleanup_button.setEnabled(not busy and merged and self._data.get("can_merge", False))
         self.more_button.setEnabled(not busy and bool(self._data))
 
     def _selected(self, current, previous=None):
@@ -580,6 +707,18 @@ class NexusTimelinePanel(QWidget):
         else:
             self.details.clear()
         self._buttons()
+
+    def _files(self):
+        event = self.graph.currentItem().data(0, EVENT_ROLE) if self.graph.currentItem() else {}
+        branch = self._branch() or {}
+        snapshot_id = event.get("snapshot_id")
+        branch_id = event.get("branch_id") if snapshot_id else branch.get("id")
+        if not branch_id:
+            return
+        service, item_id = self._service, self._item_id
+        self._run(lambda: service.list_branch_files(item_id, branch_id, snapshot_id=snapshot_id),
+                  lambda data: _BranchFilesDialog(data, service, self).exec_(),
+                  "Loading branch CAD, PDF, STEP and attached documents…")
 
     def _changed(self, result=None):
         if isinstance(result, dict) and result.get("branch_id"):
@@ -646,8 +785,15 @@ class NexusTimelinePanel(QWidget):
                 return
             branch_id, head = details["id"], details["head_snapshot_id"]
             note, attrs, quantities = dialog.note.toPlainText(), dialog.edits, dialog.quantity_edits
-            self._run(lambda: service.check_in(branch_id, head, note, attributes=attrs, quantities=quantities),
-                      self._changed, "Freezing the branch check-in…")
+            checkout = service.branch_checkout_for_item(item_id, branch_id=branch_id)
+            if checkout:
+                self._run(lambda: service.checkin_branch_item(
+                    item_id, branch_id, note, attributes=attrs, quantities=quantities
+                ), self._changed, "Saving the branch checkout as a new snapshot…")
+            else:
+                self._run(lambda: service.check_in(
+                    branch_id, head, note, attributes=attrs, quantities=quantities
+                ), self._changed, "Freezing the branch check-in…")
         self._run(lambda: service.branch_details(branch["id"]), ready)
 
     def _pause(self):
@@ -697,21 +843,39 @@ class NexusTimelinePanel(QWidget):
                   lambda path: self.status.setText("Exported exact release package: " + path),
                   "Verifying and exporting the frozen release files…")
 
+    def _merge_finished(self, result):
+        self._changed(result)
+        if result.get("cleanup_pending"):
+            self.status.setText("Merged to Master. Branch workspace cleanup is pending.")
+            QMessageBox.warning(
+                self, "Merge complete — workspace cleanup pending",
+                str(result.get("cleanup_warning") or "Workspace cleanup is pending.")
+                + "\n\nRemaining workspace:\n" + str(result.get("cleanup_path") or ""),
+            )
+            return
+        archive_path = str(result.get("archive_path") or "")
+        message = ("The branch is merged and closed. Its timeline and frozen files remain available. "
+                   "Workspace cleanup is complete.")
+        if result.get("native_state"):
+            message += "\nMaster work status: " + str(result["native_state"])
+        if archive_path:
+            message += ("\n\nThe extra workspace copy is in this optional archive. You may delete it "
+                        "when no longer needed:\n\n" + archive_path)
+        QMessageBox.information(self, "Branch merged", message)
+
+    def _retry_cleanup(self):
+        branch = self._branch()
+        if not branch or branch["state"] != "Merged":
+            return
+        service, branch_id = self._service, branch["id"]
+        self._run(lambda: service.cleanup_merged_branch(branch_id), self._merge_finished,
+                  "Retrying workspace cleanup for the completed merge…")
+
     def _merge(self):
         branch = self._branch()
         if not branch:
             return
         service, branch_id = self._service, branch["id"]
-        def merge_finished(result):
-            self._changed(result)
-            archive_path = str((result or {}).get("archive_path") or "")
-            if archive_path:
-                QMessageBox.information(
-                    self, "Branch merged",
-                    "The branch is closed and can no longer create release packages. Its snapshots "
-                    "and timeline remain in history. The branch workspace was moved here; you may "
-                    "delete this folder whenever you no longer need the extra copy:\n\n" + archive_path,
-                )
         def ready(preview):
             if not preview["changes"]:
                 answer = QMessageBox.question(
@@ -726,15 +890,15 @@ class NexusTimelinePanel(QWidget):
                 note, accepted = QInputDialog.getText(self, "Close branch as merged", "Merge note:")
                 if not accepted or not note.strip():
                     return
-                self._run(lambda: service.merge(preview, {}, note.strip()), merge_finished,
+                self._run(lambda: service.merge(preview, {}, note.strip()), self._merge_finished,
                           "Closing branch and preserving its history…")
                 return
             dialog = _MergeDialog(preview, self)
             if dialog.exec_() != QDialog.Accepted:
                 return
             decisions, note = dialog.decisions(), dialog.note.toPlainText()
-            self._run(lambda: service.merge(preview, decisions, note), merge_finished,
-                      "Publishing the reviewed branch as under development…")
+            self._run(lambda: service.merge(preview, decisions, note), self._merge_finished,
+                      "Publishing the reviewed branch and deliverables to Master…")
         self._run(lambda: service.preview_merge(branch_id), ready, "Comparing base, master and branch…")
 
     def _more(self):

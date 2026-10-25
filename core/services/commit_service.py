@@ -373,6 +373,54 @@ class CommitService(BaseService):
                 "a new commit for further changes; published snapshots cannot be replaced or extended."
             )
 
+    def _branch_checkout_context_for_file(self, filepath, filename, item_ids):
+        """Authorize a CAD file from this user's active, checked-out Nexus workspace."""
+        from core.services.nexus_history_service import NexusHistoryService
+
+        user_id = int(self.session.user_id or 0)
+        project_id = int(self.session.project_id or 0)
+        if not user_id or not project_id:
+            return None
+        service = NexusHistoryService(
+            self.commit_repository.db_name, user_id=user_id, project_id=project_id
+        )
+        active = service.active_branch_map(item_ids)
+        leased = []
+        for item_id in item_ids or []:
+            branch = active.get(int(item_id))
+            if not branch:
+                continue
+            checkout = service.branch_checkout_for_item(
+                int(item_id), branch_id=branch["branch_id"]
+            )
+            if checkout:
+                leased.append((int(item_id), branch, checkout))
+        if not leased:
+            return None
+
+        owner_leases = [row for row in leased if int(row[2]["user_id"]) == user_id]
+        if not owner_leases:
+            owner = str(leased[0][2].get("checked_out_by") or "another user")
+            raise ValueError(
+                f"Commit blocked: this Item's Nexus branch workspace is checked out by {owner}."
+            )
+        branch_ids = {str(row[1]["branch_id"]) for row in owner_leases}
+        if len(branch_ids) != 1:
+            raise ValueError("Commit blocked: staged CAD files span multiple active Nexus branches.")
+        branch_id = next(iter(branch_ids))
+        workspace_paths = {os.path.realpath(str(row[2]["workspace_path"])) for row in owner_leases}
+        if len(workspace_paths) != 1:
+            raise ValueError("Commit blocked: branch checkout workspace paths do not match.")
+        workspace = next(iter(workspace_paths))
+        expected_name = self._clean_creo_file_name(filename).casefold()
+        staged_name = self._clean_creo_file_name(os.path.basename(str(filepath))).casefold()
+        if expected_name != staged_name:
+            raise ValueError("Commit blocked: the staged CAD filename does not match the managed CAD document.")
+        if any(str(row[1].get("state") or "") != "Active" for row in owner_leases):
+            raise ValueError("Commit blocked: resume the Nexus branch before committing to it.")
+        return {"branch_id": branch_id, "workspace_path": workspace,
+                "item_ids": {row[0] for row in owner_leases}}
+
     def _normalize_engineering_attachments(self, engineering_attachments) -> list[dict]:
         if not engineering_attachments:
             return []
@@ -451,6 +499,8 @@ class CommitService(BaseService):
                 "file_role": item.get("file_role") or "other",
                 "filename": safe_name,
                 "stored_rel_path": os.path.relpath(dest_path, commit_user_dir),
+                "sha256": self._sha256(dest_path),
+                "size_bytes": os.path.getsize(dest_path),
                 "note": item.get("note") or "",
                 "revision": item.get("revision") or "",
                 "display_name": item.get("display_name") or f"{file_type} attachment",
@@ -664,7 +714,15 @@ class CommitService(BaseService):
                     f"Commit blocked: drawing {filename} is managed but is not bound to an owning PRT/ASM CAD Document."
                 )
 
-            if category == "DRAWING":
+            part_ids = self._item_ids_for_cad_commit(cad_document)
+            branch_context = self._branch_checkout_context_for_file(
+                filepath, clean_filename, part_ids
+            )
+            if branch_context and int(designer_id) != int(self.session.user_id or 0):
+                raise ValueError(
+                    "Commit blocked: a Nexus branch workspace commit must be attributed to its checkout owner."
+                )
+            if category == "DRAWING" and not branch_context:
                 cad_document = self._ensure_drawing_checkout_from_owner(
                     cad_document,
                     int(designer_id),
@@ -672,17 +730,16 @@ class CommitService(BaseService):
                 )
             checkout_owner = cad_document.get("checked_out_by")
             label = self._cad_document_label(cad_document, filename)
-            if checkout_owner is None:
+            if not branch_context and checkout_owner is None:
                 raise ValueError(
                     f"Commit blocked: CAD Document {label} is not checked out. "
                     "Check out the CAD Document, then commit the file."
                 )
-            if int(checkout_owner) != int(designer_id):
+            if not branch_context and int(checkout_owner) != int(designer_id):
                 raise ValueError(
                     f"Commit blocked: CAD Document {label} is checked out by another user."
                 )
 
-            part_ids = self._item_ids_for_cad_commit(cad_document)
             part_id = self._item_id_for_cad_commit(cad_document)
             commit_plan.append({
                 "filepath": filepath,
@@ -693,6 +750,7 @@ class CommitService(BaseService):
                 "part_id": part_id,
                 "part_ids": part_ids,
                 "cad_document_id": int(cad_document["id"]),
+                "nexus_branch_id": branch_context.get("branch_id") if branch_context else None,
                 "drawing_owner_cad_document_id": (
                     int(cad_document["drawing_owner_cad_document_id"])
                     if cad_document.get("drawing_owner_cad_document_id") is not None
@@ -712,6 +770,15 @@ class CommitService(BaseService):
                     "workspace_sha256": expected_baseline_hash or None,
                 },
             })
+
+        branch_targets = {str(item["nexus_branch_id"]) for item in commit_plan
+                          if item.get("nexus_branch_id")}
+        if branch_targets and (len(branch_targets) != 1 or any(
+                not item.get("nexus_branch_id") for item in commit_plan)):
+            raise ValueError(
+                "Commit blocked: branch workspace files cannot be mixed with Master checkout files "
+                "or files from another branch."
+            )
 
         planned_cad_ids = {
             int(row["cad_document_id"])
@@ -936,6 +1003,7 @@ class CommitService(BaseService):
                         ),
                         cad_document_id=item.get("cad_document_id"),
                         creo_file_version=item.get("creo_file_version"),
+                        nexus_branch_id=item.get("nexus_branch_id"),
                     ))
                     inserted_any = True
 
@@ -1138,6 +1206,10 @@ class CommitService(BaseService):
             raise ValueError("The commit was not found in the active project.")
         if any(str(row.get("status") or "").casefold() not in {"pending", "validated"} for row in rows):
             raise ValueError("Only a complete Pending or Validated commit can be pushed to a branch.")
+        bound_branches = {str(row.get("nexus_branch_id") or "").strip()
+                          for row in rows if str(row.get("nexus_branch_id") or "").strip()}
+        if bound_branches and bound_branches != {str(branch_id)}:
+            raise ValueError("This commit was created from a checked-out Nexus branch and can only be pushed back to that branch.")
         project = self.project_service.get_project_by_id(project_id) or {}
         working = str(project.get("working_directory") or "")
         if not working:

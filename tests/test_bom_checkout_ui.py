@@ -25,6 +25,7 @@ class BomCheckoutUiTests(unittest.TestCase):
             session=SimpleNamespace(user_id=7),
             perm=SimpleNamespace(can=lambda permission: permission == "manage_parts"),
             bom_service=Mock(),
+            _nexus_checkout_service=Mock(return_value=Mock(active_branch_map=Mock(return_value={}))),
             _refresh_loaded_part_branch=Mock(),
             _invalidate_doc_indicator=Mock(),
             _renumber_full_bom_tree_rows=Mock(),

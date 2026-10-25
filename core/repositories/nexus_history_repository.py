@@ -23,6 +23,15 @@ CREATE TABLE IF NOT EXISTS nexus_branch_items (
 );
 CREATE INDEX IF NOT EXISTS idx_nexus_branch_items_item
     ON nexus_branch_items(bom_id,branch_id);
+CREATE TABLE IF NOT EXISTS nexus_branch_checkouts (
+    branch_id TEXT NOT NULL REFERENCES nexus_branches(id),
+    project_id INTEGER NOT NULL, bom_id INTEGER NOT NULL REFERENCES bom(id),
+    user_id INTEGER NOT NULL, head_snapshot_id TEXT NOT NULL,
+    workspace_path TEXT NOT NULL, checked_out_at TEXT NOT NULL,
+    PRIMARY KEY(branch_id,bom_id)
+);
+CREATE INDEX IF NOT EXISTS idx_nexus_branch_checkouts_item
+    ON nexus_branch_checkouts(project_id,bom_id,branch_id);
 CREATE TABLE IF NOT EXISTS nexus_branch_snapshots (
     id TEXT PRIMARY KEY, branch_id TEXT NOT NULL REFERENCES nexus_branches(id),
     parent_id TEXT, manifest_json TEXT NOT NULL, manifest_sha256 TEXT NOT NULL,

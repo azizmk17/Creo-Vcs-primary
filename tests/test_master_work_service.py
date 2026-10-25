@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import tempfile
 import unittest
@@ -12,6 +13,58 @@ from core.services.master_work_service import (
 
 
 class MasterWorkTests(unittest.TestCase):
+    def test_deliverables_publish_with_native_and_survive_a_later_native_only_push(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cad, pdf = root / "case.prt.1", root / "case.pdf"
+            cad.write_bytes(b"validated CAD")
+            pdf.write_bytes(b"validated PDF")
+            native = {"filename": cad.name, "dest_path": str(cad), "part_ids": [4]}
+            document = {"key": "4:pdf", "filename": pdf.name, "relative_path": "deliverables/PDF/CASE__4/case.pdf",
+                        "dest_path": str(pdf), "sha256": hashlib.sha256(pdf.read_bytes()).hexdigest(),
+                        "file_type": "PDF", "file_revision": "A010", "part_ids": [4]}
+            MasterWorkService.publish(root, "validated", [native], deliverables=[document])
+            cad.write_bytes(b"next CAD under development")
+            MasterWorkService.publish(root, "next-draft", [native])
+            manifest = MasterWorkService.read_manifest(root)
+            self.assertEqual(manifest["files"]["case.prt"]["source_commit_id"], "next-draft")
+            self.assertEqual(manifest["deliverables"]["4:pdf"]["source_commit_id"], "validated")
+            self.assertEqual((root / "master" / document["relative_path"]).read_bytes(), b"validated PDF")
+
+    def test_failed_database_callback_restores_deliverable_bytes_and_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cad, pdf = root / "case.prt.1", root / "case.pdf"
+            cad.write_bytes(b"old CAD")
+            pdf.write_bytes(b"old PDF")
+            native = {"filename": cad.name, "dest_path": str(cad), "part_ids": [4]}
+            document = {"key": "4:pdf", "filename": pdf.name, "relative_path": "deliverables/PDF/CASE__4/case.pdf",
+                        "dest_path": str(pdf), "sha256": hashlib.sha256(pdf.read_bytes()).hexdigest(),
+                        "file_type": "PDF", "part_ids": [4]}
+            MasterWorkService.publish(root, "old", [native], deliverables=[document])
+            old_manifest = (root / "master/manifest.json").read_bytes()
+            cad.write_bytes(b"new CAD")
+            pdf.write_bytes(b"new PDF")
+            document["sha256"] = hashlib.sha256(pdf.read_bytes()).hexdigest()
+            def fail():
+                raise RuntimeError("Database write failed")
+            with self.assertRaisesRegex(RuntimeError, "Database write failed"):
+                MasterWorkService.publish(root, "new", [native], deliverables=[document], on_published=fail)
+            self.assertEqual((root / "master/case.prt").read_bytes(), b"old CAD")
+            self.assertEqual((root / "master" / document["relative_path"]).read_bytes(), b"old PDF")
+            self.assertEqual((root / "master/manifest.json").read_bytes(), old_manifest)
+
+    def test_master_deliverable_cannot_escape_its_storage_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf = root / "case.pdf"
+            pdf.write_bytes(b"PDF")
+            document = {"key": "4:pdf", "filename": pdf.name, "relative_path": "deliverables/../../outside.pdf",
+                        "dest_path": str(pdf), "sha256": hashlib.sha256(pdf.read_bytes()).hexdigest(),
+                        "file_type": "PDF", "part_ids": [4]}
+            with self.assertRaisesRegex(ValueError, "outside managed deliverable storage"):
+                MasterWorkService.publish(root, "unsafe", [], deliverables=[document])
+            self.assertFalse((root / "outside.pdf").exists())
     def test_first_master_seeds_latest_native_dependencies(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -91,6 +144,13 @@ class MasterWorkTests(unittest.TestCase):
         result = deliverable_provenance("PDF", SimpleNamespace(source_commit_id="v5"), current, current)
         self.assertEqual(result["state"], "ok")
         self.assertEqual(native_work_state(current), "Validated")
+
+    def test_older_validated_branch_export_remains_identified_when_master_has_newer_work(self):
+        source = SimpleNamespace(commit_id="branch-checked", status="Branched", checked_by=2)
+        current = SimpleNamespace(commit_id="master-new", status="Integrated")
+        result = deliverable_provenance("PDF", SimpleNamespace(source_commit_id="branch-checked"), current, source)
+        self.assertEqual(result["state"], "previous")
+        self.assertEqual(native_work_state(current), "Under development")
 
     def test_matching_unvalidated_export_is_not_ready(self):
         current = SimpleNamespace(commit_id="v5", status="Pending")

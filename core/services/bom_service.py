@@ -4,7 +4,7 @@ from contextlib import closing
 import os
 import re
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from core.models.bom_model import Bom
 from core.repositories.bom_repository import BomRepository
 from core.repositories.bom_children_repository import BomChildrenRepository
@@ -1601,6 +1601,20 @@ class BomService(BaseService):
         except Exception:
             return None
 
+    @classmethod
+    def _history_timestamp_epoch(cls, event: Dict) -> float | None:
+        """Normalize mixed legacy/local and ISO/UTC history timestamps for comparison."""
+        dt = cls._parse_dt(event.get("timestamp"))
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            if str(event.get("timestamp_timezone") or "").strip().upper() == "UTC":
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                # Legacy commit and lock rows store local wall time without an offset.
+                dt = dt.astimezone()
+        return dt.astimezone(timezone.utc).timestamp()
+
     def _project_family_ids(self, project_id: int) -> List[Dict]:
         """Return projects in the same family as project_id.
 
@@ -2065,8 +2079,8 @@ class BomService(BaseService):
 
         # Sort by parsed datetime when possible; fallback to raw string
         def _sort_key(ev):
-            dt = self._parse_dt(ev.get("timestamp"))
-            return (dt is None, dt or datetime.min, str(ev.get("timestamp") or ""))
+            epoch = self._history_timestamp_epoch(ev)
+            return (epoch is not None, epoch or 0.0, str(ev.get("timestamp") or ""))
 
         for event in events:
             event.setdefault("object_version", "")
@@ -2089,7 +2103,7 @@ class BomService(BaseService):
         }
         users = set()
         last_ts = ""
-        last_dt = None
+        last_epoch = None
         for ev in events:
             et = (ev.get("event") or "").upper()
             if et == "COMMIT":
@@ -2109,9 +2123,9 @@ class BomService(BaseService):
             if u:
                 users.add(u)
 
-            dt = self._parse_dt(ev.get("timestamp"))
-            if dt and (last_dt is None or dt > last_dt):
-                last_dt = dt
+            epoch = self._history_timestamp_epoch(ev)
+            if epoch is not None and (last_epoch is None or epoch > last_epoch):
+                last_epoch = epoch
                 last_ts = str(ev.get("timestamp") or "")
 
         out["unique_users"] = len(users)
@@ -2941,6 +2955,30 @@ class BomService(BaseService):
                     ).upper()
         except Exception:
             pass
+        try:
+            if self.session.project_id and self.session.user_id:
+                from core.services.nexus_history_service import NexusHistoryService
+                nexus = NexusHistoryService(
+                    getattr(self.bom_repo, "db_name", DB_NAME),
+                    user_id=int(self.session.user_id), project_id=int(self.session.project_id),
+                )
+                active = nexus.active_branch_map([int(part_id)]).get(int(part_id))
+                d["active_branch_id"] = active.get("branch_id") if active else None
+                d["active_branch_name"] = active.get("name") if active else "Master"
+                d["active_branch_state"] = active.get("state") if active else ""
+                branch_checkout = (nexus.branch_checkout_for_item(
+                    int(part_id), branch_id=active["branch_id"]
+                ) if active else None)
+                d["branch_checkout"] = branch_checkout
+                d["branch_checked_out"] = bool(branch_checkout)
+                if branch_checkout:
+                    d["branch_checkout_owner_id"] = int(branch_checkout["user_id"])
+                    d["branch_checkout_owner"] = branch_checkout.get("checked_out_by") or ""
+                    d["branch_checkout_by_me"] = int(branch_checkout["user_id"]) == int(self.session.user_id)
+                    d["branch_checkout_name"] = branch_checkout.get("branch_name") or ""
+        except Exception:
+            d["branch_checkout"] = None
+            d["branch_checked_out"] = False
         return d
 
     def suggest_next_revision(self, part_id: int) -> str:

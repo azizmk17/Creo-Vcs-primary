@@ -10,10 +10,18 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 
+def _file_digest(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 class MasterWorkService:
     @staticmethod
     def publish(working_directory, commit_id, items, *, actor_user_id=None, preserve_newer=False,
-                on_published=None, before_publish=None):
+                on_published=None, before_publish=None, deliverables=None):
         if not working_directory:
             raise ValueError("A project working directory is required to publish master work.")
         root = Path(working_directory) / "master"
@@ -55,7 +63,7 @@ class MasterWorkService:
                     source = Path(item["dest_path"])
                     staged = Path(staging) / name
                     shutil.copy2(source, staged)
-                    digest = hashlib.sha256(staged.read_bytes()).hexdigest()
+                    digest = _file_digest(staged)
                     expected = str(item.get("snapshot_sha256") or "")
                     if expected and digest != expected:
                         raise ValueError(f"Frozen native file changed while publishing master: {name}")
@@ -70,12 +78,42 @@ class MasterWorkService:
                         "cad_document_id": item.get("cad_document_id"),
                     }
                     replacements[root / name] = staged
+                documents = dict(manifest.get("deliverables", {}))
+                seen_paths = set()
+                for number, document in enumerate(deliverables or []):
+                    relative = Path(str(document["relative_path"]))
+                    destination = (root / relative).resolve()
+                    if (relative.is_absolute() or relative.parts[:1] != ("deliverables",)
+                            or destination == (root / "deliverables").resolve()
+                            or not destination.is_relative_to((root / "deliverables").resolve())):
+                        raise ValueError("A Master deliverable path points outside managed deliverable storage.")
+                    path_key = os.path.normcase(str(destination))
+                    if path_key in seen_paths:
+                        raise ValueError("Multiple deliverables use the same Master destination.")
+                    seen_paths.add(path_key)
+                    staged = Path(staging) / f"deliverable-{number}"
+                    shutil.copyfile(document["dest_path"], staged)
+                    digest = _file_digest(staged)
+                    if digest != str(document["sha256"]):
+                        raise ValueError("A frozen deliverable changed while publishing Master.")
+                    documents[str(document["key"])] = {
+                        "path": relative.as_posix(), "filename": document["filename"],
+                        "file_type": document["file_type"], "file_revision": document.get("file_revision") or "",
+                        "sha256": digest, "part_ids": document["part_ids"],
+                        "source_commit_id": document.get("source_commit_id") or str(commit_id),
+                        "published_at": published_at, "published_by": actor_user_id,
+                    }
+                    replacements[destination] = staged
                 staged_index = Path(staging) / "manifest.json"
-                staged_index.write_text(json.dumps({"files": files}, indent=2), encoding="utf-8")
+                next_manifest = {**manifest, "files": files}
+                if documents:
+                    next_manifest["deliverables"] = documents
+                staged_index.write_text(json.dumps(next_manifest, indent=2), encoding="utf-8")
                 replacements[index] = staged_index
                 backups = {}
                 try:
                     for number, (destination, staged) in enumerate(replacements.items()):
+                        destination.parent.mkdir(parents=True, exist_ok=True)
                         backup = Path(staging) / f"backup-{number}"
                         if destination.exists():
                             shutil.copy2(destination, backup)
@@ -136,7 +174,10 @@ def deliverable_provenance(doc_type, version, latest_commit, source_commit):
         "native_commit_id": latest_id,
         "native_state": native_work_state(latest_commit),
     }
-    if source_id and source_commit and source_status in {"validated", "approved"}:
+    source_validated = source_status in {"validated", "approved"} or (
+        source_status == "branched" and getattr(source_commit, "checked_by", None) is not None
+    )
+    if source_id and source_commit and source_validated:
         current = source_id == latest_id
         state = "ok" if current else "previous"
         text = "current validated native" if current else "previous validated native; master has newer work"

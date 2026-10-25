@@ -3847,6 +3847,15 @@ def _migration_51(conn):
 MIGRATIONS[51] = _migration_51
 
 
+def _migration_52(conn):
+    """Add branch-scoped workspace checkout leases, separate from master locks."""
+    from core.repositories.nexus_history_repository import ensure_history_schema
+    ensure_history_schema(conn)
+
+
+MIGRATIONS[52] = _migration_52
+
+
 # --- Migration ---
 def migrate():
     init_db()  
