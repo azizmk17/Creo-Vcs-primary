@@ -79,6 +79,20 @@ class UnvalidatedMasterPushTests(unittest.TestCase):
         self.assertEqual(approved_step.read_bytes(), b"old validated STEP")
         self.assertEqual(self.service.emit_project_event.call_args.args[0], "commit.pushed_under_development")
 
+    def test_commit_can_be_pushed_to_selected_nexus_branch(self):
+        self.service.commit_repository.db_name = self.db_path
+        branch_service = Mock()
+        branch_service.branch_details.return_value = {"head_snapshot_id": "head-1"}
+        branch_service.check_in_from_commit.return_value = "head-2"
+        with patch("core.services.nexus_history_service.NexusHistoryService",
+                   return_value=branch_service):
+            result = self.service.push_commit_to_nexus_branch("draft", "branch-1")
+        self.assertEqual(result["branch_id"], "branch-1")
+        self.assertEqual(result["branch_snapshot_id"], "head-2")
+        self.assertEqual(result["status"], "Branched")
+        branch_service.check_in_from_commit.assert_called_once()
+        self.assertEqual(self.service.emit_project_event.call_args.args[0], "commit.pushed_to_branch")
+
     def test_designers_checkers_and_other_project_masters_cannot_push(self):
         for user_id in (1, 2, 6):
             with self.subTest(user_id=user_id):

@@ -231,8 +231,11 @@ No Python, Anaconda, or Command Prompt is needed on the destination PC.
 4. If your administrator supplied a company release folder, choose it in Setup,
    for example `\\server\NexusReleases`. It can be left blank for an installation
    without a configured update feed.
-5. Choose whether to create a **Desktop shortcut**, then select **Install**.
-   A **Start Menu shortcut** is created automatically. Setup copies the bootstrap
+5. Optionally select the signed `.lic` file supplied by your administrator.
+   Setup copies it to `%APPDATA%\CreoVCS\creovcs.lic` during installation;
+   leaving the field blank keeps the existing license. Choose whether to create
+   a **Desktop shortcut** before selecting **Install**. A **Start Menu shortcut**
+   is created automatically. Setup copies the bootstrap
    and application files, shows progress, and leaves the extracted source intact.
    The installed version includes `Setup.exe`, `Nexus.exe`, and `CADViewer.exe`
    sharing one `_internal` runtime. Signed update packages retain that layout.
@@ -255,10 +258,11 @@ its active version and offers to open Nexus or repair shortcuts. Use the app's
 installation is not silently overwritten; select a separate empty destination
 or ask the administrator to inspect it.
 
-Setup does not change the company database, CAD workspaces, or existing licenses.
-If needed, install the administrator-provided signed license at
-`%APPDATA%\CreoVCS\creovcs.lic`, then select the existing company workspace when
-Nexus prompts for it. The launcher checks a previously selected workspace before
+Setup does not change the company database or CAD workspaces. It keeps the
+existing license when the license field is blank and replaces it when a new
+license file is selected. If needed, choose the administrator-provided signed
+license in Setup; it is saved to `%APPDATA%\CreoVCS\creovcs.lic`. Then select
+the existing company workspace when Nexus prompts for it. The launcher checks a previously selected workspace before
 starting Nexus; Nexus checks again before constructing login repositories.
 
 **A one-time Setup or IT-managed deployment introduces the launcher and its

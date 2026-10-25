@@ -1569,6 +1569,22 @@ class BomGUI(QMainWindow):
         for event in events:
             payload = event.get("payload") or {}
             event_type = str(event.get("event_type") or "").strip()
+            if event_type == "nexus.history.changed":
+                affected_ids = self._event_ints(payload, "item_ids")
+                try:
+                    timeline = getattr(getattr(self, "bom_page", None), "timeline_panel", None)
+                    if timeline and getattr(timeline, "_item_id", None) in affected_ids:
+                        timeline.refresh()
+                except Exception:
+                    pass
+                if not payload.get("master_changed"):
+                    if len(messages) < 2:
+                        messages.append("Nexus history changed")
+                    continue
+                # A branch merge creates ordinary Integrated master commits and
+                # new BOM iterations, so refresh the same views as a commit event.
+                commit_changed = True
+                structure_changed = True
             item_ids.update(self._event_ints(payload, "item_ids", "affected_part_ids"))
             cad_ids.update(self._event_ints(payload, "cad_document_ids", "affected_cad_document_ids"))
             if event_type.startswith("commit."):

@@ -71,6 +71,7 @@ _STATUS_STYLES = {
     "withdrawn":  {"icon": "[OUT]", "color": "#6b7280", "bg": "#f3f4f6", "label": "Withdrawn"},
     "pending":    {"icon": "[PEND]", "color": "#ca8a04", "bg": "#fef9c3", "label": "Pending"},
     "integrated": {"icon": "[INT]", "color": "#6b7280", "bg": "#f3f4f6", "label": "Integrated"},
+    "branched":   {"icon": "[BR]", "color": "#2563eb", "bg": "#dbeafe", "label": "Branched"},
     "reverted":   {"icon": "[REV]", "color": "#dc2626", "bg": "#fee2e2", "label": "Reverted"},
     "pushed":     {"icon": "[PUSH]", "color": "#0284c7", "bg": "#e0f2fe", "label": "Pushed"},
     "released":   {"icon": "[REL]", "color": "#7c3aed", "bg": "#ede9fe", "label": "Released"},
@@ -2980,6 +2981,41 @@ class CommitPage(QWidget):
             if self.push_to_master(group):
                 dialog.accept()
 
+        def handle_push_to_branch():
+            branch_id = branch_target_combo.currentData()
+            if not branch_id:
+                QMessageBox.information(dialog, "Push to Branch", "Select an active Nexus Branch first.")
+                return
+            branch_name = branch_target_combo.currentText()
+            answer = QMessageBox.question(
+                dialog, "Push to Nexus Branch",
+                f"Push this commit into branch '{branch_name}'?\n\n"
+                "Its CAD files will be copied to that branch's isolated workspace. "
+                "This does not publish files to master.",
+                QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel,
+            )
+            if answer != QMessageBox.Yes:
+                return
+            commit_id = str(group.get("commit_id") or "")
+            def do_branch_push():
+                return self.commit_service.push_commit_to_nexus_branch(commit_id, str(branch_id))
+            def after_branch_push(result):
+                result = result or {}
+                self.load_pending_commits()
+                self.load_commit_history()
+                dialog.accept()
+                # _run_processing_task invokes a returned callback only after
+                # hiding the processing overlay. Showing a modal message here
+                # stacks it over the still-visible progress dialog.
+                return lambda: QMessageBox.information(
+                    self, "Pushed to Branch",
+                    f"Commit saved to '{branch_name}' as a branch snapshot. Master was not changed.",
+                )
+            self._run_processing_task(
+                "Pushing commit to Nexus branch…", do_branch_push, after_branch_push,
+                lambda exc: QMessageBox.warning(dialog, "Branch Push Blocked", str(exc)),
+            )
+
         def handle_withdraw():
             answer = QMessageBox.question(
                 dialog,
@@ -3080,6 +3116,31 @@ class CommitPage(QWidget):
         )
         push_btn.setToolTip("Publish Pending work as Under development, or approve a Validated submission")
 
+        branch_target_combo = QComboBox()
+        branch_target_combo.addItem("Select branch…", None)
+        try:
+            from core.services.nexus_history_service import NexusHistoryService
+            group_item_ids = sorted({int(row["part_id"]) for row in (group_details.get("files") or [])
+                                     if row.get("part_id") is not None})
+            branch_service = NexusHistoryService(
+                self.commit_service.commit_repository.db_name,
+                user_id=int(self.session.user_id), project_id=int(self.session.project_id),
+            )
+            for branch in branch_service.branch_choices(group_item_ids):
+                branch_target_combo.addItem(branch["name"], str(branch["id"]))
+        except Exception:
+            pass
+        branch_target_combo.setEnabled(branch_target_combo.count() > 1)
+        branch_target_combo.setToolTip("Choose the Nexus Branch that will receive this checked-in commit.")
+        push_branch_btn = QPushButton("Push to Branch")
+        push_branch_btn.setObjectName("neutral")
+        push_branch_btn.setCursor(Qt.PointingHandCursor)
+        push_branch_btn.clicked.connect(handle_push_to_branch)
+        push_branch_btn.setEnabled(
+            self.perm.can("commit") and branch_target_combo.count() > 1
+            and str(group.get("status") or "").casefold() in {"pending", "validated"}
+        )
+
         close_btn = QPushButton("Close")
         close_btn.setObjectName("neutral")
         close_btn.setCursor(Qt.PointingHandCursor)
@@ -3090,6 +3151,8 @@ class CommitPage(QWidget):
         btn_layout.addWidget(withdraw_btn)
         btn_layout.addWidget(reject_btn)
         btn_layout.addWidget(validate_btn)
+        btn_layout.addWidget(branch_target_combo)
+        btn_layout.addWidget(push_branch_btn)
         btn_layout.addWidget(push_btn)
 
         main.addLayout(btn_layout)

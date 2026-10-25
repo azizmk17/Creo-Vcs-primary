@@ -26,6 +26,7 @@ import csv
 from datetime import datetime
 
 from core.session_manager import SessionManager
+from config import DB_NAME
 from core.services.diag_service import DiagService
 from core.working_directory_inventory import WorkingDirectoryInventory
 from core.services.project_service import ProjectService
@@ -52,6 +53,7 @@ from core.repositories.bom_revision_repository import BomRevisionRepository
 from core.service_resources import ServiceResources, DeferredService
 from core.repositories.user_repository import UserRepository
 from core.services.commit_service import CommitService
+from pages.nexus_timeline import NexusTimelinePanel
 from pages.dialogs.package_parts_dialog import PackagePartsDialog
 from pages.dialogs.assembly_iteration_compare_dialog import AssemblyIterationCompareDialog
 from pages.dialogs.checkout_review_dialog import CheckoutReviewDialog
@@ -577,8 +579,11 @@ BOM_EXTRA_COLUMN_SPECS = [
     ("modified", "Modified", 125, False, ("modified", "modified_at")),
     ("notes", "Notes", 180, False, ("notes",)),
     ("item_status", "Item Status", 145, True, ("item_status", "status")),
+    ("active_branch", "Active Branch", 125, True, ("active_branch",)),
 ]
-BOM_COL_ITEM_STATUS = BOM_COL_EXTRA_START + len(BOM_EXTRA_COLUMN_SPECS) - 1
+BOM_COL_ITEM_STATUS = BOM_COL_EXTRA_START + next(
+    index for index, spec in enumerate(BOM_EXTRA_COLUMN_SPECS) if spec[0] == "item_status"
+)
 BOM_TREE_COLUMN_COUNT = BOM_COL_EXTRA_START + len(BOM_EXTRA_COLUMN_SPECS)
 
 # Inline "In Work" beside name (spec)
@@ -2843,6 +2848,7 @@ class BomPage(QWidget):
         self.commit_repo = self.resources.repository(CommitRepository)
         self.undo_service = UndoService()
         self._issue_summary_cache = {}
+        self._active_branch_names = {}
 
         self.working_dir = None
         self.commits_dir = None
@@ -4035,6 +4041,7 @@ class BomPage(QWidget):
     def _start_structure_load(self, mode: str) -> None:
         if self._project_load_cancelled:
             return
+        self._load_active_branch_names()
         self._structure_load_seq += 1
         self._cancel_lazy_level_requests()
         try:
@@ -7876,6 +7883,63 @@ class BomPage(QWidget):
             return [int(self.current_part_id)]
         return []
 
+    def _load_active_branch_names(self):
+        try:
+            from core.services.nexus_history_service import NexusHistoryService
+            self._active_branch_names = NexusHistoryService(
+                getattr(self.bom_service.bom_repo, "db_name", DB_NAME),
+                user_id=int(self.session.user_id), project_id=int(self.session.project_id),
+            ).active_branch_map()
+        except Exception:
+            self._active_branch_names = {}
+
+    def activate_branch_for_selection(self):
+        if str(getattr(self, "_bom_mode", "ebom")) != "ebom":
+            QMessageBox.information(self, "Active Branch", "Switch to EBOM / Item Structure to select Items.")
+            return
+        item_ids = self._selected_bom_item_ids_for_variant_assignment()
+        if not item_ids:
+            QMessageBox.information(self, "Active Branch", "Select one or more BOM Items first.")
+            return
+        try:
+            from core.services.nexus_history_service import NexusHistoryService
+            service = NexusHistoryService(
+                getattr(self.bom_service.bom_repo, "db_name", DB_NAME),
+                user_id=int(self.session.user_id), project_id=int(self.session.project_id),
+            )
+            branches = service.branch_choices(item_ids)
+            options = ["Master"] + [branch["name"] for branch in branches]
+            chosen, accepted = QInputDialog.getItem(
+                self, "Activate Nexus Branch",
+                f"Active branch for {len(item_ids)} selected Item(s):", options, 0, False,
+            )
+            if not accepted:
+                return
+            branch_id = next((str(branch["id"]) for branch in branches
+                              if branch["name"] == chosen), None)
+            service.activate_branch(item_ids, branch_id)
+            self._load_active_branch_names()
+            column = next(BOM_COL_EXTRA_START + index
+                          for index, spec in enumerate(BOM_EXTRA_COLUMN_SPECS)
+                          if spec[0] == "active_branch")
+            for item_id in item_ids:
+                branch = self._active_branch_names.get(int(item_id))
+                value = branch["name"] if branch else "Master"
+                for tree in (self.tree, self._search_tree, self._ebom_tree, self._ebom_filter_tree):
+                    for row in self._find_tree_items(int(item_id), tree):
+                        row.setText(column, value)
+                        row.setToolTip(column, "Active branch for you: " + value)
+            if getattr(self, "current_part_id", None) in item_ids and hasattr(self, "timeline_panel"):
+                self.timeline_panel.refresh()
+            try:
+                self.window().statusBar().showMessage(
+                    f"Active branch set to {chosen} for {len(item_ids)} Item(s).", 6000
+                )
+            except Exception:
+                pass
+        except Exception as exc:
+            QMessageBox.warning(self, "Active Branch", str(exc))
+
     def assign_variants_to_selected_items(self) -> None:
         tree = self._current_pdm_tree() if str(getattr(self, "_bom_mode", "cad")) == "ebom" else None
         selected_rows = list(tree.selectedItems() if tree is not None else [])
@@ -8787,7 +8851,15 @@ class BomPage(QWidget):
         if not isinstance(loaded, list):
             return self._default_visible_bom_column_keys()
         allowed = {spec[0] for spec in BOM_EXTRA_COLUMN_SPECS}
-        return {str(key) for key in loaded if str(key) in allowed}
+        visible = {str(key) for key in loaded if str(key) in allowed}
+        if "active_branch" not in visible:
+            layouts = self._bom_column_preferences().get("layouts")
+            layouts = layouts if isinstance(layouts, dict) else {}
+            legacy_headers = (self._bom_tree_headers(False)[:-1], self._bom_tree_headers(True)[:-1])
+            if any((layout or {}).get("headers") in legacy_headers
+                   for layout in layouts.values() if isinstance(layout, dict)):
+                visible.add("active_branch")
+        return visible
 
     def _bom_column_preferences(self) -> dict:
         if self.session.user_id is None:
@@ -8847,6 +8919,8 @@ class BomPage(QWidget):
                     previous_headers[BOM_COL_STATUS] = "Development State"
             compatible = previous_headers == headers or (
                 headers[-1:] == ["Item Status"] and previous_headers == headers[:-1]
+            ) or (
+                headers[-1:] == ["Active Branch"] and previous_headers == headers[:-1]
             )
             if compatible and isinstance(saved.get("state"), str):
                 tree.header().restoreState(QByteArray.fromBase64(saved["state"].encode("ascii", errors="ignore")))
@@ -8977,7 +9051,15 @@ class BomPage(QWidget):
         for offset, spec in enumerate(BOM_EXTRA_COLUMN_SPECS):
             column = BOM_COL_EXTRA_START + offset
             try:
-                value = self._extra_bom_column_value(info or {}, spec)
+                if spec[0] == "active_branch":
+                    try:
+                        part_id = int(item.data(0, Qt.UserRole))
+                    except (TypeError, ValueError):
+                        part_id = None
+                    active = (getattr(self, "_active_branch_names", {}) or {}).get(part_id)
+                    value = str(active["name"]) if active else "Master"
+                else:
+                    value = self._extra_bom_column_value(info or {}, spec)
                 item.setText(column, value)
                 if value:
                     item.setToolTip(column, value)
@@ -9224,6 +9306,14 @@ class BomPage(QWidget):
             self.compare_top_level_cad_to_item_structure
         )
         bom_header_row.addWidget(self.bom_compare_btn)
+        self.active_branch_btn = QPushButton("Active Branch")
+        self.active_branch_btn.setObjectName("neutral")
+        self.active_branch_btn.setFixedHeight(24)
+        self.active_branch_btn.setToolTip(
+            "Set the active Nexus branch for the selected Item(s). Multi-select Items that share a branch."
+        )
+        self.active_branch_btn.clicked.connect(self.activate_branch_for_selection)
+        bom_header_row.addWidget(self.active_branch_btn)
         self.pdm_actions_btn = QPushButton("PDM")
         self.pdm_actions_btn.setObjectName("neutral")
         self.pdm_actions_btn.setFixedHeight(24)
@@ -9997,6 +10087,13 @@ class BomPage(QWidget):
         files_layout.addWidget(self.pdf_viewer)
 
         self.tabs.addTab(files_tab, "Managed Files")
+
+        self.timeline_panel = NexusTimelinePanel(
+            self, db_name=getattr(self.bom_service.bom_repo, "db_name", DB_NAME)
+        )
+        self.timeline_panel.changed.connect(self._on_nexus_history_changed)
+        self.tabs.addTab(self.timeline_panel, "Timeline & Branches")
+        self._timeline_initially_shown = False
 
         # ── History tab (genius panel) ────────────────────────────────
         self.history_panel = HistoryPanel(self)
@@ -19322,6 +19419,7 @@ class BomPage(QWidget):
 
     def refresh_after_pdm_merge(self, part_ids=None, cad_document_ids=None) -> None:
         """Refresh only affected Item and CAD Document rows after push to master."""
+        self._load_active_branch_names()
         if part_ids:
             self.refresh_parts_after_merge(part_ids)
         if cad_document_ids:
@@ -20759,6 +20857,7 @@ class BomPage(QWidget):
             field_label.setText(str(titles.get(key) or key).upper())
 
     def _show_pdm_cad_selection(self, item: QTreeWidgetItem) -> None:
+        self.timeline_panel.clear()
         payload = dict(item.data(0, PDM_CAD_PAYLOAD_ROLE) or {})
         cad_id = item.data(0, PDM_CAD_DOCUMENT_ID_ROLE)
         if cad_id is None:
@@ -21381,12 +21480,29 @@ class BomPage(QWidget):
         # History panel (genius panel)
         self._history_rows = list(history)
         self.history_panel.set_data(history, analytics)
+        self.timeline_panel.set_item(int(item_id), history)
+        if not self._timeline_initially_shown:
+            self.tabs.setCurrentWidget(self.timeline_panel)
+            self._timeline_initially_shown = True
 
         self.notes_view.setText(details.get("notes", ""))
         self.refresh_issues_tab()
         self._sync_visual_action_states()
 
+    def _on_nexus_history_changed(self, result):
+        result = result if isinstance(result, dict) else {}
+        ids = [int(value) for value in result.get("item_ids", []) if value is not None]
+        if result.get("commit_id"):
+            self._load_active_branch_names()
+            self.bom_service._tree_dirty.add(int(self.session.project_id))
+            for item_id in ids:
+                self._refresh_part_in_tree(item_id)
+            if getattr(self, "current_part_id", None) in ids:
+                self.display_details(int(self.current_part_id))
+
     def clear_details(self):
+        if hasattr(self, "timeline_panel"):
+            self.timeline_panel.clear()
         self.current_part_id = None
         self.current_cad_document_id = None
         self.current_associated_item_id = None

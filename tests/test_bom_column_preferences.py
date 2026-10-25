@@ -215,6 +215,18 @@ class BomColumnUiTests(unittest.TestCase):
         self.assertEqual(row.text(BOM_COL_STATUS), "Not recorded")
         self.assertEqual(row.text(BOM_COL_ITEM_STATUS), "Obsolete")
 
+    def test_active_branch_column_displays_personal_branch_selection(self):
+        from pages.bom_page import BOM_TREE_COLUMN_COUNT
+        page = self.page()
+        row = QTreeWidgetItem(page._ebom_tree)
+        row.setData(0, Qt.UserRole, 42)
+        page._active_branch_names = {42: {"branch_id": "branch-42", "name": "fix-gap"}}
+        BomPage._apply_extra_bom_columns(page, row, {})
+        column = self.column("active_branch")
+        self.assertEqual(page._ebom_tree.headerItem().text(column), "Active Branch")
+        self.assertEqual(row.text(column), "fix-gap")
+        self.assertEqual(page._ebom_tree.columnCount(), BOM_TREE_COLUMN_COUNT)
+
     def test_item_parameter_editor_uses_distinct_status_label_without_changing_value(self):
         from pages.part_dialog import PartDialog
         dialog = PartDialog(part_data={"id": 1, "name": "Part", "status": "Obsolete"})

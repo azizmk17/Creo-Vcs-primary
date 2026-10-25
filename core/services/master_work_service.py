@@ -12,7 +12,8 @@ from datetime import datetime, timezone
 
 class MasterWorkService:
     @staticmethod
-    def publish(working_directory, commit_id, items, *, actor_user_id=None, preserve_newer=False, on_published=None):
+    def publish(working_directory, commit_id, items, *, actor_user_id=None, preserve_newer=False,
+                on_published=None, before_publish=None):
         if not working_directory:
             raise ValueError("A project working directory is required to publish master work.")
         root = Path(working_directory) / "master"
@@ -24,6 +25,8 @@ class MasterWorkService:
             raise ValueError("Another master publication is active; retry after it completes.")
         os.close(descriptor)
         try:
+            if before_publish is not None:
+                before_publish()
             with tempfile.TemporaryDirectory(prefix=".publish-", dir=root) as staging:
                 index = root / "manifest.json"
                 manifest = json.loads(index.read_text(encoding="utf-8")) if index.exists() else {}

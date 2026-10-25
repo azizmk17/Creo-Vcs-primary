@@ -1839,6 +1839,7 @@ class BomService(BaseService):
                         released_iteration = latest_iteration_by_revision.get(int(revision["id"]))
                         events.append({
                             "timestamp": revision.get("released_at"),
+                            "timestamp_timezone": "UTC",
                             "event": "PART_RELEASED",
                             "user": username_for(revision.get("released_by")),
                             "project": info.get("project_name", ""),
@@ -1859,6 +1860,7 @@ class BomService(BaseService):
                     version_label = iteration.get("version_label", "")
                     events.append({
                         "timestamp": iteration.get("created_at"),
+                        "timestamp_timezone": "UTC",
                         "event": "REVISION_CREATED" if iteration_number == 1 else "OBJECT_ITERATION",
                         "user": iteration.get("username") or "",
                         "project": info.get("project_name", ""),
@@ -1878,6 +1880,7 @@ class BomService(BaseService):
                         events.append(
                             {
                                 "timestamp": ts,
+                                "timestamp_timezone": "UTC",
                                 "event": "PART_RELEASED",
                                 "user": username_for(pr.get("released_by")),
                                 "project": info.get("project_name", ""),
@@ -1911,6 +1914,7 @@ class BomService(BaseService):
                     events.append(
                         {
                             "timestamp": d.get("committed_at"),
+                            "timestamp_timezone": "local",
                             "event": "COMMIT",
                             "user": (d.get("designer_name") or ""),
                             "project": (d.get("project_name") or ""),
@@ -1925,6 +1929,8 @@ class BomService(BaseService):
                             "commit_id": d.get("commit_id"),
                             "commit_unique_id": d.get("id"),
                             "part_id": d.get("part_id"),
+                            "project_id": d.get("project_id"),
+                            "object_iteration_id": d.get("object_iteration_id"),
                             "cad_type": d.get("type"),
                             "step_diff_status": d.get("step_diff_status"),
                             "step_file_path": d.get("step_file_path"),
@@ -1971,8 +1977,12 @@ class BomService(BaseService):
                     events.append(
                         {
                             "timestamp": d.get("timestamp"),
+                            "timestamp_timezone": "local",
                             "event": event_name,
                             "user": (d.get("username") or ""),
+                            "part_id": d.get("part_id"),
+                            "project_id": d.get("project_id"),
+                            "object_iteration_id": d.get("object_iteration_id"),
                             "project": info.get("project_name", ""),
                             "version": info.get("project_version", ""),
                             "object_version": object_version_for(
@@ -2019,6 +2029,7 @@ class BomService(BaseService):
                         events.append(
                             {
                                 "timestamp": d.get("created_at"),
+                                "timestamp_timezone": "UTC",
                                 "event": "ATTACHMENT_VERSION",
                                 "user": username_for(d.get("created_by")),
                                 "project": info.get("project_name", ""),
@@ -2036,6 +2047,7 @@ class BomService(BaseService):
                             events.append(
                                 {
                                     "timestamp": d.get("released_at"),
+                                    "timestamp_timezone": "UTC",
                                     "event": "ATTACHMENT_RELEASED",
                                     "user": username_for(d.get("released_by")),
                                     "project": info.get("project_name", ""),

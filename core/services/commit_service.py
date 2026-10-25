@@ -1126,6 +1126,65 @@ class CommitService(BaseService):
         )
         return result
 
+    @require_permission("commit")
+    def push_commit_to_nexus_branch(self, commit_id: str, branch_id: str) -> dict:
+        """Route a Pending/Validated submission into an isolated Nexus branch."""
+        from core.services.nexus_history_service import NexusHistoryService
+
+        project_id = int(self.session.project_id)
+        logical_id = str(commit_id or "").strip()
+        rows = self.commit_repository.get_rows_by_commit_id(logical_id, project_id)
+        if not rows or any(int(row.get("project_id") or 0) != project_id for row in rows):
+            raise ValueError("The commit was not found in the active project.")
+        if any(str(row.get("status") or "").casefold() not in {"pending", "validated"} for row in rows):
+            raise ValueError("Only a complete Pending or Validated commit can be pushed to a branch.")
+        project = self.project_service.get_project_by_id(project_id) or {}
+        working = str(project.get("working_directory") or "")
+        if not working:
+            raise ValueError("A project working directory is required to push a commit to a branch.")
+        commits_root = os.path.realpath(os.path.join(working, "commits"))
+        snapshots = self.snapshot_service.verify_pending_snapshot(
+            commits_root, project_id, logical_id, rows
+        )
+        files, seen = [], set()
+        for row in rows:
+            filename = os.path.basename(str(row.get("filename") or ""))
+            key = filename.casefold()
+            if not filename or key in seen:
+                continue
+            seen.add(key)
+            snapshot = snapshots.get(key)
+            if not snapshot:
+                raise ValueError("A commit file is missing from its sealed snapshot: " + filename)
+            source = os.path.realpath(os.path.join(commits_root, snapshot["path"]))
+            if os.path.commonpath((commits_root, source)) != commits_root:
+                raise ValueError("A commit file is outside the sealed submission store.")
+            files.append({"filename": filename, "path": source, "sha256": snapshot["sha256"]})
+        if not files:
+            raise ValueError("The commit does not contain files to push to a branch.")
+        branch_service = NexusHistoryService(
+            self.commit_repository.db_name, user_id=int(self.session.user_id), project_id=project_id
+        )
+        branch = branch_service.branch_details(branch_id)
+        note = str(rows[0].get("title") or "Commit").strip()
+        message = str(rows[0].get("message") or "").strip()
+        if message:
+            note += " · " + message
+        snapshot_id = branch_service.check_in_from_commit(
+            branch_id, branch["head_snapshot_id"], note, files, logical_id
+        )
+        affected_ids = sorted({int(row["part_id"]) for row in rows if row.get("part_id") is not None})
+        affected_cad_ids = sorted({int(row["cad_document_id"]) for row in rows
+                                   if row.get("cad_document_id") is not None})
+        result = {"commit_id": logical_id, "branch_id": str(branch_id),
+                  "branch_snapshot_id": snapshot_id, "item_ids": affected_ids,
+                  "cad_document_ids": affected_cad_ids, "status": "Branched"}
+        self.emit_project_event(
+            "commit.pushed_to_branch", entity_type="COMMIT", entity_id=logical_id,
+            payload=result, project_id=project_id,
+        )
+        return result
+
     def pending_commit_choices(self, user_id: int | None = None) -> list[dict]:
         """Return the current user's persisted Pending commit groups."""
         actor_id = int(user_id if user_id is not None else self.user_id)

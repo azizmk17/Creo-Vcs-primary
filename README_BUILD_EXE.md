@@ -156,19 +156,22 @@ On each Windows account that will run Nexus:
 2. Keep the default destination `%LOCALAPPDATA%\Nexus`, or choose another local
    writable folder. Choose the company release folder if your administrator
    supplied one, for example `\\server\NexusReleases`.
-3. Choose whether to create a Desktop shortcut, then select **Install**. A Start
-   Menu shortcut is created automatically. Setup copies the files; it keeps the
-   extracted distribution available for another attempt.
-4. Install the administrator-provided signed license at
-   `%APPDATA%\CreoVCS\creovcs.lic` if it is not already installed. To open this
-   location, press **Win + R**, enter `%APPDATA%`, and create **CreoVCS** if needed.
+3. If needed, browse to the signed `.lic` file supplied by your administrator.
+   Setup copies it to `%APPDATA%\CreoVCS\creovcs.lic` during installation and
+   replaces a license already at that location. Leave the field blank to keep
+   the existing license.
+4. Choose whether to create a Desktop shortcut before selecting **Install**.
+   The selected Desktop shortcut and the Start Menu shortcut are created during
+   installation. Setup copies the files and keeps the extracted distribution
+   available for another attempt.
 5. Choose **Open Nexus** when setup finishes, or use the Start Menu/Desktop
    shortcut. Select the company workspace containing `creo_vcs.db` when prompted.
 
 No Python, Conda, Command Prompt, or administrator elevation is needed for the
 normal per-user installation. The large CAD/PDF runtime goes in **Local AppData**,
-not roaming `%APPDATA%`. Setup does not change company databases, workspaces, or
-existing licenses. An existing valid installation keeps its active version;
+not roaming `%APPDATA%`. Setup does not change company databases or workspaces.
+It keeps the existing license when the license field is blank and replaces it
+when a new license file is selected. An existing valid installation keeps its active version;
 Setup can open it or repair its shortcuts. It does not silently replace it.
 Installed versions retain `Setup.exe`, `Nexus.exe`, and `CADViewer.exe` sharing
 one `_internal` runtime. The shortcuts always target the stable installed

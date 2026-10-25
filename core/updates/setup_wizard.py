@@ -1,14 +1,16 @@
 """First-install window for an extracted, trusted Nexus distribution.
 
-The wizard copies application files and creates per-user shortcuts. It does not
-resolve a workspace, open a database, or install a license.
+The wizard copies application files, optionally installs a license, and creates
+per-user shortcuts. It does not resolve a workspace or open a database.
 """
 from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import tempfile
 
 from PyQt5.QtCore import QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QIcon
@@ -31,6 +33,35 @@ def _location(value: str) -> Path:
     if not value.strip():
         raise ValueError("Choose an installation folder.")
     return Path(os.path.expandvars(value.strip())).expanduser().resolve()
+
+
+def _license_destination() -> Path:
+    app_data = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+    return app_data / "CreoVCS" / "creovcs.lic"
+
+
+def _install_license(source: Path) -> Path:
+    """Install the selected signed license without risking an existing file."""
+    source = Path(source)
+    if source.suffix.casefold() != ".lic":
+        raise ValueError("Choose a license file with the .lic extension.")
+    if not source.is_file():
+        raise FileNotFoundError(f"License file not found: {source}")
+
+    destination = _license_destination()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=".creovcs-license-", suffix=".tmp", dir=destination.parent, delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+        shutil.copy2(source, temporary_path)
+        os.replace(temporary_path, destination)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+    return destination
 
 
 def _destination(root: Path) -> tuple[str, dict, str]:
@@ -65,14 +96,19 @@ class _SetupWorker(QThread):
     error = pyqtSignal(str)
 
     def __init__(self, source: Path, root: Path, public_key_hex: str, feed: str,
-                 desktop: bool, *, repair=False, parent=None):
+                 desktop: bool, license_path: Path | None = None, *, repair=False, parent=None):
         super().__init__(parent)
         self.source, self.root = source, root
         self.public_key_hex, self.feed = public_key_hex, feed
         self.desktop, self.repair = desktop, repair
+        self.license_path = license_path
 
     def run(self):
         try:
+            license_destination = ""
+            if self.license_path:
+                self.progress.emit("Installing your CreoVCS license…")
+                license_destination = str(_install_license(self.license_path))
             if self.repair:
                 current = install._read_json(self.root / "current.json")
             else:
@@ -80,16 +116,21 @@ class _SetupWorker(QThread):
                 current = install.initial_install(
                     self.source, self.root, self.feed, self.public_key_hex,
                 )
+            warnings = []
             self.progress.emit("Creating your Start menu and desktop shortcuts…")
-            warning = ""
             shortcuts = []
             try:
                 shortcuts = [str(path) for path in _create_shortcuts(self.root, desktop=self.desktop)]
             except Exception as exc:
                 # Installation has committed already. Keep that success visible
                 # and let the user retry only the failed shortcut operation.
-                warning = str(exc)
-            self.result.emit({"current": current, "shortcuts": shortcuts, "warning": warning})
+                warnings.append(f"Some shortcuts could not be created: {exc}")
+            self.result.emit({
+                "current": current,
+                "shortcuts": shortcuts,
+                "license_destination": license_destination,
+                "warning": "\n".join(warnings),
+            })
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -136,11 +177,20 @@ class SetupDialog(QDialog):
         self.feed_edit.setPlaceholderText("Optional — company release folder, e.g. \\\\server\\NexusReleases")
         self.feed_button = QPushButton("Browse…")
         form.addRow("Company updates:", self._path_row(self.feed_edit, self.feed_button))
+        self.license_edit = QLineEdit()
+        self.license_edit.setPlaceholderText("Optional — select your administrator-provided .lic file")
+        self.license_button = QPushButton("Browse…")
+        form.addRow("CreoVCS license:", self._path_row(self.license_edit, self.license_button))
         layout.addLayout(form)
-        self.desktop_checkbox = QCheckBox("Add a desktop shortcut")
+        self.desktop_checkbox = QCheckBox("Create a Desktop shortcut during installation")
         self.desktop_checkbox.setChecked(True)
         layout.addWidget(self.desktop_checkbox)
-        layout.addWidget(QLabel("A Start menu shortcut is included."))
+        self.options_help = QLabel(
+            f"A Start Menu shortcut is included. A selected license is copied to "
+            f"{_license_destination()}. Leave the license field blank to keep any license already installed."
+        )
+        self.options_help.setWordWrap(True)
+        layout.addWidget(self.options_help)
 
         self.status_label = QLabel()
         self.status_label.setWordWrap(True)
@@ -167,6 +217,7 @@ class SetupDialog(QDialog):
         self.location_edit.textChanged.connect(self._refresh)
         self.location_button.clicked.connect(self._browse_location)
         self.feed_button.clicked.connect(self._browse_feed)
+        self.license_button.clicked.connect(self._browse_license)
         self.install_button.clicked.connect(self._primary_action)
         self.repair_button.clicked.connect(self._repair_shortcuts)
         self.cancel_button.clicked.connect(self._close_requested)
@@ -200,6 +251,8 @@ class SetupDialog(QDialog):
         self.cancel_button.setText("Close" if installed or self._completed else "Cancel")
         self.feed_edit.setEnabled(not installed)
         self.feed_button.setEnabled(not installed)
+        self.license_edit.setEnabled(not installed)
+        self.license_button.setEnabled(not installed)
         self.progress.hide()
 
     def _browse_location(self):
@@ -211,6 +264,14 @@ class SetupDialog(QDialog):
         folder = QFileDialog.getExistingDirectory(self, "Choose company release folder", self.feed_edit.text())
         if folder:
             self.feed_edit.setText(folder)
+
+    def _browse_license(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose CreoVCS license", str(Path.home()),
+            "CreoVCS license (*.lic);;All files (*.*)",
+        )
+        if path:
+            self.license_edit.setText(path)
 
     def _primary_action(self):
         if self.busy:
@@ -231,16 +292,23 @@ class SetupDialog(QDialog):
         except (OSError, ValueError) as exc:
             self.status_label.setText(str(exc))
             return
+        selected_license = self.license_edit.text().strip()
+        license_path = Path(selected_license).expanduser() if selected_license else None
+        if license_path and (license_path.suffix.casefold() != ".lic" or not license_path.is_file()):
+            self.status_label.setText("Choose an existing license file with the .lic extension, or leave the field blank.")
+            return
         self._worker = _SetupWorker(
             self.source, root, self.public_key_hex, self.feed_edit.text().strip(),
-            self.desktop_checkbox.isChecked(), repair=repair, parent=self,
+            self.desktop_checkbox.isChecked(), license_path=license_path,
+            repair=repair, parent=self,
         )
         self._worker.progress.connect(self.status_label.setText)
         self._worker.result.connect(self._record_result)
         self._worker.error.connect(self._record_error)
         self._worker.finished.connect(self._job_finished)
         for widget in (self.location_edit, self.location_button, self.feed_edit,
-                       self.feed_button, self.desktop_checkbox, self.install_button,
+                       self.feed_button, self.license_edit, self.license_button,
+                       self.desktop_checkbox, self.install_button,
                        self.repair_button, self.cancel_button):
             widget.setEnabled(False)
         self.status_label.setText("Preparing installation…" if not repair else "Repairing shortcuts…")
@@ -257,7 +325,8 @@ class SetupDialog(QDialog):
         worker, self._worker = self._worker, None
         worker.deleteLater()
         for widget in (self.location_edit, self.location_button, self.feed_edit,
-                       self.feed_button, self.desktop_checkbox, self.install_button,
+                       self.feed_button, self.license_edit, self.license_button,
+                       self.desktop_checkbox, self.install_button,
                        self.repair_button, self.cancel_button):
             widget.setEnabled(True)
         self._refresh()
@@ -275,15 +344,21 @@ class SetupDialog(QDialog):
         self.cancel_button.setText("Close")
         self.feed_edit.setEnabled(False)
         self.feed_button.setEnabled(False)
+        self.license_edit.setEnabled(False)
+        self.license_button.setEnabled(False)
         if self._job_result["warning"]:
             self.status_label.setText(
-                "Nexus is installed, but some shortcuts could not be created. "
-                f"{self._job_result['warning']}\nChoose Repair shortcuts to try again, or Open Nexus."
+                f"Nexus {self._current.get('version', '')} is installed with setup warnings. "
+                f"{self._job_result['warning']}\nOpen Nexus to continue. Use Repair shortcuts if shortcut creation failed."
             )
         else:
+            license_note = (
+                f" License installed at {self._job_result['license_destination']}."
+                if self._job_result["license_destination"] else ""
+            )
             self.status_label.setText(
                 f"Nexus {self._current.get('version', '')} is ready. "
-                "Use the Nexus shortcut whenever you want to start the app."
+                f"Use the Nexus shortcut whenever you want to start the app.{license_note}"
             )
 
     def _open_nexus(self):

@@ -3821,6 +3821,32 @@ WHERE r.name = 'designer' AND p.name = 'manage_issues';
 
 }
 
+def _migration_50(conn):
+    """Vertical item history, independent Nexus branches and frozen release packs."""
+    from core.repositories.nexus_history_repository import ensure_history_schema
+    ensure_history_schema(conn)
+
+
+MIGRATIONS[50] = _migration_50
+
+
+def _migration_51(conn):
+    """Per-user BOM branch activation and branch-routed commit tracking."""
+    from core.repositories.nexus_history_repository import ensure_history_schema
+    ensure_history_schema(conn)
+    tables = {str(row[0]) for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "commits" in tables:
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(commits)").fetchall()}
+        if "nexus_branch_id" not in columns:
+            conn.execute("ALTER TABLE commits ADD COLUMN nexus_branch_id TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_commits_nexus_branch "
+                      "ON commits(project_id,nexus_branch_id,status)")
+
+
+MIGRATIONS[51] = _migration_51
+
+
 # --- Migration ---
 def migrate():
     init_db()  

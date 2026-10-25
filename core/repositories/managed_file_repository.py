@@ -68,7 +68,11 @@ class ManagedFileRepository:
         entry["binding_key"] = (
             f"file:{int(entry['part_file_id'])}"
             if entry.get("part_file_id") is not None
-            else str(entry.get("file_role") or "content")
+            else (
+                str(entry.get("binding_key") or "cad_dependency")
+                if entry.get("file_role") == "cad_dependency"
+                else str(entry.get("file_role") or "content")
+            )
         )
         columns = (
             "bom_id", "iteration_id", "binding_key", "file_role", "file_type", "source_kind",
