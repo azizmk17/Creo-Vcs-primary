@@ -32,6 +32,7 @@ from datetime import date, timedelta
 import os
 
 from core.models.issue_model import ISSUE_CATEGORIES, ISSUE_PRIORITIES, ISSUE_STATUSES
+from core.performance_recorder import timed
 from core.repositories.user_repository import UserRepository
 from core.services.issue_service import IssueService
 from core.services.user_service import UserService
@@ -624,6 +625,7 @@ class EngineeringIssuePage(QWidget):
             "part_id": self.part_filter.currentData(),
         }
 
+    @timed("issues.view_refresh")
     def refresh(self, *_):
         if not self.service.project_id:
             return

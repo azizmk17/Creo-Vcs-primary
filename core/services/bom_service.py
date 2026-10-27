@@ -18,6 +18,7 @@ from core.repositories.part_file_repository import PartFileRepository
 from core.repositories.pdm_repository import PdmRepository
 from core.service_resources import ServiceResources
 from core.session_manager import SessionManager
+from core.performance_recorder import timed
 from config import DB_NAME
 
 from core.services.base_service import BaseService
@@ -959,6 +960,7 @@ class BomService(BaseService):
         self._tree_dirty.add(int(self.session.project_id))
         return True
 
+    @timed("item.checkout")
     def checkout_item(
         self,
         item_id: int,
@@ -1007,6 +1009,7 @@ class BomService(BaseService):
         self._finish_bom_item_checkout(int(item_id), as_user_id=as_user_id)
         return True
 
+    @timed("item.checkin")
     def checkin_item_data(self, item_id: int, note: str) -> Dict:
         """Check in Item data and undo every remaining related CAD reservation."""
         return self._finish_bom_item_checkout(int(item_id), checkin=True, note=note)
@@ -1353,6 +1356,7 @@ class BomService(BaseService):
             "analysis": selected,
         }
 
+    @timed("item.undo_checkout")
     def undo_checkout(
         self,
         part_id: int,
@@ -1659,6 +1663,7 @@ class BomService(BaseService):
                 r["version_label"] = (r.get("version_label") or "").strip() or "A"
             return out
 
+    @timed("item.history_query")
     def get_history_detailed(self, part_id: int, include_all_revisions: bool = True) -> List[Dict]:
         """Unified event timeline for a part.
 
@@ -2087,9 +2092,17 @@ class BomService(BaseService):
         events.sort(key=_sort_key, reverse=True)
         return events
 
-    def get_history_analytics(self, part_id: int, include_all_revisions: bool = True) -> Dict:
+    def get_history_analytics(
+        self,
+        part_id: int,
+        include_all_revisions: bool = True,
+        events: List[Dict] | None = None,
+    ) -> Dict:
         """Small analytics summary for the part history tab."""
-        events = self.get_history_detailed(part_id, include_all_revisions=include_all_revisions)
+        if events is None:
+            events = self.get_history_detailed(
+                part_id, include_all_revisions=include_all_revisions
+            )
         out = {
             "events_total": len(events),
             "commits": 0,
@@ -2135,6 +2148,7 @@ class BomService(BaseService):
     # -------------------------------
     # SEARCH PARTS
     # -------------------------------
+    @timed("bom.search_query")
     def search_parts(self, query: str) -> List[Dict]:
         """
         Search parts by AES number, name, or part number
@@ -2899,6 +2913,7 @@ class BomService(BaseService):
     # -------------------------------
     # GET PART DETAILS
     # -------------------------------
+    @timed("item.details_query")
     def get_part_details(self, part_id: int) -> Dict:
         part = self.bom_repo.get_by_id(part_id)
         if not part:
@@ -2909,6 +2924,7 @@ class BomService(BaseService):
             version_context = self.revision_repo.get_current_context(int(part_id))
         except Exception:
             version_context = {}
+        d["version_context"] = dict(version_context or {})
         d["current_revision_id"] = version_context.get("current_revision_id")
         d["current_iteration_id"] = version_context.get("current_iteration_id")
         d["iteration_number"] = version_context.get("iteration_number")
@@ -3120,6 +3136,7 @@ class BomService(BaseService):
         project_id = int(project_id or self.session.project_id)
         return self.get_released_ebom_level(project_id, offset=offset)
 
+    @timed("bom.ebom_level_query")
     def get_released_ebom_level(self, project_id, parent=None, *, offset=0):
         structure = self.pdm_service.get_item_structure_level(
             int(project_id), parent, offset=offset,
@@ -4239,6 +4256,7 @@ class BomService(BaseService):
                 parents.add(parent_id)
         return sorted(parents)
 
+    @timed("item.structure_query")
     def get_structure_context(self, part_id: int) -> Dict:
         """Return recursive Uses and direct Where Used relations for one BOM item."""
         selected = self.bom_repo.get_by_id(int(part_id))

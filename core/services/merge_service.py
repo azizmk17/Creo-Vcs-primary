@@ -7,6 +7,7 @@ import tempfile
 from datetime import datetime
 import uuid
 from core.services.permission_decorators import require_permission
+from core.performance_recorder import timed
 from core.repositories.commit_repository import CommitRepository
 from core.repositories.merge_repository import MergeRepository
 from core.repositories.bom_repository import BomRepository
@@ -883,6 +884,7 @@ class MergeService(BaseService):
         )
 
     @require_permission("merge")
+    @timed("commit.merge_master")
     def excute_merge(self, selected_ids, message):
         selected = []
         for selected_id in dict.fromkeys(selected_ids):
@@ -912,6 +914,7 @@ class MergeService(BaseService):
         }
 
     @require_permission("merge")
+    @timed("commit.merge_master_group")
     def excute_merge_by_commit_id(self, commit_id, message=""):
         logical_id = str(commit_id or "").strip()
         project_id = int(self.session.project_id)

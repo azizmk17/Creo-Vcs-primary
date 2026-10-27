@@ -1,9 +1,11 @@
 """A request-scoped filename index, separate from saved engineering status."""
 import os
 import re
+from core.performance_recorder import measured, timed
 
 
 class WorkingDirectoryInventory:
+    @timed("diagnostics.directory_inventory")
     def __init__(self, directory, *, cancel_cb=None):
         self.directory = os.path.abspath(directory)
         self.names = set()
@@ -30,7 +32,8 @@ class WorkingDirectoryInventory:
         if os.path.normcase(os.path.dirname(path)) == os.path.normcase(self.directory):
             return os.path.normcase(os.path.basename(path)) in self._lookup
         if path not in self._external_exists:
-            self._external_exists[path] = os.path.isfile(path)
+            with measured("filesystem.inventory_external_exists", event=False):
+                self._external_exists[path] = os.path.isfile(path)
         return self._external_exists[path]
 
     def latest_version(self, base):

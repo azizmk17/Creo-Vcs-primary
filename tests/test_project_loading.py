@@ -20,10 +20,12 @@ import config
 from core.session_manager import SessionManager
 from main3 import BomGUI, StartupWindow
 from pages.bom_page import (
-    BomPage, _InitialDiagWorker, _ProjectStructureWorker, _PROJECT_LOAD_THREADS,
+    BomPage, _InitialDiagWorker, _LazyChildrenWorker, _ProjectStructureWorker,
+    _SearchWorker, _PROJECT_LOAD_THREADS,
     _start_project_worker,
 )
 from pages.login_page import LoginPage
+from core.repositories.user_repository import UserRepository
 from setup.migrations import migrate
 
 
@@ -151,6 +153,39 @@ class ProjectLoadingTests(unittest.TestCase):
         done.assert_called_once()
         finished.assert_not_called()
 
+    def test_search_and_lazy_workers_keep_their_project_session_snapshot(self):
+        session = SimpleNamespace(project_id=12, user_id=7)
+        service = SimpleNamespace(session=session)
+        search = _SearchWorker(1, service, "gear")
+        children = _LazyChildrenWorker(2, service, 12, 31, "31")
+
+        session.project_id = 13
+
+        self.assertEqual(search._bom_service.session.project_id, 12)
+        self.assertEqual(children._bom_service.session.project_id, 12)
+        self.assertIsNot(search._bom_service.session, session)
+        self.assertIsNot(children._bom_service.session, session)
+
+    def test_initial_diagnostics_group_missing_files_before_emitting_to_ui(self):
+        session = SimpleNamespace(project_id=12, user_id=7)
+        service = Mock(session=session)
+        rows = [(4, "missing_pdf", "a.pdf"), (4, "missing_step", "a.step"), (9, "missing_pdf", "b.pdf")]
+        service.sync_bom_files.return_value = rows
+        service.check_working_directory.return_value = False
+        result = []
+        with patch("pages.bom_page.DiagService", return_value=service), \
+                patch("pages.bom_page.WorkingDirectoryInventory"), \
+                patch("pages.bom_page.os.path.isdir", return_value=True):
+            worker = _InitialDiagWorker("fixture")
+            worker.finished.connect(lambda *args: result.append(args))
+            worker.run()
+
+        payload, working_result = result[0]
+        self.assertEqual(working_result, False)
+        self.assertEqual(payload["rows"], rows)
+        self.assertEqual(payload["ids"], {4, 9})
+        self.assertEqual(payload["by_part"], {4: rows[:2], 9: rows[2:]})
+
 
 class ProjectShellIntegrationTests(unittest.TestCase):
     """Exercise the real toolbar, page construction, signals, and worker UI."""
@@ -255,6 +290,81 @@ class ProjectShellIntegrationTests(unittest.TestCase):
             self.assertTrue(page.bom_mode_selector.isEnabled())
             self.assertTrue(page.isEnabled())
             self.assertEqual(query.call_args.args, (13,))
+
+    def test_column_preferences_load_in_background_without_blocking_ui_events(self):
+        entered, release = threading.Event(), threading.Event()
+        worker_thread_ids = []
+        ticks = []
+
+        def slow_preferences(_repo, user_id):
+            worker_thread_ids.append(threading.get_ident())
+            entered.set()
+            release.wait(5)
+            return {"visible_extra_columns": ["active_branch"], "layouts": {}}
+
+        timer = QTimer()
+        timer.setInterval(5)
+        timer.timeout.connect(lambda: ticks.append(True))
+        timer.start()
+        emitted = []
+        try:
+            with patch.object(UserRepository, "get_bom_column_preferences", slow_preferences):
+                self.window = BomGUI()
+                page = self.window.bom_page
+                self.wait_until(entered.is_set)
+                page._bom_column_preferences_worker.finished.connect(
+                    lambda *args: emitted.append(args)
+                )
+                self.wait_until(lambda: len(ticks) >= 3)
+                self.assertNotEqual(worker_thread_ids[0], threading.get_ident())
+                self.assertIsNone(getattr(page, "_bom_column_layout_user", None))
+        finally:
+            release.set()
+            timer.stop()
+        self.wait_until(lambda: not _PROJECT_LOAD_THREADS)
+        self.app.processEvents()
+        self.assertEqual(
+            getattr(self.window.bom_page, "_bom_column_layout_user", None), 7,
+            msg=(f"result={emitted!r}; request_user="
+                 f"{getattr(self.window.bom_page, '_bom_column_preferences_request_user', None)!r}; "
+                 f"cache_user={getattr(self.window.bom_page, '_bom_column_preferences_cache_user', None)!r}; "
+                 f"revision={getattr(self.window.bom_page, '_bom_column_preferences_revision', 0)!r}"),
+        )
+
+    def test_large_tree_roots_are_added_over_multiple_ui_timer_ticks(self):
+        self.window = BomGUI()
+        page = self.window.bom_page
+        page._queue_indicator_refresh = Mock()
+        page._indicator_summary_for_part = Mock(side_effect=AssertionError("indicator I/O ran during rendering"))
+        page._apply_native_work_status = Mock(side_effect=AssertionError("native status I/O ran during rendering"))
+        page._tree_load_seq += 1
+        seq = page._tree_load_seq
+        rows = [
+            {"id": index, "name": f"Part {index}", "type": "Part"}
+            for index in range(1, 1801)
+        ]
+        ticks = []
+        timer = QTimer()
+        timer.setInterval(1)
+        timer.timeout.connect(lambda: ticks.append(True))
+        timer.start()
+        try:
+            page._begin_tree_build(seq, {"roots": rows}, {})
+            self.wait_until(lambda: not page._tree_build_timer.isActive(), timeout=10)
+        finally:
+            timer.stop()
+        self.assertEqual(page.tree.topLevelItemCount(), len(rows))
+        self.assertGreater(len(ticks), 3)
+        page._apply_lazy_children_result(
+            page.tree.topLevelItem(0), 1,
+            [{"id": 5000 + index, "name": f"Child {index}", "type": "Part"}
+             for index in range(180)],
+        )
+        self.assertEqual(page.tree.topLevelItem(0).childCount(), 0)
+        self.wait_until(lambda: not page._lazy_child_build_timer.isActive(), timeout=5)
+        self.assertEqual(page.tree.topLevelItem(0).childCount(), 180)
+        page._indicator_summary_for_part.assert_not_called()
+        page._apply_native_work_status.assert_not_called()
 
     def test_structure_failure_stops_loader_and_shows_retry_message(self):
         self.session.update_project(13)

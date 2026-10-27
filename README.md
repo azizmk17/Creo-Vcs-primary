@@ -8,7 +8,15 @@ Nexus **4.5.0** reuses repository initialization within a BOM service graph, def
 
 Nexus **4.8.0** adds an item timeline with independent CAD/project and document revisions, per-user active **Nexus Branches**, branch-routed commits, and immutable, exportable release packages. See [Item Timeline, Nexus Branches, and Frozen Release Packages](docs/nexus_branches_and_release_packages.md).
 
+Nexus **4.9.0** adds an opt-in recorder for real company-workspace performance.
+
 For repeatable loading measurements, see the [large benchmark project guide](tools/README_benchmark_project.md). It describes the isolated 10,000-part / 1,000-assembly dataset, disk limits, and its synthetic CAD limitations.
+
+To measure a real company workspace, select **Performance recording…** on the
+sign-in screen, start recording, use Nexus normally, and choose **Performance:
+Recording → Stop and save report**. Share the saved ZIP. See the [company
+performance guide](docs/company_workspace_performance_test.md) for the test
+sequence, report contents, and measurement limits.
 
 The graphical **Setup.exe** introduced in 4.2.0 remains included: users extract the complete folder, double-click Setup, and install without Command Prompt. Nexus also retains the BOM checkout cleanup introduced in 4.1.1, including remaining drawings after a 3D-only push, and includes [signed releases, managed updates, and workspace compatibility checks](README_RELEASE_UPDATES.md), alongside [shared master work and version-aware PDF/STEP status](docs/master_work_and_deliverables.md).
 

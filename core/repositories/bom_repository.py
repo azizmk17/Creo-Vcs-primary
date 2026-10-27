@@ -2,6 +2,7 @@ import sqlite3
 from contextlib import nullcontext
 from typing import List, Optional
 from core.models.bom_model import Bom
+from core.performance_recorder import timed
 from core.ebom_policy import (
     normalize_classification,
     normalize_cad_control_mode,
@@ -1356,6 +1357,7 @@ class BomRepository:
                 base_file_name, base_drw_name, id, project_id
             ))
 
+    @timed("diagnostics.metadata_batch_update")
     def update_bom_file_names_batch(self, rows, project_id):
         """Update changed metadata only; never overwrite a concurrent CAD change.
 

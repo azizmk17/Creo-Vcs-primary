@@ -19,6 +19,7 @@ from core.repositories.user_repository import UserRepository
 from core.services.project_service import ProjectService
 from core.services.user_service import UserService
 from core.session_manager import SessionManager
+from core.performance_recorder import recorder, timed
 
 
 def _resource_path(relative: str) -> str:
@@ -180,6 +181,11 @@ class LoginPage(QWidget):
         self.login_btn.setMinimumHeight(32)
         self.login_btn.clicked.connect(self.login)
         content_layout.addWidget(self.login_btn)
+
+        self.performance_btn = QPushButton("Performance recording…")
+        self.performance_btn.setToolTip("Record an anonymous performance report for this session")
+        self.performance_btn.clicked.connect(self._open_performance_recording)
+        content_layout.addWidget(self.performance_btn)
 
         self.username_input.returnPressed.connect(self.login)
         self.password_input.returnPressed.connect(self.login)
@@ -361,6 +367,14 @@ class LoginPage(QWidget):
         self.status_label.setText(message)
         self._set_busy(False)
 
+    def _open_performance_recording(self):
+        from pages.performance_dialog import open_performance_dialog
+        open_performance_dialog(self)
+        self.performance_btn.setText(
+            "Performance recording is running…" if recorder.active else "Performance recording…"
+        )
+
+    @timed("login.submit")
     def login(self):
         username = self.username_input.text().strip()
         password = self.password_input.text()

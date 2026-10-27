@@ -7,6 +7,7 @@ from core.repositories.bom_repository import BomRepository
 from core.repositories.pdm_repository import PdmRepository
 from core.services.pdm_service import PdmService
 from core.working_directory_inventory import WorkingDirectoryInventory
+from core.performance_recorder import timed
 from core.service_resources import ServiceResources
 
 import re
@@ -249,6 +250,7 @@ class DiagService:
         }
 
 
+    @timed("diagnostics.integrity_check")
     def check_working_directory(self, working_dir, *, cancel_cb=None, inventory=None):
         if not working_dir or not os.path.isdir(working_dir):
             return []
@@ -565,6 +567,7 @@ class DiagService:
         return self._sync_bom_record(working_dir, bom, force_integrated_filenames=force_integrated_filenames)
 
     # everytime the app refreshed the bom page check if the filename and drawing exists in the working directory and check if the update the base_file_name and base_drw_name columns in the commit table regarding to the filename and drawing columns in the bom table
+    @timed("diagnostics.file_synchronization")
     def sync_bom_files(self, working_dir, *, cancel_cb=None, inventory=None):
         if not working_dir or not os.path.isdir(working_dir):
             return []

@@ -9,6 +9,7 @@ from core.repositories.managed_file_repository import ManagedFileRepository
 from core.services.part_file_service import PartFileService
 from core.services.project_service import ProjectService
 from core.session_manager import SessionManager
+from core.performance_recorder import timed
 from utils import ensure_dir_exists, safe_copy2, safe_exists, safe_getsize, safe_open
 
 
@@ -297,8 +298,11 @@ class ManagedFileService:
             int(bom_id), int(context["current_iteration_id"]), source_commit_id
         )
 
-    def list_current_files(self, bom_id: int) -> list[dict]:
-        context = self.revision_repo.get_current_context(int(bom_id))
+    @timed("item.managed_files_query")
+    def list_current_files(
+        self, bom_id: int, context: dict | None = None
+    ) -> list[dict]:
+        context = dict(context or self.revision_repo.get_current_context(int(bom_id)))
         iteration_id = int(context["current_iteration_id"])
         entries = self.repo.list_for_iteration(iteration_id)
         context = dict(context)
@@ -432,6 +436,7 @@ class ManagedFileService:
             collapsed.append(chosen)
         return collapsed
 
+    @timed("item.file_history_query")
     def list_file_history(self, bom_id: int, role: str, file_id=None) -> list[dict]:
         if isinstance(file_id, (list, tuple, set)):
             rows = []

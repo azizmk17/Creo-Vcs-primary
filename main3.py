@@ -122,6 +122,7 @@ from core.services.ui_permission import UIPermissionHelper
 from core.session_manager import SessionManager
 from core.repositories.project_event_repository import ProjectEventRepository
 from core.startup_gate import MINIMUM_STARTUP_LOADER_MS, StartupGate
+from core.performance_recorder import recorder, timed
 _startup_mark("main_imports_ready")
 
 
@@ -331,6 +332,14 @@ class StartupWindow(QMainWindow):
             self.main_page.show()
         self.close()
 
+    def closeEvent(self, event):
+        if not self._main_shown and recorder.active:
+            from pages.performance_dialog import confirm_recording_before_exit
+            if not confirm_recording_before_exit(self):
+                event.ignore()
+                return
+        super().closeEvent(event)
+
 
 class Notifier(QObject):
     notify = pyqtSignal(str)
@@ -433,6 +442,11 @@ class BomGUI(QMainWindow):
     def closeEvent(self, event):
         # A page can be replaced while its I/O finishes. Do not destroy an active
         # QThread on application exit; cancel and let the event loop drain it.
+        if recorder.active:
+            from pages.performance_dialog import confirm_recording_before_exit
+            if not confirm_recording_before_exit(self):
+                event.ignore()
+                return
         from pages.bom_page import _PROJECT_LOAD_THREADS
         running = [thread for thread in list(_PROJECT_LOAD_THREADS) if thread.isRunning()]
         if running:
@@ -457,6 +471,13 @@ class BomGUI(QMainWindow):
         status.setObjectName("applicationStatusBar")
         status.setSizeGripEnabled(False)
         status.showMessage("Ready")
+
+        self.performance_status_button = QPushButton(
+            "Performance: Recording" if recorder.active else "Performance"
+        )
+        self.performance_status_button.setToolTip("Record and save an anonymous performance report")
+        self.performance_status_button.clicked.connect(self._open_performance_recording)
+        status.addPermanentWidget(self.performance_status_button)
 
         self.status_identity_label = QLabel()
         self.status_identity_label.setObjectName("statusIdentity")
@@ -861,6 +882,14 @@ class BomGUI(QMainWindow):
         add_action(
             toolbar, "Updates", self.open_update_center, "SP_BrowserReload",
             role="utility", tooltip="Check, download and prepare a Nexus update",
+        )
+        self._performance_action = add_action(
+            toolbar,
+            "Performance: Recording" if recorder.active else "Performance",
+            self._open_performance_recording,
+            "SP_ComputerIcon",
+            role="utility",
+            tooltip="Record and save an anonymous performance report",
         )
         toolbar.addSeparator()
         self.shell_user_label = QLabel(
@@ -1312,6 +1341,19 @@ class BomGUI(QMainWindow):
                 f"{username.upper()}   |   PRODUCT {label}   |   VERSION {version}"
             )
 
+    def _open_performance_recording(self):
+        from pages.performance_dialog import open_performance_dialog
+        open_performance_dialog(self)
+        if hasattr(self, "_performance_action"):
+            self._performance_action.setText(
+                "Performance: Recording" if recorder.active else "Performance"
+            )
+        if hasattr(self, "performance_status_button"):
+            self.performance_status_button.setText(
+                "Performance: Recording" if recorder.active else "Performance"
+            )
+
+    @timed("ui.page_navigation")
     def switch_page(self, index):
         if int(index) == 7 and not self._engineer_cli_available():
             QMessageBox.warning(
@@ -1507,6 +1549,7 @@ class BomGUI(QMainWindow):
         except Exception:
             self._sync_last_event_id = 0
 
+    @timed("ui.project_event_poll")
     def _poll_project_events(self):
         if self._sync_poll_in_progress or not getattr(self.session, "project_id", None):
             return

@@ -6,7 +6,7 @@ from PyQt5.QtWidgets import (
     QMessageBox, QInputDialog, QFileDialog, QMenu, QAction, QDialog, QDialogButtonBox, QFrame,
     QPlainTextEdit, QStackedWidget, QSizePolicy, QCheckBox, QGridLayout, QScrollArea,
     QGraphicsDropShadowEffect, QToolTip, QStyledItemDelegate, QStyle, QStyleOptionViewItem,
-    QApplication, QProgressDialog, QShortcut,
+    QApplication, QProgressDialog, QProgressBar, QShortcut,
 )
 from PyQt5.QtCore import Qt, QDateTime, pyqtSignal, QTimer, QObject, QThread, QSize, QRect, QRectF, QPointF, QEvent, QSettings
 from PyQt5.QtGui import QColor, QPen, QFont, QBrush, QCursor, QPalette, QFontMetrics, QPolygonF, QKeySequence
@@ -26,6 +26,7 @@ import csv
 from datetime import datetime
 
 from core.session_manager import SessionManager
+from core.performance_recorder import recorder, timed
 from config import DB_NAME
 from core.services.diag_service import DiagService
 from core.working_directory_inventory import WorkingDirectoryInventory
@@ -677,10 +678,15 @@ def _integrity_payload(part_id, missing_files, missing_ids: set) -> dict:
     except Exception:
         pid = None
     if pid is not None:
-        for row in (missing_files or []):
+        rows = (
+            missing_files.get(pid, [])
+            if isinstance(missing_files, dict)
+            else (missing_files or [])
+        )
+        for row in rows:
             try:
                 bom_id, issue_type, filename = row
-                if int(bom_id) != pid:
+                if not isinstance(missing_files, dict) and int(bom_id) != pid:
                     continue
                 fn = str(filename or "")
                 it = str(issue_type or "")
@@ -2181,6 +2187,217 @@ class HistoryPanel(QWidget):
 _PROJECT_LOAD_THREADS = set()
 
 
+def _pdm_document_associations_payload(document: dict) -> list[dict]:
+    """Return normalized Item associations without depending on a widget."""
+    associations = [dict(row) for row in (document.get("associations") or []) if row]
+    if not associations and document.get("association_id") is not None:
+        associations = [{
+            "id": document.get("association_id"),
+            "association_id": document.get("association_id"),
+            "item_id": document.get("item_id"),
+            "association_type": document.get("association_type"),
+            "item_number": document.get("item_number"),
+            "item_name": document.get("item_name"),
+            "item_aes_number": document.get("item_aes_number"),
+            "item_version_label": document.get("item_version_label"),
+            "is_primary_drawing": document.get("is_primary_drawing"),
+        }]
+    unique = []
+    seen = set()
+    for association in associations:
+        key = (
+            association.get("association_id") or association.get("id"),
+            association.get("item_id"),
+            str(association.get("association_type") or "").upper(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(association)
+    return unique
+
+
+def _cad_payload_path_index(roots: list[dict]) -> dict[int, list[str]]:
+    """Build the CAD occurrence path lookup away from the UI thread."""
+    paths_by_id = defaultdict(list)
+    stack = [(root, ()) for root in reversed(list(roots or []))]
+    while stack:
+        node, ancestors = stack.pop()
+        if not isinstance(node, dict) or not node:
+            continue
+        label = str(node.get("file_name") or node.get("name") or node.get("id") or "CAD")
+        current = (*ancestors, label)
+        try:
+            paths_by_id[int(node.get("id"))].append(" > ".join(current))
+        except (TypeError, ValueError):
+            pass
+        for child in reversed(node.get("children") or []):
+            stack.append((child, current))
+    return {
+        cad_id: list(dict.fromkeys(paths))
+        for cad_id, paths in paths_by_id.items()
+    }
+
+
+def _cad_structure_metrics(data: dict) -> dict:
+    documents = list((data or {}).get("documents") or [])
+    models = [
+        row for row in documents
+        if str(row.get("category") or "").upper() in {"ASSEMBLY", "COMPONENT"}
+    ]
+    return {
+        "document_count": int((data or {}).get("document_count") or len(models)),
+        "drawing_count": int((data or {}).get("drawing_count") or 0),
+        "unassociated_count": sum(1 for row in models if not row.get("association_id")),
+        "unbound_drawing_count": int((data or {}).get("unbound_drawing_count") or 0),
+    }
+
+
+class _BomIndicatorLookupContext:
+    """Read-only indicator services isolated from the UI thread."""
+
+    def __init__(self, *, project_id, user_id, working_dir, services):
+        self.session = SimpleNamespace(project_id=int(project_id), user_id=user_id)
+        self.working_dir = str(working_dir or "")
+        self.bom_service = copy(services["bom_service"])
+        self.bom_service.session = SimpleNamespace(**vars(self.session))
+        self.diag_service = copy(services["diag_service"])
+        self.diag_service.session = SimpleNamespace(**vars(self.session))
+        self.part_file_service = copy(services["part_file_service"])
+        self.part_file_service.session = SimpleNamespace(**vars(self.session))
+        self.part_doc_ack_service = copy(services["part_doc_ack_service"])
+        self.part_doc_ack_service.session = SimpleNamespace(**vars(self.session))
+        self.project_service = copy(services["project_service"])
+        self._doc_indicator_cache = {}
+        self._legacy_paths = {}
+        self._manifest = MasterWorkService.read_manifest(self.working_dir)
+        self._commits_by_part = defaultdict(list)
+        try:
+            for commit in self.diag_service.repo.get_all_commits(self.session.project_id):
+                try:
+                    self._commits_by_part[int(getattr(commit, "part_id", 0) or 0)].append(commit)
+                except (TypeError, ValueError):
+                    continue
+        except Exception:
+            pass
+        self._published_parts = {
+            int(part_id)
+            for record in (self._manifest.get("files") or {}).values()
+            if record.get("source_commit_id")
+            for part_id in (record.get("part_ids") or [])
+            if str(part_id).isdigit()
+        }
+
+    def __getattr__(self, name):
+        # Reuse BomPage's status rules with this non-widget context. The methods
+        # perform read-only database/filesystem operations on the copied services.
+        owner = globals().get("BomPage")
+        method = getattr(owner, name, None) if owner is not None else None
+        if callable(method):
+            return method.__get__(self, type(self))
+        raise AttributeError(name)
+
+    def _part_change_commits(self, part_id):
+        try:
+            return list(self._commits_by_part.get(int(part_id), []))
+        except (TypeError, ValueError):
+            return []
+
+    def _master_change_commit_for_part(self, part_id):
+        return master_commit_for_part(
+            self._part_change_commits(int(part_id)), self._manifest, int(part_id)
+        )
+
+    def _has_published_master_for_part(self, part_id):
+        return int(part_id) in self._published_parts
+
+    def _legacy_doc_path(self, part_id, doc_type):
+        key = (int(part_id), str(doc_type).upper())
+        if key not in self._legacy_paths:
+            column = "pdf_path" if key[1] == "PDF" else "step_path"
+            try:
+                with self.bom_service.bom_repo.get_conn() as conn:
+                    row = conn.execute(
+                        f"SELECT {column} FROM bom WHERE id=? AND project_id=?",
+                        (key[0], self.session.project_id),
+                    ).fetchone()
+                self._legacy_paths[key] = str(row[0] or "").strip() if row else ""
+            except Exception:
+                self._legacy_paths[key] = ""
+        return self._legacy_paths[key]
+
+
+class _IndicatorDataWorker(QObject):
+    batch = pyqtSignal(int, int, object)
+    finished = pyqtSignal(int, int)
+    failed = pyqtSignal(int, int, str)
+    done = pyqtSignal()
+
+    def __init__(self, request_id, project_id, user_id, working_dir, part_ids,
+                 missing_by_part, missing_ids, services):
+        super().__init__()
+        self.request_id = int(request_id)
+        self.project_id = int(project_id)
+        self.user_id = user_id
+        self.working_dir = str(working_dir or "")
+        self.part_ids = [int(value) for value in part_ids]
+        self.missing_by_part = missing_by_part if isinstance(missing_by_part, dict) else {}
+        self.missing_ids = missing_ids if isinstance(missing_ids, set) else set()
+        self.services = services
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            context = _BomIndicatorLookupContext(
+                project_id=self.project_id,
+                user_id=self.user_id,
+                working_dir=self.working_dir,
+                services=self.services,
+            )
+            result = {}
+            for part_id in self.part_ids:
+                if self._cancelled:
+                    return
+                issues = {
+                    str(row[1])
+                    for row in self.missing_by_part.get(part_id, [])
+                    if len(row) > 1
+                }
+                summary = context._indicator_summary_for_part(part_id, issues)
+                latest = context._master_change_commit_for_part(part_id)
+                native_state = native_work_state(latest) if latest else "Not recorded"
+                native_tip = (
+                    f"Master native: {latest.commit_id} — {native_state}"
+                    if latest else
+                    "No master submission is recorded for this Item. See Item Status for its controlled parameter."
+                )
+                result[part_id] = {
+                    "summary": summary,
+                    "integrity": _integrity_payload(
+                        part_id, self.missing_by_part, self.missing_ids
+                    ),
+                    "native_state": native_state,
+                    "native_tooltip": native_tip,
+                }
+                if len(result) >= 24:
+                    if self._cancelled:
+                        return
+                    self.batch.emit(self.request_id, self.project_id, result)
+                    result = {}
+            if not self._cancelled:
+                if result:
+                    self.batch.emit(self.request_id, self.project_id, result)
+                self.finished.emit(self.request_id, self.project_id)
+        except Exception as exc:
+            if not self._cancelled:
+                self.failed.emit(self.request_id, self.project_id, str(exc))
+        finally:
+            self.done.emit()
+
+
 def _start_project_worker(worker):
     thread = QThread(QApplication.instance())
     thread._project_worker = worker
@@ -2191,7 +2408,7 @@ def _start_project_worker(worker):
     worker.done.connect(worker.deleteLater)
     thread.finished.connect(lambda: _PROJECT_LOAD_THREADS.discard(thread))
     thread.finished.connect(thread.deleteLater)
-    thread.start()
+    thread.start(QThread.LowPriority)
     return thread
 
 
@@ -2216,11 +2433,30 @@ class _ProjectStructureWorker(QObject):
     def cancel(self):
         self._cancelled = True
 
+    @timed("bom.project_structure_worker")
     def run(self):
         try:
             if self._cancelled:
                 return
             service = self.service
+            try:
+                project = ProjectService().get_project_by_id(self.project_id) or {}
+            except Exception:
+                project = {}
+            working_dir = str(project.get("working_directory") or "")
+            active_branch_names = {}
+            active_branch_checkouts = {}
+            try:
+                from core.services.nexus_history_service import NexusHistoryService
+                nexus = NexusHistoryService(
+                    getattr(service.bom_repo, "db_name", DB_NAME),
+                    user_id=int(getattr(service.session, "user_id", 0) or 0),
+                    project_id=self.project_id,
+                )
+                active_branch_names = nexus.active_branch_map()
+                active_branch_checkouts = nexus.active_branch_checkout_map()
+            except Exception:
+                pass
             if self.mode == "ebom":
                 roots_query = getattr(service, "get_released_ebom_roots", None) or service.get_released_ebom_project
                 data = roots_query(self.project_id) or {}
@@ -2230,10 +2466,37 @@ class _ProjectStructureWorker(QObject):
                     self.project_id, include_related_drawings=False, include_legacy_fallback=False,
                 ) or []
                 folders = service.list_bom_folders() or []
+                associations_by_item = defaultdict(list)
+                for document in documents:
+                    if str(document.get("category") or "").upper() == "DRAWING":
+                        continue
+                    for association in _pdm_document_associations_payload(document):
+                        try:
+                            item_id = int(association.get("item_id"))
+                        except (TypeError, ValueError):
+                            continue
+                        item_document = dict(document)
+                        item_document.update(association)
+                        item_document["association_id"] = (
+                            association.get("association_id") or association.get("id")
+                        )
+                        item_document["item_id"] = item_id
+                        item_document["association_type"] = str(
+                            association.get("association_type") or "CONTENT"
+                        ).upper()
+                        item_document["related_drawings"] = []
+                        associations_by_item[item_id].append(item_document)
+                associations_by_item = dict(associations_by_item)
+                cad_path_index = {}
+                cad_metrics = {}
             else:
                 data = service.get_pdm_cad_structure() or {}
                 documents = []
                 folders = service.list_cad_folders() or []
+                associations_by_item = {}
+                roots = list(data.get("roots") or [])
+                cad_path_index = _cad_payload_path_index(roots)
+                cad_metrics = _cad_structure_metrics(data)
             if self._cancelled:
                 return
             try:
@@ -2252,6 +2515,12 @@ class _ProjectStructureWorker(QObject):
                 self.finished.emit(self.seq, self.project_id, self.mode, {
                     "data": data, "documents": documents, "folders": folders,
                     "health": health, "variants": variants, "issue_summary": issue_summary,
+                    "working_dir": working_dir,
+                    "active_branch_names": active_branch_names,
+                    "active_branch_checkouts": active_branch_checkouts,
+                    "associations_by_item": associations_by_item,
+                    "cad_path_index": cad_path_index,
+                    "cad_metrics": cad_metrics,
                 })
         except Exception as exc:
             if not self._cancelled:
@@ -2264,12 +2533,18 @@ class _TreeLoadWorker(QObject):
     finished = pyqtSignal(int, object, object)  # seq, tree_data, missing_map
     failed = pyqtSignal(int, str)
 
-    def __init__(self, seq: int, bom_service, project_id: int, missing_files: list):
+    def __init__(self, seq: int, bom_service, project_id: int, missing_files: list, issue_service=None):
         super().__init__()
         self._seq = int(seq)
-        self._bom_service = bom_service
+        self._bom_service = copy(bom_service)
         self._project_id = int(project_id)
-        self._missing_files = list(missing_files or [])
+        self._bom_service.session = SimpleNamespace(**vars(bom_service.session))
+        self._bom_service.session.project_id = self._project_id
+        self._issue_service = copy(issue_service) if issue_service is not None else None
+        if self._issue_service is not None:
+            self._issue_service.session = SimpleNamespace(**vars(issue_service.session))
+            self._issue_service.session.project_id = self._project_id
+        self._missing_files = missing_files if isinstance(missing_files, list) else list(missing_files or [])
         self._cancelled = False
 
     def cancel(self):
@@ -2293,6 +2568,30 @@ class _TreeLoadWorker(QObject):
 
             if self._cancelled:
                 return
+
+            startup = {"variants": []}
+            if self._issue_service is not None:
+                try:
+                    startup["health"] = self._issue_service.health_score()
+                except Exception:
+                    startup["health"] = None
+                try:
+                    startup["issue_summary"] = self._issue_service.part_summary() or {}
+                except Exception:
+                    startup["issue_summary"] = {}
+            try:
+                startup["variants"] = self._bom_service.list_product_variants() or []
+            except Exception:
+                startup["variants"] = []
+            folders = tree_data.get("folders")
+            if folders is None:
+                try:
+                    folders = self._bom_service.list_bom_folders() or []
+                except Exception:
+                    folders = []
+            tree_data["folders"] = folders
+            tree_data = dict(tree_data)
+            tree_data["_startup_payload"] = startup
 
             self.finished.emit(self._seq, tree_data, missing_map)
         except Exception as e:
@@ -2339,7 +2638,9 @@ class _LazyChildrenWorker(QObject):
     def __init__(self, request_id: int, bom_service, project_id: int, parent_id: int, parent_path: str):
         super().__init__()
         self._request_id = int(request_id)
-        self._bom_service = bom_service
+        self._bom_service = copy(bom_service)
+        self._bom_service.session = SimpleNamespace(**vars(bom_service.session))
+        self._bom_service.session.project_id = int(project_id)
         self._project_id = int(project_id)
         self._parent_id = int(parent_id)
         self._parent_path = str(parent_path or "")
@@ -2348,6 +2649,7 @@ class _LazyChildrenWorker(QObject):
     def cancel(self) -> None:
         self._cancelled = True
 
+    @timed("bom.lazy_children_worker")
     def run(self) -> None:
         try:
             if self._cancelled:
@@ -2373,7 +2675,8 @@ class _SearchWorker(QObject):
     def __init__(self, seq: int, bom_service, query: str):
         super().__init__()
         self._seq = int(seq)
-        self._bom_service = bom_service
+        self._bom_service = copy(bom_service)
+        self._bom_service.session = SimpleNamespace(**vars(bom_service.session))
         self._query = str(query or "")
         self._cancelled = False
 
@@ -2390,6 +2693,153 @@ class _SearchWorker(QObject):
             self.finished.emit(self._seq, results)
         except Exception as e:
             self.failed.emit(self._seq, str(e))
+
+
+class _BomColumnPreferencesWorker(QObject):
+    finished = pyqtSignal(int, int, object)
+    done = pyqtSignal()
+
+    def __init__(self, request_id: int, user_id: int):
+        super().__init__()
+        self.request_id = int(request_id)
+        self.user_id = int(user_id)
+
+    def run(self):
+        try:
+            preferences = UserRepository().get_bom_column_preferences(self.user_id) or {}
+        except Exception:
+            preferences = {}
+        self.finished.emit(self.request_id, self.user_id, preferences)
+        self.done.emit()
+
+
+class _PartDetailsWorker(QObject):
+    finished = pyqtSignal(int, int, int, object)
+    failed = pyqtSignal(int, int, int, str)
+    done = pyqtSignal()
+
+    def __init__(self, request_id, project_id, item_id, bom_service,
+                 managed_file_service, issue_service):
+        super().__init__()
+        self.request_id = int(request_id)
+        self.project_id = int(project_id)
+        self.item_id = int(item_id)
+        session = SimpleNamespace(**vars(bom_service.session))
+        session.project_id = self.project_id
+
+        self.bom_service = copy(bom_service)
+        self.bom_service.session = session
+        self.managed_file_service = copy(managed_file_service)
+        self.managed_file_service.session = session
+        self.managed_file_service.part_file_service = copy(
+            managed_file_service.part_file_service
+        )
+        self.managed_file_service.part_file_service.session = session
+        self.issue_service = copy(issue_service)
+        self.issue_service.session = session
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            details = self.bom_service.get_part_details(self.item_id) or {}
+            if self._cancelled:
+                return
+            if not details:
+                raise ValueError("The selected Item could not be loaded.")
+
+            payload = {"details": details, "errors": []}
+            operations = (
+                ("associations", lambda: self.bom_service.list_item_cad_associations(self.item_id) or []),
+                ("active_cad", lambda: (
+                    [] if details.get("active_branch_id") else
+                    self.bom_service.checked_out_cad_for_item(self.item_id) or []
+                )),
+                ("history", lambda: self.bom_service.get_history_detailed(
+                    self.item_id, include_all_revisions=True
+                ) or []),
+                ("issues", lambda: self.issue_service.issues_for_part(self.item_id) or []),
+            )
+            for key, load in operations:
+                if self._cancelled:
+                    return
+                try:
+                    payload[key] = load()
+                except Exception as exc:
+                    payload[key] = []
+                    payload["errors"].append(f"{key.replace('_', ' ').title()}: {exc}")
+
+            if self._cancelled:
+                return
+            try:
+                payload["analytics"] = self.bom_service.get_history_analytics(
+                    self.item_id,
+                    include_all_revisions=True,
+                    events=payload.get("history") or [],
+                ) or {}
+            except Exception as exc:
+                payload["analytics"] = {}
+                payload["errors"].append(f"History summary: {exc}")
+
+            if self._cancelled:
+                return
+            try:
+                payload["managed_files"] = self.managed_file_service.list_current_files(
+                    self.item_id,
+                    context=details.get("version_context") or None,
+                ) or []
+            except Exception as exc:
+                payload["managed_files"] = []
+                payload["errors"].append(f"Managed files: {exc}")
+
+            if not self._cancelled:
+                self.finished.emit(
+                    self.request_id, self.project_id, self.item_id, payload
+                )
+        except Exception as exc:
+            if not self._cancelled:
+                self.failed.emit(
+                    self.request_id, self.project_id, self.item_id, str(exc)
+                )
+        finally:
+            self.done.emit()
+
+
+class _ItemStructureContextWorker(QObject):
+    finished = pyqtSignal(int, int, int, object)
+    failed = pyqtSignal(int, int, int, str)
+    done = pyqtSignal()
+
+    def __init__(self, request_id, project_id, item_id, bom_service):
+        super().__init__()
+        self.request_id = int(request_id)
+        self.project_id = int(project_id)
+        self.item_id = int(item_id)
+        self.service = copy(bom_service)
+        self.service.session = SimpleNamespace(**vars(bom_service.session))
+        self.service.session.project_id = self.project_id
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            if not self._cancelled:
+                context = self.service.get_structure_context(self.item_id) or {}
+                if not self._cancelled:
+                    self.finished.emit(
+                        self.request_id, self.project_id, self.item_id, context
+                    )
+        except Exception as exc:
+            if not self._cancelled:
+                self.failed.emit(
+                    self.request_id, self.project_id, self.item_id, str(exc)
+                )
+        finally:
+            self.done.emit()
 
 
 class _InitialDiagWorker(QObject):
@@ -2428,7 +2878,22 @@ class _InitialDiagWorker(QObject):
                 )
             if self._cancelled:
                 return
-            self.finished.emit(missing_files, working_result)
+            missing_by_part = defaultdict(list)
+            missing_ids = set()
+            for row in missing_files or []:
+                try:
+                    part_id = int(row[0])
+                    missing_by_part[part_id].append(row)
+                    missing_ids.add(part_id)
+                except (TypeError, ValueError, IndexError):
+                    continue
+            if self._cancelled:
+                return
+            self.finished.emit({
+                "rows": missing_files,
+                "by_part": dict(missing_by_part),
+                "ids": missing_ids,
+            }, working_result)
         except Exception as e:
             if not self._cancelled:
                 self.failed.emit(str(e))
@@ -2883,6 +3348,10 @@ class BomPage(QWidget):
 
     RELATIONSHIP_GRAPH_PATH_LIMIT = 6
     RELATIONSHIP_GRAPH_ALL_PATH_LIMIT = 10000
+    PDM_ROOT_BATCH_SIZE = 24
+    PDM_ROOT_SLICE_SECONDS = 0.004
+    LAZY_CHILD_BATCH_SIZE = 24
+    LAZY_CHILD_SLICE_SECONDS = 0.004
 
     initial_tree_ready = pyqtSignal()
     issue_requested = pyqtSignal(int)
@@ -2938,11 +3407,8 @@ class BomPage(QWidget):
 
         self.working_dir = None
         self.commits_dir = None
-
-        if self.session.project_id:
-            self.working_dir = self.get_working_dir()
-            if self.working_dir:
-                self.commits_dir = self.working_dir + "/commits"
+        # Project metadata may live in SQLite on a company network share.
+        # Resolve it in the startup worker instead of blocking page creation.
         
         self.current_part_aes = None
         self.current_part_id = None
@@ -2962,26 +3428,48 @@ class BomPage(QWidget):
         self._structure_error = None
         self._diagnostics_finished = False
         self._diagnostics_result = None
+        self._diagnostics_started = False
         self._lazy_level_request_seq = 0
         self._lazy_level_requests = {}
         self._retired_lazy_level_requests = []
 
         self._tree_build_seq = 0
         self._tree_build_queue = deque()
+        self._tree_build_roots = iter(())
+        self._tree_build_roots_done = True
         self._tree_build_missing_map = {}
         self._tree_build_timer = QTimer(self)
-        self._tree_build_timer.setInterval(0)
+        self._tree_build_timer.setInterval(12)
         self._tree_build_timer.timeout.connect(self._tree_build_step)
         self._indicator_refresh_queue = deque()
         self._indicator_refresh_timer = QTimer(self)
-        self._indicator_refresh_timer.setInterval(0)
+        self._indicator_refresh_timer.setInterval(12)
         self._indicator_refresh_timer.timeout.connect(self._indicator_refresh_step)
+        self._indicator_scan_iterators = deque()
+        self._indicator_worker = None
+        self._indicator_thread = None
+        self._indicator_request_seq = 0
+        self._indicator_pending_rows = {}
+        self._indicator_seen_items = set()
+        self._indicator_collected_rows = defaultdict(list)
+        self._indicator_apply_queue = deque()
+
+        self._pdm_root_build_timer = QTimer(self)
+        self._pdm_root_build_timer.setInterval(12)
+        self._pdm_root_build_timer.timeout.connect(self._pdm_root_build_step)
+        self._pdm_root_build_seq = 0
+        self._pdm_root_build = None
 
         self._search_build_seq = 0
         self._search_build_queue = deque()
         self._search_build_timer = QTimer(self)
-        self._search_build_timer.setInterval(0)
+        self._search_build_timer.setInterval(12)
         self._search_build_timer.timeout.connect(self._search_build_step)
+
+        self._lazy_child_build_queue = deque()
+        self._lazy_child_build_timer = QTimer(self)
+        self._lazy_child_build_timer.setInterval(12)
+        self._lazy_child_build_timer.timeout.connect(self._lazy_child_build_step)
 
         self._last_tree_node_count = 0
         self._full_tree_cached = False
@@ -3027,6 +3515,7 @@ class BomPage(QWidget):
 
         self.missing_files = []
         self.missing_ids = set()
+        self._missing_files_by_part = {}
         self._doc_indicator_cache = {}
 
         self._search_timer = QTimer(self)
@@ -3104,6 +3593,9 @@ class BomPage(QWidget):
         self.load_tree()
 
     def _cancel_background_work(self) -> None:
+        for name in ("_perf_project_span", "_perf_diag_span", "_perf_item_span", "_perf_item_structure_span"):
+            recorder.end(getattr(self, name, None), "cancelled")
+            setattr(self, name, None)
         self._project_load_cancelled = True
         self._structure_load_seq += 1
         try:
@@ -3131,14 +3623,20 @@ class BomPage(QWidget):
         except Exception:
             pass
         try:
+            self._pdm_root_build_timer.stop()
+            self._pdm_root_build = None
+        except Exception:
+            pass
+        try:
             self._search_build_timer.stop()
         except Exception:
             pass
         try:
-            self._indicator_refresh_timer.stop()
-            self._indicator_refresh_queue.clear()
+            self._lazy_child_build_timer.stop()
+            self._lazy_child_build_queue.clear()
         except Exception:
             pass
+        self._reset_indicator_refresh()
 
     def _cancel_lazy_level_requests(self, wait: bool = False) -> None:
         requests = list((getattr(self, "_lazy_level_requests", {}) or {}).values())
@@ -3147,6 +3645,7 @@ class BomPage(QWidget):
             requests.extend(getattr(self, "_retired_lazy_level_requests", []) or [])
             self._retired_lazy_level_requests = []
         for request in requests:
+            recorder.end(request.pop("_perf_span", None), "cancelled")
             item = request.get("item")
             try:
                 request.get("tree", self.tree).setItemLoading(item, False)
@@ -3337,7 +3836,7 @@ class BomPage(QWidget):
 
     def _build_pdm_cad_working_file_index(self) -> dict:
         """Index Creo files physically present in the project working directory."""
-        root = str(self.get_working_dir() or self.working_dir or "").strip()
+        root = str(self.working_dir or self.get_working_dir() or "").strip()
         if root:
             self.working_dir = root
         index: dict[str, list[dict]] = {}
@@ -3483,34 +3982,7 @@ class BomPage(QWidget):
     @staticmethod
     def _pdm_document_associations(document: dict) -> list[dict]:
         """Return every Item association while accepting the legacy flat payload."""
-        associations = [
-            dict(row) for row in (document.get("associations") or []) if row
-        ]
-        if not associations and document.get("association_id") is not None:
-            associations = [{
-                "id": document.get("association_id"),
-                "association_id": document.get("association_id"),
-                "item_id": document.get("item_id"),
-                "association_type": document.get("association_type"),
-                "item_number": document.get("item_number"),
-                "item_name": document.get("item_name"),
-                "item_aes_number": document.get("item_aes_number"),
-                "item_version_label": document.get("item_version_label"),
-                "is_primary_drawing": document.get("is_primary_drawing"),
-            }]
-        unique = []
-        seen = set()
-        for association in associations:
-            key = (
-                association.get("association_id") or association.get("id"),
-                association.get("item_id"),
-                str(association.get("association_type") or "").upper(),
-            )
-            if key in seen:
-                continue
-            seen.add(key)
-            unique.append(association)
-        return unique
+        return _pdm_document_associations_payload(document)
 
     @classmethod
     def _pdm_association_for_item(
@@ -3639,10 +4111,14 @@ class BomPage(QWidget):
             shown.append(f"+{len(paths) - len(shown)} more location(s)")
         return "\n".join(shown)
 
-    def _cad_representation_summary_line(self, document: dict) -> str:
+    def _cad_representation_summary_line(
+        self, document: dict, *, include_path: bool = True
+    ) -> str:
         role = self._cad_representation_role(document)
         file_name = self._cad_payload_identity(document)
         drawings = self._cad_representation_drawings_text(document)
+        if not include_path:
+            return f"{role}: {file_name} | DRW: {drawings}"
         path = self._cad_representation_path_text(document, max_paths=1)
         return f"{role}: {file_name} | DRW: {drawings} | Path: {path}"
 
@@ -3877,41 +4353,31 @@ class BomPage(QWidget):
     def _load_pdm_cad_tree(self) -> None:
         self._start_structure_load("cad")
 
-    def _apply_pdm_cad_tree(self, payload: dict) -> None:
+    def _apply_pdm_cad_tree(self, payload: dict, on_render_complete=None) -> None:
         tree = getattr(self, "_cad_tree", None)
         if tree is None:
             return
-        self._set_tree_loading(True)
         try:
             self._pdm_cad_working_file_index = {}
             self._pdm_cad_working_file_index_ready = False
             data = payload.get("data") or {}
-            roots = list(data.get("roots") or [])
+            roots = data.get("roots") or []
             self._pdm_cad_roots = roots
-            self._rebuild_cad_path_index()
+            self._pdm_cad_path_index = dict(
+                payload.get("cad_path_index") or _cad_payload_path_index(roots)
+            )
             self._cad_folders_cache = [dict(folder, scope="CAD") for folder in payload.get("folders") or []]
             self._pdm_cad_scope_path, render_roots = self._pdm_roots_for_reload_scope(
                 "cad", roots, getattr(self, "_pdm_cad_scope_path", []) or []
             )
-            self._render_pdm_cad_roots(render_roots)
-            all_documents = list(data.get("documents") or []) if self.session.project_id else []
-            models = [
-                row for row in all_documents
-                if str(row.get("category") or "").upper()
-                in {"ASSEMBLY", "COMPONENT"}
-            ]
-            unassociated = sum(1 for row in models if not row.get("association_id"))
-            drawing_count = int(data.get("drawing_count") or 0)
-            unbound_drawings = int(data.get("unbound_drawing_count") or 0)
-            cad_iteration_warning_count = sum(
-                1
-                for row in all_documents
-                if self._pdm_cad_iteration_warnings(row)
-            )
+            metrics = payload.get("cad_metrics") or _cad_structure_metrics(data)
+            cad_iteration_warning_count = 0
             self.bom_health_label.setText(
-                f"Models: {int(data.get('document_count') or len(models))}  |  "
-                f"Drawings: {drawing_count}  |  Unassociated: {unassociated}"
-                + (f"  |  Drawings to bind: {unbound_drawings}" if unbound_drawings else "")
+                f"Models: {int(metrics.get('document_count') or 0)}  |  "
+                f"Drawings: {int(metrics.get('drawing_count') or 0)}  |  "
+                f"Unassociated: {int(metrics.get('unassociated_count') or 0)}"
+                + (f"  |  Drawings to bind: {int(metrics.get('unbound_drawing_count') or 0)}"
+                   if int(metrics.get("unbound_drawing_count") or 0) else "")
                 + (f"  |  CAD file warnings: {cad_iteration_warning_count}" if cad_iteration_warning_count else "")
             )
             self.bom_health_label.setStyleSheet(
@@ -3923,15 +4389,10 @@ class BomPage(QWidget):
                 "Native CAD Document assembly/member structure. Item delivery files and "
                 "Item integrity are intentionally shown only in EBOM / Item Structure."
             )
+            self._render_pdm_cad_roots(render_roots, on_complete=on_render_complete)
         except Exception as exc:
             tree.clear()
             raise
-        finally:
-            try:
-                tree.setUpdatesEnabled(True)
-            except Exception:
-                pass
-            self._set_tree_loading(False)
 
     def _add_ebom_associated_cad_node(
         self, document: dict, item_parent: QTreeWidgetItem, item_id: int,
@@ -4057,6 +4518,9 @@ class BomPage(QWidget):
         payload["relation_parent_id"] = payload.get("effective_parent_bom_id")
         payload["usage_id"] = payload.get("item_usage_id") or payload.get("usage_id")
         payload["quantity"] = int(payload.get("source_quantity") or 1)
+        # PDF/STEP and master-native status are resolved by the background
+        # indicator worker after this row has been created.
+        payload["_defer_indicators"] = True
         payload["_has_children"] = bool(payload.get("children") or payload.get("_children_deferred"))
         item = QTreeWidgetItem([""] * self._ebom_tree.columnCount())
         self._apply_tree_item_data(item, payload)
@@ -4127,9 +4591,13 @@ class BomPage(QWidget):
     def _start_structure_load(self, mode: str) -> None:
         if self._project_load_cancelled:
             return
-        self._load_active_branch_names()
+        recorder.end(getattr(self, "_perf_project_span", None), "cancelled")
+        self._perf_project_span = None
         self._structure_load_seq += 1
+        self._reset_indicator_refresh()
         self._cancel_lazy_level_requests()
+        self._lazy_child_build_timer.stop()
+        self._lazy_child_build_queue.clear()
         try:
             if self._structure_worker is not None:
                 self._structure_worker.cancel()
@@ -4142,6 +4610,7 @@ class BomPage(QWidget):
             self._set_tree_loading(False)
             self._mark_initial_tree_ready()
             return
+        self._perf_project_span = recorder.begin("ui.project_structure_ready")
         self._structure_loading = True
         self._structure_error = None
         self._set_tree_loading(True)
@@ -4166,26 +4635,42 @@ class BomPage(QWidget):
         if not self._structure_result_is_current(seq, project_id):
             return
         try:
+            self.working_dir = str(payload.get("working_dir") or "") or None
+            self.commits_dir = os.path.join(self.working_dir, "commits") if self.working_dir else None
+            self._active_branch_names = dict(payload.get("active_branch_names") or {})
+            self._active_branch_checkouts = dict(payload.get("active_branch_checkouts") or {})
+            if mode == "cad":
+                self._pdm_cad_path_index = dict(payload.get("cad_path_index") or {})
             self._issue_summary_cache = dict(payload.get("issue_summary") or {})
-            if mode == "ebom":
-                self._apply_released_ebom_tree(payload)
-            else:
-                self._apply_pdm_cad_tree(payload)
             self._refresh_variant_selector(payload.get("variants") or [])
+            if not self._diagnostics_started:
+                self._start_initial_diagnostics_worker()
+            finish = lambda: self._finish_structure_load(seq, project_id)
+            if mode == "ebom":
+                self._apply_released_ebom_tree(payload, on_render_complete=finish)
+            else:
+                self._apply_pdm_cad_tree(payload, on_render_complete=finish)
             if self._diagnostics_finished:
                 self._apply_project_diagnostics_alert(self._diagnostics_result)
         except Exception as exc:
             self._on_structure_failed(seq, project_id, mode, str(exc))
-        finally:
-            self._structure_loading = False
-            self.setEnabled(True)
-            self.bom_mode_selector.setEnabled(True)
-            self._set_tree_loading(False)
-            self._mark_initial_tree_ready()
+
+    def _finish_structure_load(self, seq: int, project_id: int) -> None:
+        if not self._structure_result_is_current(seq, project_id):
+            return
+        recorder.end(getattr(self, "_perf_project_span", None))
+        self._perf_project_span = None
+        self._structure_loading = False
+        self.setEnabled(True)
+        self.bom_mode_selector.setEnabled(True)
+        self._set_tree_loading(False)
+        self._mark_initial_tree_ready()
 
     def _on_structure_failed(self, seq: int, project_id: int, mode: str, error: str):
         if not self._structure_result_is_current(seq, project_id):
             return
+        recorder.end(getattr(self, "_perf_project_span", None), "error")
+        self._perf_project_span = None
         self._structure_loading = False
         self._structure_error = str(error)
         self.setEnabled(True)
@@ -4195,39 +4680,14 @@ class BomPage(QWidget):
         self.show_alert(f"Project structure could not be loaded: {error}. Click Refresh to retry.", "error")
         self._mark_initial_tree_ready()
 
-    def _apply_released_ebom_tree(self, payload: dict) -> None:
-        self._set_tree_loading(True)
+    def _apply_released_ebom_tree(self, payload: dict, on_render_complete=None) -> None:
         try:
             data = payload.get("data") or {}
             self._ebom_root_page = data
-            associations_by_item = defaultdict(list)
-            if self.session.project_id:
-                for document in payload.get("documents") or []:
-                    if str(document.get("category") or "").upper() == "DRAWING":
-                        continue
-                    for association in self._pdm_document_associations(document):
-                        if association.get("item_id") is None:
-                            continue
-                        item_document = dict(document)
-                        item_document.update(association)
-                        item_document["association_id"] = (
-                            association.get("association_id")
-                            or association.get("id")
-                        )
-                        item_document["item_id"] = int(association["item_id"])
-                        item_document["association_type"] = str(
-                            association.get("association_type") or "CONTENT"
-                        ).upper()
-                        # Global CAD data contains every model-bound drawing. Item-specific
-                        # drawing assignments are loaded only when the user chooses Show CAD.
-                        item_document["related_drawings"] = []
-                        associations_by_item[int(association["item_id"])].append(
-                            item_document
-                        )
-            self._ebom_associations_by_item = associations_by_item
-            visible_roots = list(data.get("roots") or [])
-            excluded_roots = list(data.get("excluded_roots") or [])
-            flattened_roots = list(data.get("flattened_roots") or [])
+            self._ebom_associations_by_item = payload.get("associations_by_item") or {}
+            visible_roots = data.get("roots") or []
+            excluded_roots = data.get("excluded_roots") or []
+            flattened_roots = data.get("flattened_roots") or []
             self._pdm_ebom_roots = visible_roots
             self._bom_folders_cache = [dict(folder, scope="EBOM") for folder in payload.get("folders") or []]
             # Status/type choices for Advanced Filter are derived lazily from
@@ -4238,7 +4698,6 @@ class BomPage(QWidget):
             self._pdm_ebom_scope_path, render_roots = self._pdm_roots_for_reload_scope(
                 "ebom", visible_roots, getattr(self, "_pdm_ebom_scope_path", []) or []
             )
-            self._render_pdm_ebom_roots(render_roots)
             try:
                 score = max(
                     0,
@@ -4252,10 +4711,7 @@ class BomPage(QWidget):
                 )
             except Exception:
                 self.bom_health_label.setText(
-                    "Items: " + str(sum(
-                        1 for row in self._iter_tree_items(self._ebom_tree)
-                        if row.data(0, PDM_OBJECT_KIND_ROLE) != PDM_OBJECT_CAD
-                    ))
+                    "Items: " + str(len(visible_roots))
                 )
             self.bom_mode_selector.setToolTip(
                 "Persisted EBOM contains Item usages. Associated CAD Documents are "
@@ -4271,12 +4727,17 @@ class BomPage(QWidget):
                 )
             else:
                 self.hide_alert()
+            def rendered():
+                self._ebom_filter_flat_mode = False
+                self._tree_stack.setCurrentWidget(self._ebom_tree)
+                self._sync_search_tree_row_numbers()
+                if on_render_complete is not None:
+                    on_render_complete()
+
+            self._render_pdm_ebom_roots(render_roots, on_complete=rendered)
         except Exception as exc:
             self._ebom_tree.clear()
             raise
-        finally:
-            self._ebom_tree.setUpdatesEnabled(True)
-            self._set_tree_loading(False)
 
     def _pdm_current_item_id(self) -> int | None:
         value = getattr(self, "current_part_id", None)
@@ -7933,15 +8394,20 @@ class BomPage(QWidget):
             return
         entry = self._pdm_scope_entry_from_payload(payload, "ebom")
         self._pdm_ebom_scope_path = [entry]
-        self._render_pdm_ebom_roots([payload])
         tree = getattr(self, "_ebom_tree", None)
+        self._render_pdm_ebom_roots(
+            [payload],
+            on_complete=lambda: self._select_rendered_pdm_root(tree, BOM_COL_NAME),
+        )
+
+    def _select_rendered_pdm_root(self, tree, column: int) -> None:
         try:
             if tree is not None and tree.topLevelItemCount():
                 root_item = tree.topLevelItem(0)
                 tree.setCurrentItem(root_item)
                 root_item.setSelected(True)
-                self.on_tree_item_clicked(root_item, BOM_COL_NAME)
-        except Exception:
+                self.on_tree_item_clicked(root_item, column)
+        except (RuntimeError, AttributeError):
             pass
 
     def _selected_bom_item_ids_for_variant_assignment(self) -> list[int]:
@@ -8808,9 +9274,15 @@ class BomPage(QWidget):
     def _start_initial_diagnostics_and_load(self) -> None:
         if self._project_load_cancelled or not self.session.project_id:
             return
-        # Display the lazy root level immediately. Diagnostics are independent and
-        # update badges later; disk scanning must never gate BOM navigation.
+        # Resolve project metadata first in the structure worker. That worker
+        # starts diagnostics as soon as it returns the working-directory path.
         self._load_released_ebom_tree()
+
+    def _start_initial_diagnostics_worker(self) -> None:
+        if self._project_load_cancelled or self._diagnostics_started:
+            return
+        self._diagnostics_started = True
+        self._perf_diag_span = recorder.begin("ui.initial_diagnostics_ready")
         try:
             if self._diag_worker is not None:
                 self._diag_worker.cancel()
@@ -8829,25 +9301,32 @@ class BomPage(QWidget):
     def _on_initial_diag_finished(self, missing_files: object, working_result: object) -> None:
         if self._project_load_cancelled:
             return
+        recorder.end(getattr(self, "_perf_diag_span", None))
+        self._perf_diag_span = None
         self._diagnostic_status_label.setText("Project file check complete")
         self._diagnostics_finished = True
         self._diagnostics_result = working_result
-        try:
-            self.missing_files = list(missing_files or [])
-        except Exception:
-            self.missing_files = []
-
-        try:
+        if isinstance(missing_files, dict) and "rows" in missing_files:
+            self.missing_files = missing_files.get("rows") or []
+            self._missing_files_by_part = missing_files.get("by_part") or {}
+            ids = missing_files.get("ids")
+            self.missing_ids = ids if isinstance(ids, set) else set(ids or ())
+        else:
+            try:
+                self.missing_files = list(missing_files or [])
+            except Exception:
+                self.missing_files = []
+            missing_by_part = defaultdict(list)
             ids = set()
-            for row in (self.missing_files or []):
+            for row in self.missing_files:
                 try:
-                    bom_id = row[0]
-                    ids.add(int(bom_id))
-                except Exception:
+                    part_id = int(row[0])
+                    missing_by_part[part_id].append(row)
+                    ids.add(part_id)
+                except (TypeError, ValueError, IndexError):
                     continue
+            self._missing_files_by_part = dict(missing_by_part)
             self.missing_ids = ids
-        except Exception:
-            self.missing_ids = set()
 
         self._apply_project_diagnostics_alert(working_result)
         self._refresh_loaded_integrity_indicators()
@@ -8869,36 +9348,50 @@ class BomPage(QWidget):
     def _on_initial_diag_failed(self, _err: str) -> None:
         if self._project_load_cancelled:
             return
+        recorder.end(getattr(self, "_perf_diag_span", None), "error")
+        self._perf_diag_span = None
         self._diagnostic_status_label.setText("Project file check failed. Open Diagnostics to retry.")
         self._diagnostic_status_label.setToolTip(str(_err))
         try:
             self.missing_files = []
             self.missing_ids = set()
+            self._missing_files_by_part = {}
         except Exception:
             pass
 
     def _refresh_loaded_integrity_indicators(self) -> None:
         self._invalidate_doc_indicator()
-        for tree in (
+        self._reset_indicator_refresh()
+        self._indicator_scan_iterators = deque(
+            iter(self._iter_tree_items_incremental(tree))
+            for tree in (
             getattr(self, "tree", None), getattr(self, "_search_tree", None),
             getattr(self, "_ebom_tree", None),
-        ):
-            if tree is None:
-                continue
-            for item in self._iter_tree_items(tree):
-                if self._is_folder_tree_item(item) or self._is_lazy_placeholder(item):
-                    continue
-                if item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
-                    continue
-                part_id = item.data(0, Qt.UserRole)
-                item.setData(
-                    BOM_COL_INTEGRITY,
-                    BOM_TREE_INTEGRITY_ROLE,
-                    _integrity_payload(part_id, self.missing_files, self.missing_ids),
-                )
-                self._indicator_refresh_queue.append((item, part_id))
-        if self._indicator_refresh_queue and not self._indicator_refresh_timer.isActive():
+            ) if tree is not None
+        )
+        if self._indicator_scan_iterators and not self._indicator_refresh_timer.isActive():
             self._indicator_refresh_timer.start()
+
+    def _iter_tree_items_incremental(self, tree_widget: QTreeWidget):
+        """Walk a tree without first copying every top-level row into a list."""
+        stack = [(tree_widget, 0)]
+        while stack:
+            parent, index = stack[-1]
+            try:
+                if parent is tree_widget:
+                    count = tree_widget.topLevelItemCount()
+                    item = tree_widget.topLevelItem(index) if index < count else None
+                else:
+                    count = parent.childCount()
+                    item = parent.child(index) if index < count else None
+            except RuntimeError:
+                return
+            if item is None:
+                stack.pop()
+                continue
+            stack[-1] = (parent, index + 1)
+            yield item
+            stack.append((item, 0))
 
 
 
@@ -8925,7 +9418,12 @@ class BomPage(QWidget):
         }
 
     def _visible_bom_column_keys(self) -> set[str]:
-        loaded = self._bom_column_preferences().get("visible_extra_columns")
+        preferences = getattr(self, "_bom_column_preferences_cache", None)
+        if getattr(self, "_bom_column_preferences_cache_user", None) != getattr(
+            self.session, "user_id", None
+        ) or not isinstance(preferences, dict):
+            preferences = {}
+        loaded = preferences.get("visible_extra_columns")
         if loaded is None:
             raw = str(QSettings("Nexus", "NexusPDM").value("bom/visible_extra_columns", "") or "")
             try:
@@ -8941,9 +9439,56 @@ class BomPage(QWidget):
     def _bom_column_preferences(self) -> dict:
         if self.session.user_id is None:
             return {}
+        cached = getattr(self, "_bom_column_preferences_cache", None)
+        if (getattr(self, "_bom_column_preferences_cache_user", None) == int(self.session.user_id)
+                and isinstance(cached, dict)):
+            return dict(cached)
         if not hasattr(self, "_bom_column_repo"):
             self._bom_column_repo = UserRepository()
-        return self._bom_column_repo.get_bom_column_preferences(int(self.session.user_id))
+        preferences = self._bom_column_repo.get_bom_column_preferences(int(self.session.user_id)) or {}
+        self._bom_column_preferences_cache = dict(preferences)
+        self._bom_column_preferences_cache_user = int(self.session.user_id)
+        return dict(preferences)
+
+    def _start_bom_column_preferences_load(self) -> None:
+        user_id = getattr(self.session, "user_id", None)
+        if user_id is None:
+            return
+        user_id = int(user_id)
+        if (getattr(self, "_bom_column_preferences_cache_user", None) == user_id
+                and isinstance(getattr(self, "_bom_column_preferences_cache", None), dict)):
+            return
+        if getattr(self, "_bom_column_preferences_request_user", None) == user_id:
+            return
+        self._bom_column_preferences_request_seq = int(
+            getattr(self, "_bom_column_preferences_request_seq", 0)
+        ) + 1
+        request_id = self._bom_column_preferences_request_seq
+        self._bom_column_preferences_request_user = user_id
+        self._bom_column_preferences_request_revision = int(
+            getattr(self, "_bom_column_preferences_revision", 0)
+        )
+        worker = _BomColumnPreferencesWorker(request_id, user_id)
+        worker.finished.connect(self._on_bom_column_preferences_loaded)
+        self._bom_column_preferences_worker = worker
+        self._bom_column_preferences_thread = _start_project_worker(worker)
+
+    def _on_bom_column_preferences_loaded(
+        self, request_id: int, user_id: int, preferences: object
+    ) -> None:
+        if int(request_id) != int(getattr(self, "_bom_column_preferences_request_seq", 0)):
+            return
+        self._bom_column_preferences_request_user = None
+        if int(user_id) != int(getattr(self.session, "user_id", 0) or 0):
+            return
+        if int(getattr(self, "_bom_column_preferences_revision", 0)) != int(
+            getattr(self, "_bom_column_preferences_request_revision", 0)
+        ):
+            return
+        self._bom_column_preferences_cache = dict(preferences or {})
+        self._bom_column_preferences_cache_user = int(user_id)
+        if getattr(self, "_bom_column_layout_user", None) != int(user_id):
+            self._restore_saved_bom_columns(self._bom_column_preferences_cache)
 
     def _save_visible_bom_column_keys(self, keys: set[str]) -> None:
         if self.session.user_id is None:
@@ -8951,6 +9496,11 @@ class BomPage(QWidget):
         preferences = self._bom_column_preferences()
         preferences["visible_extra_columns"] = sorted(set(keys) | {"active_branch"})
         self._bom_column_repo.set_bom_column_preferences(int(self.session.user_id), preferences)
+        self._bom_column_preferences_cache = dict(preferences)
+        self._bom_column_preferences_cache_user = int(self.session.user_id)
+        self._bom_column_preferences_revision = int(
+            getattr(self, "_bom_column_preferences_revision", 0)
+        ) + 1
 
     def _bom_column_tree_kind(self, tree):
         if tree is getattr(self, "_cad_tree", None):
@@ -8973,10 +9523,10 @@ class BomPage(QWidget):
             header.setProperty("nexusColumnMenuInstalled", True)
             header.setToolTip("Resize or reorder columns, then right-click and Save for Me.")
 
-    def _restore_saved_bom_columns(self):
+    def _restore_saved_bom_columns(self, preferences: dict | None = None):
         from PyQt5.QtCore import QByteArray
 
-        preferences = self._bom_column_preferences()
+        preferences = dict(preferences) if isinstance(preferences, dict) else self._bom_column_preferences()
         layouts = preferences.get("layouts")
         if not isinstance(layouts, dict):
             layouts = {}
@@ -9032,7 +9582,12 @@ class BomPage(QWidget):
         }
         preferences["layouts"] = layouts
         self._bom_column_repo.set_bom_column_preferences(int(self.session.user_id), preferences)
-        self._restore_saved_bom_columns()
+        self._bom_column_preferences_cache = dict(preferences)
+        self._bom_column_preferences_cache_user = int(self.session.user_id)
+        self._bom_column_preferences_revision = int(
+            getattr(self, "_bom_column_preferences_revision", 0)
+        ) + 1
+        self._restore_saved_bom_columns(self._bom_column_preferences_cache)
 
     def _configure_bom_tree_columns(self, tree: QTreeWidget | None, ebom: bool = False) -> None:
         if tree is None:
@@ -9639,7 +10194,7 @@ class BomPage(QWidget):
             self._handle_pdm_folder_drag_reorder
         )
         self._tree_stack.addWidget(self._cad_tree)              # index 5
-        self._restore_saved_bom_columns()
+        self._start_bom_column_preferences_load()
 
         _bom_tree_qss = f"""
             QTreeWidget {{
@@ -9760,6 +10315,45 @@ class BomPage(QWidget):
         self.tabs = QTabWidget()
         self.tabs.setObjectName("objectWorkspaceTabs")
         self.tabs.setDocumentMode(True)
+        self._details_request_seq = 0
+        self._structure_detail_request_seq = 0
+        self._pending_detail_request = None
+        self._details_worker = None
+        self._details_worker_thread = None
+        self._structure_detail_worker = None
+        self._structure_detail_thread = None
+        self._details_structure_loaded_item_id = None
+        self._details_history_payload_item_id = None
+        self._details_history_rendered_item_id = None
+        self._details_request_timer = QTimer(self)
+        self._details_request_timer.setSingleShot(True)
+        self._details_request_timer.setInterval(70)
+        self._details_request_timer.timeout.connect(self._start_pending_details_load)
+
+        self.details_loading_frame = QFrame()
+        self.details_loading_frame.setObjectName("detailsLoadingFrame")
+        self.details_loading_frame.setStyleSheet(
+            "QFrame#detailsLoadingFrame { background:#eff6ff; border:1px solid #bfdbfe; "
+            "border-left:3px solid #2878b8; }"
+            "QLabel { color:#1e3a5f; font-size:10px; font-weight:600; border:none; }"
+        )
+        details_loading_layout = QHBoxLayout(self.details_loading_frame)
+        details_loading_layout.setContentsMargins(9, 4, 9, 4)
+        details_loading_layout.setSpacing(8)
+        self.details_loading_label = QLabel("Loading item details…")
+        details_loading_layout.addWidget(self.details_loading_label)
+        details_loading_layout.addStretch(1)
+        self.details_loading_progress = QProgressBar()
+        self.details_loading_progress.setRange(0, 0)
+        self.details_loading_progress.setTextVisible(False)
+        self.details_loading_progress.setFixedSize(92, 8)
+        self.details_loading_progress.setStyleSheet(
+            "QProgressBar { background:#dbeafe; border:0; border-radius:4px; }"
+            "QProgressBar::chunk { background:#2878b8; border-radius:4px; }"
+        )
+        details_loading_layout.addWidget(self.details_loading_progress)
+        self.details_loading_frame.hide()
+        right_layout.addWidget(self.details_loading_frame)
 
         # Details tab: compact engineering summary with an on-demand full attribute view.
         details_tab = QWidget()
@@ -9960,6 +10554,7 @@ class BomPage(QWidget):
         structure_layout.addWidget(self.structure_summary_label)
 
         self.structure_views = QTabWidget()
+        self.structure_tab = structure_tab
         self.structure_views.setDocumentMode(True)
         self.uses_tree = self._create_structure_relation_tree()
         self.where_used_tree = self._create_structure_relation_tree()
@@ -10200,6 +10795,7 @@ class BomPage(QWidget):
         self.tabs.addTab(self.history_panel, "History")
 
         right_layout.addWidget(self.tabs)
+        self.tabs.currentChanged.connect(self._on_details_tab_changed)
 
         # Contextual object ribbon.  Its groups follow the selected Item or CAD
         # Document and remain part of the workspace chrome, above both panes.
@@ -10585,55 +11181,172 @@ class BomPage(QWidget):
             if self._is_lazy_placeholder(item.child(index)):
                 item.takeChild(index)
 
-    def _render_pdm_cad_roots(self, roots: list[dict]) -> None:
+    def _render_pdm_cad_roots(self, roots: list[dict], on_complete=None) -> None:
         tree = getattr(self, "_cad_tree", None)
         if tree is None:
             return
-        tree.setUpdatesEnabled(False)
-        try:
-            tree.resetLoadingIndicators()
-            tree.clear()
-            for root in list(roots or []):
-                self._add_pdm_cad_node(root)
-            if not getattr(self, "_pdm_cad_scope_path", []):
-                self._render_pdm_folder_context("CAD", None, [tree])
-            tree.collapseAll()
-            # Filtering may expand ancestors of matching descendants, so it
-            # must run after the default collapsed state is established.
-            self._refresh_pdm_cad_filter()
-        finally:
-            tree.setUpdatesEnabled(True)
-        self._update_pdm_scope_bar()
-        self._sync_visual_action_states()
+        self._begin_pdm_root_render("cad", roots, on_complete)
 
-    def _render_pdm_ebom_roots(self, roots: list[dict]) -> None:
+    def _render_pdm_ebom_roots(self, roots: list[dict], on_complete=None) -> None:
         tree = getattr(self, "_ebom_tree", None)
         if tree is None:
             return
-        tree.setUpdatesEnabled(False)
+        self._begin_pdm_root_render("ebom", roots, on_complete)
+
+    def _begin_pdm_root_render(self, mode: str, roots, on_complete=None) -> None:
+        tree = self._cad_tree if mode == "cad" else self._ebom_tree
+        if tree is None:
+            if on_complete is not None:
+                on_complete()
+            return
+        try:
+            self._pdm_root_build_timer.stop()
+        except RuntimeError:
+            pass
+        self._pdm_root_build_seq += 1
+        state = {
+            "seq": self._pdm_root_build_seq,
+            "mode": str(mode),
+            "tree": tree,
+            "roots": roots or [],
+            "index": 0,
+            "on_complete": on_complete,
+        }
+        self._pdm_root_build = state
         try:
             tree.resetLoadingIndicators()
-            tree.clear()
-            for root in list(roots or []):
-                if self._is_deleted_bom_payload(root):
-                    continue
-                self._add_released_ebom_node(
-                    root,
-                    associations_by_item=getattr(self, "_ebom_associations_by_item", {}),
-                )
-            if not getattr(self, "_pdm_ebom_scope_path", []):
-                self._render_pdm_folder_context("EBOM", None, [tree])
-            self._renumber_tree_rows(tree)
-            tree.collapseAll()
-            # Preserve the expansions created by search/advanced filtering.
-            self._refresh_ebom_filters()
-            page = getattr(self, "_ebom_root_page", {}) or {}
-            if not getattr(self, "_pdm_ebom_scope_path", []) and page.get("has_more"):
-                self._add_ebom_page_row(None, page)
-        finally:
+        except Exception:
+            pass
+        self._set_tree_loading(True)
+
+        # Small edits and navigation remain immediate. Large project refreshes
+        # clear and add rows in short timer slices so paints and input can run.
+        try:
+            root_count = len(state["roots"])
+        except Exception:
+            root_count = self.PDM_ROOT_BATCH_SIZE + 1
+        if (root_count <= self.PDM_ROOT_BATCH_SIZE
+                and tree.topLevelItemCount() <= self.PDM_ROOT_BATCH_SIZE):
+            tree.setUpdatesEnabled(False)
+            try:
+                tree.clear()
+                for root in state["roots"]:
+                    self._add_pdm_root_item(mode, root)
+            finally:
+                tree.setUpdatesEnabled(True)
+            self._finish_pdm_root_render(state)
+            return
+        self._pdm_root_build_timer.start()
+
+    def _add_pdm_root_item(self, mode: str, root: dict) -> None:
+        if mode == "cad":
+            self._add_pdm_cad_node(root)
+        elif not self._is_deleted_bom_payload(root):
+            self._add_released_ebom_node(
+                root,
+                associations_by_item=getattr(self, "_ebom_associations_by_item", {}),
+            )
+
+    def _pdm_root_build_step(self) -> None:
+        state = self._pdm_root_build
+        if not state or state.get("seq") != self._pdm_root_build_seq:
+            self._pdm_root_build_timer.stop()
+            return
+        tree = state["tree"]
+        started = time.perf_counter()
+        processed = 0
+        removed = []
+        tree.setUpdatesEnabled(False)
+        try:
+            while (tree.topLevelItemCount() and processed < self.PDM_ROOT_BATCH_SIZE
+                   and time.perf_counter() - started < self.PDM_ROOT_SLICE_SECONDS):
+                removed.append(tree.takeTopLevelItem(tree.topLevelItemCount() - 1))
+                processed += 1
+            if tree.topLevelItemCount() == 0:
+                state["cleared"] = True
+            if state.get("cleared"):
+                roots = state["roots"]
+                while (state["index"] < len(roots)
+                       and processed < self.PDM_ROOT_BATCH_SIZE
+                       and time.perf_counter() - started < self.PDM_ROOT_SLICE_SECONDS):
+                    self._add_pdm_root_item(state["mode"], roots[state["index"]])
+                    state["index"] += 1
+                    processed += 1
+        except (RuntimeError, IndexError):
+            self._pdm_root_build_timer.stop()
+            self._pdm_root_build = None
             tree.setUpdatesEnabled(True)
-        self._update_pdm_scope_bar()
-        self._sync_visual_action_states()
+            self._set_tree_loading(False)
+            return
+        except Exception as exc:
+            self._pdm_root_build_timer.stop()
+            self._pdm_root_build = None
+            try:
+                tree.setUpdatesEnabled(True)
+            except RuntimeError:
+                pass
+            if self._structure_loading:
+                self._on_structure_failed(
+                    self._structure_load_seq,
+                    int(self.session.project_id or 0),
+                    state["mode"],
+                    str(exc),
+                )
+            else:
+                self._set_tree_loading(False)
+                self.show_alert(f"Could not draw this project structure: {exc}", "error")
+            return
+        finally:
+            try:
+                tree.setUpdatesEnabled(True)
+            except RuntimeError:
+                pass
+            removed.clear()
+
+        if (state.get("cleared")
+                and state["index"] >= len(state["roots"])):
+            self._pdm_root_build_timer.stop()
+            self._pdm_root_build = None
+            try:
+                self._finish_pdm_root_render(state)
+            except Exception as exc:
+                if self._structure_loading:
+                    self._on_structure_failed(
+                        self._structure_load_seq,
+                        int(self.session.project_id or 0),
+                        state["mode"],
+                        str(exc),
+                    )
+                else:
+                    self._set_tree_loading(False)
+                    self.show_alert(f"Could not finish drawing this project structure: {exc}", "error")
+
+    def _finish_pdm_root_render(self, state: dict) -> None:
+        mode = state["mode"]
+        tree = state["tree"]
+        try:
+            if mode == "cad":
+                if not getattr(self, "_pdm_cad_scope_path", []):
+                    self._render_pdm_folder_context("CAD", None, [tree])
+                # An empty search already matches every row. Avoid a full-tree
+                # recursive pass just to set every row visible again.
+                if str(self.search_input.text() or "").strip():
+                    self._refresh_pdm_cad_filter()
+            else:
+                if not getattr(self, "_pdm_ebom_scope_path", []):
+                    self._render_pdm_folder_context("EBOM", None, [tree])
+                self._renumber_tree_rows(tree)
+                page = getattr(self, "_ebom_root_page", {}) or {}
+                if not getattr(self, "_pdm_ebom_scope_path", []) and page.get("has_more"):
+                    self._add_ebom_page_row(None, page)
+                self._refresh_ebom_filters()
+            self._update_pdm_scope_bar()
+            self._sync_visual_action_states()
+        finally:
+            self._set_tree_loading(False)
+        callback = state.get("on_complete")
+        if callback is not None:
+            callback()
 
     def _add_ebom_page_row(self, parent, page):
         row = QTreeWidgetItem([""] * self._ebom_tree.columnCount())
@@ -10667,6 +11380,7 @@ class BomPage(QWidget):
             "worker": worker, "item": item, "tree": tree, "part_id": (parent_context or {}).get("id"),
             "project_id": self.session.project_id, "seq": self._structure_load_seq,
             "parent": parent_context, "more": more,
+            "_perf_span": recorder.begin("ui.ebom_expand"),
         }
         signals = tree.blockSignals(True)
         item.setExpanded(False)
@@ -10678,6 +11392,8 @@ class BomPage(QWidget):
 
     def _on_pdm_level_failed(self, request_id, error):
         request = self._lazy_level_requests.pop(request_id, None)
+        if request is not None:
+            recorder.end(request.pop("_perf_span", None), "error")
         if request is None or not self._structure_result_is_current(request["seq"], request["project_id"]):
             return
         try:
@@ -10689,10 +11405,13 @@ class BomPage(QWidget):
     def _on_pdm_level_loaded(self, request_id, page):
         request = self._lazy_level_requests.pop(request_id, None)
         if request is None or not self._structure_result_is_current(request["seq"], request["project_id"]):
+            if request is not None:
+                recorder.end(request.pop("_perf_span", None), "cancelled")
             return
         item, tree, context = request["item"], request["tree"], request["parent"]
         try:
             if item.treeWidget() is not tree:
+                recorder.end(request.pop("_perf_span", None), "cancelled")
                 return
             tree.setItemLoading(item, False)
             parent = item.parent() if request["more"] else item
@@ -10740,7 +11459,9 @@ class BomPage(QWidget):
                 tree.setUpdatesEnabled(True)
         except RuntimeError:
             # The project/branch may have been removed while the worker ran.
+            recorder.end(request.pop("_perf_span", None), "cancelled")
             return
+        recorder.end(request.pop("_perf_span", None))
 
     def _on_pdm_tree_item_expanded(self, item: QTreeWidgetItem) -> None:
         if item is not None and item.treeWidget() is getattr(self, "_ebom_tree", None):
@@ -10788,6 +11509,7 @@ class BomPage(QWidget):
             ),
         )
 
+    @timed("ui.cad_expand_render")
     def _finish_pdm_tree_item_expansion(
         self, tree: BomTreeWidget, item: QTreeWidgetItem
     ) -> None:
@@ -11208,9 +11930,9 @@ class BomPage(QWidget):
         self, mode: str, roots: list[dict], previous_scope_path: list
     ) -> tuple[list, list[dict]]:
         previous_scope_path = list(previous_scope_path or [])
-        roots = list(roots or [])
         if not previous_scope_path:
-            return [], roots
+            return [], roots or []
+        roots = list(roots or [])
 
         identities = [
             self._pdm_scope_identity(entry.get("payload") or {}, mode)
@@ -11290,20 +12012,18 @@ class BomPage(QWidget):
             return
         if mode == "cad":
             self._pdm_cad_scope_path = path
-            self._render_pdm_cad_roots([dict(path[-1]["payload"])])
             target_tree = self._cad_tree
+            render = self._render_pdm_cad_roots
         else:
             self._pdm_ebom_scope_path = path
-            self._render_pdm_ebom_roots([dict(path[-1]["payload"])])
             target_tree = self._ebom_tree
-        try:
-            root_item = target_tree.topLevelItem(0)
-            if root_item is not None:
-                target_tree.setCurrentItem(root_item)
-                root_item.setSelected(True)
-                self.on_tree_item_clicked(root_item, self._pdm_name_column_for_tree(target_tree))
-        except Exception:
-            pass
+            render = self._render_pdm_ebom_roots
+        render(
+            [dict(path[-1]["payload"])],
+            on_complete=lambda: self._select_rendered_pdm_root(
+                target_tree, self._pdm_name_column_for_tree(target_tree)
+            ),
+        )
 
     def _open_pdm_scope_at(self, mode: str, index: int) -> None:
         path = self._pdm_scope_path_for_mode(mode)
@@ -11316,20 +12036,18 @@ class BomPage(QWidget):
             return
         if mode == "cad":
             self._pdm_cad_scope_path = path
-            self._render_pdm_cad_roots([dict(path[-1]["payload"])])
             target_tree = self._cad_tree
+            render = self._render_pdm_cad_roots
         else:
             self._pdm_ebom_scope_path = path
-            self._render_pdm_ebom_roots([dict(path[-1]["payload"])])
             target_tree = self._ebom_tree
-        try:
-            root_item = target_tree.topLevelItem(0)
-            if root_item is not None:
-                target_tree.setCurrentItem(root_item)
-                root_item.setSelected(True)
-                self.on_tree_item_clicked(root_item, self._pdm_name_column_for_tree(target_tree))
-        except Exception:
-            pass
+            render = self._render_pdm_ebom_roots
+        render(
+            [dict(path[-1]["payload"])],
+            on_complete=lambda: self._select_rendered_pdm_root(
+                target_tree, self._pdm_name_column_for_tree(target_tree)
+            ),
+        )
 
     def _open_pdm_folder_snapshot(self, entry: dict, mode: str) -> None:
         payload = dict((entry or {}).get("payload") or {})
@@ -16044,7 +16762,7 @@ class BomPage(QWidget):
     # -------------------------
     # Files (Vault / PLM-like)
     # -------------------------
-    def _set_files_tab_enabled(self, enabled: bool):
+    def _set_files_tab_enabled(self, enabled: bool, details=None):
         # Read-only controls: follow enabled state only
         for w in (
             getattr(self, "files_table", None),
@@ -16063,7 +16781,8 @@ class BomPage(QWidget):
         released = False
         if enabled and getattr(self, "current_part_id", None):
             try:
-                details = self.bom_service.get_part_details(int(self.current_part_id)) or {}
+                if details is None:
+                    details = self.bom_service.get_part_details(int(self.current_part_id)) or {}
                 state = str(details.get("revision_state") or details.get("lifecycle_state") or "")
                 released = state.strip().lower() == "released"
             except Exception:
@@ -16343,7 +17062,7 @@ class BomPage(QWidget):
             error_title="Export Baseline Failed",
         )
 
-    def refresh_files_tab(self):
+    def refresh_files_tab(self, managed_files=None, details=None, *, load_attachment=True):
         if not getattr(self, "current_part_id", None):
             if hasattr(self, "files_table"):
                 self.files_table.setRowCount(0)
@@ -16362,68 +17081,79 @@ class BomPage(QWidget):
             self._set_files_tab_enabled(False)
             return
 
-        self._set_files_tab_enabled(True)
-        details = {}
+        if details is None:
+            try:
+                details = self.bom_service.get_part_details(int(self.current_part_id)) or {}
+            except Exception:
+                details = {}
+        self._set_files_tab_enabled(True, details=details)
+        if managed_files is None:
+            try:
+                managed_files = self.managed_file_service.list_current_files(
+                    int(self.current_part_id),
+                    context=(details or {}).get("version_context") or None,
+                )
+            except Exception as exc:
+                managed_files = []
+                if hasattr(self, "pdf_viewer"):
+                    self.pdf_viewer.show_error(f"Unable to load managed files:\n{exc}")
+        self._populate_managed_files_tab(
+            managed_files or [], details or {}, load_attachment=load_attachment
+        )
+
+    def _populate_managed_files_tab(self, managed_files, details, *, load_attachment=False):
+        details = details or {}
+        branch_checkout = details.get("branch_checkout") or {}
+        lock_label = (
+            branch_checkout.get("checked_out_by")
+            or details.get("locked_by_username")
+            or ("Checked out" if details.get("locked") else "Not checked out")
+        )
+        values = {
+            "item": self._item_identity_text(details),
+            "version": str(details.get("current_version") or "-"),
+            "state": str(details.get("revision_state") or details.get("lifecycle_state") or "-"),
+            "lock": str(lock_label),
+        }
+        for key, label in getattr(self, "files_summary_labels", {}).items():
+            label.setText(values.get(key, "-"))
+
+        self.files_table.blockSignals(True)
+        self.files_table.setUpdatesEnabled(False)
         try:
-            managed_files = self.managed_file_service.list_current_files(
-                int(self.current_part_id)
-            )
-        except Exception as exc:
-            managed_files = []
-            if hasattr(self, "pdf_viewer"):
-                self.pdf_viewer.show_error(f"Unable to load managed files:\n{exc}")
+            self.files_table.setRowCount(len(managed_files))
+            first_pdf_row = None
+            for i, entry in enumerate(managed_files):
+                role_item = QTableWidgetItem(str(entry.get("role_label") or ""))
+                role_item.setData(Qt.UserRole, entry.get("file_id"))
+                role_item.setData(Qt.UserRole + 1, entry)
+                self.files_table.setItem(i, 0, role_item)
+                row_values = [
+                    entry.get("filename"), entry.get("file_revision"),
+                    entry.get("creo_iteration"), entry.get("bound_to"),
+                    entry.get("source"), entry.get("state"), entry.get("health"),
+                    entry.get("created_by_label"), entry.get("updated"),
+                ]
+                for column, value in enumerate(row_values, start=1):
+                    self.files_table.setItem(i, column, QTableWidgetItem(str(value or "")))
+                if first_pdf_row is None and str(entry.get("file_type") or "").upper() == "PDF":
+                    first_pdf_row = i
+            if load_attachment and first_pdf_row is not None:
+                self.files_table.selectRow(first_pdf_row)
+            else:
+                self.files_table.clearSelection()
+        finally:
+            self.files_table.setUpdatesEnabled(True)
+            self.files_table.blockSignals(False)
 
-        try:
-            details = self.bom_service.get_part_details(int(self.current_part_id)) or {}
-            context = self.managed_file_service.revision_repo.get_current_context(
-                int(self.current_part_id)
-            )
-            lock = self.managed_file_service.part_file_service.lock_repo.get_by_part(
-                int(self.current_part_id)
-            )
-            values = {
-                "item": self._item_identity_text(details),
-                "version": str(context.get("version_label") or "-"),
-                "state": str(context.get("state") or "-"),
-                "lock": self.managed_file_service._username(lock.user_id) if lock else "Not checked out",
-            }
-            for key, label in getattr(self, "files_summary_labels", {}).items():
-                label.setText(values.get(key, "-"))
-        except Exception:
-            pass
-
-        self.files_table.setRowCount(len(managed_files))
-        first_pdf_row = None
-        for i, entry in enumerate(managed_files):
-            role_item = QTableWidgetItem(str(entry.get("role_label") or ""))
-            role_item.setData(Qt.UserRole, entry.get("file_id"))
-            role_item.setData(Qt.UserRole + 1, entry)
-            self.files_table.setItem(i, 0, role_item)
-            values = [
-                entry.get("filename"),
-                entry.get("file_revision"),
-                entry.get("creo_iteration"),
-                entry.get("bound_to"),
-                entry.get("source"),
-                entry.get("state"),
-                entry.get("health"),
-                entry.get("created_by_label"),
-                entry.get("updated"),
-            ]
-            for column, value in enumerate(values, start=1):
-                self.files_table.setItem(i, column, QTableWidgetItem(str(value or "")))
-            if first_pdf_row is None and str(entry.get("file_type") or "").upper() == "PDF":
-                first_pdf_row = i
-
-        # Clear versions view until an attachment is selected
         self.versions_table.setRowCount(0)
         if hasattr(self, "file_related_issues_table"):
             self.file_related_issues_table.setRowCount(0)
-        if first_pdf_row is not None:
-            self.files_table.selectRow(first_pdf_row)
+        if load_attachment and self.files_table.currentRow() >= 0:
             self.on_attachment_selected()
         elif hasattr(self, "pdf_viewer"):
             self._collapse_managed_preview()
+            self._update_managed_file_actions()
 
     def _selected_attachment_id(self):
         items = getattr(self, "files_table", None).selectedItems() if hasattr(self, "files_table") else []
@@ -16454,6 +17184,7 @@ class BomPage(QWidget):
             return None
         return self.versions_table.item(self.versions_table.currentRow(), 0).data(Qt.UserRole)
 
+    @timed("ui.managed_file_selection")
     def on_attachment_selected(self):
         selected = self._selected_managed_file()
         file_id = self._selected_attachment_id()
@@ -17896,6 +18627,7 @@ class BomPage(QWidget):
         """Backward-compatible entrypoint (called elsewhere)."""
         self._perform_search_now()
 
+    @timed("ui.search_dispatch")
     def _perform_search_now(self):
         if getattr(self, "_structure_loading", False):
             return
@@ -17943,7 +18675,7 @@ class BomPage(QWidget):
         thread.finished.connect(thread.deleteLater)
         self._search_worker = worker
         self._search_thread = thread
-        thread.start()
+        thread.start(QThread.LowPriority)
 
     def _on_search_finished(self, seq: int, results: object) -> None:
         if getattr(self, "_bom_mode", "cad") == "ebom":
@@ -17972,13 +18704,11 @@ class BomPage(QWidget):
 
         # A new basic search replaces any previous advanced flat result list.
         self._advanced_filter_flat_mode = False
-        self._enter_search_mode()   # switch stack to _search_tree (index 2), clears it
+        self._enter_search_mode(clear_tree=False)
+        self._search_build_clearing = self._search_tree.topLevelItemCount() > 0
 
         self._set_tree_loading(True)
-        try:
-            self._search_tree.setUpdatesEnabled(False)
-        except Exception:
-            pass
+        self._search_tree.setUpdatesEnabled(True)
         self._search_build_timer.start()
 
     def _search_build_step(self) -> None:
@@ -17991,20 +18721,34 @@ class BomPage(QWidget):
 
         start = time.perf_counter()
         processed = 0
+        removed = []
+        self._search_tree.setUpdatesEnabled(False)
         try:
-            while self._search_build_queue and processed < 200 and (time.perf_counter() - start) < 0.01:
+            if getattr(self, "_search_build_clearing", False):
+                while (self._search_tree.topLevelItemCount() and processed < 24
+                       and time.perf_counter() - start < 0.004):
+                    removed.append(self._search_tree.takeTopLevelItem(
+                        self._search_tree.topLevelItemCount() - 1
+                    ))
+                    processed += 1
+                if not self._search_tree.topLevelItemCount():
+                    self._search_build_clearing = False
+
+            while (not getattr(self, "_search_build_clearing", False)
+                   and self._search_build_queue and processed < 24
+                    and time.perf_counter() - start < 0.004):
                 part = self._search_build_queue.popleft()
+                part = dict(part or {})
+                part["_defer_indicators"] = True
+                part["_tree_row_text"] = self._full_bom_row_text_for_part(part.get("id"))
                 item = self._make_tree_item(part)
                 self._search_tree.addTopLevelItem(item)
                 processed += 1
 
-            if not self._search_build_queue:
+            if (not getattr(self, "_search_build_clearing", False)
+                    and not self._search_build_queue):
                 self._search_build_timer.stop()
-                try:
-                    self._sync_search_tree_row_numbers()
-                    self._search_tree.setUpdatesEnabled(True)
-                except Exception:
-                    pass
+                self._search_tree.setUpdatesEnabled(True)
                 try:
                     # Search results are flat; no need to expand deeply.
                     self._search_tree.expandToDepth(1)
@@ -18022,16 +18766,25 @@ class BomPage(QWidget):
             except Exception:
                 pass
             return
+        finally:
+            try:
+                self._search_tree.setUpdatesEnabled(True)
+            except RuntimeError:
+                pass
+            removed.clear()
 
     def _issues_for_part(self, part_id: int | None) -> set:
-        issues = set()
         if part_id is None:
-            return issues
+            return set()
         try:
             pid = int(part_id)
         except Exception:
-            return issues
-        for row in (self.missing_files or []):
+            return set()
+        rows = getattr(self, "_missing_files_by_part", {}).get(pid)
+        if rows is not None:
+            return {str(row[1]) for row in rows if len(row) > 1}
+        issues = set()
+        for row in self.missing_files or []:
             try:
                 bom_id, issue_type, _filename = row
                 if int(bom_id) == pid:
@@ -18257,11 +19010,12 @@ class BomPage(QWidget):
             for folder in roots:
                 add_folder(folder, base_container, base_container)
 
-    def _apply_organizational_folders(self) -> None:
-        try:
-            folders = self.bom_service.list_bom_folders() or []
-        except Exception:
-            folders = []
+    def _apply_organizational_folders(self, folders=None) -> None:
+        if folders is None:
+            try:
+                folders = self.bom_service.list_bom_folders() or []
+            except Exception:
+                folders = []
         self._bom_folders_cache = list(folders)
         contexts = {folder.get("effective_parent_bom_id") for folder in folders}
         for context in sorted(contexts, key=lambda value: (-1 if value is None else int(value))):
@@ -18444,16 +19198,14 @@ class BomPage(QWidget):
                     "step": {"state": "absent", "tooltip": "STEP: checking..."},
                 }
                 item.setData(BOM_COL_FILES, BOM_TREE_FILES_ROLE, _file_badges_payload(part_id, issues, empty_summary))
-                item.setData(BOM_COL_INTEGRITY, BOM_TREE_INTEGRITY_ROLE, _integrity_payload(part_id, self.missing_files, self.missing_ids))
+                item.setData(BOM_COL_INTEGRITY, BOM_TREE_INTEGRITY_ROLE, _integrity_payload(part_id, self._missing_files_by_part, self.missing_ids))
                 item.setIcon(BOM_COL_NAME, _bom_type_icon(info.get("type")))
-                self._indicator_refresh_queue.append((item, part_id))
-                if not self._indicator_refresh_timer.isActive():
-                    self._indicator_refresh_timer.start()
+                self._queue_indicator_refresh(item, part_id)
                 return
             summary = self._indicator_summary_for_part(part_id, issues)
             self._apply_native_work_status(item, part_id)
             item.setData(BOM_COL_FILES, BOM_TREE_FILES_ROLE, _file_badges_payload(part_id, issues, summary))
-            item.setData(BOM_COL_INTEGRITY, BOM_TREE_INTEGRITY_ROLE, _integrity_payload(part_id, self.missing_files, self.missing_ids))
+            item.setData(BOM_COL_INTEGRITY, BOM_TREE_INTEGRITY_ROLE, _integrity_payload(part_id, self._missing_files_by_part, self.missing_ids))
             item.setIcon(BOM_COL_NAME, _bom_type_icon(info.get("type")))
             tips0 = []
             if locked_txt:
@@ -20588,9 +21340,11 @@ class BomPage(QWidget):
 
     def load_tree(self):
         if getattr(self, "_bom_column_layout_user", None) != self.session.user_id:
-            self._restore_saved_bom_columns()
+            self._start_bom_column_preferences_load()
         # Show spinner immediately, then fetch tree data in a background thread.
         self._cancel_lazy_level_requests()
+        self._lazy_child_build_timer.stop()
+        self._lazy_child_build_queue.clear()
         self._tree_load_seq += 1
         seq = self._tree_load_seq
 
@@ -20600,22 +21354,10 @@ class BomPage(QWidget):
                 self.tree.clear()
             except Exception:
                 pass
-            self._refresh_variant_selector()
+            self._refresh_variant_selector([])
             self._set_tree_loading(False)
             self._mark_initial_tree_ready()
             return
-        self._refresh_variant_selector()
-        try:
-            self._issue_summary_cache = self.issue_service.part_summary()
-            score = max(0, self.issue_service.health_score() - len(getattr(self, "missing_ids", set()) or set()))
-            color = "#2e7d32" if score >= 85 else ("#a16207" if score >= 65 else "#b91c1c")
-            self.bom_health_label.setText(f"Health: {score}/100")
-            self.bom_health_label.setStyleSheet(
-                f"font-size:11px;font-weight:700;color:{color};background:transparent;border:none;"
-            )
-        except Exception:
-            self._issue_summary_cache = {}
-
         self._set_tree_loading(True)
 
         try:
@@ -20624,7 +21366,10 @@ class BomPage(QWidget):
         except Exception:
             pass
 
-        worker = _TreeLoadWorker(seq, self.bom_service, int(pid), list(self.missing_files or []))
+        self._reset_indicator_refresh()
+        worker = _TreeLoadWorker(
+            seq, self.bom_service, int(pid), self.missing_files or [], self.issue_service,
+        )
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -20636,12 +21381,25 @@ class BomPage(QWidget):
         thread.finished.connect(thread.deleteLater)
         self._tree_worker = worker
         self._tree_thread = thread
-        thread.start()
+        thread.start(QThread.LowPriority)
 
     def _on_tree_loaded(self, seq: int, tree_data: object, missing_map: object) -> None:
         if int(seq) != int(getattr(self, "_tree_load_seq", 0)):
             return
-        self._begin_tree_build(int(seq), dict(tree_data or {}), dict(missing_map or {}))
+        data = dict(tree_data or {})
+        startup = data.pop("_startup_payload", {}) or {}
+        self._issue_summary_cache = dict(startup.get("issue_summary") or {})
+        self._refresh_variant_selector(startup.get("variants") or [])
+        if startup.get("health") is not None:
+            score = max(0, int(startup["health"]) - len(getattr(self, "missing_ids", set()) or set()))
+            color = "#2e7d32" if score >= 85 else ("#a16207" if score >= 65 else "#b91c1c")
+            self.bom_health_label.setText(f"Health: {score}/100")
+            self.bom_health_label.setStyleSheet(
+                f"font-size:11px;font-weight:700;color:{color};background:transparent;border:none;"
+            )
+        self._begin_tree_build(
+            int(seq), data, missing_map if isinstance(missing_map, dict) else {}
+        )
 
     def _on_tree_failed(self, seq: int, err: str) -> None:
         if int(seq) != int(getattr(self, "_tree_load_seq", 0)):
@@ -20673,16 +21431,15 @@ class BomPage(QWidget):
         self._tree_build_missing_map = missing_map or {}
         self._last_tree_node_count = 0
         self._invalidate_doc_indicator()
-        self._indicator_refresh_timer.stop()
-        self._indicator_refresh_queue.clear()
+        self._reset_indicator_refresh()
         self._lazy_tree_active = "roots" in (tree_data or {})
         self._lazy_tree_materialized = False
         self._pending_relation_expanded_paths = set()
         self._pending_relation_expanded_part_ids = set()
-        self._bom_row_numbers = dict((tree_data or {}).get("row_numbers") or {})
-        self._bom_folder_row_numbers = dict((tree_data or {}).get("folder_rows") or {})
-        self._bom_folder_path_rows = dict((tree_data or {}).get("folder_path_rows") or {})
-        self._bom_folders_cache = list((tree_data or {}).get("folders") or [])
+        self._bom_row_numbers = (tree_data or {}).get("row_numbers") or {}
+        self._bom_folder_row_numbers = (tree_data or {}).get("folder_rows") or {}
+        self._bom_folder_path_rows = (tree_data or {}).get("folder_path_rows") or {}
+        self._bom_folders_cache = (tree_data or {}).get("folders") or []
 
         # cache for restore after search
         try:
@@ -20700,21 +21457,16 @@ class BomPage(QWidget):
         self._tree_build_queue = deque()
         try:
             roots = (tree_data or {}).get("roots") if self._lazy_tree_active else (tree_data or {}).values()
-            for info in (roots or []):
-                self._tree_build_queue.append((None, info))
+            self._tree_build_roots = iter(roots or ())
+            self._tree_build_roots_done = False
         except Exception:
             self._tree_build_queue = deque()
+            self._tree_build_roots = iter(())
+            self._tree_build_roots_done = True
 
-        try:
-            self.tree.clear()
-        except Exception:
-            pass
-
+        self._tree_build_clearing = self.tree.topLevelItemCount() > 0
         self._set_tree_loading(True)
-        try:
-            self.tree.setUpdatesEnabled(False)
-        except Exception:
-            pass
+        self.tree.setUpdatesEnabled(True)
         self._tree_build_timer.start()
 
     def _tree_build_step(self) -> None:
@@ -20727,9 +21479,43 @@ class BomPage(QWidget):
 
         start = time.perf_counter()
         processed = 0
+        removed = []
+        self.tree.setUpdatesEnabled(False)
         try:
-            while self._tree_build_queue and processed < 50 and (time.perf_counter() - start) < 0.01:
-                parent_item, info = self._tree_build_queue.popleft()
+            if getattr(self, "_tree_build_clearing", False):
+                while (self.tree.topLevelItemCount() and processed < 24
+                       and time.perf_counter() - start < 0.004):
+                    removed.append(self.tree.takeTopLevelItem(self.tree.topLevelItemCount() - 1))
+                    processed += 1
+                if not self.tree.topLevelItemCount():
+                    self._tree_build_clearing = False
+
+            while (not getattr(self, "_tree_build_clearing", False)
+                   and processed < 24 and time.perf_counter() - start < 0.004):
+                if self._tree_build_queue:
+                    task = self._tree_build_queue.popleft()
+                    if task[0] == "children":
+                        parent_item, children = task[1], task[2]
+                        try:
+                            child_info = next(children)
+                        except StopIteration:
+                            continue
+                        self._tree_build_queue.append(("children", parent_item, children))
+                        self._tree_build_queue.append(("node", parent_item, child_info))
+                        processed += 1
+                        continue
+                    _kind, parent_item, info = task
+                elif not self._tree_build_roots_done:
+                    try:
+                        info = next(self._tree_build_roots)
+                        parent_item = None
+                    except StopIteration:
+                        self._tree_build_roots_done = True
+                        break
+                else:
+                    break
+                info = dict(info or {})
+                info["_defer_indicators"] = True
                 item = self._make_tree_item(info)
 
                 if parent_item is None:
@@ -20743,33 +21529,24 @@ class BomPage(QWidget):
                 children = info.get("children", [])
                 if children:
                     try:
-                        for c in children:
-                            self._tree_build_queue.append((item, c))
+                        self._tree_build_queue.append(("children", item, iter(children)))
                     except Exception:
                         pass
 
                 self._last_tree_node_count += 1
                 processed += 1
 
-            if not self._tree_build_queue:
+            if (not getattr(self, "_tree_build_clearing", False)
+                    and not self._tree_build_queue
+                    and self._tree_build_roots_done):
                 self._tree_build_timer.stop()
-                try:
-                    self.tree.setUpdatesEnabled(True)
-                except Exception:
-                    pass
+                self.tree.setUpdatesEnabled(True)
                 try:
                     if self._lazy_tree_active:
                         self._render_folder_context(None, self._bom_folders_cache)
                     else:
-                        self._apply_organizational_folders()
+                        self._apply_organizational_folders(self._bom_folders_cache)
                         self._renumber_full_bom_tree_rows()
-                    self._sync_search_tree_row_numbers()
-                except Exception:
-                    pass
-
-                # Start every BOM level collapsed; users expand only the branches they need.
-                try:
-                    self.tree.collapseAll()
                 except Exception:
                     pass
 
@@ -20800,6 +21577,12 @@ class BomPage(QWidget):
             except Exception:
                 pass
             return
+        finally:
+            try:
+                self.tree.setUpdatesEnabled(True)
+            except RuntimeError:
+                pass
+            removed.clear()
 
     def _load_tree_impl(self, project_id: int) -> None:
         # Legacy internal method name kept for compatibility; now sync-calls the builder.
@@ -20814,13 +21597,14 @@ class BomPage(QWidget):
             missing_map = {}
         self._load_tree_from_data(tree_data, missing_map)
 
-    def _enter_search_mode(self) -> None:
+    def _enter_search_mode(self, *, clear_tree: bool = True) -> None:
         """Switch the stack to the search-results view and prepare it for new results."""
         self._in_search_mode = True
-        try:
-            self._search_tree.clear()
-        except Exception:
-            pass
+        if clear_tree:
+            try:
+                self._search_tree.clear()
+            except Exception:
+                pass
         try:
             self._tree_stack.setCurrentIndex(2)
         except Exception:
@@ -20925,7 +21709,7 @@ class BomPage(QWidget):
         worker.done.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        thread.start()
+        thread.start(QThread.LowPriority)
 
     def _lazy_request_item_is_current(self, request: dict) -> bool:
         item = request.get("item")
@@ -21004,27 +21788,100 @@ class BomPage(QWidget):
             for index in range(item.childCount() - 1, -1, -1):
                 if self._is_lazy_placeholder(item.child(index)):
                     item.takeChild(index)
-            for node in nodes:
-                try:
-                    child_id = int(node.get("id"))
-                except (TypeError, ValueError):
-                    child_id = None
-                if child_id is not None and self._child_exists_under_item(item, child_id):
-                    continue
-                child = self._make_tree_item(node)
+        finally:
+            self.tree.setUpdatesEnabled(True)
+
+        existing_ids = set()
+        for index in range(item.childCount()):
+            child = item.child(index)
+            if self._is_lazy_placeholder(child) or self._is_folder_tree_item(child):
+                continue
+            try:
+                existing_ids.add(int(child.data(0, Qt.UserRole)))
+            except (TypeError, ValueError, RuntimeError):
+                continue
+        pending = deque()
+        for node in nodes or []:
+            payload = dict(node or {})
+            try:
+                child_id = int(payload.get("id"))
+            except (TypeError, ValueError):
+                child_id = None
+            if child_id is not None and child_id in existing_ids:
+                continue
+            if child_id is not None:
+                existing_ids.add(child_id)
+            payload["_defer_indicators"] = True
+            pending.append(payload)
+
+        state = {
+            "item": item,
+            "part_id": int(part_id),
+            "nodes": pending,
+            "has_nodes": bool(pending),
+            "expand_after": bool(expand_after),
+        }
+        item.setData(0, BOM_TREE_IS_ASSEMBLY_ROLE, state["has_nodes"])
+        if len(pending) <= self.LAZY_CHILD_BATCH_SIZE:
+            if not self._build_lazy_child_slice(state):
+                self.tree.setItemLoading(item, True)
+                self._lazy_child_build_queue.append(state)
+                if not self._lazy_child_build_timer.isActive():
+                    self._lazy_child_build_timer.start()
+        else:
+            self.tree.setItemLoading(item, True)
+            self._lazy_child_build_queue.append(state)
+            if not self._lazy_child_build_timer.isActive():
+                self._lazy_child_build_timer.start()
+
+    def _build_lazy_child_slice(self, state: dict) -> bool:
+        item = state.get("item")
+        try:
+            if item is None or item.treeWidget() is not self.tree:
+                return True
+        except RuntimeError:
+            return True
+        started = time.perf_counter()
+        processed = 0
+        self.tree.setUpdatesEnabled(False)
+        try:
+            while (state["nodes"] and processed < self.LAZY_CHILD_BATCH_SIZE
+                   and time.perf_counter() - started < self.LAZY_CHILD_SLICE_SECONDS):
+                payload = state["nodes"].popleft()
+                child = self._make_tree_item(payload)
                 item.addChild(child)
                 self._ensure_lazy_placeholder(child)
-            self._render_folder_context(part_id, self._bom_folders_cache, containers=[item])
-            item.setData(0, BOM_TREE_IS_ASSEMBLY_ROLE, bool(nodes))
-            self._restore_pending_relation_expansions(item)
+                processed += 1
         finally:
             try:
                 self.tree.setUpdatesEnabled(True)
-                self.tree.viewport().update()
-            except Exception:
+            except RuntimeError:
                 pass
-        if expand_after and item.treeWidget() is self.tree and bool(nodes):
-            item.setExpanded(True)
+        if state["nodes"]:
+            return False
+        try:
+            self._render_folder_context(
+                state["part_id"], self._bom_folders_cache, containers=[item]
+            )
+            self._restore_pending_relation_expansions(item)
+            self.tree.setItemLoading(item, False)
+            if state["expand_after"] and item.treeWidget() is self.tree and state["has_nodes"]:
+                item.setExpanded(True)
+            self.tree.viewport().update()
+        except (RuntimeError, AttributeError):
+            pass
+        return True
+
+    def _lazy_child_build_step(self) -> None:
+        started = time.perf_counter()
+        while self._lazy_child_build_queue and time.perf_counter() - started < self.LAZY_CHILD_SLICE_SECONDS:
+            state = self._lazy_child_build_queue[0]
+            if self._build_lazy_child_slice(state):
+                self._lazy_child_build_queue.popleft()
+            else:
+                break
+        if not self._lazy_child_build_queue:
+            self._lazy_child_build_timer.stop()
 
     def _materialize_all_lazy_branches(self) -> None:
         if not getattr(self, "_lazy_tree_active", False) or getattr(self, "_lazy_tree_materialized", False):
@@ -21090,6 +21947,7 @@ class BomPage(QWidget):
             field_label.setText(str(titles.get(key) or key).upper())
 
     def _show_pdm_cad_selection(self, item: QTreeWidgetItem) -> None:
+        self._cancel_detail_requests()
         self.timeline_panel.clear()
         payload = dict(item.data(0, PDM_CAD_PAYLOAD_ROLE) or {})
         cad_id = item.data(0, PDM_CAD_DOCUMENT_ID_ROLE)
@@ -21275,69 +22133,248 @@ class BomPage(QWidget):
         except Exception:
             pass
 
+    def _reset_indicator_refresh(self) -> None:
+        self._indicator_request_seq += 1
+        try:
+            self._indicator_refresh_timer.stop()
+        except RuntimeError:
+            pass
+        self._indicator_refresh_queue.clear()
+        self._indicator_scan_iterators.clear()
+        self._indicator_seen_items.clear()
+        self._indicator_collected_rows.clear()
+        self._indicator_apply_queue.clear()
+        self._indicator_pending_rows.clear()
+        worker = self._indicator_worker
+        if worker is not None:
+            try:
+                worker.cancel()
+            except RuntimeError:
+                pass
+        self._indicator_worker = None
+        self._indicator_thread = None
+
+    def _queue_indicator_refresh(self, item, part_id) -> None:
+        try:
+            pid = int(part_id)
+            if item is None or item.treeWidget() is None:
+                return
+            identity = id(item)
+        except (RuntimeError, TypeError, ValueError):
+            return
+        if identity in self._indicator_seen_items:
+            return
+        self._indicator_seen_items.add(identity)
+        self._indicator_refresh_queue.append((item, pid))
+        if not self._indicator_refresh_timer.isActive():
+            self._indicator_refresh_timer.start()
+
+    def _next_indicator_candidate(self):
+        while self._indicator_scan_iterators:
+            iterator = self._indicator_scan_iterators[0]
+            try:
+                item = next(iterator)
+            except StopIteration:
+                self._indicator_scan_iterators.popleft()
+                continue
+            except RuntimeError:
+                self._indicator_scan_iterators.popleft()
+                continue
+            try:
+                if (self._is_folder_tree_item(item) or self._is_lazy_placeholder(item)
+                        or item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD):
+                    continue
+                part_id = item.data(0, Qt.UserRole)
+                self._queue_indicator_refresh(item, part_id)
+                if self._indicator_refresh_queue:
+                    return self._indicator_refresh_queue.popleft()
+            except (RuntimeError, TypeError, ValueError):
+                continue
+        return None
+
     def _indicator_refresh_step(self) -> None:
+        if self._indicator_worker is not None:
+            start = time.perf_counter()
+            processed = 0
+            while (self._indicator_apply_queue and processed < 32
+                   and time.perf_counter() - start < 0.004):
+                item, part_id, result = self._indicator_apply_queue.popleft()
+                try:
+                    if item.treeWidget() is not None:
+                        self._apply_indicator_result_to_item(item, int(part_id), result)
+                except (RuntimeError, TypeError, ValueError):
+                    pass
+                processed += 1
+            while ((self._indicator_refresh_queue or self._indicator_scan_iterators)
+                   and processed < 80
+                   and time.perf_counter() - start < 0.004):
+                candidate = (
+                    self._indicator_refresh_queue.popleft()
+                    if self._indicator_refresh_queue
+                    else self._next_indicator_candidate()
+                )
+                if candidate is not None:
+                    item, part_id = candidate
+                    try:
+                        if item.treeWidget() is not None:
+                            self._indicator_collected_rows[int(part_id)].append(item)
+                    except (RuntimeError, TypeError, ValueError):
+                        pass
+                processed += 1
+            return
+
         start = time.perf_counter()
         processed = 0
-        while self._indicator_refresh_queue and processed < 8 and (time.perf_counter() - start) < 0.008:
-            item, part_id = self._indicator_refresh_queue.popleft()
+        while (self._indicator_apply_queue and processed < 32
+               and time.perf_counter() - start < 0.004):
+            item, part_id, result = self._indicator_apply_queue.popleft()
+            try:
+                if item.treeWidget() is not None:
+                    self._apply_indicator_result_to_item(item, int(part_id), result)
+            except (RuntimeError, TypeError, ValueError):
+                pass
+            processed += 1
+        unique_limit = 16
+        while processed < 80 and time.perf_counter() - start < 0.005:
+            candidate = (
+                self._indicator_refresh_queue.popleft()
+                if self._indicator_refresh_queue
+                else self._next_indicator_candidate()
+            )
+            if candidate is None:
+                break
+            item, part_id = candidate
             try:
                 if item.treeWidget() is None:
                     continue
-                issues = self._issues_for_part(part_id)
-                summary = self._indicator_summary_for_part(part_id, issues)
-                self._apply_native_work_status(item, part_id)
-                item.setData(BOM_COL_FILES, BOM_TREE_FILES_ROLE, _file_badges_payload(part_id, issues, summary))
-                item.setData(BOM_COL_INTEGRITY, BOM_TREE_INTEGRITY_ROLE, _integrity_payload(part_id, self.missing_files, self.missing_ids))
-                item.setToolTip(BOM_COL_FILES, "\n".join([
-                    str(summary["pdf"].get("tooltip", "PDF: unknown")),
-                    str(summary["step"].get("tooltip", "STEP: unknown")),
-                ]))
-                name_tips = []
-                locked_text = str(item.data(0, BOM_TREE_INWORK_ROLE) or "")
-                if locked_text:
-                    name_tips.append(locked_text)
-                issue_summary = item.data(0, BOM_TREE_ISSUE_ROLE) or {}
-                active_count = int(issue_summary.get("active_count") or 0)
-                if active_count:
-                    name_tips.append(f"{active_count} active issue(s) linked to this part")
-                policy = item.data(0, BOM_TREE_POLICY_ROLE) or {}
-                classification = str(
-                    policy.get("classification") or "PHYSICAL"
-                ).upper()
-                occurrence_behavior = str(
-                    policy.get("ebom_behavior") or "INHERIT"
-                ).upper()
-                resolved_behavior = str(
-                    policy.get("resolved_ebom_behavior") or "NORMAL"
-                ).upper()
-                name_tips.append(
-                    f"EBOM policy: {classification}; occurrence {occurrence_behavior}; "
-                    f"effective {resolved_behavior}"
-                )
-                if resolved_behavior == "EXCLUDE":
-                    name_tips.append(
-                        "Not for delivery: excluded with all descendants from Released EBOM."
-                    )
-                elif resolved_behavior == "FLATTEN":
-                    name_tips.append(
-                        "CAD grouping only: hidden from Released EBOM; children are promoted."
-                    )
-                name_tips.extend([
-                    str(summary["pdf"].get("tooltip", "PDF: unknown")),
-                    str(summary["step"].get("tooltip", "STEP: unknown")),
-                ])
-                item.setToolTip(BOM_COL_NAME, "\n".join(name_tips))
-            except Exception:
-                pass
+                self._indicator_collected_rows[int(part_id)].append(item)
+            except (RuntimeError, TypeError, ValueError):
+                continue
             processed += 1
-        if not self._indicator_refresh_queue:
+            if len(self._indicator_collected_rows) >= unique_limit and self._indicator_refresh_queue:
+                break
+
+        if (self._indicator_collected_rows and not self._indicator_refresh_queue
+                and not self._indicator_scan_iterators):
+            project_id = int(self.session.project_id or 0)
+            if project_id:
+                self._indicator_request_seq += 1
+                request_id = self._indicator_request_seq
+                rows_by_part = dict(self._indicator_collected_rows)
+                self._indicator_collected_rows.clear()
+                self._indicator_pending_rows[request_id] = rows_by_part
+                worker = _IndicatorDataWorker(
+                    request_id,
+                    project_id,
+                    getattr(self.session, "user_id", None),
+                    self.working_dir,
+                    list(rows_by_part),
+                    getattr(self, "_missing_files_by_part", {}) or {},
+                    getattr(self, "missing_ids", set()) or set(),
+                    {
+                        "bom_service": self.bom_service,
+                        "diag_service": self.diag_service,
+                        "part_file_service": self.part_file_service,
+                        "part_doc_ack_service": self.part_doc_ack_service,
+                        "project_service": self.project_service,
+                    },
+                )
+                worker.batch.connect(self._on_indicator_data_batch)
+                worker.finished.connect(self._on_indicator_data_finished)
+                worker.failed.connect(self._on_indicator_data_failed)
+                self._indicator_worker = worker
+                self._indicator_thread = _start_project_worker(worker)
+
+        if (not self._indicator_apply_queue and not self._indicator_refresh_queue
+                and not self._indicator_scan_iterators and not self._indicator_collected_rows
+                and not self._indicator_pending_rows and self._indicator_worker is None):
             self._indicator_refresh_timer.stop()
-        try:
-            self.tree.viewport().update()
-            self._search_tree.viewport().update()
-            self._ebom_tree.viewport().update()
-        except Exception:
-            pass
+
+    def _on_indicator_data_batch(self, request_id: int, project_id: int, results: object) -> None:
+        if int(request_id) != self._indicator_request_seq:
+            return
+        if int(project_id) != int(self.session.project_id or 0):
+            return
+        rows_by_part = self._indicator_pending_rows.get(int(request_id), {})
+        for raw_part_id, result in (results or {}).items():
+            part_id = int(raw_part_id)
+            for item in rows_by_part.pop(part_id, []):
+                self._indicator_apply_queue.append((item, part_id, result))
+        if self._indicator_apply_queue and not self._indicator_refresh_timer.isActive():
+            self._indicator_refresh_timer.start()
+
+    def _apply_indicator_result_to_item(self, item, part_id: int, result: dict) -> None:
+        summary = result.get("summary") or {}
+        issues = self._issues_for_part(part_id)
+        item.setText(BOM_COL_STATUS, str(result.get("native_state") or "Not recorded"))
+        item.setToolTip(BOM_COL_STATUS, str(result.get("native_tooltip") or ""))
+        item.setData(BOM_COL_FILES, BOM_TREE_FILES_ROLE, _file_badges_payload(part_id, issues, summary))
+        item.setData(
+            BOM_COL_INTEGRITY, BOM_TREE_INTEGRITY_ROLE,
+            result.get("integrity") or _integrity_payload(
+                part_id, getattr(self, "_missing_files_by_part", {}), self.missing_ids
+            ),
+        )
+        item.setToolTip(BOM_COL_FILES, "\n".join([
+            str(summary.get("pdf", {}).get("tooltip", "PDF: unknown")),
+            str(summary.get("step", {}).get("tooltip", "STEP: unknown")),
+        ]))
+        name_tips = []
+        locked_text = str(item.data(0, BOM_TREE_INWORK_ROLE) or "")
+        if locked_text:
+            name_tips.append(locked_text)
+        issue_summary = item.data(0, BOM_TREE_ISSUE_ROLE) or {}
+        active_count = int(issue_summary.get("active_count") or 0)
+        if active_count:
+            name_tips.append(f"{active_count} active issue(s) linked to this part")
+        policy = item.data(0, BOM_TREE_POLICY_ROLE) or {}
+        classification = str(policy.get("classification") or "PHYSICAL").upper()
+        occurrence_behavior = str(policy.get("ebom_behavior") or "INHERIT").upper()
+        resolved_behavior = str(policy.get("resolved_ebom_behavior") or "NORMAL").upper()
+        name_tips.append(
+            f"EBOM policy: {classification}; occurrence {occurrence_behavior}; "
+            f"effective {resolved_behavior}"
+        )
+        if resolved_behavior == "EXCLUDE":
+            name_tips.append("Not for delivery: excluded with all descendants from Released EBOM.")
+        elif resolved_behavior == "FLATTEN":
+            name_tips.append("CAD grouping only: hidden from Released EBOM; children are promoted.")
+        name_tips.extend([
+            str(summary.get("pdf", {}).get("tooltip", "PDF: unknown")),
+            str(summary.get("step", {}).get("tooltip", "STEP: unknown")),
+        ])
+        item.setToolTip(BOM_COL_NAME, "\n".join(name_tips))
+
+    def _on_indicator_data_finished(self, request_id: int, project_id: int) -> None:
+        self._indicator_pending_rows.pop(int(request_id), None)
+        if int(request_id) != self._indicator_request_seq:
+            return
+        self._indicator_worker = None
+        self._indicator_thread = None
+        if int(project_id) != int(self.session.project_id or 0):
+            return
+        pending = (
+            self._indicator_apply_queue or self._indicator_refresh_queue
+            or self._indicator_scan_iterators or self._indicator_collected_rows
+        )
+        if pending:
+            if not self._indicator_refresh_timer.isActive():
+                self._indicator_refresh_timer.start()
+        else:
+            self._indicator_refresh_timer.stop()
+
+    def _on_indicator_data_failed(self, request_id: int, project_id: int, _error: str) -> None:
+        self._indicator_pending_rows.pop(int(request_id), None)
+        if int(request_id) != self._indicator_request_seq:
+            return
+        self._indicator_worker = None
+        self._indicator_thread = None
+        if (self._indicator_refresh_queue or self._indicator_scan_iterators
+                or self._indicator_collected_rows or self._indicator_apply_queue):
+            if not self._indicator_refresh_timer.isActive():
+                self._indicator_refresh_timer.start()
+        else:
+            self._indicator_refresh_timer.stop()
 
     def _clear_folder_selection(self) -> None:
         self.current_folder_id = None
@@ -21372,6 +22409,8 @@ class BomPage(QWidget):
         tree: QTreeWidget,
         node: dict,
         parent: QTreeWidgetItem | None = None,
+        *,
+        include_children: bool = True,
     ) -> QTreeWidgetItem | None:
         if not node:
             return None
@@ -21408,27 +22447,27 @@ class BomPage(QWidget):
             tree.addTopLevelItem(item)
         else:
             parent.addChild(item)
-        for child in node.get("children") or []:
-            self._add_structure_relation_node(tree, child, item)
+        if include_children:
+            for child in node.get("children") or []:
+                self._add_structure_relation_node(tree, child, item)
         return item
 
-    def _populate_structure_views(self, context: dict) -> None:
+    def _populate_structure_views(
+        self, context: dict, *, request_id=None, item_id=None, on_complete=None
+    ) -> None:
         uses = (context or {}).get("uses")
         where_used = (context or {}).get("where_used")
         effective_where_used = (context or {}).get("effective_where_used")
-        for tree, root in (
+        roots = (
             (self.uses_tree, uses),
             (self.where_used_tree, where_used),
             (self.effective_where_used_tree, effective_where_used),
-        ):
-            tree.setUpdatesEnabled(False)
-            try:
-                tree.clear()
-                root_item = self._add_structure_relation_node(tree, root)
-                if root_item is not None:
-                    root_item.setExpanded(True)
-            finally:
-                tree.setUpdatesEnabled(True)
+        )
+        queue = deque()
+        for tree, root in roots:
+            tree.clear()
+            if root:
+                queue.append((tree, root, None))
 
         uses_count = int((context or {}).get("uses_count") or 0)
         where_used_count = int((context or {}).get("where_used_count") or 0)
@@ -21450,12 +22489,41 @@ class BomPage(QWidget):
         self.effective_where_used_tree.setToolTip(
             effective_error or "First visible EBOM parent after flattening."
         )
-        try:
-            details = getattr(self, "_current_part_details", {}) or {}
-            self._update_lifecycle_action_states(details)
-        except Exception:
-            self.compare_iterations_btn.setEnabled(False)
-            self.update_child_versions_btn.setEnabled(False)
+        # Lifecycle/action state was already updated from the selected Item's
+        # detail payload. Avoid repeating checkout queries while painting trees.
+
+        def render_batch():
+            if request_id is not None and (
+                int(request_id) != int(self._structure_detail_request_seq)
+                or int(item_id or 0) != int(self.current_part_id or 0)
+            ):
+                return
+            touched = []
+            for _ in range(80):
+                if not queue:
+                    break
+                tree, node, parent = queue.popleft()
+                if not any(existing is tree for existing in touched):
+                    tree.setUpdatesEnabled(False)
+                    touched.append(tree)
+                item = self._add_structure_relation_node(
+                    tree, node, parent, include_children=False
+                )
+                if item is None:
+                    continue
+                if parent is None:
+                    item.setExpanded(True)
+                for child in reversed(node.get("children") or []):
+                    queue.appendleft((tree, child, item))
+            for tree in touched:
+                tree.setUpdatesEnabled(True)
+                tree.viewport().update()
+            if queue:
+                QTimer.singleShot(0, render_batch)
+            elif callable(on_complete):
+                on_complete()
+
+        QTimer.singleShot(0, render_batch)
 
     def update_child_versions(self):
         if not getattr(self, "current_part_id", None):
@@ -21658,9 +22726,342 @@ class BomPage(QWidget):
             return
         self.issue_requested.emit(int(item_id))
 
+    def _set_details_loader(self, key, message=None):
+        messages = getattr(self, "_details_loading_messages", {})
+        if message:
+            messages[str(key)] = str(message)
+        else:
+            messages.pop(str(key), None)
+        self._details_loading_messages = messages
+        if hasattr(self, "details_loading_frame"):
+            self.details_loading_label.setText(
+                list(messages.values())[-1] if messages else ""
+            )
+            self.details_loading_frame.setVisible(bool(messages))
+
+    def _cancel_detail_requests(self):
+        for name in ("_perf_item_span", "_perf_item_structure_span"):
+            recorder.end(getattr(self, name, None), "cancelled")
+            setattr(self, name, None)
+        if hasattr(self, "_details_request_timer"):
+            self._details_request_timer.stop()
+        self._details_request_seq = int(getattr(self, "_details_request_seq", 0)) + 1
+        self._structure_detail_request_seq = int(
+            getattr(self, "_structure_detail_request_seq", 0)
+        ) + 1
+        self._pending_detail_request = None
+        for worker in (
+            getattr(self, "_details_worker", None),
+            getattr(self, "_structure_detail_worker", None),
+        ):
+            if worker is not None:
+                try:
+                    worker.cancel()
+                except RuntimeError:
+                    pass
+        self._details_loading_messages = {}
+        if hasattr(self, "details_loading_frame"):
+            self._set_details_loader("item")
+
+    def _start_pending_details_load(self):
+        request = self._pending_detail_request
+        if request is None:
+            return
+        thread = self._details_worker_thread
+        try:
+            running = bool(thread and thread.isRunning())
+        except RuntimeError:
+            running = False
+        if running:
+            if self._details_worker is not None:
+                self._details_worker.cancel()
+            return
+
+        self._pending_detail_request = None
+        request_id, project_id, item_id = request
+        worker = _PartDetailsWorker(
+            request_id,
+            project_id,
+            item_id,
+            self.bom_service,
+            self.managed_file_service,
+            self.issue_service,
+        )
+        worker.finished.connect(self._on_part_details_loaded)
+        worker.failed.connect(self._on_part_details_failed)
+        worker.done.connect(worker.deleteLater)
+        thread = QThread(QApplication.instance())
+        thread._project_worker = worker
+        _PROJECT_LOAD_THREADS.add(thread)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.done.connect(thread.quit)
+        thread.finished.connect(
+            lambda seq=request_id, t=thread: self._on_part_details_thread_finished(seq, t)
+        )
+        thread.finished.connect(lambda t=thread: _PROJECT_LOAD_THREADS.discard(t))
+        thread.finished.connect(thread.deleteLater)
+        self._details_worker = worker
+        self._details_worker_thread = thread
+        self._details_worker_seq = request_id
+        thread.start(QThread.LowPriority)
+
+    def _on_part_details_thread_finished(self, request_id, thread):
+        active_thread = getattr(self, "_details_worker_thread", None)
+        if getattr(self, "_details_worker_thread", None) is thread:
+            self._details_worker_thread = None
+            self._details_worker = None
+            active_thread = None
+        try:
+            active_running = bool(active_thread and active_thread.isRunning())
+        except RuntimeError:
+            active_running = False
+        if self._pending_detail_request is not None and not active_running:
+            self._details_request_timer.start(0)
+
+    def _on_part_details_loaded(self, request_id, project_id, item_id, payload):
+        if (
+            int(request_id) != int(getattr(self, "_details_request_seq", 0))
+            or int(project_id) != int(self.session.project_id or 0)
+            or int(item_id) != int(self.current_part_id or 0)
+        ):
+            return
+        payload = payload if isinstance(payload, dict) else {}
+        details = payload.get("details") or {}
+        self._set_engineering_item_actions_enabled(True)
+        self._update_details_summary(
+            details,
+            associations=payload.get("associations") or [],
+            active_cad_checkout=payload.get("active_cad") or [],
+        )
+        self.refresh_files_tab(
+            managed_files=payload.get("managed_files") or [],
+            details=details,
+            load_attachment=False,
+        )
+        self._refresh_files_tab(details)
+        self.notes_view.setText(details.get("notes", ""))
+        self.refresh_issues_tab(payload.get("issues") or [])
+
+        history = payload.get("history") or []
+        analytics = payload.get("analytics") or {}
+        self._history_rows = list(history)
+        self._history_analytics = dict(analytics)
+        self._details_history_payload_item_id = int(item_id)
+        if self.tabs.currentWidget() is self.history_panel:
+            self.history_panel.set_data(history, analytics)
+            self._details_history_rendered_item_id = int(item_id)
+        self.timeline_panel.set_item(int(item_id), history)
+
+        missing_rows = (getattr(self, "_missing_files_by_part", {}) or {}).get(
+            int(item_id), []
+        )
+        if missing_rows:
+            missing_msgs = []
+            for _bom_id, issue_type, filename in missing_rows:
+                if issue_type == "missing_file":
+                    missing_msgs.append(f"⚠️ Missing file: {filename}")
+                elif issue_type == "outdated_file":
+                    missing_msgs.append(
+                        f"⚠️ Outdated file: {filename} is not the latest version in working directory."
+                    )
+                elif issue_type == "missing_drawing":
+                    missing_msgs.append(f"⚠️ Missing drawing: {filename}")
+                elif issue_type == "missing_pdf":
+                    missing_msgs.append(f"⚠️ Missing PDF: {filename}")
+                elif issue_type == "missing_step":
+                    missing_msgs.append(f"⚠️ Missing STEP: {filename}")
+            if missing_msgs:
+                self.show_alert(" | ".join(missing_msgs), "warning", "details")
+            elif payload.get("errors"):
+                self.show_alert(
+                    "Some item details could not be loaded: "
+                    + " | ".join(payload["errors"]),
+                    "warning", "details",
+                )
+            else:
+                self.hide_alert("details")
+        elif payload.get("errors"):
+            self.show_alert(
+                "Some item details could not be loaded: "
+                + " | ".join(payload["errors"]),
+                "warning", "details",
+            )
+        else:
+            self.hide_alert("details")
+
+        self._set_details_loader("item")
+        recorder.end(getattr(self, "_perf_item_span", None), "error" if payload.get("errors") else "ok")
+        self._perf_item_span = None
+        if not self._timeline_initially_shown:
+            self.tabs.setCurrentWidget(self.timeline_panel)
+            self._timeline_initially_shown = True
+        self._sync_visual_action_states()
+        if self.tabs.currentWidget() is self.structure_tab:
+            self._load_item_structure_context(int(item_id))
+
+    def _on_part_details_failed(self, request_id, project_id, item_id, message):
+        if (
+            int(request_id) != int(getattr(self, "_details_request_seq", 0))
+            or int(project_id) != int(self.session.project_id or 0)
+            or int(item_id) != int(self.current_part_id or 0)
+        ):
+            return
+        recorder.end(getattr(self, "_perf_item_span", None), "error")
+        self._perf_item_span = None
+        self._set_details_loader("item")
+        self.details_name_label.setText("Unable to load item details")
+        self.details_identity_label.setText(str(message or "The selected Item could not be loaded."))
+        self.show_alert(f"Unable to load item details: {message}", "warning", "details")
+        self.timeline_panel.set_item(int(item_id), [])
+
+    def _load_item_structure_context(self, item_id):
+        item_id = int(item_id)
+        if item_id != int(self.current_part_id or 0):
+            return
+        if self._details_structure_loaded_item_id == item_id:
+            return
+        thread = self._structure_detail_thread
+        try:
+            if thread and thread.isRunning() and getattr(
+                self, "_structure_detail_item_id", None
+            ) == item_id:
+                return
+        except RuntimeError:
+            pass
+        recorder.end(getattr(self, "_perf_item_structure_span", None), "cancelled")
+        self._perf_item_structure_span = recorder.begin("ui.item_structure_ready")
+        self._structure_detail_request_seq += 1
+        request_id = self._structure_detail_request_seq
+        old_worker = self._structure_detail_worker
+        if old_worker is not None:
+            try:
+                old_worker.cancel()
+            except RuntimeError:
+                pass
+        self._set_details_loader("structure", "Loading item structure…")
+        self.structure_summary_label.setText("Loading structure relations…")
+        worker = _ItemStructureContextWorker(
+            request_id,
+            int(self.session.project_id or 0),
+            item_id,
+            self.bom_service,
+        )
+        worker.finished.connect(self._on_item_structure_context_loaded)
+        worker.failed.connect(self._on_item_structure_context_failed)
+        worker.done.connect(worker.deleteLater)
+        thread = QThread(QApplication.instance())
+        thread._project_worker = worker
+        _PROJECT_LOAD_THREADS.add(thread)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.done.connect(thread.quit)
+        thread.finished.connect(
+            lambda seq=request_id, t=thread: self._on_item_structure_thread_finished(seq, t)
+        )
+        thread.finished.connect(lambda t=thread: _PROJECT_LOAD_THREADS.discard(t))
+        thread.finished.connect(thread.deleteLater)
+        self._structure_detail_worker = worker
+        self._structure_detail_thread = thread
+        self._structure_detail_item_id = item_id
+        thread.start(QThread.LowPriority)
+
+    def _on_item_structure_thread_finished(self, request_id, thread):
+        if getattr(self, "_structure_detail_thread", None) is thread:
+            self._structure_detail_thread = None
+            self._structure_detail_worker = None
+
+    def _on_item_structure_context_loaded(self, request_id, project_id, item_id, context):
+        if (
+            int(request_id) != int(self._structure_detail_request_seq)
+            or int(project_id) != int(self.session.project_id or 0)
+            or int(item_id) != int(self.current_part_id or 0)
+        ):
+            return
+        self._populate_structure_views(
+            context or {},
+            request_id=int(request_id),
+            item_id=int(item_id),
+            on_complete=lambda: self._on_item_structure_render_finished(
+                int(request_id), int(project_id), int(item_id)
+            ),
+        )
+
+    def _on_item_structure_render_finished(self, request_id, project_id, item_id):
+        if (
+            int(request_id) != int(self._structure_detail_request_seq)
+            or int(project_id) != int(self.session.project_id or 0)
+            or int(item_id) != int(self.current_part_id or 0)
+        ):
+            return
+        recorder.end(getattr(self, "_perf_item_structure_span", None))
+        self._perf_item_structure_span = None
+        self._details_structure_loaded_item_id = int(item_id)
+        self._set_details_loader("structure")
+
+    def _on_item_structure_context_failed(self, request_id, project_id, item_id, message):
+        if (
+            int(request_id) != int(self._structure_detail_request_seq)
+            or int(project_id) != int(self.session.project_id or 0)
+            or int(item_id) != int(self.current_part_id or 0)
+        ):
+            return
+        recorder.end(getattr(self, "_perf_item_structure_span", None), "error")
+        self._perf_item_structure_span = None
+        self.structure_summary_label.setText(
+            f"Could not load structure relations: {message}"
+        )
+        self._set_details_loader("structure")
+
+    def _on_details_tab_changed(self, _index):
+        if (
+            self.tabs.currentWidget() is self.history_panel
+            and self.current_part_id is not None
+            and self._details_history_payload_item_id == int(self.current_part_id)
+            and self._details_history_rendered_item_id != int(self.current_part_id)
+        ):
+            self.history_panel.set_data(
+                getattr(self, "_history_rows", []) or [],
+                getattr(self, "_history_analytics", {}) or {},
+            )
+            self._details_history_rendered_item_id = int(self.current_part_id)
+        if (
+            self.tabs.currentWidget() is self.structure_tab
+            and self.current_part_id is not None
+        ):
+            self._load_item_structure_context(int(self.current_part_id))
+
     def display_details(self, item_id):
         if item_id is None:
             return
+        try:
+            item_id = int(item_id)
+        except (TypeError, ValueError):
+            return
+        recorder.end(getattr(self, "_perf_item_span", None), "cancelled")
+        self._perf_item_span = recorder.begin("ui.item_details_ready")
+        recorder.end(getattr(self, "_perf_item_structure_span", None), "cancelled")
+        self._perf_item_structure_span = None
+        self._details_request_seq += 1
+        request_id = self._details_request_seq
+        project_id = int(self.session.project_id or 0)
+        self._details_request_timer.stop()
+        self._pending_detail_request = (request_id, project_id, item_id)
+        if self._details_worker is not None:
+            try:
+                self._details_worker.cancel()
+            except RuntimeError:
+                pass
+        self._structure_detail_request_seq += 1
+        if self._structure_detail_worker is not None:
+            try:
+                self._structure_detail_worker.cancel()
+            except RuntimeError:
+                pass
+        self._details_structure_loaded_item_id = None
+        self._details_loading_messages = {}
+        self._set_details_loader("item", "Loading item details…")
+
         self._selected_pdm_kind = PDM_OBJECT_ITEM
         self.current_cad_document_id = None
         self.current_associated_item_id = None
@@ -21670,56 +23071,37 @@ class BomPage(QWidget):
         self.checkin_part_btn.setToolTip("Review and finish the selected Item checkout")
         self.undo_checkout_btn.setToolTip("Undo the selected Item checkout")
         self.current_folder_id = None
+        self.current_part_id = item_id
         self.details_summary_card.show()
         self.associated_files_card.show()
-        self._set_engineering_item_actions_enabled(True)
-        self.current_part_id = item_id
-        details = self.bom_service.get_part_details(item_id) or {}
-        try:
-            structure_context = self.bom_service.get_structure_context(int(item_id)) or {}
-        except Exception:
-            structure_context = {}
-        # Detailed unified history across revisions
-        history = self.bom_service.get_history_detailed(item_id, include_all_revisions=True) or []
-        analytics = self.bom_service.get_history_analytics(item_id, include_all_revisions=True) or {}
-
-        self.refresh_files_tab()
-
-        if self.missing_files:
-            missing_msgs = []
-            for bom_id, issue_type, filename in self.missing_files:
-                if bom_id == item_id:
-                    if issue_type == 'missing_file':
-                        missing_msgs.append(f"⚠️ Missing file: {filename} ")
-                    elif issue_type == 'outdated_file':
-                        missing_msgs.append(f"⚠️ Outdated file : {filename} is not the latest version in working directory.")
-                    elif issue_type == 'missing_drawing':
-                        missing_msgs.append(f"⚠️ Missing drawing: {filename}")
-                    elif issue_type == 'missing_pdf':
-                        missing_msgs.append(f"⚠️ Missing PDF: {filename}")
-                    elif issue_type == 'missing_step':
-                        missing_msgs.append(f"⚠️ Missing STEP: {filename}")
-            if missing_msgs:
-                self.show_alert(" | ".join(missing_msgs), "warning", "details")
-            else:
-                self.hide_alert("details")
-        else:
-            self.hide_alert("details")
-
-        self._update_details_summary(details)
-
-        self._populate_structure_views(structure_context)
-
-        # History panel (genius panel)
-        self._history_rows = list(history)
-        self.history_panel.set_data(history, analytics)
-        self.timeline_panel.set_item(int(item_id), history)
+        self._set_engineering_item_actions_enabled(False)
+        self.details_name_label.setText("Loading item details…")
+        self.details_identity_label.setText("The selected Item is being refreshed.")
+        self._current_part_details = {}
+        self._update_details_summary({}, associations=[], active_cad_checkout=[])
+        self.notes_view.clear()
+        self.part_issues_table.setRowCount(0)
+        self.history_panel.clear()
+        self._history_rows = []
+        self._history_analytics = {}
+        self._details_history_payload_item_id = None
+        self._details_history_rendered_item_id = None
+        self.timeline_panel.clear()
+        self.uses_tree.clear()
+        self.where_used_tree.clear()
+        self.effective_where_used_tree.clear()
+        self.structure_summary_label.setText("Select a structure relation to load it.")
+        self.structure_views.setTabText(0, "Uses")
+        self.structure_views.setTabText(1, "CAD Where Used")
+        self.structure_views.setTabText(2, "Effective EBOM Where Used")
+        self.refresh_files_tab(managed_files=[], details={}, load_attachment=False)
+        self._set_files_tab_enabled(False)
+        self._refresh_files_tab({})
+        self.hide_alert("details")
         if not self._timeline_initially_shown:
             self.tabs.setCurrentWidget(self.timeline_panel)
             self._timeline_initially_shown = True
-
-        self.notes_view.setText(details.get("notes", ""))
-        self.refresh_issues_tab()
+        self._details_request_timer.start()
         self._sync_visual_action_states()
 
     def _on_nexus_history_changed(self, result):
@@ -21738,6 +23120,7 @@ class BomPage(QWidget):
                 self.display_details(int(self.current_part_id))
 
     def clear_details(self):
+        self._cancel_detail_requests()
         if hasattr(self, "timeline_panel"):
             self.timeline_panel.clear()
         self.current_part_id = None
@@ -21783,7 +23166,9 @@ class BomPage(QWidget):
                 return str(value)
         return ""
 
-    def _update_details_summary(self, details: dict) -> None:
+    def _update_details_summary(
+        self, details: dict, associations=None, active_cad_checkout=None
+    ) -> None:
         self._current_part_details = dict(details or {})
         has_details = bool(self._current_part_details)
         self.view_full_details_btn.setEnabled(has_details)
@@ -21847,14 +23232,17 @@ class BomPage(QWidget):
         drawing_file = self._details_value(
             self._current_part_details, ("drawing", "base_drw_name", "drawing_number")
         )
-        try:
-            pdm_documents = self.bom_service.list_item_cad_associations(
-                int(self.current_part_id)
-            ) if self.current_part_id is not None else []
-        except Exception:
-            pdm_documents = []
+        if associations is None:
+            try:
+                pdm_documents = self.bom_service.list_item_cad_associations(
+                    int(self.current_part_id)
+                ) if self.current_part_id is not None else []
+            except Exception:
+                pdm_documents = []
+        else:
+            pdm_documents = list(associations or [])
         model_links = [
-            self._cad_representation_summary_line(row)
+            self._cad_representation_summary_line(row, include_path=False)
             for row in pdm_documents
             if str(row.get("category") or "").upper() != "DRAWING"
         ]
@@ -21912,9 +23300,14 @@ class BomPage(QWidget):
             field_label.show()
             value_label.show()
             value_label.setText(value)
-        self._update_lifecycle_action_states(self._current_part_details)
+        self._update_lifecycle_action_states(
+            self._current_part_details,
+            active_cad_checkout=active_cad_checkout,
+        )
 
-    def _update_lifecycle_action_states(self, details: dict) -> None:
+    def _update_lifecycle_action_states(
+        self, details: dict, active_cad_checkout=None
+    ) -> None:
         has_item = bool(details and getattr(self, "current_part_id", None))
         master_locked = bool(details.get("locked")) if has_item else False
         in_branch = bool(details.get("active_branch_id")) if has_item else False
@@ -21933,13 +23326,16 @@ class BomPage(QWidget):
         # Item Structure is an engineering workspace, not a read-only report.
         # Finishing an Item checkout also closes any remaining related CAD checkouts.
         read_only_ebom = False
-        try:
-            active_cad = (
-                self.bom_service.checked_out_cad_for_item(int(self.current_part_id))
-                if has_item and not in_branch else []
-            )
-        except Exception:
-            active_cad = []
+        if active_cad_checkout is None:
+            try:
+                active_cad = (
+                    self.bom_service.checked_out_cad_for_item(int(self.current_part_id))
+                    if has_item and not in_branch else []
+                )
+            except Exception:
+                active_cad = []
+        else:
+            active_cad = list(active_cad_checkout or []) if not in_branch else []
         checkout_origin = str(details.get("checkout_origin") or "ITEM").upper()
         lock_is_mine = (
             (int(branch_checkout["user_id"]) == int(self.session.user_id))
@@ -22250,14 +23646,15 @@ class BomPage(QWidget):
         layout.addWidget(buttons)
         dlg.exec_()
 
-    def refresh_issues_tab(self):
+    def refresh_issues_tab(self, issues=None):
         if not getattr(self, "current_part_id", None):
             self.part_issues_table.setRowCount(0)
             return
-        try:
-            issues = self.issue_service.issues_for_part(int(self.current_part_id))
-        except Exception:
-            issues = []
+        if issues is None:
+            try:
+                issues = self.issue_service.issues_for_part(int(self.current_part_id))
+            except Exception:
+                issues = []
         self.part_issues_table.setRowCount(len(issues))
         for row, issue in enumerate(issues):
             values = [issue["issue_number"], issue["title"], issue["status"], issue["priority"]]

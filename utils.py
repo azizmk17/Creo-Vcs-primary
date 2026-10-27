@@ -8,6 +8,7 @@ import shutil
 import hashlib
 import tempfile
 import subprocess
+from core.performance_recorder import timed
 
 
 def long_path(path: str) -> str:
@@ -27,22 +28,27 @@ def long_path(path: str) -> str:
     return "\\\\?\\" + os.path.abspath(normalized)
 
 
+@timed("filesystem.exists", event=False)
 def safe_exists(path: str) -> bool:
     return bool(path and os.path.exists(long_path(path)))
 
 
+@timed("filesystem.isdir", event=False)
 def safe_isdir(path: str) -> bool:
     return bool(path and os.path.isdir(long_path(path)))
 
 
+@timed("filesystem.isfile", event=False)
 def safe_isfile(path: str) -> bool:
     return bool(path and os.path.isfile(long_path(path)))
 
 
+@timed("filesystem.listdir", event=False)
 def safe_listdir(path: str):
     return os.listdir(long_path(path))
 
 
+@timed("filesystem.copy")
 def safe_copy2(src: str, dst: str):
     ensure_dir_exists(os.path.dirname(dst))
     return shutil.copy2(long_path(src), long_path(dst))

@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+from core.performance_recorder import timed
 from pathlib import Path
 import re
 import shutil
@@ -1719,6 +1720,7 @@ class NexusHistoryService:
                     "native_state": "Validated" if affected and all(validation.get(key) == "Validated" for key in affected)
                                     else "Under development"}
 
+    @timed("branch.merge")
     def merge(self, preview, decisions, note):
         """Recheck a three-way review under the master lock, then publish atomically."""
         self._require("merge")

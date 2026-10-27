@@ -21,12 +21,25 @@ def enabled():
 
 
 def mark(name, *, flush=False, **details):
-    if not _TARGET:
-        return
     if len(_EVENTS) < 512:
         _EVENTS.append(dict(stage=name, seconds=round(time.perf_counter() - _ORIGIN, 6), **details))
-    if flush or os.environ.get("NEXUS_STARTUP_PROFILE_EACH_STAGE") == "1":
+    if _TARGET and (flush or os.environ.get("NEXUS_STARTUP_PROFILE_EACH_STAGE") == "1"):
         save()
+
+
+def milestones():
+    """Return only known, non-sensitive stages for an opt-in session report."""
+    allowed = {
+        "frozen_entry", "main_module_entered", "main_imports_ready",
+        "qt_application_ready", "workspace_resolved", "workspace_compatible",
+        "license_verified", "login_constructed", "login_painted",
+        "login_authenticated", "shell_construction_started", "shell_constructed",
+        "shell_painted",
+    }
+    return [
+        {"stage": event["stage"], "seconds": event["seconds"]}
+        for event in _EVENTS if event.get("stage") in allowed
+    ]
 
 
 def save():

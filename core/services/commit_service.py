@@ -17,6 +17,7 @@ from core.services.user_service import UserService
 from core.services.base_service import BaseService
 from core.services.project_service import ProjectService
 from core.session_manager import SessionManager
+from core.performance_recorder import timed
 from core.services.permission_decorators import require_permission
 from core.services.issue_service import IssueService
 from core.services.traceability_service import TraceabilityService
@@ -515,6 +516,7 @@ class CommitService(BaseService):
         return manifest_rows
 
     @require_permission("commit")
+    @timed("commit.checkin")
     def commit_file(
         self,
         commit_dir,
@@ -1140,6 +1142,7 @@ class CommitService(BaseService):
         }
 
     @require_permission("merge")
+    @timed("commit.push_master")
     def push_unvalidated_to_master(self, commit_id: str) -> dict:
         """Master/admin publication of a whole Pending snapshot, without approval."""
         from core.services.master_work_service import MasterWorkService
@@ -1195,6 +1198,7 @@ class CommitService(BaseService):
         return result
 
     @require_permission("commit")
+    @timed("commit.push_branch")
     def push_commit_to_nexus_branch(self, commit_id: str, branch_id: str) -> dict:
         """Route a Pending/Validated submission into an isolated Nexus branch."""
         from core.services.nexus_history_service import NexusHistoryService
@@ -1619,6 +1623,7 @@ class CommitService(BaseService):
 
     
     @require_permission("validate")
+    @timed("commit.validate")
     def validate_commit(self, commit_id: int, project_id: int = None,
                         confirmed_issue_ids=None, rejected_issue_ids=None, validation_comment=""):
         result = self.commit_repository.validate(

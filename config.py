@@ -3,7 +3,7 @@ import sqlite3
 from pathlib import Path
 
 # Application version — bump this string with each release.
-APP_VERSION = "4.8.0"
+APP_VERSION = "4.9.0"
 
 # ---------------------------------------------------------------------------
 # Database path
@@ -119,15 +119,23 @@ def _install_sqlite_runtime_profile() -> None:
 
     def nexus_connect(database, *args, **kwargs):
         kwargs.setdefault("timeout", SQLITE_TIMEOUT_SECONDS)
-        conn = original_connect(database, *args, **kwargs)
+        from core.performance_recorder import RecordingConnection, recorder
+
+        span = recorder.begin("sqlite.connection_and_setup")
+        if span is not None and len(args) < 5 and "factory" not in kwargs:
+            kwargs["factory"] = RecordingConnection
         try:
+            conn = original_connect(database, *args, **kwargs)
             from core.updates.compatibility import guard_connection
 
             guard_connection(conn, database)
             _configure_sqlite_connection(conn, database)
         except Exception:
-            conn.close()
+            if "conn" in locals():
+                conn.close()
+            recorder.end(span, "error", event=False)
             raise
+        recorder.end(span, event=False)
         return conn
 
     sqlite3.connect = nexus_connect

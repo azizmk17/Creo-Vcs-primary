@@ -1,8 +1,82 @@
 # Company workspace performance test
 
-Use the installed Nexus EXE, the actual company database location, and an actual
-company project/version. No Python or Anaconda installation is required for the
-EXE commands below. Keep the complete EXE/DLL installation together.
+Use a Nexus **4.9.0 or newer** build containing the **Performance** recorder, the actual company
+database location, and a representative company project and version. The
+recorder works in the installed app; users do not need Python, Anaconda, a
+command prompt, or a separate benchmark project.
+
+The existing 4.8.0 EXE does not contain this recorder. Build 4.9.0 using
+[the Windows build guide](../README_BUILD_EXE.md), then deploy that build to the
+company computer. For an existing managed installation, follow the signed
+update process in [Release, installation, and updates](../README_RELEASE_UPDATES.md).
+For a fresh installation, extract the complete built folder and run `Setup.exe`.
+The recorder itself introduces no database migration.
+
+## Recommended: record and export from Nexus
+
+1. Open Nexus. On the sign-in screen, click **Performance recording…**.
+2. Select **Company network / Wi-Fi** or **VPN** and the session type. Click
+   **Start recording**, then **Close**. The recording continues in the background.
+3. Sign in. Select the product and version you want to measure, then load it.
+4. When the BOM is ready, expand the same large assembly, select several items,
+   open an item's Structure and Managed Files tabs, and perform a search. Wait
+   for the project file check to finish. You can also open Commit and Issues.
+   For checkout, check-in, or merge timings, use an appropriate test item and
+   follow your company's normal workflow.
+5. Click **Performance: Recording** on the top toolbar and select
+   **Stop and save report…**. Choose the Desktop or another **local** folder.
+6. Send the resulting `Nexus-performance-....zip` file for analysis. The ZIP
+   contains `summary.txt`, `performance.json`, and a short README. No command
+   is required.
+
+You can also start recording from the **Performance** button after signing in.
+Starting before sign-in records more of the session. If Nexus is closed while a
+recording is active, it offers to save the report; canceling the save leaves the
+recording running.
+
+For a useful comparison, repeat the same sequence at least three times using
+the same project/version and assembly. Mark the first session and subsequent
+sessions using the **Session** selector. Repeat separately over VPN if that is
+relevant. Use a different ZIP for each run; keep failed or unusually slow runs.
+The selector is your description of the session, not proof that Windows or the
+server cache is cold.
+
+### What the report contains
+
+The recorder includes the app version, Python/frozen runtime, Windows version,
+UTC start time, your selected connection/session type, startup milestones,
+operation durations, aggregate SQLite connection/statement/fetch timings and
+counts, selected file-check timings, event-loop timer delays, and periodic CPU
+and memory samples for the Nexus process. It also
+captures named background checks, BOM loading, item details, expansion, search,
+and instrumented checkout/commit/merge operations when they actually occur.
+
+It does **not** copy the database, CAD files, PDFs, or STEP files. It does not
+include SQL text or parameters, item names, project names, user names, or file
+paths. You may review `summary.txt` and `performance.json` before sharing.
+
+Interpretation limits:
+
+- Startup milestones begin at the Python entry point; they do not include all
+  operating-system process launch and EXE loading time. They may start before
+  the recording button was pressed. No database calls before recording began
+  are included.
+- SQLite timings cover connections opened through the app's instrumented
+  connection wrapper while recording is active. Existing connections, custom
+  factories, SQLite cursor iteration, and some implicit operations may be
+  absent. Execution, fetch, connection, and transaction durations can overlap.
+  They are wall time, not separate measurements of network, disk, CPU, or locks.
+- File timings cover instrumented checks and scan operations, not every file
+  operation in Nexus or Creo. Event-loop delay includes OS scheduling, sleep,
+  and backgrounding; it is not proof of an app freeze.
+- CPU percentage is relative to one logical CPU, so a multi-threaded process
+  may exceed 100%. The working-set value is sampled Windows physical memory,
+  not a continuous peak. Neither includes separate Creo or CAD Viewer processes.
+- Recording adds overhead. Operations still in progress at export may be absent;
+  wait for the activity you want to measure to finish. Histograms use the upper
+  bounds in the JSON; a missing metric means it was not observed.
+
+## Optional: older external measurements
 
 ## What these measurements cover
 
@@ -13,10 +87,8 @@ Collect both kinds of evidence:
 | Normal interactive session + startup trace | Real startup/workspace/license checks and the visible experience using the company database and project | The startup trace has no detailed BOM/query/file-operation timings; record the actions below separately |
 | EXE component benchmark JSON | BOM service setup, structure loading, initial row creation, GUI refresh, file synchronization, integrity checking, and controlled metadata writes | Database operations run on temporary local copies. Project files are read from their configured location. This is not a measurement of shared-database query/write latency |
 
-The current app does **not** have a complete live-session performance recorder
-or a one-click performance ZIP export. Do not treat the component JSON as an
-end-to-end company-network result. An in-app recorder would be needed for
-automatic timing of live SQL, UI stalls, and every user operation.
+Do not treat the component JSON as an end-to-end company-network result. The
+in-app recording above is more representative of an interactive company run.
 The component runner also uses a hidden Qt view and the first assigned project
 user for its test session. Its view and permissions may differ from those of the
 person doing the interactive test. Keep these limits in mind when comparing runs.
@@ -25,8 +97,7 @@ person doing the interactive test. Keep these limits in mind when comparing runs
 
 1. Use the exact app build that will be deployed, installed on the laptop's
    local disk. Record its version. Before first deployment of a newer version,
-   take the normal database backup because ordinary app startup may apply its
-   database migrations.
+   follow the workspace's normal backup and administrator migration procedure.
 2. Select one representative large project and its version. Use the same pair
    throughout the repeated runs.
 3. Record whether you are on company LAN/Wi-Fi or VPN, where the database and
@@ -173,5 +244,5 @@ $zip
 Send the ZIP containing startup JSON, component JSON/logs, and `notes.md`.
 The analysis can compare first versus repeated runs, medians and ranges,
 component bottlenecks, scan completeness, and the gap between local-copy
-benchmarks and the actual shared-workspace experience. Detailed attribution of
-that gap to individual live SQL queries still requires a live-session recorder.
+benchmarks and the actual shared-workspace experience. The in-app recorder
+groups SQL timings by operation type; it does not save individual SQL text.

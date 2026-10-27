@@ -35,6 +35,7 @@ from core.services.ui_permission import UIPermissionHelper
 from core.services.role_service import RoleService
 from core.services.project_service import ProjectService
 from core.session_manager import SessionManager
+from core.performance_recorder import measured, timed
 from core.services.issue_service import IssueService
 from pages.rich_text_image_editor import RichTextImageEditor, html_to_plain_text, looks_like_html
 from pages.dialogs.cad_workspace_dialogs import (
@@ -520,7 +521,9 @@ class _ProcessingWorker(QObject):
 
     def run(self):
         try:
-            self.finished.emit(self._fn())
+            with measured("commit.background_processing"):
+                result = self._fn()
+            self.finished.emit(result)
         except Exception as exc:
             self.failed.emit(exc)
 
@@ -2017,6 +2020,7 @@ class CommitPage(QWidget):
     #  PENDING COMMITS
     # ═══════════════════════════════════════════════════════════════════
 
+    @timed("commit.pending_view_refresh")
     def load_pending_commits(self):
         commits = self.commit_service.get_pending_commits_grouped(
             self.session.project_id, self.session.user_id, self.is_designer
@@ -2126,6 +2130,7 @@ class CommitPage(QWidget):
     #  COMMIT HISTORY
     # ═══════════════════════════════════════════════════════════════════
 
+    @timed("commit.history_view_refresh")
     def load_commit_history(self):
         self._history_cache = []
         if not self.commit_service:
