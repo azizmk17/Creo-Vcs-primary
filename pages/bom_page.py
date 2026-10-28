@@ -2361,27 +2361,32 @@ class _IndicatorDataWorker(QObject):
             for part_id in self.part_ids:
                 if self._cancelled:
                     return
-                issues = {
-                    str(row[1])
-                    for row in self.missing_by_part.get(part_id, [])
-                    if len(row) > 1
-                }
-                summary = context._indicator_summary_for_part(part_id, issues)
-                latest = context._master_change_commit_for_part(part_id)
-                native_state = native_work_state(latest) if latest else "Not recorded"
-                native_tip = (
-                    f"Master native: {latest.commit_id} — {native_state}"
-                    if latest else
-                    "No master submission is recorded for this Item. See Item Status for its controlled parameter."
-                )
-                result[part_id] = {
-                    "summary": summary,
-                    "integrity": _integrity_payload(
-                        part_id, self.missing_by_part, self.missing_ids
-                    ),
-                    "native_state": native_state,
-                    "native_tooltip": native_tip,
-                }
+                try:
+                    issues = {
+                        str(row[1])
+                        for row in self.missing_by_part.get(part_id, [])
+                        if len(row) > 1
+                    }
+                    summary = context._indicator_summary_for_part(part_id, issues)
+                    latest = context._master_change_commit_for_part(part_id)
+                    native_state = native_work_state(latest) if latest else "Not recorded"
+                    native_tip = (
+                        f"Master native: {latest.commit_id} — {native_state}"
+                        if latest else
+                        "No master submission is recorded for this Item. See Item Status for its controlled parameter."
+                    )
+                    result[part_id] = {
+                        "summary": summary,
+                        "integrity": _integrity_payload(
+                            part_id, self.missing_by_part, self.missing_ids
+                        ),
+                        "native_state": native_state,
+                        "native_tooltip": native_tip,
+                    }
+                except Exception as exc:
+                    # Isolate a bad attachment/commit lookup to its Item so it
+                    # cannot discard the rest of this indicator batch.
+                    result[part_id] = {"lookup_error": str(exc)}
                 if len(result) >= 24:
                     if self._cancelled:
                         return
@@ -3453,6 +3458,7 @@ class BomPage(QWidget):
         self._indicator_seen_items = set()
         self._indicator_collected_rows = defaultdict(list)
         self._indicator_apply_queue = deque()
+        self._indicator_retry_counts = {}
 
         self._pdm_root_build_timer = QTimer(self)
         self._pdm_root_build_timer.setInterval(12)
@@ -11272,11 +11278,34 @@ class BomPage(QWidget):
                     self._add_pdm_root_item(state["mode"], roots[state["index"]])
                     state["index"] += 1
                     processed += 1
-        except (RuntimeError, IndexError):
+            total_roots = len(state["roots"])
+            completed_roots = int(state["index"])
+            if completed_roots < total_roots:
+                structure_label = "BOM" if state["mode"] == "ebom" else "CAD"
+                self._tree_loading_label.setText(
+                    f"Loading {structure_label} roots… {completed_roots} of {total_roots}"
+                )
+        except (RuntimeError, IndexError) as exc:
             self._pdm_root_build_timer.stop()
             self._pdm_root_build = None
-            tree.setUpdatesEnabled(True)
-            self._set_tree_loading(False)
+            try:
+                tree.setUpdatesEnabled(True)
+            except RuntimeError:
+                pass
+            if self._structure_loading:
+                self._on_structure_failed(
+                    self._structure_load_seq,
+                    int(self.session.project_id or 0),
+                    state["mode"],
+                    f"Could not finish drawing all root items: {exc}",
+                )
+            else:
+                self._set_tree_loading(False)
+                self.show_alert(
+                    f"Could not finish drawing all root items: {exc}. "
+                    "Refresh the BOM to try again.",
+                    "error",
+                )
             return
         except Exception as exc:
             self._pdm_root_build_timer.stop()
@@ -11335,6 +11364,59 @@ class BomPage(QWidget):
             else:
                 if not getattr(self, "_pdm_ebom_scope_path", []):
                     self._render_pdm_folder_context("EBOM", None, [tree])
+                    # The tree is rendered over multiple timer slices. Reconcile
+                    # the finished tree against the root page so a missed Qt row
+                    # cannot leave a plausible-looking but incomplete BOM.
+                    page = getattr(self, "_ebom_root_page", {}) or {}
+                    expected_roots = [
+                        root for root in (page.get("roots") or [])
+                        if not self._is_deleted_bom_payload(root)
+                    ]
+                    expected_ids = {
+                        int(root.get("bom_id") or root.get("id"))
+                        for root in expected_roots
+                        if root.get("bom_id") is not None or root.get("id") is not None
+                    }
+                    present_ids = set()
+                    for item in self._iter_tree_items(tree):
+                        if (
+                            self._is_lazy_placeholder(item)
+                            or self._is_folder_tree_item(item)
+                            or item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD
+                        ):
+                            continue
+                        try:
+                            present_ids.add(int(item.data(0, Qt.UserRole)))
+                        except (TypeError, ValueError):
+                            continue
+                    missing_roots = [
+                        root for root in expected_roots
+                        if int(root.get("bom_id") or root.get("id") or 0) not in present_ids
+                    ]
+                    for root in missing_roots:
+                        self._add_pdm_root_item("ebom", root)
+                    if missing_roots:
+                        self._render_pdm_folder_context("EBOM", None, [tree])
+                        present_ids = set()
+                        for item in self._iter_tree_items(tree):
+                            if (
+                                self._is_lazy_placeholder(item)
+                                or self._is_folder_tree_item(item)
+                                or item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD
+                            ):
+                                continue
+                            try:
+                                present_ids.add(int(item.data(0, Qt.UserRole)))
+                            except (TypeError, ValueError):
+                                continue
+                    still_missing = expected_ids - present_ids
+                    if still_missing:
+                        self.show_alert(
+                            f"The BOM root list is incomplete: {len(still_missing)} "
+                            f"of {len(expected_ids)} root item(s) could not be drawn. "
+                            "Refresh the BOM to retry.",
+                            "error",
+                        )
                 self._renumber_tree_rows(tree)
                 page = getattr(self, "_ebom_root_page", {}) or {}
                 if not getattr(self, "_pdm_ebom_scope_path", []) and page.get("has_more"):
@@ -21306,10 +21388,10 @@ class BomPage(QWidget):
 
         cached = self._doc_indicator_cache.get(pid)
         if cached is None:
-            try:
-                attachments = self.part_file_service.list_attachments(pid)
-            except Exception:
-                attachments = []
+            # A failed DB lookup is not the same as having no attachments.
+            # Let the background worker retry it instead of painting a false
+            # gray "absent" badge.
+            attachments = self.part_file_service.list_attachments(pid)
             latest_commit = self._master_change_commit_for_part(pid)
             cached = {
                 "pdf": self._doc_indicator_state(pid, "PDF", attachments, latest_commit),
@@ -22145,6 +22227,7 @@ class BomPage(QWidget):
         self._indicator_collected_rows.clear()
         self._indicator_apply_queue.clear()
         self._indicator_pending_rows.clear()
+        self._indicator_retry_counts.clear()
         worker = self._indicator_worker
         if worker is not None:
             try:
@@ -22296,12 +22379,70 @@ class BomPage(QWidget):
         if int(project_id) != int(self.session.project_id or 0):
             return
         rows_by_part = self._indicator_pending_rows.get(int(request_id), {})
+        failed_parts = 0
         for raw_part_id, result in (results or {}).items():
             part_id = int(raw_part_id)
-            for item in rows_by_part.pop(part_id, []):
+            rows = rows_by_part.pop(part_id, [])
+            if result.get("lookup_error"):
+                if self._retry_or_finalize_indicator_part(
+                    part_id, rows, str(result.get("lookup_error"))
+                ):
+                    failed_parts += 1
+                continue
+            for item in rows:
                 self._indicator_apply_queue.append((item, part_id, result))
         if self._indicator_apply_queue and not self._indicator_refresh_timer.isActive():
             self._indicator_refresh_timer.start()
+        if failed_parts:
+            self.show_alert(
+                f"Could not resolve PDF/STEP status for {failed_parts} item(s). "
+                "Their badges are marked unverified. Refresh to retry.",
+                "warning",
+            )
+
+    def _retry_or_finalize_indicator_part(self, part_id: int, rows, error: str) -> bool:
+        live_rows = []
+        for item in rows or []:
+            try:
+                if item.treeWidget() is not None:
+                    live_rows.append(item)
+            except RuntimeError:
+                continue
+        if not live_rows:
+            return False
+
+        retry_count = int(self._indicator_retry_counts.get(int(part_id), 0))
+        if retry_count < 2:
+            self._indicator_retry_counts[int(part_id)] = retry_count + 1
+            for item in live_rows:
+                self._indicator_seen_items.discard(id(item))
+                self._indicator_refresh_queue.append((item, int(part_id)))
+            if not self._indicator_refresh_timer.isActive():
+                self._indicator_refresh_timer.start()
+            return False
+
+        detail = str(error or "Unknown lookup error").strip()
+        if len(detail) > 180:
+            detail = detail[:177] + "..."
+        message = f"Status lookup failed after two retries: {detail}. Use Refresh to try again."
+        failure = {
+            "summary": {
+                "pdf": {"state": "unverified", "tooltip": f"PDF: {message}"},
+                "step": {"state": "unverified", "tooltip": f"STEP: {message}"},
+            },
+            "integrity": _integrity_payload(
+                int(part_id),
+                getattr(self, "_missing_files_by_part", {}),
+                getattr(self, "missing_ids", set()),
+            ),
+            "native_state": "Not verified",
+            "native_tooltip": "Master native status could not be checked. Use Refresh to retry.",
+        }
+        for item in live_rows:
+            self._indicator_apply_queue.append((item, int(part_id), failure))
+        if not self._indicator_refresh_timer.isActive():
+            self._indicator_refresh_timer.start()
+        return True
 
     def _apply_indicator_result_to_item(self, item, part_id: int, result: dict) -> None:
         summary = result.get("summary") or {}
@@ -22344,15 +22485,27 @@ class BomPage(QWidget):
             str(summary.get("step", {}).get("tooltip", "STEP: unknown")),
         ])
         item.setToolTip(BOM_COL_NAME, "\n".join(name_tips))
+        try:
+            tree = item.treeWidget()
+            if tree is not None:
+                tree.viewport().update(tree.visualItemRect(item))
+        except RuntimeError:
+            pass
 
     def _on_indicator_data_finished(self, request_id: int, project_id: int) -> None:
-        self._indicator_pending_rows.pop(int(request_id), None)
+        rows_by_part = self._indicator_pending_rows.pop(int(request_id), {})
         if int(request_id) != self._indicator_request_seq:
             return
         self._indicator_worker = None
         self._indicator_thread = None
         if int(project_id) != int(self.session.project_id or 0):
             return
+        failed_parts = 0
+        for part_id, rows in rows_by_part.items():
+            if self._retry_or_finalize_indicator_part(
+                int(part_id), rows, "The lookup returned no status for this Item."
+            ):
+                failed_parts += 1
         pending = (
             self._indicator_apply_queue or self._indicator_refresh_queue
             or self._indicator_scan_iterators or self._indicator_collected_rows
@@ -22362,19 +22515,43 @@ class BomPage(QWidget):
                 self._indicator_refresh_timer.start()
         else:
             self._indicator_refresh_timer.stop()
+        if failed_parts:
+            self.show_alert(
+                f"PDF/STEP status was not returned for {failed_parts} item(s). "
+                "Their badges are marked unverified. Refresh to retry.",
+                "warning",
+            )
 
-    def _on_indicator_data_failed(self, request_id: int, project_id: int, _error: str) -> None:
-        self._indicator_pending_rows.pop(int(request_id), None)
+    def _on_indicator_data_failed(self, request_id: int, project_id: int, error: str) -> None:
+        rows_by_part = self._indicator_pending_rows.pop(int(request_id), {})
         if int(request_id) != self._indicator_request_seq:
             return
         self._indicator_worker = None
         self._indicator_thread = None
+        if int(project_id) != int(self.session.project_id or 0):
+            return
+
+        failed_parts = 0
+        for raw_part_id, rows in rows_by_part.items():
+            try:
+                part_id = int(raw_part_id)
+            except (TypeError, ValueError):
+                continue
+            if self._retry_or_finalize_indicator_part(part_id, rows, error):
+                failed_parts += 1
+
         if (self._indicator_refresh_queue or self._indicator_scan_iterators
                 or self._indicator_collected_rows or self._indicator_apply_queue):
             if not self._indicator_refresh_timer.isActive():
                 self._indicator_refresh_timer.start()
         else:
             self._indicator_refresh_timer.stop()
+        if failed_parts:
+            self.show_alert(
+                f"Could not resolve PDF/STEP status for {failed_parts} item(s). "
+                "Their badges are marked unverified. Refresh to retry.",
+                "warning",
+            )
 
     def _clear_folder_selection(self) -> None:
         self.current_folder_id = None
