@@ -1,0 +1,1932 @@
+{
+  "format_version": 1,
+  "run_id": "b61a3741ce4140428644fd3b74c74656",
+  "started_utc": "2026-10-28T08:15:40.653966+00:00",
+  "duration_seconds": 215.205,
+  "app_version": "4.9.0",
+  "frozen": false,
+  "python_version": "3.12.12",
+  "platform": {
+    "system": "Windows",
+    "release": "11",
+    "architecture": "AMD64",
+    "logical_cpus": 12
+  },
+  "network_selected_by_user": "company_network",
+  "run_type_selected_by_user": "normal_work",
+  "startup_milestones": [
+    {
+      "stage": "main_module_entered",
+      "seconds": 2.3e-05
+    },
+    {
+      "stage": "main_imports_ready",
+      "seconds": 0.225746
+    },
+    {
+      "stage": "qt_application_ready",
+      "seconds": 0.271117
+    },
+    {
+      "stage": "workspace_resolved",
+      "seconds": 0.296714
+    },
+    {
+      "stage": "workspace_compatible",
+      "seconds": 0.422654
+    },
+    {
+      "stage": "license_verified",
+      "seconds": 0.528263
+    },
+    {
+      "stage": "login_constructed",
+      "seconds": 0.700706
+    },
+    {
+      "stage": "login_painted",
+      "seconds": 1.069411
+    },
+    {
+      "stage": "login_authenticated",
+      "seconds": 13.704211
+    },
+    {
+      "stage": "shell_construction_started",
+      "seconds": 13.745024
+    },
+    {
+      "stage": "shell_constructed",
+      "seconds": 15.808294
+    },
+    {
+      "stage": "shell_painted",
+      "seconds": 15.819844
+    }
+  ],
+  "histogram_upper_bounds_ms": [
+    1,
+    5,
+    10,
+    20,
+    50,
+    100,
+    250,
+    500,
+    1000,
+    2000,
+    5000,
+    10000,
+    30000,
+    60000,
+    null
+  ],
+  "metrics": {
+    "ui.event_loop_delay": {
+      "count": 1040,
+      "total_ms": 112578.351,
+      "mean_ms": 108.248,
+      "min_ms": 0.0,
+      "max_ms": 66453.693,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        159,
+        28,
+        48,
+        678,
+        63,
+        37,
+        7,
+        7,
+        9,
+        1,
+        1,
+        0,
+        1,
+        0,
+        1
+      ]
+    },
+    "sqlite.execute.SELECT": {
+      "count": 18755,
+      "total_ms": 27804.907,
+      "mean_ms": 1.483,
+      "min_ms": 0.006,
+      "max_ms": 420.354,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        11438,
+        6404,
+        895,
+        11,
+        1,
+        3,
+        2,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "sqlite.fetch.one": {
+      "count": 8791,
+      "total_ms": 132.243,
+      "mean_ms": 0.015,
+      "min_ms": 0.002,
+      "max_ms": 0.359,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        8791,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "sqlite.execute.PRAGMA": {
+      "count": 27459,
+      "total_ms": 18257.299,
+      "mean_ms": 0.665,
+      "min_ms": 0.003,
+      "max_ms": 14905.506,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        26701,
+        757,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0
+      ]
+    },
+    "sqlite.connection_and_setup": {
+      "count": 4496,
+      "total_ms": 70542.712,
+      "mean_ms": 15.69,
+      "min_ms": 9.896,
+      "max_ms": 308.369,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        0,
+        0,
+        4,
+        3721,
+        765,
+        4,
+        1,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "sqlite.fetch.all": {
+      "count": 5847,
+      "total_ms": 609.452,
+      "mean_ms": 0.104,
+      "min_ms": 0.001,
+      "max_ms": 96.515,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        5802,
+        28,
+        10,
+        6,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "sqlite.transaction_context": {
+      "count": 4494,
+      "total_ms": 10.511,
+      "mean_ms": 0.002,
+      "min_ms": 0.001,
+      "max_ms": 0.13,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        4494,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "sqlite.execute.CREATE": {
+      "count": 66,
+      "total_ms": 1144.908,
+      "mean_ms": 17.347,
+      "min_ms": 0.006,
+      "max_ms": 145.511,
+      "failed": 17,
+      "cancelled": 0,
+      "histogram_counts": [
+        45,
+        4,
+        0,
+        0,
+        10,
+        4,
+        3,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "login.submit": {
+      "count": 1,
+      "total_ms": 85.57,
+      "mean_ms": 85.57,
+      "min_ms": 85.57,
+      "max_ms": 85.57,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "sqlite.execute.UPDATE": {
+      "count": 90,
+      "total_ms": 422.777,
+      "mean_ms": 4.698,
+      "min_ms": 0.061,
+      "max_ms": 82.213,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        47,
+        39,
+        0,
+        0,
+        0,
+        4,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "sqlite.executescript": {
+      "count": 100,
+      "total_ms": 409.088,
+      "mean_ms": 4.091,
+      "min_ms": 0.919,
+      "max_ms": 11.459,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        2,
+        66,
+        31,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "sqlite.execute.DELETE": {
+      "count": 14,
+      "total_ms": 21.657,
+      "mean_ms": 1.547,
+      "min_ms": 0.416,
+      "max_ms": 3.522,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        6,
+        8,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "sqlite.commit": {
+      "count": 4,
+      "total_ms": 0.133,
+      "mean_ms": 0.033,
+      "min_ms": 0.03,
+      "max_ms": 0.037,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        4,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "bom.ebom_level_query": {
+      "count": 5,
+      "total_ms": 707.342,
+      "mean_ms": 141.468,
+      "min_ms": 119.193,
+      "max_ms": 160.925,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        5,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "bom.project_structure_worker": {
+      "count": 1,
+      "total_ms": 318.488,
+      "mean_ms": 318.488,
+      "min_ms": 318.488,
+      "max_ms": 318.488,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "diagnostics.directory_inventory": {
+      "count": 2,
+      "total_ms": 123.056,
+      "mean_ms": 61.528,
+      "min_ms": 47.022,
+      "max_ms": 76.034,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "diagnostics.file_synchronization": {
+      "count": 1,
+      "total_ms": 108.397,
+      "mean_ms": 108.397,
+      "min_ms": 108.397,
+      "max_ms": 108.397,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "ui.project_structure_ready": {
+      "count": 1,
+      "total_ms": 608.864,
+      "mean_ms": 608.864,
+      "min_ms": 608.864,
+      "max_ms": 608.864,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "diagnostics.integrity_check": {
+      "count": 2,
+      "total_ms": 379.077,
+      "mean_ms": 189.538,
+      "min_ms": 157.579,
+      "max_ms": 221.497,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        2,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "ui.initial_diagnostics_ready": {
+      "count": 1,
+      "total_ms": 316.326,
+      "mean_ms": 316.326,
+      "min_ms": 316.326,
+      "max_ms": 316.326,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "filesystem.exists": {
+      "count": 25,
+      "total_ms": 717.722,
+      "mean_ms": 28.709,
+      "min_ms": 0.003,
+      "max_ms": 249.703,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        6,
+        13,
+        1,
+        0,
+        1,
+        1,
+        3,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "ui.project_event_poll": {
+      "count": 32,
+      "total_ms": 957.845,
+      "mean_ms": 29.933,
+      "min_ms": 12.541,
+      "max_ms": 40.104,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        0,
+        0,
+        0,
+        5,
+        27,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "item.details_query": {
+      "count": 4,
+      "total_ms": 1120.933,
+      "mean_ms": 280.233,
+      "min_ms": 158.13,
+      "max_ms": 573.499,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        3,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "sqlite.execute.WITH": {
+      "count": 4,
+      "total_ms": 7.802,
+      "mean_ms": 1.95,
+      "min_ms": 1.6,
+      "max_ms": 2.298,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        0,
+        4,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "item.history_query": {
+      "count": 2,
+      "total_ms": 542.424,
+      "mean_ms": 271.212,
+      "min_ms": 62.346,
+      "max_ms": 480.077,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "item.managed_files_query": {
+      "count": 2,
+      "total_ms": 1235.945,
+      "mean_ms": 617.973,
+      "min_ms": 49.421,
+      "max_ms": 1186.524,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "ui.item_details_ready": {
+      "count": 2,
+      "total_ms": 3535.954,
+      "mean_ms": 1767.977,
+      "min_ms": 1069.279,
+      "max_ms": 2466.675,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "ui.ebom_expand": {
+      "count": 4,
+      "total_ms": 739.154,
+      "mean_ms": 184.789,
+      "min_ms": 165.512,
+      "max_ms": 203.318,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        4,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "item.file_history_query": {
+      "count": 3,
+      "total_ms": 493.35,
+      "mean_ms": 164.45,
+      "min_ms": 122.901,
+      "max_ms": 246.706,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        3,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "sqlite.execute.INSERT": {
+      "count": 8,
+      "total_ms": 27.924,
+      "mean_ms": 3.49,
+      "min_ms": 1.868,
+      "max_ms": 4.952,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        0,
+        8,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "ui.managed_file_selection": {
+      "count": 1,
+      "total_ms": 409.741,
+      "mean_ms": 409.741,
+      "min_ms": 409.741,
+      "max_ms": 409.741,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "ui.page_navigation": {
+      "count": 6,
+      "total_ms": 5523.546,
+      "mean_ms": 920.591,
+      "min_ms": 9.209,
+      "max_ms": 4345.286,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        0,
+        0,
+        1,
+        2,
+        0,
+        0,
+        0,
+        1,
+        1,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "commit.pending_view_refresh": {
+      "count": 1,
+      "total_ms": 14.637,
+      "mean_ms": 14.637,
+      "min_ms": 14.637,
+      "max_ms": 14.637,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "commit.history_view_refresh": {
+      "count": 1,
+      "total_ms": 78945.883,
+      "mean_ms": 78945.883,
+      "min_ms": 78945.883,
+      "max_ms": 78945.883,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    },
+    "issues.view_refresh": {
+      "count": 1,
+      "total_ms": 1160.939,
+      "mean_ms": 1160.939,
+      "min_ms": 1160.939,
+      "max_ms": 1160.939,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "sqlite.execute.BEGIN": {
+      "count": 1,
+      "total_ms": 1.98,
+      "mean_ms": 1.98,
+      "min_ms": 1.98,
+      "max_ms": 1.98,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "sqlite.execute.ROLLBACK": {
+      "count": 1,
+      "total_ms": 0.07,
+      "mean_ms": 0.07,
+      "min_ms": 0.07,
+      "max_ms": 0.07,
+      "failed": 0,
+      "cancelled": 0,
+      "histogram_counts": [
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "events": [
+    {
+      "operation": "login.submit",
+      "ended_after_start_ms": 8108.889,
+      "duration_ms": 85.57,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.event_loop_delay",
+      "ended_after_start_ms": 9011.289,
+      "duration_ms": 787.765,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.event_loop_delay",
+      "ended_after_start_ms": 9986.644,
+      "duration_ms": 875.309,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.event_loop_delay",
+      "ended_after_start_ms": 10349.059,
+      "duration_ms": 262.445,
+      "outcome": "ok"
+    },
+    {
+      "operation": "bom.ebom_level_query",
+      "ended_after_start_ms": 10748.886,
+      "duration_ms": 143.347,
+      "outcome": "ok"
+    },
+    {
+      "operation": "bom.project_structure_worker",
+      "ended_after_start_ms": 10856.759,
+      "duration_ms": 318.488,
+      "outcome": "ok"
+    },
+    {
+      "operation": "diagnostics.directory_inventory",
+      "ended_after_start_ms": 10907.437,
+      "duration_ms": 47.022,
+      "outcome": "ok"
+    },
+    {
+      "operation": "diagnostics.file_synchronization",
+      "ended_after_start_ms": 11015.884,
+      "duration_ms": 108.397,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_structure_ready",
+      "ended_after_start_ms": 11096.917,
+      "duration_ms": 608.864,
+      "outcome": "ok"
+    },
+    {
+      "operation": "diagnostics.integrity_check",
+      "ended_after_start_ms": 11173.491,
+      "duration_ms": 157.579,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.initial_diagnostics_ready",
+      "ended_after_start_ms": 11173.69,
+      "duration_ms": 316.326,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 14522.586,
+      "duration_ms": 31.535,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.event_loop_delay",
+      "ended_after_start_ms": 15933.135,
+      "duration_ms": 590.46,
+      "outcome": "ok"
+    },
+    {
+      "operation": "item.details_query",
+      "ended_after_start_ms": 16142.843,
+      "duration_ms": 208.872,
+      "outcome": "ok"
+    },
+    {
+      "operation": "item.history_query",
+      "ended_after_start_ms": 16242.381,
+      "duration_ms": 62.346,
+      "outcome": "ok"
+    },
+    {
+      "operation": "item.managed_files_query",
+      "ended_after_start_ms": 16312.556,
+      "duration_ms": 49.421,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.item_details_ready",
+      "ended_after_start_ms": 16562.023,
+      "duration_ms": 1069.279,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.event_loop_delay",
+      "ended_after_start_ms": 16623.272,
+      "duration_ms": 307.611,
+      "outcome": "ok"
+    },
+    {
+      "operation": "bom.ebom_level_query",
+      "ended_after_start_ms": 18337.693,
+      "duration_ms": 160.925,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.ebom_expand",
+      "ended_after_start_ms": 18346.733,
+      "duration_ms": 193.362,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 18510.309,
+      "duration_ms": 28.632,
+      "outcome": "ok"
+    },
+    {
+      "operation": "bom.ebom_level_query",
+      "ended_after_start_ms": 19382.941,
+      "duration_ms": 125.632,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.ebom_expand",
+      "ended_after_start_ms": 19398.984,
+      "duration_ms": 165.512,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 22525.842,
+      "duration_ms": 32.417,
+      "outcome": "ok"
+    },
+    {
+      "operation": "bom.ebom_level_query",
+      "ended_after_start_ms": 25955.231,
+      "duration_ms": 158.246,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.ebom_expand",
+      "ended_after_start_ms": 25970.44,
+      "duration_ms": 203.318,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 26526.981,
+      "duration_ms": 31.775,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 30513.967,
+      "duration_ms": 30.484,
+      "outcome": "ok"
+    },
+    {
+      "operation": "bom.ebom_level_query",
+      "ended_after_start_ms": 33080.054,
+      "duration_ms": 119.193,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.ebom_expand",
+      "ended_after_start_ms": 33103.483,
+      "duration_ms": 176.962,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 34524.08,
+      "duration_ms": 38.476,
+      "outcome": "ok"
+    },
+    {
+      "operation": "item.details_query",
+      "ended_after_start_ms": 35716.941,
+      "duration_ms": 180.432,
+      "outcome": "ok"
+    },
+    {
+      "operation": "item.history_query",
+      "ended_after_start_ms": 36233.58,
+      "duration_ms": 480.077,
+      "outcome": "ok"
+    },
+    {
+      "operation": "item.details_query",
+      "ended_after_start_ms": 36346.829,
+      "duration_ms": 573.499,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.event_loop_delay",
+      "ended_after_start_ms": 36692.84,
+      "duration_ms": 860.042,
+      "outcome": "ok"
+    },
+    {
+      "operation": "item.managed_files_query",
+      "ended_after_start_ms": 37466.886,
+      "duration_ms": 1186.524,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.item_details_ready",
+      "ended_after_start_ms": 37710.413,
+      "duration_ms": 2466.675,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.event_loop_delay",
+      "ended_after_start_ms": 37791.814,
+      "duration_ms": 316.04,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 38526.007,
+      "duration_ms": 32.103,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 42532.915,
+      "duration_ms": 38.263,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 46526.313,
+      "duration_ms": 33.382,
+      "outcome": "ok"
+    },
+    {
+      "operation": "item.details_query",
+      "ended_after_start_ms": 49854.876,
+      "duration_ms": 158.13,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.event_loop_delay",
+      "ended_after_start_ms": 50182.412,
+      "duration_ms": 460.007,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 50528.045,
+      "duration_ms": 32.601,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 54522.057,
+      "duration_ms": 35.861,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 58515.359,
+      "duration_ms": 33.613,
+      "outcome": "ok"
+    },
+    {
+      "operation": "item.file_history_query",
+      "ended_after_start_ms": 61974.732,
+      "duration_ms": 123.743,
+      "outcome": "ok"
+    },
+    {
+      "operation": "item.file_history_query",
+      "ended_after_start_ms": 62097.655,
+      "duration_ms": 122.901,
+      "outcome": "ok"
+    },
+    {
+      "operation": "item.file_history_query",
+      "ended_after_start_ms": 62097.677,
+      "duration_ms": 246.706,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.managed_file_selection",
+      "ended_after_start_ms": 62260.452,
+      "duration_ms": 409.741,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.event_loop_delay",
+      "ended_after_start_ms": 62264.111,
+      "duration_ms": 330.707,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 62517.009,
+      "duration_ms": 31.254,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.event_loop_delay",
+      "ended_after_start_ms": 64917.576,
+      "duration_ms": 896.579,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 66531.328,
+      "duration_ms": 40.104,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.page_navigation",
+      "ended_after_start_ms": 72240.696,
+      "duration_ms": 4345.286,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.event_loop_delay",
+      "ended_after_start_ms": 72321.956,
+      "duration_ms": 4356.923,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 72348.676,
+      "duration_ms": 26.64,
+      "outcome": "ok"
+    },
+    {
+      "operation": "commit.pending_view_refresh",
+      "ended_after_start_ms": 138834.912,
+      "duration_ms": 14.637,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.event_loop_delay",
+      "ended_after_start_ms": 138875.648,
+      "duration_ms": 66453.693,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 138888.261,
+      "duration_ms": 12.541,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 142504.901,
+      "duration_ms": 16.518,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 146586.125,
+      "duration_ms": 16.971,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 150557.826,
+      "duration_ms": 19.917,
+      "outcome": "ok"
+    },
+    {
+      "operation": "commit.history_view_refresh",
+      "ended_after_start_ms": 151301.559,
+      "duration_ms": 78945.883,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 154524.415,
+      "duration_ms": 36.163,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 158533.104,
+      "duration_ms": 35.852,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.event_loop_delay",
+      "ended_after_start_ms": 161158.51,
+      "duration_ms": 806.078,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 162532.331,
+      "duration_ms": 33.02,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.event_loop_delay",
+      "ended_after_start_ms": 165163.043,
+      "duration_ms": 316.955,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 166541.402,
+      "duration_ms": 37.711,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.page_navigation",
+      "ended_after_start_ms": 166970.261,
+      "duration_ms": 11.129,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.page_navigation",
+      "ended_after_start_ms": 169184.393,
+      "duration_ms": 9.209,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 170538.069,
+      "duration_ms": 34.722,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.page_navigation",
+      "ended_after_start_ms": 173564.069,
+      "duration_ms": 484.392,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.event_loop_delay",
+      "ended_after_start_ms": 173593.286,
+      "duration_ms": 432.914,
+      "outcome": "ok"
+    },
+    {
+      "operation": "issues.view_refresh",
+      "ended_after_start_ms": 174768.742,
+      "duration_ms": 1160.939,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.event_loop_delay",
+      "ended_after_start_ms": 174837.075,
+      "duration_ms": 1143.749,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 174866.29,
+      "duration_ms": 27.832,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.page_navigation",
+      "ended_after_start_ms": 177158.127,
+      "duration_ms": 662.547,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.event_loop_delay",
+      "ended_after_start_ms": 177170.964,
+      "duration_ms": 602.602,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 178528.89,
+      "duration_ms": 31.094,
+      "outcome": "ok"
+    },
+    {
+      "operation": "diagnostics.directory_inventory",
+      "ended_after_start_ms": 181574.074,
+      "duration_ms": 76.034,
+      "outcome": "ok"
+    },
+    {
+      "operation": "diagnostics.integrity_check",
+      "ended_after_start_ms": 181715.358,
+      "duration_ms": 221.497,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.event_loop_delay",
+      "ended_after_start_ms": 197517.726,
+      "duration_ms": 17006.683,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 197533.956,
+      "duration_ms": 14.695,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 198532.031,
+      "duration_ms": 32.106,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.page_navigation",
+      "ended_after_start_ms": 201602.628,
+      "duration_ms": 10.981,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 202529.801,
+      "duration_ms": 30.164,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.event_loop_delay",
+      "ended_after_start_ms": 207451.382,
+      "duration_ms": 993.97,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 207472.216,
+      "duration_ms": 20.752,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.event_loop_delay",
+      "ended_after_start_ms": 208293.59,
+      "duration_ms": 742.207,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.event_loop_delay",
+      "ended_after_start_ms": 210418.611,
+      "duration_ms": 228.394,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 210533.573,
+      "duration_ms": 29.403,
+      "outcome": "ok"
+    },
+    {
+      "operation": "ui.project_event_poll",
+      "ended_after_start_ms": 214538.858,
+      "duration_ms": 31.246,
+      "outcome": "ok"
+    }
+  ],
+  "dropped_events": 0,
+  "resource_samples": [
+    {
+      "after_start_ms": 2083.895,
+      "process_cpu_percent": 5.291,
+      "working_set_bytes": 93839360
+    },
+    {
+      "after_start_ms": 4161.543,
+      "process_cpu_percent": 0.752,
+      "working_set_bytes": 93925376
+    },
+    {
+      "after_start_ms": 6270.716,
+      "process_cpu_percent": 2.222,
+      "working_set_bytes": 93933568
+    },
+    {
+      "after_start_ms": 9011.327,
+      "process_cpu_percent": 25.085,
+      "working_set_bytes": 107593728
+    },
+    {
+      "after_start_ms": 11097.605,
+      "process_cpu_percent": 98.111,
+      "working_set_bytes": 155439104
+    },
+    {
+      "after_start_ms": 13161.015,
+      "process_cpu_percent": 36.349,
+      "working_set_bytes": 159674368
+    },
+    {
+      "after_start_ms": 15242.825,
+      "process_cpu_percent": 3.002,
+      "working_set_bytes": 159887360
+    },
+    {
+      "after_start_ms": 17332.708,
+      "process_cpu_percent": 49.345,
+      "working_set_bytes": 160899072
+    },
+    {
+      "after_start_ms": 19452.423,
+      "process_cpu_percent": 28.747,
+      "working_set_bytes": 163606528
+    },
+    {
+      "after_start_ms": 21485.652,
+      "process_cpu_percent": 8.454,
+      "working_set_bytes": 161705984
+    },
+    {
+      "after_start_ms": 23580.654,
+      "process_cpu_percent": 9.696,
+      "working_set_bytes": 161714176
+    },
+    {
+      "after_start_ms": 25672.912,
+      "process_cpu_percent": 14.189,
+      "working_set_bytes": 161480704
+    },
+    {
+      "after_start_ms": 27754.67,
+      "process_cpu_percent": 25.519,
+      "working_set_bytes": 161918976
+    },
+    {
+      "after_start_ms": 29827.906,
+      "process_cpu_percent": 11.305,
+      "working_set_bytes": 161931264
+    },
+    {
+      "after_start_ms": 31907.736,
+      "process_cpu_percent": 36.812,
+      "working_set_bytes": 156643328
+    },
+    {
+      "after_start_ms": 33989.637,
+      "process_cpu_percent": 21.014,
+      "working_set_bytes": 157929472
+    },
+    {
+      "after_start_ms": 36692.917,
+      "process_cpu_percent": 47.974,
+      "working_set_bytes": 164585472
+    },
+    {
+      "after_start_ms": 38798.024,
+      "process_cpu_percent": 37.113,
+      "working_set_bytes": 166617088
+    },
+    {
+      "after_start_ms": 40879.984,
+      "process_cpu_percent": 12.008,
+      "working_set_bytes": 166977536
+    },
+    {
+      "after_start_ms": 42957.255,
+      "process_cpu_percent": 5.265,
+      "working_set_bytes": 166711296
+    },
+    {
+      "after_start_ms": 45036.328,
+      "process_cpu_percent": 7.515,
+      "working_set_bytes": 166457344
+    },
+    {
+      "after_start_ms": 47116.246,
+      "process_cpu_percent": 5.259,
+      "working_set_bytes": 166457344
+    },
+    {
+      "after_start_ms": 49191.171,
+      "process_cpu_percent": 18.826,
+      "working_set_bytes": 166973440
+    },
+    {
+      "after_start_ms": 51276.573,
+      "process_cpu_percent": 20.979,
+      "working_set_bytes": 171331584
+    },
+    {
+      "after_start_ms": 53346.865,
+      "process_cpu_percent": 6.038,
+      "working_set_bytes": 171331584
+    },
+    {
+      "after_start_ms": 55429.961,
+      "process_cpu_percent": 12.752,
+      "working_set_bytes": 171843584
+    },
+    {
+      "after_start_ms": 57539.59,
+      "process_cpu_percent": 4.444,
+      "working_set_bytes": 171732992
+    },
+    {
+      "after_start_ms": 59634.141,
+      "process_cpu_percent": 4.476,
+      "working_set_bytes": 171757568
+    },
+    {
+      "after_start_ms": 61721.784,
+      "process_cpu_percent": 11.227,
+      "working_set_bytes": 171425792
+    },
+    {
+      "after_start_ms": 63810.048,
+      "process_cpu_percent": 20.95,
+      "working_set_bytes": 172503040
+    },
+    {
+      "after_start_ms": 65898.555,
+      "process_cpu_percent": 15.711,
+      "working_set_bytes": 196022272
+    },
+    {
+      "after_start_ms": 72322.001,
+      "process_cpu_percent": 44.757,
+      "working_set_bytes": 200323072
+    },
+    {
+      "after_start_ms": 138875.69,
+      "process_cpu_percent": 67.615,
+      "working_set_bytes": 216059904
+    },
+    {
+      "after_start_ms": 140969.186,
+      "process_cpu_percent": 99.265,
+      "working_set_bytes": 234942464
+    },
+    {
+      "after_start_ms": 142990.978,
+      "process_cpu_percent": 98.149,
+      "working_set_bytes": 252977152
+    },
+    {
+      "after_start_ms": 145099.772,
+      "process_cpu_percent": 99.287,
+      "working_set_bytes": 264212480
+    },
+    {
+      "after_start_ms": 147172.801,
+      "process_cpu_percent": 100.246,
+      "working_set_bytes": 279449600
+    },
+    {
+      "after_start_ms": 149207.368,
+      "process_cpu_percent": 99.069,
+      "working_set_bytes": 295784448
+    },
+    {
+      "after_start_ms": 151301.707,
+      "process_cpu_percent": 98.479,
+      "working_set_bytes": 308490240
+    },
+    {
+      "after_start_ms": 153353.816,
+      "process_cpu_percent": 6.853,
+      "working_set_bytes": 308498432
+    },
+    {
+      "after_start_ms": 155445.324,
+      "process_cpu_percent": 7.471,
+      "working_set_bytes": 308588544
+    },
+    {
+      "after_start_ms": 157522.406,
+      "process_cpu_percent": 7.523,
+      "working_set_bytes": 308588544
+    },
+    {
+      "after_start_ms": 159599.568,
+      "process_cpu_percent": 8.274,
+      "working_set_bytes": 308850688
+    },
+    {
+      "after_start_ms": 161669.185,
+      "process_cpu_percent": 34.728,
+      "working_set_bytes": 313765888
+    },
+    {
+      "after_start_ms": 163758.079,
+      "process_cpu_percent": 12.716,
+      "working_set_bytes": 313782272
+    },
+    {
+      "after_start_ms": 165831.576,
+      "process_cpu_percent": 25.623,
+      "working_set_bytes": 312459264
+    },
+    {
+      "after_start_ms": 167843.969,
+      "process_cpu_percent": 20.186,
+      "working_set_bytes": 313798656
+    },
+    {
+      "after_start_ms": 169879.564,
+      "process_cpu_percent": 29.937,
+      "working_set_bytes": 313802752
+    },
+    {
+      "after_start_ms": 171999.221,
+      "process_cpu_percent": 8.846,
+      "working_set_bytes": 313819136
+    },
+    {
+      "after_start_ms": 174837.157,
+      "process_cpu_percent": 39.642,
+      "working_set_bytes": 329752576
+    },
+    {
+      "after_start_ms": 177171.001,
+      "process_cpu_percent": 32.804,
+      "working_set_bytes": 330047488
+    },
+    {
+      "after_start_ms": 179216.015,
+      "process_cpu_percent": 6.113,
+      "working_set_bytes": 330043392
+    },
+    {
+      "after_start_ms": 197517.777,
+      "process_cpu_percent": 4.269,
+      "working_set_bytes": 330092544
+    },
+    {
+      "after_start_ms": 199581.076,
+      "process_cpu_percent": 6.058,
+      "working_set_bytes": 330321920
+    },
+    {
+      "after_start_ms": 201666.321,
+      "process_cpu_percent": 15.735,
+      "working_set_bytes": 330358784
+    },
+    {
+      "after_start_ms": 203739.664,
+      "process_cpu_percent": 22.609,
+      "working_set_bytes": 330358784
+    },
+    {
+      "after_start_ms": 205814.84,
+      "process_cpu_percent": 17.318,
+      "working_set_bytes": 330981376
+    },
+    {
+      "after_start_ms": 208293.631,
+      "process_cpu_percent": 64.925,
+      "working_set_bytes": 370356224
+    },
+    {
+      "after_start_ms": 210418.689,
+      "process_cpu_percent": 27.206,
+      "working_set_bytes": 372338688
+    },
+    {
+      "after_start_ms": 212482.324,
+      "process_cpu_percent": 6.057,
+      "working_set_bytes": 371781632
+    },
+    {
+      "after_start_ms": 214562.087,
+      "process_cpu_percent": 6.762,
+      "working_set_bytes": 371789824
+    }
+  ],
+  "dropped_resource_samples": 0,
+  "limitations": [
+    "Startup milestones begin when the Python entry point starts, not at operating-system process launch; no pre-recording database calls are measured.",
+    "SQLite measurements cover instrumented connections opened while recording, not existing connections or connections that bypass the application wrapper.",
+    "SQL execution, fetch, connection and transaction timings are elapsed wall time; they include CPU, filesystem, network and lock waiting together.",
+    "Cursor iteration and implicit SQLite work are not fully measured. Metrics can overlap and must not be summed as independent elapsed time.",
+    "UI delay is timer lateness, which may include operating-system scheduling, sleep, or backgrounding; it is not proof of an application freeze.",
+    "Resource samples cover this Nexus process only. CPU percent is relative to one logical CPU and can exceed 100%; working set is sampled Windows physical memory, not a continuous peak.",
+    "Timing instrumentation adds some overhead. A missing metric means it was not observed, not that an operation took zero time."
+  ]
+}
