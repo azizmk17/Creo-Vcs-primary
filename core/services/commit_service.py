@@ -1382,6 +1382,68 @@ class CommitService(BaseService):
                 "compared_against_commit_id": compared_against_commit_id,
             })
         return history
+
+    def get_commit_history_page(
+        self, *, limit: int = 20, offset: int = 0,
+        search: str = "", status: str = "all", include_summary: bool = False,
+    ) -> dict:
+        """Return one bounded page of history without hydrating the full log."""
+        project_id = self.session.project_id
+        if not project_id:
+            return {"rows": [], "total": 0, "summary": None}
+
+        root_project_id = None
+        try:
+            project = self.project_service.get_project_by_id(project_id)
+            if isinstance(project, dict):
+                root_project_id = project.get("root_project_id") or project.get("id")
+        except Exception:
+            root_project_id = None
+
+        page = self.commit_repository.get_commit_history_page(
+            int(root_project_id or project_id),
+            limit=limit,
+            offset=offset,
+            search=search,
+            status=status,
+            include_summary=include_summary,
+            root_family=bool(root_project_id),
+        )
+        history = []
+        for row in page.get("rows") or []:
+            compared_against_commit_id = None
+            try:
+                summary_obj = json.loads(row.get("step_diff_summary") or "{}")
+                if isinstance(summary_obj, dict):
+                    compared_against_commit_id = summary_obj.get("compared_against_commit_id")
+            except Exception:
+                pass
+            history.append({
+                "id": row.get("id"),
+                "status": row.get("status"),
+                "filename": row.get("filename"),
+                "title": row.get("title"),
+                "project_id": row.get("project_id"),
+                "part_id": row.get("part_id"),
+                "cad_document_id": row.get("cad_document_id"),
+                "creo_file_version": row.get("creo_file_version"),
+                "type": row.get("type"),
+                "date": row.get("committed_at"),
+                "designed_by": row.get("designer_username") or "Unknown",
+                "checked_by": row.get("checker_username") or "Unknown",
+                "message": row.get("message"),
+                "commit_id": row.get("commit_id"),
+                "step_diff_status": row.get("step_diff_status"),
+                "step_diff_path": row.get("step_diff_path"),
+                "step_file_path": row.get("step_file_path"),
+                "step_prev_file_path": row.get("step_prev_file_path"),
+                "step_diff_summary": row.get("step_diff_summary"),
+                "compared_against_commit_id": compared_against_commit_id,
+            })
+        page["rows"] = history
+        page["has_more"] = int(offset) + len(history) < int(page.get("total") or 0)
+        page["next_offset"] = int(offset) + len(history)
+        return page
     
     def get_pending_commits(self, own_only=False):
         all_commits = self.commit_repository.get_by_status("Pending", self.session.project_id)

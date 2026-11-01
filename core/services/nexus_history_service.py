@@ -21,6 +21,7 @@ from config import DB_NAME
 from core.repositories.nexus_history_repository import NexusHistoryRepository
 from core.repositories.permission_repository import PermissionRepository
 from core.services.master_work_service import MasterWorkService
+from utils import ensure_dir_exists, long_path, safe_exists, safe_isdir, safe_isfile, safe_open, safe_remove
 
 
 ITEM_FIELDS = ("name", "part_number", "drawing_number", "aes_number", "material", "weight", "notes")
@@ -37,7 +38,7 @@ def fingerprint(value):
 
 def file_hash(path):
     digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
+    with safe_open(str(path), "rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -101,7 +102,7 @@ class NexusHistoryService:
         if not value:
             raise ValueError("Configure the project's working directory first.")
         root = Path(value).expanduser().resolve()
-        if not root.is_dir():
+        if not safe_isdir(str(root)):
             raise ValueError("The project working directory is unavailable.")
         return root
 
@@ -163,7 +164,7 @@ class NexusHistoryService:
 
     def _freeze(self, root, entry):
         source = Path(entry["path"])
-        if not source.is_file():
+        if not safe_isfile(str(source)):
             raise ValueError("Snapshot source is missing: " + str(source))
         digest = file_hash(source)
         expected = str(entry.get("sha256") or "")
@@ -172,26 +173,32 @@ class NexusHistoryService:
         filename = re.sub(r"[^A-Za-z0-9._ -]", "_", source.name) or "file"
         relative = Path(".nexus/history/blobs") / digest[:2] / digest / filename
         destination = self._safe_path(root, relative)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if not destination.exists():
-            fd, temporary = tempfile.mkstemp(prefix=".freeze-", dir=destination.parent)
+        ensure_dir_exists(str(destination.parent))
+        if not safe_exists(str(destination)):
+            fd, temporary = tempfile.mkstemp(
+                prefix=".freeze-", dir=long_path(str(destination.parent))
+            )
             os.close(fd)
             try:
-                shutil.copyfile(source, temporary)
+                shutil.copyfile(long_path(str(source)), long_path(temporary))
                 if file_hash(temporary) != digest:
                     raise ValueError("A file changed while the snapshot was being created.")
-                os.replace(temporary, destination)
+                os.replace(long_path(temporary), long_path(str(destination)))
             finally:
-                Path(temporary).unlink(missing_ok=True)
+                if safe_exists(temporary):
+                    safe_remove(temporary)
         if file_hash(destination) != digest:
             raise ValueError("A frozen file failed its integrity check: " + filename)
         result = {k: v for k, v in entry.items() if k != "path"}
-        result.update(blob_path=relative.as_posix(), sha256=digest, size_bytes=source.stat().st_size)
+        result.update(
+            blob_path=relative.as_posix(), sha256=digest,
+            size_bytes=os.path.getsize(long_path(str(source))),
+        )
         return result
 
     def _blob(self, root, entry):
         path = self._safe_path(root, entry["blob_path"])
-        if not path.is_file() or file_hash(path) != entry["sha256"]:
+        if not safe_isfile(str(path)) or file_hash(path) != entry["sha256"]:
             raise ValueError("A frozen file is missing or has changed: " + entry["filename"])
         return path
 
@@ -366,12 +373,12 @@ class NexusHistoryService:
                 roots.extend(Path(row[0]).resolve() for row in rows if row[0])
             for candidate_root in roots:
                 path = self._safe_path(candidate_root, relative)
-                if path.is_file():
+                if safe_isfile(str(path)):
                     return path
             raise ValueError("A referenced file is missing: " + str(root / relative))
         filename = str(entry.get("filename") or "")
         path = self._safe_path(root, filename)
-        if not path.is_file():
+        if not safe_isfile(str(path)):
             raise ValueError("A referenced file is missing: " + filename)
         return path
 
@@ -443,9 +450,9 @@ class NexusHistoryService:
                     if any(logical_name(e.get("filename") or "") == key for e in entries):
                         continue
                     filename = document.get("latest_creo_file_name") or document["file_name"]
-                    if not (root / filename).is_file() and (root / (
+                    if not safe_isfile(str(root / filename)) and not safe_isfile(str(root / (
                         document["file_name"] + "." + str(document.get("latest_creo_file_version") or document.get("iteration") or 1)
-                    )).is_file():
+                    ))):
                         filename = document["file_name"] + "." + str(
                             document.get("latest_creo_file_version") or document.get("iteration") or 1)
                     if document["association_type"] == "OWNER" and not key.endswith(".drw"):
@@ -479,7 +486,7 @@ class NexusHistoryService:
                 else:
                     source = Path(raw["path"]) if raw.get("path") else self._source_path(conn, root, raw)
                     expected = str(raw.get("sha256") or "")
-                if not source.is_file():
+                if not safe_isfile(str(source)):
                     raise ValueError("A snapshot source is missing: " + str(source))
                 digest = file_hash(source)
                 if expected and expected != digest:
@@ -501,7 +508,7 @@ class NexusHistoryService:
                     "file_type": raw.get("file_type") or Path(logical_name(name)).suffix.lstrip(".").upper(),
                     "file_revision": str(raw.get("file_revision") or ""), "item_ids": [item_id],
                     "cad_document_id": cad_id, "path": str(source), "sha256": digest,
-                    "size_bytes": source.stat().st_size, "source_commit_id": (record or raw).get("source_commit_id"),
+                    "size_bytes": os.path.getsize(long_path(str(source))), "source_commit_id": (record or raw).get("source_commit_id"),
                     "part_file_version_id": raw.get("part_file_version_id"),
                     "part_file_id": raw.get("part_file_id")}
                 result["files"][key] = self._freeze(root, entry) if freeze else entry
@@ -532,11 +539,11 @@ class NexusHistoryService:
                         source = self._safe_path(root, "master/" + key)
                     else:
                         source = self._safe_path(root, filename)
-                        if not source.is_file():
+                        if not safe_isfile(str(source)):
                             filename = document["file_name"] + "." + str(
                                 document.get("latest_creo_file_version") or document.get("iteration") or 1)
                             source = self._safe_path(root, filename)
-                    if not source.is_file():
+                    if not safe_isfile(str(source)):
                         raise ValueError("A referenced CAD dependency is missing: " + document["file_name"])
                     actual = file_hash(source)
                     if record and record.get("sha256") and actual != record["sha256"]:
@@ -547,7 +554,7 @@ class NexusHistoryService:
                         "file_type": Path(key).suffix.lstrip(".").upper(), "file_revision": "",
                         "item_ids": [], "cad_document_id": document["id"], "readonly_dependency": True,
                         "path": str(source), "sha256": actual,
-                        "size_bytes": source.stat().st_size}
+                        "size_bytes": os.path.getsize(long_path(str(source)))}
                     result["files"][key] = self._freeze(root, entry) if freeze else entry
         return result
 
@@ -595,7 +602,7 @@ class NexusHistoryService:
                           for row in rows if str(row["part_id"]) in saved["items"]},
             }
             for document in self._commit_documents(conn, self._root(conn), source_id, allow_missing=True):
-                if not Path(document["path"]).is_file():
+                if not safe_isfile(str(document["path"])):
                     continue
                 key, entry = self._branch_document_entry(saved, document, source_id)
                 digest = file_hash(document["path"])
@@ -1635,7 +1642,7 @@ class NexusHistoryService:
                             continue
                         source = self._blob(root, entry)
                         digest = hashlib.sha256()
-                        with source.open("rb") as content, package.open(
+                        with safe_open(str(source), "rb") as content, package.open(
                             relative, "w"
                         ) as archived:
                             for chunk in iter(lambda: content.read(1024 * 1024), b""):

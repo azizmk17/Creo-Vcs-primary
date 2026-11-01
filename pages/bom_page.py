@@ -4670,6 +4670,10 @@ class BomPage(QWidget):
         self.setEnabled(True)
         self.bom_mode_selector.setEnabled(True)
         self._set_tree_loading(False)
+        # Resolve file badges as soon as the BOM is available. The broad
+        # working-directory diagnostic can take much longer and is not a
+        # prerequisite for reading the PDF/STEP attachment state.
+        self._refresh_loaded_integrity_indicators()
         self._mark_initial_tree_ready()
 
     def _on_structure_failed(self, seq: int, project_id: int, mode: str, error: str):
@@ -9364,6 +9368,9 @@ class BomPage(QWidget):
             self._missing_files_by_part = {}
         except Exception:
             pass
+        # A failed filesystem scan must not leave the BOM's PDF/STEP badges
+        # permanently in their initial "checking" state.
+        self._refresh_loaded_integrity_indicators()
 
     def _refresh_loaded_integrity_indicators(self) -> None:
         self._invalidate_doc_indicator()
@@ -15489,12 +15496,73 @@ class BomPage(QWidget):
         open_pdf.triggered.connect(lambda: self.open_part_pdf(item_id))
         open_step = files_menu.addAction("Open STEP")
         open_step.triggered.connect(lambda: self.open_part_step(item_id))
+        menu.addSeparator()
+        self._add_document_status_actions(menu, item_id)
         issues_action = menu.addAction("Open Item Issues")
         issues_action.triggered.connect(
             lambda _checked=False, value=item_id: self.issue_requested.emit(value)
         )
         menu.exec_(tree.viewport().mapToGlobal(position))
         tree._context_menu_selection = []
+
+    def _set_document_manual_status(self, part_id: int, doc_type: str, outdated: bool) -> None:
+        part_id = int(part_id)
+        doc_type = str(doc_type or "").upper()
+        target = self._doc_ack_target(part_id, doc_type)
+        if outdated:
+            self.part_doc_ack_service.mark_outdated(part_id, doc_type, target)
+        else:
+            self.part_doc_ack_service.mark_up_to_date(part_id, doc_type, target)
+        self._refresh_part_in_tree(part_id)
+        if getattr(self, "current_part_id", None) is not None:
+            try:
+                if int(self.current_part_id) == part_id:
+                    self.display_details(part_id)
+            except (TypeError, ValueError):
+                pass
+
+    def _add_document_status_actions(self, menu: QMenu, part_id: int) -> None:
+        """Add persistent PDF/STEP status controls to an Item row menu."""
+        try:
+            part_id = int(part_id)
+        except (TypeError, ValueError):
+            return
+        status_menu = menu.addMenu("PDF / STEP Status")
+        try:
+            summary = self._indicator_summary_for_part(part_id, self._issues_for_part(part_id))
+        except Exception:
+            summary = {}
+
+        for doc_key, doc_type in (("pdf", "PDF"), ("step", "STEP")):
+            try:
+                ack = self.part_doc_ack_service.get_ack(part_id, doc_type)
+                applies_to = self._doc_ack_target(part_id, doc_type)
+                manually_outdated = self.part_doc_ack_service.is_manually_outdated(
+                    ack, applies_to
+                )
+            except Exception:
+                manually_outdated = False
+
+            mark_action = status_menu.addAction(
+                f"Mark {doc_type} as Outdated"
+                if not manually_outdated else f"Mark {doc_type} as Current / Safe"
+            )
+            mark_action.triggered.connect(
+                lambda _checked=False, pid=part_id, kind=doc_type, outdated=not manually_outdated:
+                self._set_document_manual_status(pid, kind, outdated)
+            )
+
+            doc = (summary.get(doc_key) or {})
+            tooltip = str(doc.get("tooltip") or "").lower()
+            state = str(doc.get("state") or "").lower()
+            if not manually_outdated and state == "bad" and (
+                "newer commit" in tooltip or "needs review" in tooltip
+            ):
+                acknowledge_action = status_menu.addAction(f"Acknowledge {doc_type} as Safe")
+                acknowledge_action.triggered.connect(
+                    lambda _checked=False, pid=part_id, kind=doc_type:
+                    self._set_document_manual_status(pid, kind, False)
+                )
 
     def show_tree_context_menu(self, position):
         tree = self.sender()
@@ -15647,37 +15715,9 @@ class BomPage(QWidget):
             )
             menu.addAction(edit_ebom_behavior_action)
 
-        try:
-            summary = self._indicator_summary_for_part(int(item_id), self._issues_for_part(int(item_id)))
-            ack_actions = []
-            for doc_key, doc_type in (("pdf", "PDF"), ("step", "STEP")):
-                doc = summary.get(doc_key) or {}
-                tip = str(doc.get("tooltip") or "").lower()
-                if doc.get("state") == "bad" and ("newer commit" in tip or "needs review" in tip):
-                    action = QAction(f"Acknowledge {doc_type} as safe", self)
-
-                    def _ack_doc(_checked=False, _doc_type=doc_type, _part_id=item_id):
-                        self.part_doc_ack_service.mark_up_to_date(
-                            int(_part_id),
-                            _doc_type,
-                            self._doc_ack_target(int(_part_id), _doc_type),
-                        )
-                        self._refresh_part_in_tree(int(_part_id))
-                        try:
-                            if getattr(self, "current_part_id", None) and int(self.current_part_id) == int(_part_id):
-                                self.display_details(int(_part_id))
-                        except Exception:
-                            pass
-
-                    action.triggered.connect(_ack_doc)
-                    ack_actions.append(action)
-
-            if ack_actions:
-                menu.addSeparator()
-                for action in ack_actions:
-                    menu.addAction(action)
-        except Exception:
-            pass
+        if item_id is not None:
+            menu.addSeparator()
+            self._add_document_status_actions(menu, int(item_id))
 
         # Allow removing a child relation when right-clicking a child node
         try:
@@ -21292,6 +21332,13 @@ class BomPage(QWidget):
             ack = self.part_doc_ack_service.get_ack(int(part_id), doc_type)
         except Exception:
             ack = None
+        try:
+            if self.part_doc_ack_service.is_manually_outdated(
+                ack, self._doc_ack_target(int(part_id), doc_type)
+            ):
+                return {"state": "bad", "tooltip": f"{doc_type}: manually marked outdated"}
+        except Exception:
+            pass
         if candidates:
             version = max(candidates, key=lambda value: value[:2])[2]
             if not version:
@@ -21337,6 +21384,13 @@ class BomPage(QWidget):
             ack = self.part_doc_ack_service.get_ack(int(part_id), doc_type)
         except Exception:
             ack = None
+        try:
+            if self.part_doc_ack_service.is_manually_outdated(
+                ack, self._doc_ack_target(int(part_id), doc_type)
+            ):
+                return {"state": "bad", "tooltip": f"{doc_type}: manually marked outdated"}
+        except Exception:
+            pass
         acknowledged_current = latest_commit and self._ack_covers_commit(ack, latest_commit)
         candidates = []
         for att in attachments or []:
@@ -21633,6 +21687,7 @@ class BomPage(QWidget):
                     pass
 
                 self._set_tree_loading(False)
+                self._refresh_loaded_integrity_indicators()
                 try:
                     if not self._is_default_bom_advanced_filter():
                         self.apply_bom_tree_filter(self._bom_advanced_filters)
@@ -22240,7 +22295,7 @@ class BomPage(QWidget):
     def _queue_indicator_refresh(self, item, part_id) -> None:
         try:
             pid = int(part_id)
-            if item is None or item.treeWidget() is None:
+            if item is None:
                 return
             identity = id(item)
         except (RuntimeError, TypeError, ValueError):
@@ -22276,6 +22331,7 @@ class BomPage(QWidget):
         return None
 
     def _indicator_refresh_step(self) -> None:
+        unique_limit = 16
         if self._indicator_worker is not None:
             start = time.perf_counter()
             processed = 0
@@ -22290,6 +22346,7 @@ class BomPage(QWidget):
                 processed += 1
             while ((self._indicator_refresh_queue or self._indicator_scan_iterators)
                    and processed < 80
+                   and len(self._indicator_collected_rows) < unique_limit
                    and time.perf_counter() - start < 0.004):
                 candidate = (
                     self._indicator_refresh_queue.popleft()
@@ -22317,7 +22374,6 @@ class BomPage(QWidget):
             except (RuntimeError, TypeError, ValueError):
                 pass
             processed += 1
-        unique_limit = 16
         while processed < 80 and time.perf_counter() - start < 0.005:
             candidate = (
                 self._indicator_refresh_queue.popleft()
@@ -22334,11 +22390,13 @@ class BomPage(QWidget):
             except (RuntimeError, TypeError, ValueError):
                 continue
             processed += 1
-            if len(self._indicator_collected_rows) >= unique_limit and self._indicator_refresh_queue:
+            if len(self._indicator_collected_rows) >= unique_limit:
                 break
 
-        if (self._indicator_collected_rows and not self._indicator_refresh_queue
-                and not self._indicator_scan_iterators):
+        if self._indicator_collected_rows and (
+            len(self._indicator_collected_rows) >= unique_limit
+            or (not self._indicator_refresh_queue and not self._indicator_scan_iterators)
+        ):
             project_id = int(self.session.project_id or 0)
             if project_id:
                 self._indicator_request_seq += 1

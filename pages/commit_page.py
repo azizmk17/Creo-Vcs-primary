@@ -19,8 +19,10 @@ import sys
 import re
 import subprocess
 import json
+from copy import copy
 from datetime import datetime
 from collections import Counter
+from types import SimpleNamespace
 
 from core.services.user_service import UserService
 from core.repositories.user_repository import UserRepository
@@ -528,6 +530,40 @@ class _ProcessingWorker(QObject):
             self.failed.emit(exc)
 
 
+class _HistoryPageWorker(QObject):
+    finished = pyqtSignal(int, object)
+    failed = pyqtSignal(int, str)
+    done = pyqtSignal()
+
+    def __init__(self, request_id, service, project_id, limit, offset, search, status, include_summary):
+        super().__init__()
+        self.request_id = int(request_id)
+        self.service = copy(service)
+        self.service.session = SimpleNamespace(**vars(service.session))
+        self.service.session.project_id = int(project_id)
+        self.limit = int(limit)
+        self.offset = int(offset)
+        self.search = str(search or "")
+        self.status = str(status or "all")
+        self.include_summary = bool(include_summary)
+
+    def run(self):
+        try:
+            with measured("commit.history_page_fetch"):
+                result = self.service.get_commit_history_page(
+                    limit=self.limit,
+                    offset=self.offset,
+                    search=self.search,
+                    status=self.status,
+                    include_summary=self.include_summary,
+                )
+            self.finished.emit(self.request_id, result)
+        except Exception as exc:
+            self.failed.emit(self.request_id, str(exc))
+        finally:
+            self.done.emit()
+
+
 class _StatCard(QFrame):
     """Compact enterprise status cell used in the workspace summary strip."""
 
@@ -628,10 +664,14 @@ class _HistoryTable(QTableWidget):
 
     def populate(self, rows: list):
         self.setRowCount(0)
-        self.setRowCount(len(rows))
-        for i, c in enumerate(rows):
-            if i and i % 20 == 0:
-                QApplication.processEvents()
+        self.append_rows(rows)
+
+    def append_rows(self, rows: list):
+        rows = list(rows or [])
+        start_row = self.rowCount()
+        self.setRowCount(start_row + len(rows))
+        for offset, c in enumerate(rows):
+            i = start_row + offset
             sty = _status_style(c.get("status", ""))
 
             # col 0 — colour dot
@@ -1447,10 +1487,24 @@ class CommitPage(QWidget):
         self.history_table = _HistoryTable()
         self.history_table.setMinimumHeight(0)
         self.history_table.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
+        self._history_page_size = 20
+        self._history_request_seq = 0
+        self._history_page_loading = False
+        self._history_page_error = False
+        self._history_has_more = False
+        self._history_next_offset = 0
+        self._history_total = 0
+        self._history_summary = None
+        self._history_query = ""
+        self._history_status = "all"
+        self._history_worker = None
+        self._history_thread = None
         self.history_table.itemDoubleClicked.connect(self._on_history_double_click)
         self.history_table.restore_requested.connect(self._restore_commit_group_from_history)
         self.history_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.history_table.customContextMenuRequested.connect(self._show_history_context_menu)
+        self.history_table.verticalScrollBar().valueChanged.connect(self._on_history_scroll)
+        self.history_table.verticalScrollBar().rangeChanged.connect(self._on_history_scroll_range_changed)
         history_lay.addWidget(self.history_table, 1)
 
         main_splitter.setStretchFactor(0, 3)
@@ -1471,8 +1525,10 @@ class CommitPage(QWidget):
         self._history_search_timer.setSingleShot(True)
         self._history_search_timer.setInterval(250)
         self.history_search.textChanged.connect(lambda _: self._history_search_timer.start())
-        self._history_search_timer.timeout.connect(self._apply_history_filter)
-        self.history_status_filter.currentTextChanged.connect(lambda _: self._apply_history_filter())
+        self._history_search_timer.timeout.connect(lambda: self.load_commit_history(reset=True))
+        self.history_status_filter.currentTextChanged.connect(
+            lambda _: self.load_commit_history(reset=True)
+        )
         self.history_view_filter.currentTextChanged.connect(lambda _: self._apply_history_filter())
         self.history_clear_btn.clicked.connect(self._clear_history_filter)
 
@@ -1584,6 +1640,9 @@ class CommitPage(QWidget):
     def _expand_history_section(self):
         if not getattr(self, "_history_expanded", False):
             self._set_history_expanded(True)
+            QTimer.singleShot(0, lambda: self._on_history_scroll_range_changed(
+                0, self.history_table.verticalScrollBar().maximum()
+            ))
 
     def _collapse_history_section(self):
         if getattr(self, "_history_expanded", False):
@@ -2006,10 +2065,17 @@ class CommitPage(QWidget):
 
     def _update_dashboard_stats(self):
         cache = getattr(self, "_history_cache", []) or []
-        total = len(cache)
-        pending = sum(1 for c in cache if (c.get("status") or "").lower() == "pending")
-        validated = sum(1 for c in cache if (c.get("status") or "").lower() == "validated")
-        step = sum(1 for c in cache if (c.get("step_diff_status") or "").strip())
+        summary = getattr(self, "_history_summary", None) or {}
+        total = int(summary.get("total", len(cache)) or 0)
+        pending = int(summary.get("pending", sum(
+            1 for c in cache if (c.get("status") or "").lower() == "pending"
+        )) or 0)
+        validated = int(summary.get("validated", sum(
+            1 for c in cache if (c.get("status") or "").lower() == "validated"
+        )) or 0)
+        step = int(summary.get("step", sum(
+            1 for c in cache if (c.get("step_diff_status") or "").strip()
+        )) or 0)
         self._stat_total.set_value(str(total))
         self._stat_pending.set_value(str(pending))
         self._stat_validated.set_value(str(validated))
@@ -2131,17 +2197,129 @@ class CommitPage(QWidget):
     # ═══════════════════════════════════════════════════════════════════
 
     @timed("commit.history_view_refresh")
-    def load_commit_history(self):
-        self._history_cache = []
-        if not self.commit_service:
+    def load_commit_history(self, reset: bool = True):
+        if not self.commit_service or not self.session.project_id:
             return
 
-        commits = self.commit_service.get_commit_history() or []
-        self._set_commit_history_rows(commits)
+        if reset:
+            self._history_request_seq += 1
+            # A previous page may still be running (for example, the user
+            # changed the search). Let the new query start immediately; the
+            # old worker's response is discarded by its request id.
+            self._history_page_loading = False
+            self._history_query = str(self.history_search.text() or "").strip()
+            self._history_status = str(
+                self.history_status_filter.currentText() or "All"
+            ).strip().lower()
+            self._history_cache = []
+            self._history_next_offset = 0
+            self._history_total = 0
+            self._history_has_more = True
+            self._history_page_error = False
+            self._history_summary = None
+            self.history_table.setRowCount(0)
+            self._hist_count_lbl.setText("Loading first 20 records…")
+        elif self._history_page_loading or not self._history_has_more:
+            return
 
-    def _set_commit_history_rows(self, commits):
-        self._history_cache = commits
-        self._apply_history_filter()
+        if self._history_page_loading:
+            return
+        self._request_next_history_page()
+
+    def _request_next_history_page(self):
+        if self._history_page_loading or not self.commit_service:
+            return
+        self._history_page_loading = True
+        self._history_page_error = False
+        request_id = int(self._history_request_seq)
+        offset = int(self._history_next_offset)
+        worker = _HistoryPageWorker(
+            request_id,
+            self.commit_service,
+            int(self.session.project_id),
+            self._history_page_size,
+            offset,
+            self._history_query,
+            self._history_status,
+            include_summary=(offset == 0),
+        )
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_history_page_loaded)
+        worker.failed.connect(self._on_history_page_failed)
+        worker.done.connect(thread.quit)
+        worker.done.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._history_worker = worker
+        self._history_thread = thread
+        thread.start(QThread.LowPriority)
+
+    def _on_history_page_loaded(self, request_id: int, result: object):
+        if int(request_id) != self._history_request_seq:
+            return
+        self._history_page_loading = False
+        result = dict(result or {})
+        rows = list(result.get("rows") or [])
+        append = self._history_next_offset > 0
+        self._history_total = int(result.get("total") or 0)
+        self._history_has_more = bool(result.get("has_more"))
+        self._history_next_offset = int(result.get("next_offset") or 0)
+        if result.get("summary") is not None:
+            self._history_summary = dict(result.get("summary") or {})
+        self._set_commit_history_rows(rows, append=append)
+
+    def _on_history_page_failed(self, request_id: int, error: str):
+        if int(request_id) != self._history_request_seq:
+            return
+        self._history_page_loading = False
+        self._history_page_error = True
+        self._hist_count_lbl.setText("History could not be loaded. Click Reset to retry.")
+        self._hist_count_lbl.setToolTip(str(error or "History query failed."))
+
+    def _on_history_scroll(self, value: int):
+        if (
+            not self._history_expanded
+            or not self.history_table.isVisible()
+            or self.history_table.rowCount() == 0
+            or self._history_page_error
+        ):
+            return
+        bar = self.history_table.verticalScrollBar()
+        if self._history_has_more and not self._history_page_loading and value >= bar.maximum() - 2:
+            self.load_commit_history(reset=False)
+
+    def _on_history_scroll_range_changed(self, _minimum: int, maximum: int):
+        if (
+            maximum <= 0
+            and self._history_has_more
+            and not self._history_page_loading
+            and not self._history_page_error
+            and self._history_expanded
+            and self.history_table.isVisible()
+            and self.history_table.rowCount() > 0
+        ):
+            QTimer.singleShot(0, lambda: self.load_commit_history(reset=False))
+
+    def _set_commit_history_rows(self, commits, append: bool = False):
+        commits = list(commits or [])
+        if append:
+            self._history_cache.extend(commits)
+        else:
+            self._history_cache = commits
+
+        q = str(self.history_search.text() or "").strip()
+        status = str(self.history_status_filter.currentText() or "All").strip().lower()
+        grouped_view = self.history_view_filter.currentText() == "Commit Groups"
+        if append and not q and status == "all" and not grouped_view:
+            scroll_value = self.history_table.verticalScrollBar().value()
+            self.history_table.append_rows(commits)
+            self.history_table.verticalScrollBar().setValue(scroll_value)
+            loaded = len(self._history_cache)
+            suffix = " · scroll for more" if self._history_has_more else ""
+            self._hist_count_lbl.setText(f"{loaded} of {self._history_total} records{suffix}")
+        else:
+            self._apply_history_filter()
         self._update_dashboard_stats()
 
     def _apply_history_filter(self):
@@ -2174,15 +2352,20 @@ class CommitPage(QWidget):
             filtered.append(c)
 
         visible_rows = self._group_history_rows(filtered) if grouped_view else filtered
+        scroll_value = self.history_table.verticalScrollBar().value()
         self.history_table.populate(visible_rows)
-        total = len(self._history_cache)
+        self.history_table.verticalScrollBar().setValue(scroll_value)
+        loaded = len(self._history_cache)
         shown = len(visible_rows)
+        suffix = " · scroll for more" if self._history_has_more else ""
         if grouped_view:
-            self._hist_count_lbl.setText(f"{shown} groups / {len(filtered)} items")
-        elif total == shown:
-            self._hist_count_lbl.setText(f"{total} commits")
+            self._hist_count_lbl.setText(
+                f"{shown} groups / {len(filtered)} loaded records of {self._history_total}{suffix}"
+            )
+        elif self._history_query or self._history_status != "all":
+            self._hist_count_lbl.setText(f"{shown} / {self._history_total} matching records{suffix}")
         else:
-            self._hist_count_lbl.setText(f"{shown} / {total}")
+            self._hist_count_lbl.setText(f"{shown} of {self._history_total} records{suffix}")
 
     def _group_history_rows(self, rows):
         status_rank = {
@@ -2253,10 +2436,16 @@ class CommitPage(QWidget):
         return result
 
     def _clear_history_filter(self):
-        self.history_search.setText("")
-        self.history_status_filter.setCurrentText("All")
-        self.history_view_filter.setCurrentText("File Records")
-        self._apply_history_filter()
+        search_blocked = self.history_search.blockSignals(True)
+        status_blocked = self.history_status_filter.blockSignals(True)
+        try:
+            self.history_search.setText("")
+            self.history_status_filter.setCurrentText("All")
+            self.history_view_filter.setCurrentText("File Records")
+        finally:
+            self.history_search.blockSignals(search_blocked)
+            self.history_status_filter.blockSignals(status_blocked)
+        self.load_commit_history(reset=True)
 
     # ═══════════════════════════════════════════════════════════════════
     #  HISTORY INTERACTIONS
@@ -3755,7 +3944,6 @@ class CommitPage(QWidget):
                 return {
                     "affected_part_ids": sorted(int(pid) for pid in affected_part_ids if pid is not None),
                     "commit_result": commit_result or {},
-                    "history": self.commit_service.get_commit_history() or [],
                     "pending": self.commit_service.get_pending_commits_grouped(
                         self.session.project_id, self.session.user_id, self.is_designer
                     ) or [],
@@ -3776,7 +3964,7 @@ class CommitPage(QWidget):
                         lambda: self._finish_commit_staging(commit_result),
                         lambda: self._refresh_bom_rows_for_parts((result or {}).get("affected_part_ids")),
                         lambda: self._refresh_issue_views(resolved_issue_part_ids),
-                        lambda: self._set_commit_history_rows((result or {}).get("history") or []),
+                        lambda: self.load_commit_history(reset=True),
                         lambda: self._set_pending_commit_groups((result or {}).get("pending") or []),
                     ],
                     "popup": lambda: QMessageBox.information(
@@ -4064,7 +4252,6 @@ class CommitPage(QWidget):
             return {
                 "affected_part_ids": affected_part_ids,
                 "affected_cad_document_ids": affected_cad_document_ids,
-                "history": self.commit_service.get_commit_history() or [],
                 "pending": self.commit_service.get_pending_commits_grouped(
                     self.session.project_id, self.session.user_id, self.is_designer
                 ) or [],
@@ -4079,7 +4266,7 @@ class CommitPage(QWidget):
                         result.get("affected_cad_document_ids"),
                     ),
                     lambda: self._set_pending_commit_groups(result.get("pending") or []),
-                    lambda: self._set_commit_history_rows(result.get("history") or []),
+                    lambda: self.load_commit_history(reset=True),
                 ],
                 "popup": (lambda: QMessageBox.information(self, "Pushed to Master",
                     "The commit is integrated into master and has left the pending queue. The BOM remains Under development; it is not validated."))
@@ -4146,7 +4333,6 @@ class CommitPage(QWidget):
             )
             return {
                 "restore": result,
-                "history": self.commit_service.get_commit_history() or [],
                 "pending": self.commit_service.get_pending_commits_grouped(
                     self.session.project_id, self.session.user_id, self.is_designer
                 ) or [],
@@ -4171,7 +4357,7 @@ class CommitPage(QWidget):
                 "steps": [
                     lambda: self._refresh_bom_rows_for_parts(restore.get("affected_part_ids")),
                     lambda: self._set_pending_commit_groups(result.get("pending") or []),
-                    lambda: self._set_commit_history_rows(result.get("history") or []),
+                    lambda: self.load_commit_history(reset=True),
                     lambda: self._refresh_issue_views(restore.get("affected_part_ids")),
                 ],
                 "popup": popup,

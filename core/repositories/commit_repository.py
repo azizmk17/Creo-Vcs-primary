@@ -581,6 +581,105 @@ class CommitRepository:
             rows = cur.fetchall()
             return [self._row_to_commit(r) for r in rows]
 
+    def get_commit_history_page(
+        self, project_id: int, *, limit: int = 20, offset: int = 0,
+        search: str = "", status: str = "all", include_summary: bool = False,
+        root_family: bool = False,
+    ) -> dict:
+        """Fetch a bounded commit-history page and optional aggregate counts."""
+        project_id = int(project_id)
+        limit = min(100, max(1, int(limit)))
+        offset = max(0, int(offset))
+        search = str(search or "").strip().lower()
+        status = str(status or "all").strip().lower()
+
+        with self.get_conn() as conn:
+            has_root_column = False
+            if root_family:
+                try:
+                    has_root_column = any(
+                        str(row[1]) == "root_project_id"
+                        for row in conn.execute("PRAGMA table_info(projects)").fetchall()
+                    )
+                except Exception:
+                    has_root_column = False
+
+            from_sql = "FROM commits c"
+            base_where = []
+            base_params = []
+            if root_family and has_root_column:
+                from_sql += " JOIN projects p ON p.id=c.project_id"
+                base_where.append("p.root_project_id=?")
+                base_params.append(project_id)
+            else:
+                base_where.append("c.project_id=?")
+                base_params.append(project_id)
+
+            page_from = (
+                from_sql
+                + " LEFT JOIN users designer ON designer.id=c.designer"
+                + " LEFT JOIN users checker ON checker.id=c.checked_by"
+            )
+            where = list(base_where)
+            params = list(base_params)
+            if status and status != "all":
+                where.append("lower(COALESCE(c.status,''))=?")
+                params.append(status)
+            if search:
+                escaped = search.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+                pattern = f"%{escaped}%"
+                search_columns = (
+                    "c.status", "c.filename", "c.committed_at", "designer.username",
+                    "checker.username", "c.message", "c.commit_id", "c.title",
+                )
+                where.append(
+                    "(" + " OR ".join(
+                        f"lower(COALESCE({column},'')) LIKE ? ESCAPE '!'"
+                        for column in search_columns
+                    ) + ")"
+                )
+                params.extend([pattern] * len(search_columns))
+            where_sql = " AND ".join(where)
+
+            total = int(conn.execute(
+                f"SELECT COUNT(*) {page_from} WHERE {where_sql}", tuple(params)
+            ).fetchone()[0] or 0)
+            rows = conn.execute(
+                f"""SELECT c.*, designer.username AS designer_username,
+                           checker.username AS checker_username
+                    {page_from}
+                    WHERE {where_sql}
+                    ORDER BY c.committed_at DESC, c.id DESC
+                    LIMIT ? OFFSET ?""",
+                (*params, limit, offset),
+            ).fetchall()
+
+            summary = None
+            if include_summary:
+                grouped = conn.execute(
+                    f"""SELECT lower(COALESCE(c.status,'')) AS status, COUNT(*) AS count,
+                               SUM(CASE WHEN trim(COALESCE(c.step_diff_status,''))<>'' THEN 1 ELSE 0 END) AS step_count
+                        {from_sql}
+                        WHERE {' AND '.join(base_where)}
+                        GROUP BY lower(COALESCE(c.status,''))""",
+                    tuple(base_params),
+                ).fetchall()
+                summary = {"total": 0, "pending": 0, "validated": 0, "step": 0}
+                for row in grouped:
+                    count = int(row["count"] or 0)
+                    summary["total"] += count
+                    if str(row["status"] or "") == "pending":
+                        summary["pending"] += count
+                    if str(row["status"] or "") == "validated":
+                        summary["validated"] += count
+                    summary["step"] += int(row["step_count"] or 0)
+
+        return {
+            "rows": [dict(row) for row in rows],
+            "total": total,
+            "summary": summary,
+        }
+
     def get_rows_by_commit_id(self, commit_id: str, project_id: int | None = None) -> list[dict]:
         """Return all file rows for a logical commit id with manager-facing joins."""
         with self.get_conn() as conn:
