@@ -21,7 +21,10 @@ from config import DB_NAME
 from core.repositories.nexus_history_repository import NexusHistoryRepository
 from core.repositories.permission_repository import PermissionRepository
 from core.services.master_work_service import MasterWorkService
-from utils import ensure_dir_exists, long_path, safe_exists, safe_isdir, safe_isfile, safe_open, safe_remove
+from utils import (
+    ensure_dir_exists, long_path, safe_exists, safe_isdir, safe_isfile,
+    safe_listdir, safe_open, safe_remove,
+)
 
 
 ITEM_FIELDS = ("name", "part_number", "drawing_number", "aes_number", "material", "weight", "notes")
@@ -134,17 +137,18 @@ class NexusHistoryService:
     @contextmanager
     def _branch_lock(self, root, branch_id):
         folder = root / ".nexus" / "branches" / str(branch_id)
-        folder.mkdir(parents=True, exist_ok=True)
+        ensure_dir_exists(str(folder))
         lock = folder / ".operation.lock"
         try:
-            descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            descriptor = os.open(long_path(str(lock)), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             raise ValueError("Another operation is updating this branch. Retry when it finishes.")
         os.close(descriptor)
         try:
             yield
         finally:
-            lock.unlink(missing_ok=True)
+            if safe_exists(str(lock)):
+                safe_remove(str(lock))
 
     @staticmethod
     def _verified_manifest(row):
@@ -1087,8 +1091,8 @@ class NexusHistoryService:
             folder = self._safe_path(
                 root, Path(".nexus/branches") / branch_id / "workspaces" / str(checkout_owner)
             )
-            if folder.exists():
-                shutil.rmtree(folder)
+                if safe_isdir(str(folder)):
+                    shutil.rmtree(long_path(str(folder)))
             with self.repo.connection() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 item_ids = [int(row[0]) for row in conn.execute(
@@ -1203,12 +1207,12 @@ class NexusHistoryService:
             for entry in known:
                 target = self._workspace_target(folder, entry)
                 if NATIVE.fullmatch(entry["filename"]):
-                    candidates = [path for path in folder.iterdir()
-                                  if path.is_file() and NATIVE.fullmatch(path.name)
-                                  and logical_name(path.name) == logical_name(entry["filename"])]
+                    candidates = [folder / name for name in safe_listdir(str(folder))
+                                  if safe_isfile(str(folder / name)) and NATIVE.fullmatch(name)
+                                  and logical_name(name) == logical_name(entry["filename"])]
                     target = max(candidates, key=lambda path: int((NATIVE.fullmatch(path.name)[2] or 0)),
                                  default=target)
-                if not target.is_file() or file_hash(target) != entry["sha256"]:
+                if not safe_isfile(str(target)) or file_hash(target) != entry["sha256"]:
                     raise ValueError(
                         "The app-managed branch workspace contains uncommitted changes. "
                         "Check in or undo them before pushing this Commit."
@@ -1216,9 +1220,9 @@ class NexusHistoryService:
         plans, targets_seen = [], set()
         checked_out_item_id = None
         for source_entry in files:
-            source = Path(source_entry["path"]).resolve()
+            source = Path(os.path.normpath(str(source_entry["path"])))
             filename = Path(str(source_entry.get("filename") or source.name)).name
-            if not source.is_file() or file_hash(source) != source_entry.get("sha256"):
+            if not safe_isfile(str(source)) or file_hash(source) != source_entry.get("sha256"):
                 raise ValueError("A checked-in file is missing or changed: " + filename)
             logical = logical_name(filename)
             matches = [entry for entry in known if logical_name(entry["filename"]) == logical]
@@ -1248,22 +1252,23 @@ class NexusHistoryService:
                 iteration = max(existing_iterations, default=0) + 1
                 branch_filename = native_match[1] + (f".{iteration}" if iteration else "")
                 target = folder / branch_filename
-            normalized_target = os.path.normcase(str(target.resolve()))
+            normalized_target = os.path.normcase(os.path.abspath(str(target)))
             if normalized_target in targets_seen:
                 raise ValueError("The commit contains multiple files for the same branch destination: " + filename)
             targets_seen.add(normalized_target)
             plans.append((source, filename, target, source_entry["sha256"]))
         installed = []
         for source, filename, target, expected_hash in plans:
-            target.parent.mkdir(parents=True, exist_ok=True)
+            ensure_dir_exists(str(target.parent))
             temporary = target.with_name(target.name + "." + uuid.uuid4().hex + ".tmp")
             try:
-                shutil.copyfile(source, temporary)
+                shutil.copyfile(long_path(str(source)), long_path(str(temporary)))
                 if file_hash(temporary) != expected_hash:
                     raise ValueError("The commit file changed while being copied: " + filename)
-                os.replace(temporary, target)
+                os.replace(long_path(str(temporary)), long_path(str(target)))
             finally:
-                temporary.unlink(missing_ok=True)
+                if safe_exists(str(temporary)):
+                    safe_remove(str(temporary))
             installed.append(filename)
         if not installed:
             raise ValueError("The commit contains no files for this branch.")
@@ -1281,8 +1286,10 @@ class NexusHistoryService:
         for entry in saved["files"].values():
             if entry.get("source_commit_id") == str(source_commit_id) and not NATIVE.fullmatch(entry["filename"]):
                 target = self._workspace_target(folder, entry)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(self._blob(root, entry), target)
+                ensure_dir_exists(str(target.parent))
+                shutil.copyfile(
+                    long_path(str(self._blob(root, entry))), long_path(str(target))
+                )
         if checked_out_item_id is not None:
             with self.repo.connection() as conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -1293,11 +1300,12 @@ class NexusHistoryService:
         # workspace. The snapshot retains the exact iteration filename and bytes.
         native_targets = {logical_name(target.name): target for _, filename, target, _ in plans
                           if NATIVE.fullmatch(filename)}
-        for path in folder.iterdir():
-            if (path.is_file() and NATIVE.fullmatch(path.name)
-                    and logical_name(path.name) in native_targets
-                    and path.resolve() != native_targets[logical_name(path.name)].resolve()):
-                path.unlink(missing_ok=True)
+        for name in safe_listdir(str(folder)):
+            path = folder / name
+            target = native_targets.get(logical_name(name))
+            if (safe_isfile(str(path)) and NATIVE.fullmatch(name)
+                    and target is not None and path.name.casefold() != target.name.casefold()):
+                safe_remove(str(path))
         return snapshot_id
 
     def workspace(self, branch_id, *, refresh=False):
@@ -1308,26 +1316,30 @@ class NexusHistoryService:
             folder = root / ".nexus/branches" / branch_id / "workspaces" / str(self.user_id)
             with self._branch_lock(root, branch_id):
                 marker = folder / ".nexus-workspace.json"
-                if folder.exists() and any(folder.iterdir()):
+                if safe_isdir(str(folder)) and bool(safe_listdir(str(folder))):
                     if refresh:
                         saved = folder.with_name(folder.name + "-saved-" + uuid.uuid4().hex[:8])
-                        folder.rename(saved)
-                        folder.mkdir()
+                        os.replace(long_path(str(folder)), long_path(str(saved)))
+                        ensure_dir_exists(str(folder))
                     else:
-                        if not marker.is_file():
+                        if not safe_isfile(str(marker)):
                             raise ValueError("The branch folder contains untracked work. Refresh its workspace to preserve those files and open a clean copy.")
-                        data = json.loads(marker.read_text(encoding="utf-8"))
+                        with safe_open(str(marker), "r", encoding="utf-8") as stream:
+                            data = json.load(stream)
                         if data.get("head_snapshot_id") != branch["head_snapshot_id"]:
                             raise ValueError("The branch advanced. Refresh its workspace to preserve your files and open the latest snapshot.")
                         return str(folder)
-                folder.mkdir(parents=True, exist_ok=True)
+                ensure_dir_exists(str(folder))
                 try:
                     for entry in manifest["files"].values():
                         target = self._workspace_target(folder, entry)
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copyfile(self._blob(root, entry), target)
-                    marker.write_text(canonical({"branch_id": branch_id,
-                        "head_snapshot_id": branch["head_snapshot_id"]}), encoding="utf-8")
+                        ensure_dir_exists(str(target.parent))
+                        shutil.copyfile(
+                            long_path(str(self._blob(root, entry))), long_path(str(target))
+                        )
+                    with safe_open(str(marker), "w", encoding="utf-8") as stream:
+                        stream.write(canonical({"branch_id": branch_id,
+                            "head_snapshot_id": branch["head_snapshot_id"]}))
                 except Exception as exc:
                     raise ValueError("The partial workspace has been preserved. Use Refresh Workspace "
                                      "to keep those files and prepare a clean copy. " + str(exc)) from exc
@@ -1384,21 +1396,25 @@ class NexusHistoryService:
                 old = canonical(manifest)
                 folder = root / ".nexus/branches" / branch_id / "workspaces" / str(workspace_owner)
                 marker = folder / ".nexus-workspace.json"
-                if not marker.is_file() or json.loads(marker.read_text()).get("head_snapshot_id") != expected_head:
+                if not safe_isfile(str(marker)):
                     raise ValueError("Open the current branch workspace before checking in.")
-                names = list(folder.iterdir())
+                with safe_open(str(marker), "r", encoding="utf-8") as stream:
+                    marker_data = json.load(stream)
+                if marker_data.get("head_snapshot_id") != expected_head:
+                    raise ValueError("Open the current branch workspace before checking in.")
+                names = [folder / name for name in safe_listdir(str(folder))]
                 known = {logical_name(e["filename"]) for e in manifest["files"].values() if NATIVE.fullmatch(e["filename"])}
-                unknown = [p.name for p in names if p.is_file() and NATIVE.fullmatch(p.name) and logical_name(p.name) not in known]
+                unknown = [p.name for p in names if safe_isfile(str(p)) and NATIVE.fullmatch(p.name) and logical_name(p.name) not in known]
                 if unknown:
                     raise ValueError("New CAD names need item associations before merging: " + ", ".join(unknown))
                 for key, entry in list(manifest["files"].items()):
                     target = self._workspace_target(folder, entry)
                     if NATIVE.fullmatch(entry["filename"]):
-                        candidates = [p for p in names if p.is_file() and NATIVE.fullmatch(p.name)
+                        candidates = [p for p in names if safe_isfile(str(p)) and NATIVE.fullmatch(p.name)
                                       and logical_name(p.name) == logical_name(entry["filename"])]
                         target = max(candidates, key=lambda p: int((NATIVE.fullmatch(p.name)[2] or 0)),
                                      default=target)
-                    if not target.is_file():
+                    if not safe_isfile(str(target)):
                         raise ValueError("A workspace file is missing; check-in will not silently delete it: " + target.name)
                     file_changed = file_hash(target) != entry["sha256"]
                     committed_native = bool(source_commit_id and NATIVE.fullmatch(entry["filename"])
@@ -1481,7 +1497,8 @@ class NexusHistoryService:
                                  "WHERE project_id=? AND commit_id=?",
                                  (str(branch_id), self.project_id, str(source_commit_id)))
                 conn.commit()
-                marker.write_text(canonical({"branch_id": branch_id, "head_snapshot_id": snapshot_id}), encoding="utf-8")
+                with safe_open(str(marker), "w", encoding="utf-8") as stream:
+                    stream.write(canonical({"branch_id": branch_id, "head_snapshot_id": snapshot_id}))
                 return snapshot_id
 
     def set_branch_state(self, branch_id, state):
