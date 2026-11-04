@@ -4,14 +4,15 @@ from pathlib import Path
 import re
 import tempfile
 
-from PyQt5.QtCore import Qt, QThread, QTimer, QPointF, QUrl, pyqtSignal
-from PyQt5.QtGui import QColor, QPainterPath, QPen, QPolygonF, QDesktopServices
+from PyQt5.QtCore import Qt, QThread, QTimer, QPointF, QRectF, QUrl, pyqtSignal
+from PyQt5.QtGui import QColor, QPainter, QPainterPath, QPen, QPolygonF, QDesktopServices
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTreeWidget, QTreeWidgetItem, QHeaderView, QStyledItemDelegate, QStyle,
     QComboBox, QDialog, QFormLayout, QLineEdit, QPlainTextEdit, QDialogButtonBox,
     QMessageBox, QCheckBox, QFileDialog, QTableWidget, QTableWidgetItem,
     QAbstractItemView, QDoubleSpinBox, QSplitter, QInputDialog,
+    QGraphicsObject, QGraphicsScene, QGraphicsView,
 )
 
 from config import DB_NAME
@@ -183,6 +184,494 @@ class VerticalHistoryView(QTreeWidget):
             self.setCurrentItem(self.topLevelItem(0))
 
 
+class _ProjectTimelineNode(QGraphicsObject):
+    activated = pyqtSignal(object)
+
+    def __init__(self, event, parent=None):
+        super().__init__(parent)
+        self.event = event
+        self._selected = False
+        self._rect = QRectF(0, 0, 164, 78)
+        self.setAcceptHoverEvents(True)
+        self.setAcceptedMouseButtons(Qt.LeftButton)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(self._tooltip())
+
+    def boundingRect(self):
+        return self._rect
+
+    def _tooltip(self):
+        return "\n".join(value for value in (
+            str(self.event.get("title") or ""),
+            _local_timestamp_text(self.event.get("created_at"), self.event.get("timestamp_timezone")),
+            str(self.event.get("note") or ""),
+        ) if value)
+
+    def _colors(self):
+        category = self.event.get("category")
+        if category == "release":
+            return QColor("#fff1dc"), QColor("#a95a13")
+        if category == "master_checkin":
+            return QColor("#edf1f8"), QColor("#53657d")
+        event_type = str(self.event.get("event_type") or "")
+        if event_type == "BRANCH_MERGED":
+            return QColor("#e7f2ed"), QColor("#367253")
+        if event_type == "BRANCH_PAUSED":
+            return QColor("#fff6df"), QColor("#9b7417")
+        return QColor("#eaf0ff"), QColor("#4359ad")
+
+    def _heading(self):
+        category = self.event.get("category")
+        if category == "release":
+            return f"RELEASE · R{self.event.get('package_revision', 1)}"
+        if category == "master_checkin":
+            return "MASTER CHECK-IN"
+        labels = {
+            "BRANCH_CREATED": "BRANCH CREATED",
+            "BRANCH_CHECKIN": "BRANCH CHECK-IN",
+            "BRANCH_PAUSED": "BRANCH PAUSED",
+            "BRANCH_RESUMED": "BRANCH RESUMED",
+            "BRANCH_MERGED": "MERGED TO MASTER",
+        }
+        return labels.get(str(self.event.get("event_type") or ""), "BRANCH ACTIVITY")
+
+    def _label(self):
+        if self.event.get("category") == "release":
+            return str(self.event.get("package_name") or "Release package")
+        if self.event.get("category") == "master_checkin":
+            return str(self.event.get("member_count") or 0) + " item(s)"
+        items = self.event.get("items") or []
+        return (str(items[0].get("name")) if len(items) == 1
+                else f"{len(items)} affected item(s)" if items
+                else str(self.event.get("note") or "Branch activity"))
+
+    def paint(self, painter, option, widget=None):
+        fill, border = self._colors()
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QPen(QColor("#173c62") if self._selected else border,
+                            2.4 if self._selected else 1.4))
+        painter.setBrush(fill)
+        painter.drawRoundedRect(self._rect, 7, 7)
+        painter.setPen(QPen(border, 1.4))
+        if self.event.get("category") == "release":
+            center = QPointF(11, 12)
+            painter.setBrush(border)
+            painter.drawPolygon(QPolygonF([center + QPointF(0, -5), center + QPointF(5, 0),
+                                           center + QPointF(0, 5), center + QPointF(-5, 0)]))
+        else:
+            painter.setBrush(fill)
+            painter.drawEllipse(QPointF(11, 12), 4.5, 4.5)
+        painter.setPen(border)
+        painter.drawText(QRectF(20, 4, 138, 18), Qt.AlignLeft | Qt.AlignVCenter,
+                         self._heading())
+        painter.setPen(QColor("#263548"))
+        painter.drawText(QRectF(8, 23, 148, 31), Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap,
+                         self._label()[:58])
+        painter.setPen(QColor("#5d6876"))
+        painter.drawText(QRectF(8, 56, 148, 17), Qt.AlignLeft | Qt.AlignVCenter,
+                         _local_timestamp_text(self.event.get("created_at"),
+                                               self.event.get("timestamp_timezone")))
+
+    def set_selected(self, selected):
+        selected = bool(selected)
+        if selected != self._selected:
+            self._selected = selected
+            self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.activated.emit(self.event)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
+class _ProjectTimelineGraph(QWidget):
+    event_selected = pyqtSignal(object)
+    zoom_changed = pyqtSignal(int)
+    CARD_WIDTH = 164
+    COLUMN_GAP = 40
+    LEFT = 220
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.scene = QGraphicsScene(self)
+        self.view = QGraphicsView(self.scene, self)
+        self.view.setRenderHint(QPainter.Antialiasing)
+        self.view.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.view.setBackgroundBrush(QColor("#f7f9fc"))
+        self.view.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.view.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.view.setMinimumHeight(330)
+        layout.addWidget(self.view)
+        self._nodes = {}
+        self._selected_id = None
+        self._data = {"events": [], "branches": []}
+        self._filter = "All project activity"
+        self._zoom = 1.0
+
+    def set_timeline(self, data, filter_name="All project activity"):
+        self._data, self._filter = data, filter_name
+        self._draw()
+
+    def _draw(self):
+        self.scene.clear()
+        self._nodes.clear()
+        self._selected_id = None
+        all_events = self._data.get("events", [])
+        if self._filter == "Release packages":
+            events = [event for event in all_events if event.get("category") == "release"]
+        elif self._filter == "Nexus branches":
+            events = [event for event in all_events if event.get("category") == "branch"]
+        elif self._filter == "Master check-ins":
+            events = [event for event in all_events if event.get("category") == "master_checkin"]
+        else:
+            events = list(all_events)
+
+        branches = list(self._data.get("branches", []))
+        present = {str(event.get("branch_id") or "") for event in events if event.get("branch_id")}
+        branches = [branch for branch in branches if str(branch["id"]) in present]
+        if not events:
+            text = self.scene.addText("No project events match this view.")
+            text.setPos(30, 35)
+            self.scene.setSceneRect(0, 0, 720, 140)
+            return
+
+        master_y = 135
+        branch_top = 275
+        row_step = 120
+        branch_rows = {str(branch["id"]): branch_top + index * row_step
+                       for index, branch in enumerate(branches)}
+        max_y = branch_top + max(0, len(branches) - 1) * row_step + 100
+        spacing = self.CARD_WIDTH + self.COLUMN_GAP
+        width = self.LEFT + len(events) * spacing + 100
+        self.scene.setSceneRect(0, 0, max(width, 900), max(max_y, 390))
+        self.scene.addText("Earlier  ←                                      Time flows left to right                                      →  Later")
+        self.scene.addLine(self.LEFT - 24, master_y, width - 35, master_y,
+                           QPen(QColor("#355577"), 3))
+        master_label = self.scene.addText("MASTER")
+        master_label.setDefaultTextColor(QColor("#203c59"))
+        master_label.setPos(20, master_y - 14)
+
+        event_x = {}
+        for index, event in enumerate(events):
+            center_x = self.LEFT + index * spacing + self.CARD_WIDTH / 2
+            event_x[str(event.get("id"))] = center_x
+            lane_id = str(event.get("lane_id") or "master")
+            y = branch_rows.get(lane_id, master_y)
+            event_type = str(event.get("event_type") or "")
+            if event_type == "BRANCH_CREATED":
+                color = QColor("#4b63af")
+                path = QPainterPath(QPointF(center_x, master_y))
+                path.lineTo(center_x, y)
+                self.scene.addPath(path, QPen(color, 2.2))
+            elif event_type == "BRANCH_MERGED":
+                color = QColor("#477558")
+                path = QPainterPath(QPointF(center_x, y))
+                path.lineTo(center_x, master_y)
+                self.scene.addPath(path, QPen(color, 2.2))
+
+        for branch in branches:
+            branch_id = str(branch["id"])
+            y = branch_rows[branch_id]
+            branch_events = [event for event in events if str(event.get("branch_id") or "") == branch_id]
+            positions = [event_x[str(event.get("id"))] for event in branch_events
+                         if str(event.get("id")) in event_x]
+            if not positions:
+                continue
+            start = min(positions)
+            created = next((event_x[str(event["id"])] for event in branch_events
+                            if event.get("event_type") == "BRANCH_CREATED" and str(event["id"]) in event_x), start)
+            merged = next((event_x[str(event["id"])] for event in branch_events
+                           if event.get("event_type") == "BRANCH_MERGED" and str(event["id"]) in event_x), None)
+            end = merged if merged is not None else max(positions)
+            color = {"Active": QColor("#4b63af"), "Paused": QColor("#af8422"),
+                     "Merged": QColor("#7d8996"), "Abandoned": QColor("#8e6870")}.get(
+                         branch.get("state"), QColor("#4b63af"))
+            pen = QPen(color, 3)
+            if branch.get("state") == "Paused":
+                pen.setStyle(Qt.DashLine)
+            self.scene.addLine(created, y, max(created, end), y, pen)
+            label = self.scene.addText(str(branch.get("name") or "Nexus branch"))
+            label.setDefaultTextColor(color)
+            label.setPos(20, y - 24)
+            state_label = self.scene.addText(f"{branch.get('state')} · {branch.get('item_count', 0)} items")
+            state_label.setDefaultTextColor(QColor("#5c6670"))
+            state_label.setPos(20, y + 1)
+
+        # Month separators and labels help users orient across long histories.
+        prior_month = None
+        for index, event in enumerate(events):
+            center_x = self.LEFT + index * spacing + self.CARD_WIDTH / 2
+            parsed = local_timestamp(event.get("created_at"),
+                naive_is_utc=event.get("timestamp_timezone") == "UTC")
+            month = parsed.strftime("%b %Y") if parsed else "Unknown date"
+            if month != prior_month:
+                self.scene.addLine(center_x - self.CARD_WIDTH / 2 - 8, 42,
+                                   center_x - self.CARD_WIDTH / 2 - 8, max_y - 10,
+                                   QPen(QColor("#d4dce6"), 1, Qt.DashLine))
+                marker = self.scene.addText(month)
+                marker.setDefaultTextColor(QColor("#56687d"))
+                marker.setPos(center_x - self.CARD_WIDTH / 2, 35)
+                prior_month = month
+
+        for event in events:
+            lane_id = str(event.get("lane_id") or "master")
+            y = branch_rows.get(lane_id, master_y)
+            node = _ProjectTimelineNode(event)
+            node.setPos(event_x[str(event.get("id"))] - self.CARD_WIDTH / 2, y - 39)
+            node.activated.connect(self._select_node)
+            self.scene.addItem(node)
+            self._nodes[str(event.get("id"))] = node
+        self.scene.update()
+
+    def _select_node(self, event):
+        for node in self._nodes.values():
+            node.set_selected(node.event.get("id") == event.get("id"))
+        self.event_selected.emit(event)
+
+    def zoom_in(self):
+        self._set_zoom(min(2.5, self._zoom * 1.25))
+
+    def zoom_out(self):
+        self._set_zoom(max(0.5, self._zoom / 1.25))
+
+    def reset_zoom(self):
+        self._set_zoom(1.0)
+
+    def _set_zoom(self, value):
+        value = float(value)
+        if abs(value - self._zoom) < 0.001:
+            return
+        self.view.scale(value / self._zoom, value / self._zoom)
+        self._zoom = value
+        self.zoom_changed.emit(round(self._zoom * 100))
+
+
+class _ProjectTimelineDialog(QDialog):
+    def __init__(self, service, data, parent=None):
+        super().__init__(parent)
+        self.service, self.data = service, data
+        self.setWindowTitle("Project timeline and release packages · " +
+                            str(data.get("project", {}).get("name") or "Project"))
+        self.resize(1440, 900)
+        self.setMinimumSize(960, 650)
+        self._detail_worker = None
+        self._export_worker = None
+        self._selected_event = None
+        self._branches = {str(branch["id"]): branch for branch in data.get("branches", [])}
+        layout = QVBoxLayout(self)
+        heading = QLabel(f"{data.get('project', {}).get('name') or 'Project'}  ·  Project revision "
+                         f"{data.get('project', {}).get('revision') or 'A'}")
+        heading.setStyleSheet("font-size: 16px; font-weight: 700; color: #263d62;")
+        layout.addWidget(heading)
+        summary = QLabel(f"{data.get('release_count', 0)} package revision(s)  ·  "
+                         f"{len(data.get('branches', []))} Nexus branch(es)  ·  "
+                         f"{len(data.get('events', []))} timeline event(s).  "
+                         "Time runs left to right; use the horizontal scrollbar to move through history. "
+                         "Commits are omitted. Select a card to inspect its contents or branch activity.")
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Show"))
+        self.filter_combo = QComboBox()
+        for value in ("All project activity", "Release packages", "Nexus branches", "Master check-ins"):
+            self.filter_combo.addItem(value)
+        controls.addWidget(self.filter_combo)
+        self.zoom_out_button = QPushButton("−")
+        self.zoom_out_button.setToolTip("Zoom out of the timeline graph")
+        self.zoom_in_button = QPushButton("+")
+        self.zoom_in_button.setToolTip("Zoom in to the timeline graph")
+        self.zoom_label = QLabel("100%")
+        self.zoom_reset_button = QPushButton("Reset zoom")
+        controls.addWidget(QLabel("Zoom"))
+        controls.addWidget(self.zoom_out_button)
+        controls.addWidget(self.zoom_label)
+        controls.addWidget(self.zoom_in_button)
+        controls.addWidget(self.zoom_reset_button)
+        self.export_button = QPushButton("Export Selected Package Revision…")
+        self.export_button.setEnabled(False)
+        controls.addWidget(self.export_button)
+        controls.addStretch(1)
+        controls.addWidget(QLabel("◆ Release   ● Master check-in   Blue lane: active   "
+                                  "Dashed amber: paused   Gray: merged"))
+        layout.addLayout(controls)
+        splitter = QSplitter(Qt.Vertical)
+        self.graph = _ProjectTimelineGraph()
+        splitter.addWidget(self.graph)
+        details_panel = QWidget()
+        details_layout = QVBoxLayout(details_panel)
+        details_layout.setContentsMargins(0, 0, 0, 0)
+        self.detail_summary = QLabel("Select a release, Master check-in, or branch event above.")
+        self.detail_summary.setWordWrap(True)
+        details_layout.addWidget(self.detail_summary)
+        self.contents = QTreeWidget()
+        self.contents.setColumnCount(4)
+        self.contents.setHeaderLabels(["Package contents / affected items", "File role", "Revision", "Size"])
+        self.contents.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.contents.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.contents.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.contents.header().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        details_layout.addWidget(self.contents, 1)
+        splitter.addWidget(details_panel)
+        splitter.setStretchFactor(0, 4)
+        splitter.setStretchFactor(1, 2)
+        layout.addWidget(splitter, 1)
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
+        self.graph.event_selected.connect(self._select_event)
+        self.filter_combo.currentTextChanged.connect(self._filter_changed)
+        self.export_button.clicked.connect(self._export_selected)
+        self.zoom_in_button.clicked.connect(self.graph.zoom_in)
+        self.zoom_out_button.clicked.connect(self.graph.zoom_out)
+        self.zoom_reset_button.clicked.connect(self.graph.reset_zoom)
+        self.graph.zoom_changed.connect(lambda value: self.zoom_label.setText(f"{value}%"))
+        self.graph.set_timeline(data)
+
+    def _filter_changed(self, value):
+        self._selected_event = None
+        self.export_button.setEnabled(False)
+        self.contents.clear()
+        self.detail_summary.setText("Select a timeline card to inspect its contents or activity.")
+        self.graph.set_timeline(self.data, value)
+
+    def _select_event(self, event):
+        self._selected_event = event
+        is_release = event.get("category") == "release"
+        self.export_button.setEnabled(is_release and self._export_worker is None)
+        self.contents.clear()
+        if is_release:
+            self.detail_summary.setText("Loading frozen package contents…")
+            release_id = str(event.get("release_id") or "")
+            if self._detail_worker is None:
+                self._load_release_details(release_id)
+            return
+
+        parsed = _local_timestamp_text(event.get("created_at"), event.get("timestamp_timezone"))
+        branch = self._branches.get(str(event.get("branch_id") or ""))
+        lines = [str(event.get("title") or ""), parsed]
+        if event.get("actor"):
+            lines.append("By " + str(event["actor"]))
+        if branch:
+            lines.append("Branch state: " + str(branch.get("state") or "Unknown"))
+        if event.get("status"):
+            lines.append("Master work state: " + str(event["status"]))
+        if event.get("note"):
+            lines.extend(["", str(event["note"])])
+        if event.get("notes"):
+            lines.extend(["", *[str(note) for note in event["notes"]]])
+        self.detail_summary.setText("\n".join(lines))
+        for item in event.get("items", []):
+            row = QTreeWidgetItem([str(item.get("name") or "Item " + str(item.get("id"))), "BOM item", "", ""])
+            self.contents.addTopLevelItem(row)
+        if branch:
+            payload = event.get("payload") or {}
+            for key in ("source_commit_id", "commit_id", "validation_status", "native_state"):
+                value = payload.get(key)
+                if value not in (None, ""):
+                    self.contents.addTopLevelItem(QTreeWidgetItem([
+                        str(key.replace("_", " ").title()), "Branch activity", str(value), ""]))
+        if not self.contents.topLevelItemCount():
+            self.contents.addTopLevelItem(QTreeWidgetItem(["No additional item details are recorded.", "", "", ""]))
+
+    def _load_release_details(self, release_id):
+        worker = _Task(lambda: self.service.project_release_details(release_id), self)
+        self._detail_worker = worker
+        worker.result.connect(lambda release: self._show_release(release, release_id))
+        worker.error.connect(lambda message: self.detail_summary.setText(
+            "Could not open release contents: " + message
+            if self._selected_event and str(self._selected_event.get("release_id") or "") == release_id
+            else self.detail_summary.text()))
+        def finished():
+            self._detail_worker = None
+            worker.deleteLater()
+            selected = self._selected_event or {}
+            selected_id = str(selected.get("release_id") or "")
+            if selected.get("category") == "release" and selected_id and selected_id != release_id:
+                self.detail_summary.setText("Loading frozen package contents…")
+                self._load_release_details(selected_id)
+        worker.finished.connect(finished)
+        worker.start()
+
+    def _show_release(self, release, release_id):
+        if not self._selected_event or str(self._selected_event.get("release_id") or "") != release_id:
+            return
+        self.detail_summary.setText(
+            f"{release.get('package_name')} · R{release.get('package_revision')}  |  "
+            f"{len(release.get('members', []))} items  |  "
+            f"{_local_timestamp_text(release.get('created_at'), 'UTC')}  |  By {release.get('actor') or 'Unknown'}\n"
+            f"{release.get('note') or ''}"
+        )
+        for member in release.get("members", []):
+            item_label = " · ".join(value for value in (member.get("name"), member.get("part_number"),
+                                                         member.get("drawing_number")) if value)
+            row = QTreeWidgetItem([item_label or ("Item " + str(member["id"])), "BOM item",
+                f"CAD {member.get('cad_revision') or '—'} / DOC {member.get('document_revision') or '—'}", ""])
+            self.contents.addTopLevelItem(row)
+            for file_info in member.get("files", []):
+                child = QTreeWidgetItem([file_info.get("filename", ""), file_info.get("role", "File"),
+                    file_info.get("file_revision") or "—",
+                    (f"{file_info.get('size_bytes', 0):,} bytes" if file_info.get("size_bytes") else "")])
+                row.addChild(child)
+        shared = release.get("shared_files", [])
+        if shared:
+            row = QTreeWidgetItem(["Shared CAD dependencies", "Shared files", "", ""])
+            self.contents.addTopLevelItem(row)
+            for file_info in shared:
+                row.addChild(QTreeWidgetItem([file_info.get("filename", ""), file_info.get("role", "File"),
+                    file_info.get("file_revision") or "—",
+                    (f"{file_info.get('size_bytes', 0):,} bytes" if file_info.get("size_bytes") else "")]))
+        self.contents.expandAll()
+        self.status.setText("The contents shown are the exact files frozen for this package revision.")
+
+    def _export_selected(self):
+        event = self._selected_event or {}
+        if event.get("category") != "release" or self._export_worker is not None:
+            return
+        filename = re.sub(r"[^A-Za-z0-9._-]", "_", str(event.get("package_name") or "Release") +
+                          "_R" + str(event.get("package_revision") or 1) + ".zip")
+        destination, _ = QFileDialog.getSaveFileName(self, "Export package revision", filename,
+                                                     "Release package (*.zip)")
+        if not destination:
+            return
+        if not destination.lower().endswith(".zip"):
+            destination += ".zip"
+        release_id = str(event["release_id"])
+        worker = _Task(lambda: self.service.export_release(release_id, destination), self)
+        self._export_worker = worker
+        worker.result.connect(lambda path: self.status.setText("Exported exact package revision: " + path))
+        worker.error.connect(lambda message: self.status.setText("Could not export package: " + message))
+        def finished():
+            self._export_worker = None
+            worker.deleteLater()
+            self.export_button.setEnabled(bool(self._selected_event and
+                                               self._selected_event.get("category") == "release"))
+        worker.finished.connect(finished)
+        self.export_button.setEnabled(False)
+        self.status.setText("Verifying and exporting the selected package revision…")
+        worker.start()
+
+    def _wait_workers(self):
+        for worker in (self._detail_worker, self._export_worker):
+            if worker is not None and worker.isRunning():
+                worker.wait()
+
+    def reject(self):
+        self._wait_workers()
+        super().reject()
+
+    def closeEvent(self, event):
+        self._wait_workers()
+        super().closeEvent(event)
+
+
 class _BranchCheckinDialog(QDialog):
     def __init__(self, branch, current_item_id, parent):
         super().__init__(parent)
@@ -269,56 +758,208 @@ class _BranchCheckinDialog(QDialog):
         super().accept()
 
 
-class _ReleaseDialog(QDialog):
-    def __init__(self, sources, parent):
+class _ReleaseSelectionDialog(QDialog):
+    def __init__(self, options, current_item_id, parent):
         super().__init__(parent)
-        self.setWindowTitle("Freeze release package")
-        self.resize(720, 500)
+        self.setWindowTitle("Create or extend a release package")
+        self.resize(780, 610)
+        self.options = options
+        self.current_item_id = int(current_item_id)
+        self.available_items = {int(value["id"]): value for value in options.get("items", [])}
         layout, form = QVBoxLayout(self), QFormLayout()
-        self.cad_revision = QLineEdit(sources["cad_revision"])
-        self.cad_revision.setReadOnly(True)
-        self.document_revision = QLineEdit()
-        self.document_revision.setPlaceholderText("e.g. A010")
-        form.addRow("CAD / project revision", self.cad_revision)
-        form.addRow("Document / package revision", self.document_revision)
+        self.package_combo = QComboBox()
+        self.package_combo.addItem("Create a new release package", None)
+        for package in options.get("packages", []):
+            self.package_combo.addItem(
+                f"{package['name']} · R{package['revision']} · {len(package['member_ids'])} items",
+                package,
+            )
+        form.addRow("Release package", self.package_combo)
+        self.package_name = QLineEdit()
+        self.package_name.setPlaceholderText("e.g. 3D Printing · Housing Set")
+        form.addRow("Package name", self.package_name)
         layout.addLayout(form)
-        label = QLabel("Select the exact current file versions to freeze. This creates a permanent "
-                       "package; it does not grant validation or change the item's lifecycle.")
+        label = QLabel("Choose one or more BOM items. Each keeps its own document revision. "
+                       "Appending creates a new frozen package revision and retains all existing "
+                       "members with their original files.")
         label.setWordWrap(True)
         layout.addWidget(label)
-        self.files = QTableWidget(0, 4)
-        self.files.setHorizontalHeaderLabels(["Include", "Exact file", "Role", "Document revision"])
-        self.files.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        for key, entry in sources["files"].items():
-            row = self.files.rowCount()
-            self.files.insertRow(row)
-            check = QTableWidgetItem()
-            check.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
-            check.setCheckState(Qt.Checked)
-            check.setData(Qt.UserRole, key)
-            self.files.setItem(row, 0, check)
-            for column, value in enumerate((entry["filename"], entry["role"], entry.get("file_revision") or ""), 1):
-                cell = QTableWidgetItem(str(value))
-                cell.setFlags(cell.flags() & ~Qt.ItemIsEditable)
-                self.files.setItem(row, column, cell)
-        layout.addWidget(self.files)
-        layout.addWidget(QLabel("Release purpose / note"))
+        search_row = QHBoxLayout()
+        self.item_search = QLineEdit()
+        self.item_search.setPlaceholderText("Search BOM item by name, part number, or drawing number…")
+        self.item_results = QComboBox()
+        self.item_results.setMinimumWidth(240)
+        self.add_item_button = QPushButton("Add item")
+        search_row.addWidget(self.item_search, 1)
+        search_row.addWidget(self.item_results, 1)
+        search_row.addWidget(self.add_item_button)
+        layout.addLayout(search_row)
+        self.items_hint = QLabel()
+        layout.addWidget(self.items_hint)
+        self.items = QTableWidget(0, 3)
+        self.items.setHorizontalHeaderLabels(["Selected BOM item", "Document revision", ""])
+        self.items.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.items.setColumnWidth(1, 150)
+        self.items.setColumnWidth(2, 70)
+        layout.addWidget(self.items, 1)
+        layout.addWidget(QLabel("Release purpose / note (shared by the package revision)"))
         self.note = QPlainTextEdit()
         self.note.setMaximumHeight(80)
         layout.addWidget(self.note)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("Freeze package")
+        buttons.button(QDialogButtonBox.Ok).setText("Choose release files…")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.package_combo.currentIndexChanged.connect(self._package_changed)
+        self.item_search.textChanged.connect(self._search_items)
+        self.add_item_button.clicked.connect(self._add_selected_item)
+        self._package_changed()
+        self._search_items("")
+
+    def _package_changed(self):
+        package = self.package_combo.currentData()
+        self.package_name.setText(str(package["name"]) if package else "")
+        self.package_name.setReadOnly(bool(package))
+        members = set(map(int, package["member_ids"])) if package else set()
+        for row in reversed(range(self.items.rowCount())):
+            item_id = int(self.items.item(row, 0).data(Qt.UserRole))
+            if item_id in members:
+                self.items.removeRow(row)
+        if not package and self.current_item_id in self.available_items and not self._has_item(self.current_item_id):
+            self._append_item(self.available_items[self.current_item_id])
+        self._search_items(self.item_search.text())
+
+    def _has_item(self, item_id):
+        return any(int(self.items.item(row, 0).data(Qt.UserRole)) == int(item_id)
+                   for row in range(self.items.rowCount()))
+
+    def _search_items(self, text):
+        package = self.package_combo.currentData()
+        excluded = set(map(int, package["member_ids"])) if package else set()
+        needle = str(text or "").strip().casefold()
+        matches = [value for item_id, value in self.available_items.items()
+                   if item_id not in excluded and not self._has_item(item_id)
+                   and (not needle or needle in str(value["label"]).casefold()
+                        or needle in str(item_id))]
+        self.item_results.clear()
+        for value in matches[:100]:
+            self.item_results.addItem(str(value["label"]), int(value["id"]))
+        if len(matches) > 100:
+            self.items_hint.setText(f"Showing 100 of {len(matches)} matches. Refine the search.")
+        elif matches:
+            self.items_hint.setText(f"{len(matches)} matching item(s). Add each item you want in this package.")
+        else:
+            self.items_hint.setText("No matching BOM items are available to add.")
+        self.add_item_button.setEnabled(bool(matches))
+
+    def _append_item(self, value):
+        row = self.items.rowCount()
+        self.items.insertRow(row)
+        item = QTableWidgetItem(str(value["label"]))
+        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+        item.setData(Qt.UserRole, int(value["id"]))
+        self.items.setItem(row, 0, item)
+        revision = QTableWidgetItem("A010")
+        revision.setToolTip("PDF / STEP / drawing revision for this item")
+        self.items.setItem(row, 1, revision)
+        remove = QPushButton("Remove")
+        remove.clicked.connect(lambda _checked=False, item_id=int(value["id"]): self._remove_item(item_id))
+        self.items.setCellWidget(row, 2, remove)
+
+    def _remove_item(self, item_id):
+        for row in reversed(range(self.items.rowCount())):
+            if int(self.items.item(row, 0).data(Qt.UserRole)) == int(item_id):
+                self.items.removeRow(row)
+        self._search_items(self.item_search.text())
+
+    def _add_selected_item(self):
+        item_id = self.item_results.currentData()
+        value = self.available_items.get(int(item_id)) if item_id is not None else None
+        if value and not self._has_item(value["id"]):
+            self._append_item(value)
+            self._search_items(self.item_search.text())
+
+    def selection(self):
+        ids, revisions = [], {}
+        for row in range(self.items.rowCount()):
+            item_id = int(self.items.item(row, 0).data(Qt.UserRole))
+            ids.append(item_id)
+            revisions[str(item_id)] = self.items.item(row, 1).text().strip()
+        return ids, revisions
+
+    def package(self):
+        return self.package_combo.currentData()
+
+    def accept(self):
+        ids, revisions = self.selection()
+        if (not ids or any(not revisions.get(str(item_id)) for item_id in ids)
+                or not self.note.toPlainText().strip()
+                or (not self.package() and not self.package_name.text().strip())):
+            QMessageBox.warning(self, "Release package",
+                "Select at least one new BOM item, enter its document revision, and provide a package name and note.")
+            return
+        super().accept()
+
+
+class _ReleaseFilesDialog(QDialog):
+    def __init__(self, sources, package, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Review exact release files")
+        self.resize(760, 520)
+        layout = QVBoxLayout(self)
+        if package:
+            inherited = QLabel(
+                f"Package R{package['revision']} is being extended. Its {len(package['member_ids'])} existing "
+                "items and their exact files/revisions will be carried forward unchanged."
+            )
+        else:
+            inherited = QLabel("Select the exact file versions to include in the new package revision.")
+        inherited.setWordWrap(True)
+        layout.addWidget(inherited)
+        self.files = QTableWidget(0, 5)
+        self.files.setHorizontalHeaderLabels(["BOM item", "Include", "Exact file", "Role", "File revision"])
+        self.files.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.files.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        item_labels = {}
+        for item_key, item in sources.get("items", {}).items():
+            attrs = item.get("attributes") or {}
+            item_labels[str(item_key)] = " · ".join(str(attrs.get(name) or "").strip()
+                for name in ("name", "part_number", "drawing_number")
+                if str(attrs.get(name) or "").strip()) or ("BOM item " + str(item_key))
+        for key, entry in sources["files"].items():
+            row = self.files.rowCount()
+            self.files.insertRow(row)
+            associations = [str(value) for value in entry.get("item_ids", []) if str(value) in item_labels]
+            owner_text = ", ".join(item_labels[value] for value in associations)
+            if not owner_text:
+                owner_text = "Shared CAD dependency"
+            owner = QTableWidgetItem(owner_text)
+            owner.setFlags(owner.flags() & ~Qt.ItemIsEditable)
+            self.files.setItem(row, 0, owner)
+            check = QTableWidgetItem()
+            check.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            check.setCheckState(Qt.Checked)
+            check.setData(Qt.UserRole, key)
+            self.files.setItem(row, 1, check)
+            for column, value in enumerate((entry["filename"], entry["role"], entry.get("file_revision") or ""), 2):
+                cell = QTableWidgetItem(str(value))
+                cell.setFlags(cell.flags() & ~Qt.ItemIsEditable)
+                self.files.setItem(row, column, cell)
+        layout.addWidget(self.files, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Freeze release revision")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
     def keys(self):
-        return [self.files.item(row, 0).data(Qt.UserRole) for row in range(self.files.rowCount())
-                if self.files.item(row, 0).checkState() == Qt.Checked]
+        return [self.files.item(row, 1).data(Qt.UserRole) for row in range(self.files.rowCount())
+                if self.files.item(row, 1).checkState() == Qt.Checked]
 
     def accept(self):
-        if not self.keys() or not self.document_revision.text().strip() or not self.note.toPlainText().strip():
-            QMessageBox.warning(self, "Release package", "Select files and enter the document revision and release note.")
+        if not self.keys():
+            QMessageBox.warning(self, "Release package", "Select at least one exact file to freeze.")
             return
         super().accept()
 
@@ -527,10 +1168,15 @@ class NexusTimelinePanel(QWidget):
         layout.addWidget(self.summary)
         actions = QHBoxLayout()
         self.create_button = QPushButton("New Nexus Branch…")
-        self.release_button = QPushButton("Freeze Release Package…")
-        self.export_button = QPushButton("Export Selected Release…")
+        self.release_button = QPushButton("Release Package…")
+        self.export_button = QPushButton("Export Package Revision…")
+        self.project_timeline_button = QPushButton("Project Timeline & Releases…")
+        self.release_button.setToolTip("Create a package from one or more BOM items, or append new items to an existing package.")
+        self.export_button.setToolTip("Export the exact immutable package revision selected in the timeline.")
+        self.project_timeline_button.setToolTip("View every project release package, Master change, and Nexus branch on one horizontal timeline.")
         self.files_button = QPushButton("View Branch Files…")
-        for button in (self.create_button, self.release_button, self.export_button):
+        for button in (self.create_button, self.release_button, self.export_button,
+                       self.project_timeline_button):
             actions.addWidget(button)
         layout.addLayout(actions)
         self.status = QLabel()
@@ -573,6 +1219,7 @@ class NexusTimelinePanel(QWidget):
         self.create_button.clicked.connect(self._create)
         self.release_button.clicked.connect(self._release)
         self.export_button.clicked.connect(self._export)
+        self.project_timeline_button.clicked.connect(self._project_timeline)
         self.files_button.clicked.connect(self._files)
         self.workspace_button.clicked.connect(lambda: self._workspace(False))
         self.refresh_workspace_button.clicked.connect(lambda: self._workspace(True))
@@ -662,7 +1309,9 @@ class NexusTimelinePanel(QWidget):
         self._data = data
         item = data["item"]
         last = data["releases"][0] if data["releases"] else None
-        release = (last["cad_revision"] + " / " + last["document_revision"]) if last else "None"
+        release = ((str(last.get("package_name") or "Release") + " · R" +
+                    str(last.get("package_revision") or 1) + " · " +
+                    str(last.get("member_count") or 1) + " items") if last else "None")
         active_branch = (data.get("active_branch") or {}).get("name") or "Master"
         self.summary.setText(
             f"{item.get('name') or item['id']}  |  CAD / project revision: {data['cad_revision']}\n"
@@ -695,6 +1344,7 @@ class NexusTimelinePanel(QWidget):
         busy, branch = self._worker is not None, self._branch()
         self.create_button.setEnabled(not busy and self._data.get("can_branch", False))
         self.release_button.setEnabled(not busy and self._data.get("can_release", False))
+        self.project_timeline_button.setEnabled(not busy and bool(self._data))
         event = self.graph.currentItem().data(0, EVENT_ROLE) if self.graph.currentItem() else {}
         self.export_button.setEnabled(not busy and bool(event.get("release_id")))
         self.files_button.setEnabled(not busy and bool(event.get("snapshot_id") or branch))
@@ -722,9 +1372,19 @@ class NexusTimelinePanel(QWidget):
             text = [event["title"], _local_timestamp_text(event.get("created_at"), event.get("timestamp_timezone")),
                     str(event.get("actor") or event.get("actor_id") or ""), "", event.get("note") or ""]
             if event.get("release_id"):
+                revisions = payload.get("item_revisions") or {}
+                own_revision = revisions.get(str(event.get("bom_id")), {})
                 text += ["", "Frozen package: " + event["release_id"],
-                         "CAD / project revision: " + str(payload.get("cad_revision") or ""),
-                         "Document / package revision: " + str(payload.get("document_revision") or ""),
+                         "Package: " + str(payload.get("package_name") or event.get("title") or ""),
+                         "Package revision: R" + str(payload.get("package_revision") or 1),
+                         "CAD / project revision: " + str(own_revision.get("cad_revision") or
+                             payload.get("cad_revision") or ""),
+                         "Document revision: " + str(own_revision.get("document_revision") or
+                             payload.get("document_revision") or ""),
+                         "Package members: " + ", ".join(
+                             str(member.get("name") or member.get("id")) +
+                             (" (" + str(member.get("part_number")) + ")" if member.get("part_number") else "")
+                             for member in payload.get("members", [])),
                          "Export this package to retrieve its exact files at any time."]
             elif event.get("snapshot_id"):
                 text += ["", "Branch snapshot: " + event["snapshot_id"]]
@@ -840,16 +1500,38 @@ class NexusTimelinePanel(QWidget):
         service, item_id = self._service, self._item_id
         branch = self._branch()
         branch_id = branch["id"] if branch else None
-        def ready(sources):
-            dialog = _ReleaseDialog(sources, self)
+        def options_ready(options):
+            selection = _ReleaseSelectionDialog(options, item_id, self)
+            if selection.exec_() != QDialog.Accepted:
+                return
+            selected_ids, revisions = selection.selection()
+            package = selection.package()
+            package_id = package["id"] if package else None
+            package_name = selection.package_name.text().strip()
+            note = selection.note.toPlainText().strip()
+            self._run(lambda: service.release_sources(selected_ids, branch_id),
+                lambda sources: files_ready(sources, selected_ids, revisions, package,
+                                            package_id, package_name, note),
+                "Loading exact file versions for the selected BOM items…")
+
+        def files_ready(sources, selected_ids, revisions, package, package_id, package_name, note):
+            dialog = _ReleaseFilesDialog(sources, package, self)
             if dialog.exec_() != QDialog.Accepted:
                 return
-            revision, note, keys = dialog.document_revision.text(), dialog.note.toPlainText(), dialog.keys()
             token = service._master_token(sources)
-            self._run(lambda: service.freeze_release(item_id, revision, note,
-                expected=token, selected_keys=keys, source_snapshot_id=sources.get("source_snapshot_id")),
-                self._changed, "Freezing the exact release package…")
-        self._run(lambda: service.release_sources(item_id, branch_id), ready, "Loading exact release file versions…")
+            def freeze():
+                release_id = service.freeze_release_package(
+                    selected_ids, package_name, note, revisions, expected=token,
+                    selected_keys=dialog.keys(),
+                    source_snapshot_id=sources.get("source_snapshot_id"),
+                    existing_package_id=package_id,
+                )
+                member_ids = list(package["member_ids"]) if package else []
+                return {"release_id": release_id, "item_ids": sorted(set(member_ids + selected_ids))}
+            self._run(freeze, self._changed, "Freezing the exact multi-item release revision…")
+
+        self._run(lambda: service.release_options(branch_id), options_ready,
+                  "Loading project items and existing release packages…")
 
     def _export(self):
         row = self.graph.currentItem()
@@ -857,9 +1539,8 @@ class NexusTimelinePanel(QWidget):
         if not event.get("release_id"):
             return
         payload = event.get("payload") or {}
-        filename = re.sub(r"[^A-Za-z0-9._-]", "_", "Release_" +
-                          str(payload.get("cad_revision") or "") + "_" +
-                          str(payload.get("document_revision") or "") + ".zip")
+        filename = re.sub(r"[^A-Za-z0-9._-]", "_", str(payload.get("package_name") or "Release") +
+                          "_R" + str(payload.get("package_revision") or 1) + ".zip")
         destination, _ = QFileDialog.getSaveFileName(self, "Export frozen release", filename, "Release package (*.zip)")
         if not destination:
             return
@@ -869,6 +1550,14 @@ class NexusTimelinePanel(QWidget):
         self._run(lambda: service.export_release(release_id, destination),
                   lambda path: self.status.setText("Exported exact release package: " + path),
                   "Verifying and exporting the frozen release files…")
+
+    def _project_timeline(self):
+        if self._worker is not None or not self._service:
+            return
+        service = self._service
+        self._run(lambda: service.project_timeline(),
+            lambda data: _ProjectTimelineDialog(service, data, self).exec_(),
+            "Loading project releases, Master history, and Nexus branches…")
 
     def _merge_finished(self, result):
         self._changed(result)

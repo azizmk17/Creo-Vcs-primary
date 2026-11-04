@@ -1,10 +1,11 @@
 # Item Timeline, Nexus Branches, and Frozen Release Packages
 
-This workflow is available in **Nexus 4.8.0**. Database migration **50** adds
-the branch, snapshot, release-package, and item-event records. Migration **51**
-adds per-user active-branch selections and commit-to-branch tracking. Both are
-additive: they do not rewrite existing PDF, STEP, CAD, or deliverable status
-values.
+This workflow began in **Nexus 4.8.0**. Migration **50** adds the branch,
+snapshot, release-package, and item-event records. Migration **51** adds
+per-user active-branch selections and commit-to-branch tracking. Migration
+**53** adds named multi-item release packages and package revision metadata.
+These migrations are additive: they do not rewrite existing PDF, STEP, CAD,
+or deliverable status values.
 
 ## Revisions shown in the timeline
 
@@ -29,18 +30,29 @@ release events.
 
 ## Freeze and export a release package
 
-Choose **Freeze Release Package** to select the exact files, provide the
-document/package revision (such as `A010`), and add a note. The package records
-the CAD/project revision (such as `DV12`) separately and stores immutable,
-content-verified copies of the selected files. It is a snapshot, not a
-validation action and not an item lifecycle transition.
+Choose **Release Package** to create a named package, such as **3D Printing ·
+Housing Set**, and select one or more BOM items. Set the document revision
+(such as `A010`) for each item, add the shared release note, then select the
+exact files to freeze. The package records each item's CAD/project revision
+(such as `DV12`) separately from its document revision. It stores
+content-verified immutable files. Releasing is a snapshot action; it does not
+validate the items or change their lifecycle state.
 
-Use **Export Selected Release** to export an earlier package later. The ZIP
-contains a manifest with both revision labels and the exact frozen filenames;
-each payload uses readable folders such as `Native CAD`, `Drawings`, `PDF`, and
-`STEP`, with the original filename. Subsequent
-master edits do not alter an existing package. Content-addressed storage
-deduplicates identical bytes between snapshots.
+To add another item later, select that item's row, choose **Release Package**,
+select the existing package, search for and add the new item. The app creates the next
+package revision. It carries forward every existing member and its exact
+released files and revisions, then adds the newly selected item's snapshot.
+The earlier package revision remains available unchanged. The timeline records
+the new package revision for every member, including the added item, so a user
+can see which items belonged to each revision.
+
+Use **Export Package Revision** to export the exact revision selected in the
+timeline. The ZIP manifest lists all member items, their CAD and document
+revisions, and exact frozen filenames. Multi-item exports use readable
+per-item folders, for example `Parts/<part name>/Native CAD` and
+`Parts/<part name>/PDF`. Subsequent master edits and later package revisions do
+not alter an earlier export. Content-addressed storage deduplicates identical
+bytes between snapshots.
 
 ## Work on a Nexus Branch
 
@@ -140,3 +152,21 @@ The timeline loads item metadata and the master manifest; it does not scan or
 hash the entire working directory when opening the tab. File hashing and
 snapshot work run in a background task when creating, checking in, freezing,
 exporting, or merging.
+
+## Project timeline and all releases
+
+Choose **Project Timeline & Releases** in an item's timeline tab to open the
+project-wide view. Time runs from left to right. The Master lane contains every
+frozen release package revision and a daily summary of standalone Master
+check-ins. Commits are intentionally omitted to keep the graph readable on
+projects with large commit histories. Each Nexus branch has its own lane: the line forks
+at branch creation, continues through its branch activity, and returns to
+Master when merged. Active, paused, and merged branches use distinct line
+styles and colors.
+
+Use **+** and **−** to zoom, or **Reset zoom** to return to the normal scale.
+Select a release card to open its exact package contents in the lower panel.
+Each BOM item shows its CAD and document revisions, with the frozen CAD,
+drawing, PDF, STEP, and other files nested underneath. Use **Export Selected
+Package Revision** to export that exact revision. Filters can show only
+releases, only branches, or Master check-ins when the full timeline is busy.

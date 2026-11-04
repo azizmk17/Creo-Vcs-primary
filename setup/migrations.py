@@ -3856,6 +3856,15 @@ def _migration_52(conn):
 MIGRATIONS[52] = _migration_52
 
 
+def _migration_53(conn):
+    """Add named multi-item release packages and immutable revisions."""
+    from core.repositories.nexus_history_repository import ensure_history_schema
+    ensure_history_schema(conn)
+
+
+MIGRATIONS[53] = _migration_53
+
+
 # --- Migration ---
 def migrate():
     init_db()  

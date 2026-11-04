@@ -1532,80 +1532,354 @@ class NexusHistoryService:
                     "The last checked-in snapshot is preserved. Unchecked local work is not published.",
                     branch_id, branch["head_snapshot_id"])
 
-    def release_sources(self, item_id, branch_id=None):
+    def release_options(self, branch_id=None):
+        """Return selectable project items and the latest immutable package revisions."""
         self._require("release_files")
         with self.repo.connection() as conn:
+            tables = self.repo.tables(conn)
+            if "bom" not in tables:
+                raise ValueError("The selected project has no BOM items.")
+            columns = self.repo.columns(conn, "bom")
+            display_columns = [name for name in ("name", "part_number", "drawing_number")
+                               if name in columns]
+            selected_columns = ",".join(["id"] + display_columns)
+            query = f"SELECT {selected_columns} FROM bom WHERE project_id=? ORDER BY id"
+            allowed = None
             if branch_id:
                 branch = self._branch_access(conn, branch_id)
                 if branch["state"] != "Active":
                     raise ValueError("Only an active branch can be used for a new release package.")
-                manifest = self._snapshot(conn, branch["head_snapshot_id"])
-                if str(item_id) not in manifest["items"]:
-                    raise ValueError("The selected item is not part of this branch.")
-                manifest["source_branch_id"] = branch_id
-                manifest["source_snapshot_id"] = branch["head_snapshot_id"]
-                manifest["files"] = {key: value for key, value in manifest["files"].items()
-                                     if int(item_id) in value["item_ids"] or value.get("readonly_dependency")}
-                manifest["items"] = {str(item_id): manifest["items"][str(item_id)]}
-                return manifest
-            return self._capture(conn, [item_id])
+                head = self._snapshot(conn, branch["head_snapshot_id"])
+                allowed = {int(value) for value in head.get("items", {})}
+            items = []
+            for row in conn.execute(query, (self.project_id,)):
+                item = dict(row)
+                item_id = int(item["id"])
+                if allowed is not None and item_id not in allowed:
+                    continue
+                labels = [str(item.get(column) or "").strip() for column in display_columns]
+                label = " · ".join(value for value in labels if value) or f"BOM item {item_id}"
+                items.append({"id": item_id, "label": label})
 
-    def freeze_release(self, item_id, document_revision, note, *, expected=None, selected_keys=None,
-                       source_snapshot_id=None):
+            package_rows = conn.execute("""
+                SELECT r.* FROM nexus_releases r
+                WHERE r.project_id=? AND NOT EXISTS (
+                    SELECT 1 FROM nexus_releases newer
+                    WHERE newer.project_id=r.project_id
+                      AND COALESCE(newer.package_id,newer.id)=COALESCE(r.package_id,r.id)
+                      AND (COALESCE(newer.package_revision,1)>COALESCE(r.package_revision,1)
+                        OR (COALESCE(newer.package_revision,1)=COALESCE(r.package_revision,1)
+                            AND (newer.created_at>r.created_at
+                                OR (newer.created_at=r.created_at AND newer.id>r.id))))
+                ) ORDER BY r.created_at DESC,r.id DESC
+            """, (self.project_id,)).fetchall()
+            registered = {str(row["id"]): dict(row) for row in conn.execute(
+                "SELECT * FROM nexus_release_packages WHERE project_id=?", (self.project_id,)
+            )} if "nexus_release_packages" in tables else {}
+            latest = {}
+            for row in package_rows:
+                release = dict(row)
+                package_id = str(release.get("package_id") or release["id"])
+                revision = int(release.get("package_revision") or 1)
+                package = registered.get(package_id, {})
+                manifest = self._verified_manifest(row)
+                member_ids = sorted(int(value) for value in manifest.get("items", {}))
+                member_labels = []
+                for member_id in member_ids:
+                    member = manifest["items"].get(str(member_id), {})
+                    attrs = member.get("attributes") or {}
+                    member_labels.append(" · ".join(str(attrs.get(key) or "").strip()
+                        for key in ("name", "part_number", "drawing_number")
+                        if str(attrs.get(key) or "").strip()) or f"BOM item {member_id}")
+                name = str(release.get("package_name") or package.get("name") or "").strip()
+                if not name:
+                    name = "Release " + str(release.get("cad_revision") or "") + " / " + str(
+                        release.get("document_revision") or "")
+                latest[package_id] = {
+                    "id": package_id, "name": name, "revision": revision,
+                    "release_id": release["id"], "member_ids": member_ids,
+                    "members": member_labels, "created_at": release["created_at"],
+                }
+            packages = sorted(latest.values(), key=lambda value: value["name"].casefold())
+            return {"items": items, "packages": packages}
+
+    def _release_sources_conn(self, conn, item_ids, branch_id=None):
+        ids = sorted(set(map(int, item_ids)))
+        if not ids:
+            raise ValueError("Select at least one BOM item for this release package.")
+        if branch_id:
+            branch = self._branch_access(conn, branch_id)
+            if branch["state"] != "Active":
+                raise ValueError("Only an active branch can be used for a new release package.")
+            manifest = self._snapshot(conn, branch["head_snapshot_id"])
+            missing = [value for value in ids if str(value) not in manifest.get("items", {})]
+            if missing:
+                raise ValueError("Every selected item must belong to the active branch snapshot.")
+            wanted = set(ids)
+            manifest["items"] = {key: value for key, value in manifest["items"].items()
+                                  if int(key) in wanted}
+            manifest["files"] = {key: value for key, value in manifest["files"].items()
+                                 if wanted.intersection(map(int, value.get("item_ids") or []))
+                                 or value.get("readonly_dependency")}
+            manifest["source_branch_id"] = str(branch_id)
+            manifest["source_snapshot_id"] = branch["head_snapshot_id"]
+            return manifest
+
+        # Capture each selected item independently. If two parts have the same
+        # logical Creo name at different versions, retain both under distinct
+        # manifest keys instead of silently dropping one or rejecting the package.
+        combined = None
+        for item_id in ids:
+            captured = self._capture(conn, [item_id])
+            if combined is None:
+                combined = captured
+                continue
+            combined["items"].update(captured["items"])
+            for key, source in captured["files"].items():
+                prior = combined["files"].get(key)
+                if prior and prior["sha256"] == source["sha256"]:
+                    prior["item_ids"] = sorted(set(map(int, prior.get("item_ids", [])))
+                                                  | set(map(int, source.get("item_ids", []))))
+                    continue
+                target_key = key
+                if prior:
+                    owner = next(iter(source.get("item_ids") or [item_id]))
+                    target_key = f"{key}#item:{owner}"
+                    suffix = 2
+                    while target_key in combined["files"]:
+                        target_key = f"{key}#item:{owner}:{suffix}"
+                        suffix += 1
+                source = dict(source)
+                source["key"] = target_key
+                combined["files"][target_key] = source
+        return combined
+
+    def release_sources(self, item_id, branch_id=None):
+        """Capture exact files for one item or a multi-item release package."""
         self._require("release_files")
-        document_revision = str(document_revision).strip()
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", document_revision):
-            raise ValueError("Enter a document revision such as A010.")
-        if not str(note).strip():
-            raise ValueError("Enter the release purpose or note.")
+        ids = [item_id] if isinstance(item_id, (int, str)) else list(item_id)
         with self.repo.connection() as conn:
-            branch_id = None
-            if source_snapshot_id:
-                current = self._snapshot(conn, source_snapshot_id)
-                row = conn.execute("SELECT branch_id FROM nexus_branch_snapshots WHERE id=?", (source_snapshot_id,)).fetchone()
-                branch_id = row[0]
-                branch = self._branch_access(conn, branch_id)
-                if branch["state"] != "Active":
-                    raise ValueError("Only an active branch can be used for a new release package.")
-                if str(item_id) not in current["items"]:
-                    raise ValueError("The selected item is not in this branch snapshot.")
-                current["items"] = {str(item_id): current["items"][str(item_id)]}
-                current["files"] = {key: value for key, value in current["files"].items()
-                                     if int(item_id) in value["item_ids"] or value.get("readonly_dependency")}
-                current["source_branch_id"], current["source_snapshot_id"] = branch_id, source_snapshot_id
-            else:
-                current = self._capture(conn, [item_id])
+            return self._release_sources_conn(conn, ids, branch_id)
+
+    @staticmethod
+    def _release_doc_revision(value):
+        revision = str(value or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", revision):
+            raise ValueError("Enter a document revision such as A010 for every selected item.")
+        return revision
+
+    def freeze_release_package(self, item_ids, package_name, note, document_revisions, *,
+                              expected=None, selected_keys=None, source_snapshot_id=None,
+                              existing_package_id=None):
+        """Freeze one package revision containing multiple exact item snapshots.
+
+        Appending creates a new immutable package revision. Previously released
+        item manifests and their blobs are copied by reference without recapturing
+        or changing their exact CAD/document versions.
+        """
+        self._require("release_files")
+        ids = sorted(set(map(int, item_ids)))
+        if not ids:
+            raise ValueError("Select at least one BOM item for this release package.")
+        note = str(note or "").strip()
+        if not note:
+            raise ValueError("Enter the release purpose or note.")
+        revisions = {str(int(key)): self._release_doc_revision(value)
+                     for key, value in dict(document_revisions or {}).items()}
+        if set(revisions) != {str(value) for value in ids}:
+            raise ValueError("Provide a document revision for every selected item.")
+        with self.repo.connection() as conn:
+            current = self._release_sources_conn(conn, ids,
+                branch_id=(conn.execute("SELECT branch_id FROM nexus_branch_snapshots WHERE id=?",
+                                        (str(source_snapshot_id),)).fetchone() or [None])[0]
+                if source_snapshot_id else None)
+            if source_snapshot_id and str(current.get("source_snapshot_id")) != str(source_snapshot_id):
+                raise ValueError("The selected release branch snapshot changed. Review its files again.")
             original_token = self._master_token(current)
-            if expected and self._master_token(current) != expected:
+            if expected and original_token != expected:
                 raise ValueError("The selected file versions changed. Review the release sources again.")
             keys = set(current["files"]) if selected_keys is None else set(selected_keys)
             if not keys or keys - set(current["files"]):
                 raise ValueError("Select the exact available files for this release package.")
-            root = self._root(conn)
-            if source_snapshot_id:
-                current["files"] = {k: v for k, v in current["files"].items() if k in keys}
-                for entry in current["files"].values():
+            current["files"] = {key: value for key, value in current["files"].items() if key in keys}
+            for item_key, revision in revisions.items():
+                current["items"][item_key]["document_revision"] = revision
+                current["items"][item_key]["cad_revision"] = current.get("cad_revision", "")
+                current["items"][item_key]["source_branch_id"] = current.get("source_branch_id")
+                current["items"][item_key]["source_snapshot_id"] = current.get("source_snapshot_id")
+
+            package = None
+            old_release = None
+            package_id = str(existing_package_id or "").strip()
+            if package_id:
+                package = conn.execute("SELECT * FROM nexus_release_packages WHERE id=? AND project_id=?",
+                                       (package_id, self.project_id)).fetchone()
+                old_release = conn.execute("""
+                    SELECT * FROM nexus_releases WHERE project_id=?
+                      AND (package_id=? OR (package_id IS NULL AND id=?))
+                    ORDER BY COALESCE(package_revision,1) DESC,created_at DESC,id DESC LIMIT 1
+                """, (self.project_id, package_id, package_id)).fetchone()
+                if not old_release:
+                    raise ValueError("The selected release package is no longer available.")
+                old_manifest = self._verified_manifest(old_release)
+                for old_item in old_manifest.get("items", {}).values():
+                    old_item.setdefault("cad_revision", old_manifest.get("cad_revision") or
+                                         old_release["cad_revision"])
+                    old_item.setdefault("document_revision", old_release["document_revision"])
+                    old_item.setdefault("source_branch_id", old_manifest.get("source_branch_id"))
+                    old_item.setdefault("source_snapshot_id", old_manifest.get("source_snapshot_id"))
+                overlap = sorted(set(old_manifest.get("items", {})) & set(current.get("items", {})))
+                if overlap:
+                    raise ValueError("This package already contains the selected item(s). Choose only new items to append.")
+                package_name = str(package["name"] if package else
+                    (old_release["package_name"] or "Release " + str(old_release["cad_revision"])
+                     + " / " + str(old_release["document_revision"])))
+                package_revision = int(old_release["package_revision"] or 1) + 1
+                package_id = str(old_release["package_id"] or old_release["id"])
+                root = self._root(conn)
+                for entry in old_manifest.get("files", {}).values():
                     self._blob(root, entry)
+                combined = json.loads(json.dumps(old_manifest))
+                combined["items"].update(current["items"])
+                for key, entry in current["files"].items():
+                    prior = combined["files"].get(key)
+                    if prior and prior["sha256"] == entry["sha256"]:
+                        prior["item_ids"] = sorted(set(map(int, prior.get("item_ids", [])))
+                                                     | set(map(int, entry.get("item_ids", []))))
+                        continue
+                    target_key = key
+                    if prior:
+                        owner = next(iter(entry.get("item_ids") or [ids[0]]))
+                        target_key = f"{key}#item:{owner}"
+                        suffix = 2
+                        while target_key in combined["files"]:
+                            target_key = f"{key}#item:{owner}:{suffix}"
+                            suffix += 1
+                    frozen = dict(entry)
+                    frozen["key"] = target_key
+                    if source_snapshot_id:
+                        self._blob(root, frozen)
+                        combined["files"][target_key] = frozen
+                    else:
+                        combined["files"][target_key] = self._freeze(root, frozen)
+                combined["package_id"] = package_id
+                combined["package_name"] = package_name
+                combined["package_revision"] = package_revision
+                combined["revision_note"] = note
             else:
-                current["files"] = {k: self._freeze(root, v) for k, v in current["files"].items() if k in keys}
-            release_id, stamp, encoded = uuid.uuid4().hex, now(), canonical(current)
+                package_name = str(package_name or "").strip()
+                if not package_name or len(package_name) > 120:
+                    raise ValueError("Enter a release package name up to 120 characters.")
+                package_id, package_revision = uuid.uuid4().hex, 1
+                root = self._root(conn)
+                current["package_id"] = package_id
+                current["package_name"] = package_name
+                current["package_revision"] = package_revision
+                current["revision_note"] = note
+                if source_snapshot_id:
+                    for entry in current["files"].values():
+                        self._blob(root, entry)
+                else:
+                    current["files"] = {key: self._freeze(root, value)
+                                         for key, value in current["files"].items()}
+                combined = current
+
+            combined.setdefault("package_id", package_id)
+            combined.setdefault("package_name", package_name)
+            combined.setdefault("package_revision", package_revision)
+            member_ids = sorted(int(value) for value in combined.get("items", {}))
+            item_revisions = {
+                key: {"cad_revision": value.get("cad_revision") or combined.get("cad_revision", ""),
+                      "document_revision": value.get("document_revision") or ""}
+                for key, value in combined["items"].items()
+            }
+            cad_values = {value["cad_revision"] for value in item_revisions.values()}
+            doc_values = {value["document_revision"] for value in item_revisions.values()}
+            cad_revision = next(iter(cad_values)) if len(cad_values) == 1 else "Multiple"
+            document_revision = next(iter(doc_values)) if len(doc_values) == 1 else "Multiple"
+            encoded = canonical(combined)
+            digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            release_id, stamp = uuid.uuid4().hex, now()
+
             conn.execute("BEGIN IMMEDIATE")
-            # File sources and metadata must still match after the potentially long copies.
-            check = self._capture(conn, [item_id]) if not source_snapshot_id else None
-            if check is not None and self._master_token(check) != original_token:
-                raise ValueError("The item changed while the release package was being frozen. Retry.")
+            # Recheck the selected source after file freezing and serialize appends
+            # so two users cannot both create the same next package revision.
+            if source_snapshot_id:
+                branch_row = conn.execute("SELECT branch_id FROM nexus_branch_snapshots WHERE id=?",
+                                          (str(source_snapshot_id),)).fetchone()
+                if not branch_row:
+                    raise ValueError("The selected branch snapshot is no longer available.")
+                branch = self._branch_access(conn, branch_row[0])
+                if branch["state"] != "Active" or branch["head_snapshot_id"] != source_snapshot_id:
+                    raise ValueError("The branch changed while the release was being frozen. Review it again.")
+            else:
+                check = self._release_sources_conn(conn, ids)
+                if self._master_token(check) != original_token:
+                    raise ValueError("The selected items changed while the release was being frozen. Retry.")
+            if existing_package_id:
+                latest_check = conn.execute("""
+                    SELECT id,COALESCE(package_revision,1) AS package_revision
+                    FROM nexus_releases WHERE project_id=?
+                      AND (package_id=? OR (package_id IS NULL AND id=?))
+                    ORDER BY package_revision DESC,created_at DESC,id DESC LIMIT 1
+                """, (self.project_id, existing_package_id, existing_package_id)).fetchone()
+                if not latest_check or str(latest_check["id"]) != str(old_release["id"]):
+                    raise ValueError("Another user updated this release package. Reload it and append again.")
+                if package:
+                    conn.execute("UPDATE nexus_release_packages SET latest_revision=? WHERE id=?",
+                                 (package_revision, package_id))
+                else:
+                    conn.execute("""
+                        INSERT OR IGNORE INTO nexus_release_packages(
+                            id,project_id,name,created_by,created_at,latest_revision
+                        ) VALUES(?,?,?,?,?,?)
+                    """, (package_id, self.project_id, package_name, self.user_id, stamp, package_revision))
+                    conn.execute("UPDATE nexus_release_packages SET latest_revision=? WHERE id=?",
+                                 (package_revision, package_id))
+            else:
+                conn.execute("""
+                    INSERT INTO nexus_release_packages(id,project_id,name,created_by,created_at,latest_revision)
+                    VALUES(?,?,?,?,?,?)
+                """, (package_id, self.project_id, package_name, self.user_id, stamp, package_revision))
             conn.execute("""
                 INSERT INTO nexus_releases(id,project_id,bom_id,cad_revision,document_revision,
-                    note,manifest_json,manifest_sha256,actor_id,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?)
-            """, (release_id, self.project_id, int(item_id), current["cad_revision"], document_revision,
-                  str(note).strip(), encoded, hashlib.sha256(encoded.encode()).hexdigest(), self.user_id, stamp))
-            self.repo.event(conn, self.project_id, [item_id], self.user_id, stamp, "RELEASE_FROZEN",
-                "Release · " + current["cad_revision"] + " / " + document_revision, str(note).strip(),
-                branch_id=branch_id, snapshot_id=source_snapshot_id, release_id=release_id,
-                payload={"cad_revision": current["cad_revision"],
-                                              "document_revision": document_revision})
+                    note,manifest_json,manifest_sha256,actor_id,created_at,package_id,package_name,package_revision)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (release_id, self.project_id, member_ids[0], cad_revision, document_revision,
+                  note, encoded, digest, self.user_id, stamp, package_id, package_name, package_revision))
+            payload = {"package_id": package_id, "package_name": package_name,
+                       "package_revision": package_revision, "member_count": len(member_ids),
+                       "members": [{"id": int(key),
+                                    "name": str((value.get("attributes") or {}).get("name") or key),
+                                    "part_number": str((value.get("attributes") or {}).get("part_number") or ""),
+                                    "cad_revision": value.get("cad_revision") or combined.get("cad_revision", ""),
+                                    "document_revision": value.get("document_revision") or ""}
+                                   for key, value in combined["items"].items()],
+                       "item_revisions": item_revisions}
+            title = f"Release package · {package_name} · R{package_revision}"
+            for item_key in sorted(combined["items"], key=lambda value: int(value)):
+                member = combined["items"][item_key]
+                self.repo.event(conn, self.project_id, [int(item_key)], self.user_id, stamp,
+                    "RELEASE_FROZEN", title, note,
+                    branch_id=member.get("source_branch_id"),
+                    snapshot_id=member.get("source_snapshot_id"),
+                    release_id=release_id, payload=payload)
             return release_id
+
+    def freeze_release(self, item_id, document_revision, note, *, expected=None, selected_keys=None,
+                       source_snapshot_id=None):
+        """Compatibility wrapper for the original one-item release action."""
+        branch_id = None
+        if source_snapshot_id:
+            with self.repo.connection() as conn:
+                row = conn.execute("SELECT branch_id FROM nexus_branch_snapshots WHERE id=?",
+                                   (str(source_snapshot_id),)).fetchone()
+                branch_id = row[0] if row else None
+        sources = self.release_sources(item_id, branch_id)
+        package_name = "Release " + str(sources.get("cad_revision") or "") + " / " + str(document_revision)
+        return self.freeze_release_package([item_id], package_name, note,
+            {str(item_id): document_revision}, expected=expected, selected_keys=selected_keys,
+            source_snapshot_id=source_snapshot_id)
 
     def export_release(self, release_id, destination):
         with self.repo.connection() as conn:
@@ -1631,6 +1905,15 @@ class NexusHistoryService:
                     "pdf": "PDF", "step": "STEP",
                     "stp": "STEP", "cad_dependency": "CAD Dependencies",
                 }
+                members = export_manifest.get("items", {})
+                member_count = len(members)
+                item_folders = {}
+                for item_key, item in members.items():
+                    attrs = item.get("attributes") or {}
+                    label = (str(attrs.get("part_number") or attrs.get("name") or
+                                 attrs.get("drawing_number") or ("BOM item " + str(item_key))).strip())
+                    label = re.sub(r'[<>:"/\\|?*]', "_", label).rstrip(" .") or ("BOM item " + str(item_key))
+                    item_folders[str(item_key)] = label[:80]
                 for key, entry in export_manifest["files"].items():
                     role = str(entry.get("role") or "").strip().casefold()
                     if role in {"", "document", "attachment", "file"}:
@@ -1640,7 +1923,13 @@ class NexusHistoryService:
                     folder = role_folders.get(role, "Other Documents")
                     raw_name = Path(str(entry.get("filename") or "file").replace("\\", "/")).name
                     filename = re.sub(r'[<>:"/\\|?*]', "_", raw_name).rstrip(" .") or "file"
-                    relative = f"files/{folder}/{filename}"
+                    associated = sorted({str(value) for value in entry.get("item_ids", [])
+                                         if str(value) in item_folders})
+                    if member_count > 1:
+                        part_folder = item_folders[associated[0]] if len(associated) == 1 else "Shared"
+                        relative = f"files/Parts/{part_folder}/{folder}/{filename}"
+                    else:
+                        relative = f"files/{folder}/{filename}"
                     previous_hash = used_paths.get(relative.casefold())
                     if previous_hash and previous_hash != entry["sha256"]:
                         path = Path(filename)
@@ -1651,8 +1940,15 @@ class NexusHistoryService:
                     entry.pop("blob_path", None)
                     entry.pop("path", None)
                 with zipfile.ZipFile(long_path(temporary), "w", compression=zipfile.ZIP_DEFLATED) as package:
-                    package.writestr("release.json", json.dumps({**dict(row), "manifest": export_manifest,
-                        "manifest_json": None}, indent=2))
+                    package.writestr("release.json", json.dumps({
+                        **dict(row), "manifest": export_manifest, "manifest_json": None,
+                        "members": [{"id": int(key),
+                                     "name": str((value.get("attributes") or {}).get("name") or key),
+                                     "part_number": str((value.get("attributes") or {}).get("part_number") or ""),
+                                     "cad_revision": value.get("cad_revision") or manifest.get("cad_revision", ""),
+                                     "document_revision": value.get("document_revision") or ""}
+                                    for key, value in members.items()],
+                    }, indent=2))
                     written = set()
                     for key, entry in manifest["files"].items():
                         relative = package_paths[key]
@@ -1673,6 +1969,223 @@ class NexusHistoryService:
             finally:
                 Path(long_path(temporary)).unlink(missing_ok=True)
             return str(destination)
+
+    def project_release_details(self, release_id):
+        """Return one exact package revision and its item/file manifest for viewing."""
+        with self.repo.connection() as conn:
+            self._project(conn)
+            row = conn.execute("""
+                SELECT r.*,u.username AS actor FROM nexus_releases r
+                LEFT JOIN users u ON u.id=r.actor_id
+                WHERE r.id=? AND r.project_id=?
+            """, (str(release_id), self.project_id)).fetchone()
+            if not row:
+                raise ValueError("The selected release package revision was not found.")
+            release = dict(row)
+            manifest = self._verified_manifest(row)
+            release["package_name"] = (release.get("package_name") or
+                "Release " + str(release.get("cad_revision") or ""))
+            release["package_revision"] = int(release.get("package_revision") or 1)
+            files_by_item = {str(item_id): [] for item_id in manifest.get("items", {})}
+            shared_files = []
+            for key, entry in manifest.get("files", {}).items():
+                file_info = {"key": key, "filename": str(entry.get("filename") or ""),
+                    "role": str(entry.get("role") or entry.get("file_type") or "File"),
+                    "file_revision": str(entry.get("file_revision") or ""),
+                    "size_bytes": int(entry.get("size_bytes") or 0),
+                    "sha256": str(entry.get("sha256") or "")}
+                assigned = [str(value) for value in entry.get("item_ids", [])
+                            if str(value) in files_by_item]
+                if not assigned:
+                    shared_files.append(file_info)
+                for item_id in assigned:
+                    files_by_item[item_id].append(file_info)
+            members = []
+            for item_key, item in manifest.get("items", {}).items():
+                attrs = item.get("attributes") or {}
+                members.append({
+                    "id": int(item_key), "name": str(attrs.get("name") or ""),
+                    "part_number": str(attrs.get("part_number") or ""),
+                    "drawing_number": str(attrs.get("drawing_number") or ""),
+                    "cad_revision": str(item.get("cad_revision") or manifest.get("cad_revision") or
+                                         release.get("cad_revision") or ""),
+                    "document_revision": str(item.get("document_revision") or
+                                              release.get("document_revision") or ""),
+                    "files": sorted(files_by_item.get(str(item_key), []),
+                                     key=lambda value: (value["role"].casefold(), value["filename"].casefold())),
+                })
+            release["members"] = members
+            release["shared_files"] = sorted(shared_files,
+                key=lambda value: (value["role"].casefold(), value["filename"].casefold()))
+            return release
+
+    def project_timeline(self):
+        """Build the project-wide master/release/branch activity stream.
+
+        Multi-item release events are read from the immutable release table so
+        each package revision appears once. Repeated per-item branch events are
+        grouped into one project timeline event.
+        """
+        with self.repo.connection() as conn:
+            project = self._project(conn)
+            tables = self.repo.tables(conn)
+            project_name = str(project.get("name") or "Project")
+            project_revision = str(project.get("version_label") or "A")
+
+            branch_rows = conn.execute("""
+                SELECT b.*,u.username AS owner_name,
+                    (SELECT COUNT(*) FROM nexus_branch_items i WHERE i.branch_id=b.id) AS item_count
+                FROM nexus_branches b LEFT JOIN users u ON u.id=b.owner_id
+                WHERE b.project_id=? ORDER BY b.created_at,b.id
+            """, (self.project_id,)).fetchall()
+            branches = [dict(row) for row in branch_rows]
+            branch_by_id = {str(branch["id"]): branch for branch in branches}
+            events = []
+
+            if "nexus_item_events" in tables:
+                raw_events = conn.execute("""
+                    SELECT e.*,u.username AS actor,b.name AS item_name,b.part_number
+                    FROM nexus_item_events e
+                    LEFT JOIN users u ON u.id=e.actor_id
+                    LEFT JOIN bom b ON b.id=e.bom_id
+                    WHERE e.project_id=? AND e.event_type LIKE 'BRANCH_%'
+                      AND e.event_type<>'BRANCH_COMMIT'
+                    ORDER BY e.created_at,e.id
+                """, (self.project_id,)).fetchall()
+                grouped = {}
+                for row in raw_events:
+                    event = dict(row)
+                    signature = (event.get("event_type"), event.get("branch_id"),
+                        event.get("snapshot_id"), event.get("title"), event.get("note"),
+                        event.get("actor_id"), event.get("created_at"), event.get("payload_json"))
+                    value = grouped.get(signature)
+                    if value is None:
+                        try:
+                            payload = json.loads(event.get("payload_json") or "{}")
+                        except (TypeError, ValueError):
+                            payload = {}
+                        value = {"id": "branch-event-" + str(event["id"]),
+                            "event_type": str(event.get("event_type") or "BRANCH_ACTIVITY"),
+                            "category": "branch",
+                            "lane_id": str(event.get("branch_id") or "master"),
+                            "branch_id": str(event.get("branch_id") or ""),
+                            "title": str(event.get("title") or event.get("event_type") or "Branch activity"),
+                            "note": str(event.get("note") or ""),
+                            "actor": str(event.get("actor") or ""),
+                            "created_at": str(event.get("created_at") or ""),
+                            "timestamp_timezone": "UTC", "snapshot_id": event.get("snapshot_id"),
+                            "payload": payload, "item_ids": [], "items": []}
+                        grouped[signature] = value
+                    item_id = int(event["bom_id"])
+                    if item_id not in value["item_ids"]:
+                        value["item_ids"].append(item_id)
+                        item_name = " · ".join(str(event.get(field) or "").strip()
+                            for field in ("item_name", "part_number")
+                            if str(event.get(field) or "").strip()) or f"Item {item_id}"
+                        value["items"].append({"id": item_id, "name": item_name})
+                events.extend(grouped.values())
+
+            # Release table rows are package revisions; they already contain the
+            # full member manifest, so multi-item releases are never duplicated.
+            releases = []
+            if "nexus_releases" in tables:
+                for row in conn.execute("""
+                    SELECT r.id,r.bom_id,r.cad_revision,r.document_revision,r.note,r.actor_id,
+                           r.created_at,r.package_id,r.package_name,r.package_revision,
+                           u.username AS actor,r.manifest_json,r.manifest_sha256
+                    FROM nexus_releases r LEFT JOIN users u ON u.id=r.actor_id
+                    WHERE r.project_id=? ORDER BY r.created_at,r.id
+                """, (self.project_id,)):
+                    manifest = self._verified_manifest(row)
+                    member_ids = sorted(int(value) for value in manifest.get("items", {}))
+                    members = []
+                    for item_id in member_ids:
+                        item = manifest["items"].get(str(item_id), {})
+                        attrs = item.get("attributes") or {}
+                        members.append({"id": item_id,
+                            "name": " · ".join(str(attrs.get(field) or "").strip()
+                                for field in ("name", "part_number")
+                                if str(attrs.get(field) or "").strip()) or f"Item {item_id}"})
+                    name = str(row["package_name"] or "").strip() or (
+                        "Release " + str(row["cad_revision"] or "") + " / " +
+                        str(row["document_revision"] or ""))
+                    revision = int(row["package_revision"] or 1)
+                    release = {"id": str(row["id"]), "release_id": str(row["id"]),
+                        "package_id": str(row["package_id"] or row["id"]),
+                        "package_name": name, "package_revision": revision,
+                        "cad_revision": str(row["cad_revision"] or ""),
+                        "document_revision": str(row["document_revision"] or ""),
+                        "member_count": len(member_ids) or 1, "members": members,
+                        "note": str(row["note"] or ""), "actor": str(row["actor"] or ""),
+                        "created_at": str(row["created_at"] or ""), "timestamp_timezone": "UTC",
+                        "category": "release", "lane_id": "master",
+                        "title": f"Release · {name} · R{revision}"}
+                    releases.append(release)
+                    events.append(release)
+
+            # Standalone master check-ins are summarized by local calendar day,
+            # avoiding a huge project graph of one card per Item iteration.
+            if {"bom_iterations", "bom_revisions", "bom"} <= tables:
+                iteration_columns = self.repo.columns(conn, "bom_iterations")
+                if {"revision_id", "created_at"} <= iteration_columns:
+                    note_expr = "i.checkin_note" if "checkin_note" in iteration_columns else "''"
+                    actor_join = ("LEFT JOIN users u ON u.id=i.created_by"
+                                  if "created_by" in iteration_columns and "users" in tables else "")
+                    actor_expr = "u.username" if actor_join else "''"
+                    commit_filter = ("AND COALESCE(i.source_commit_id,'')=''"
+                                     if "source_commit_id" in iteration_columns else "")
+                    iteration_expr = "i.iteration_number" if "iteration_number" in iteration_columns else "1"
+                    rows = conn.execute(f"""
+                        SELECT i.id,i.created_at,{note_expr} AS note,{iteration_expr} AS iteration_number,
+                               {actor_expr} AS actor,r.revision_code,b.id AS item_id,b.name,b.part_number
+                        FROM bom_iterations i
+                        JOIN bom_revisions r ON r.id=i.revision_id
+                        JOIN bom b ON b.id=r.bom_id
+                        {actor_join}
+                        WHERE b.project_id=? {commit_filter}
+                        ORDER BY i.created_at,i.id
+                    """, (self.project_id,)).fetchall()
+                    checkins = {}
+                    for row in rows:
+                        parsed = local_timestamp(row["created_at"], naive_is_utc=True)
+                        if not parsed:
+                            continue
+                        day = parsed.strftime("%Y-%m-%d")
+                        group = checkins.setdefault(day, {"id": "master-checkin-" + day,
+                            "event_type": "CHECKIN", "category": "master_checkin", "lane_id": "master",
+                            "title": "Master check-ins · " + day, "note": "",
+                            "created_at": str(row["created_at"] or ""), "timestamp_timezone": "UTC",
+                            "actor": str(row["actor"] or ""), "item_ids": [], "items": [], "notes": [],
+                            "_latest_timestamp": parsed.timestamp()})
+                        if parsed.timestamp() >= group["_latest_timestamp"]:
+                            group["created_at"] = str(row["created_at"] or "")
+                            group["_latest_timestamp"] = parsed.timestamp()
+                        item_id = int(row["item_id"])
+                        if item_id not in group["item_ids"]:
+                            group["item_ids"].append(item_id)
+                            label = " · ".join(str(row[key] or "").strip()
+                                for key in ("name", "part_number") if str(row[key] or "").strip())
+                            group["items"].append({"id": item_id, "name": label or f"Item {item_id}"})
+                        revision_label = str(row["revision_code"] or "") + "." + str(row["iteration_number"] or 1)
+                        if row["note"]:
+                            group["notes"].append(revision_label + " · " + str(row["note"]))
+                    for day, group in checkins.items():
+                        group["member_count"] = len(group["item_ids"])
+                        group["note"] = f"{group['member_count']} Item check-in(s) on {day}."
+                        group.pop("_latest_timestamp", None)
+                        events.append(group)
+
+            for event in events:
+                parsed = local_timestamp(event.get("created_at"),
+                    naive_is_utc=event.get("timestamp_timezone") == "UTC")
+                event["_sort_timestamp"] = parsed.timestamp() if parsed else float("inf")
+            events.sort(key=lambda event: (event["_sort_timestamp"],
+                                           str(event.get("id") or "")))
+            for event in events:
+                event.pop("_sort_timestamp", None)
+            return {"project": {"id": self.project_id, "name": project_name,
+                                "revision": project_revision},
+                    "branches": branches, "events": events, "release_count": len(releases)}
 
     def preview_merge(self, branch_id):
         self._require("merge")
@@ -2206,9 +2719,18 @@ class NexusHistoryService:
                 return (parsed.timestamp() if parsed else float("-inf"), str(row.get("id") or ""))
             rows.sort(key=event_order, reverse=True)
             releases = [dict(row) for row in conn.execute("""
-                SELECT id,cad_revision,document_revision,note,created_at FROM nexus_releases
-                WHERE project_id=? AND bom_id=? ORDER BY created_at DESC
-            """, (self.project_id, int(item_id)))]
+                SELECT DISTINCT r.* FROM nexus_releases r
+                LEFT JOIN nexus_item_events e ON e.release_id=r.id
+                    AND e.project_id=r.project_id AND e.bom_id=?
+                WHERE r.project_id=? AND (r.bom_id=? OR e.id IS NOT NULL)
+                ORDER BY r.created_at DESC,r.id DESC LIMIT 1
+            """, (int(item_id), self.project_id, int(item_id)))]
+            for release in releases:
+                manifest = self._verified_manifest(release)
+                release["member_count"] = len(manifest.get("items", {})) or 1
+                if not release.get("package_name"):
+                    release["package_name"] = "Release " + str(release.get("cad_revision") or "")
+                release["package_revision"] = int(release.get("package_revision") or 1)
             active_row = conn.execute("""
                 SELECT b.id AS branch_id,b.name,b.state FROM nexus_active_branches a
                 JOIN nexus_branches b ON b.id=a.branch_id

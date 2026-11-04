@@ -47,6 +47,13 @@ CREATE TABLE IF NOT EXISTS nexus_releases (
 );
 CREATE INDEX IF NOT EXISTS idx_nexus_releases_item
     ON nexus_releases(project_id,bom_id,created_at);
+CREATE TABLE IF NOT EXISTS nexus_release_packages (
+    id TEXT PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL,
+    created_by INTEGER NOT NULL, created_at TEXT NOT NULL,
+    latest_revision INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_nexus_release_packages_project
+    ON nexus_release_packages(project_id,created_at DESC);
 CREATE TABLE IF NOT EXISTS nexus_item_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL,
     bom_id INTEGER NOT NULL, branch_id TEXT, event_type TEXT NOT NULL,
@@ -56,6 +63,8 @@ CREATE TABLE IF NOT EXISTS nexus_item_events (
 );
 CREATE INDEX IF NOT EXISTS idx_nexus_events_item
     ON nexus_item_events(project_id,bom_id,created_at DESC,id DESC);
+CREATE INDEX IF NOT EXISTS idx_nexus_events_release
+    ON nexus_item_events(release_id,bom_id);
 CREATE TABLE IF NOT EXISTS nexus_active_branches (
     user_id INTEGER NOT NULL, project_id INTEGER NOT NULL, bom_id INTEGER NOT NULL,
     branch_id TEXT NOT NULL REFERENCES nexus_branches(id), updated_at TEXT NOT NULL,
@@ -68,6 +77,16 @@ CREATE INDEX IF NOT EXISTS idx_nexus_active_branch
 
 def ensure_history_schema(conn):
     conn.executescript(SCHEMA)
+    release_columns = NexusHistoryRepository.columns(conn, "nexus_releases")
+    for name, declaration in (
+        ("package_id", "TEXT"),
+        ("package_name", "TEXT NOT NULL DEFAULT ''"),
+        ("package_revision", "INTEGER NOT NULL DEFAULT 1"),
+    ):
+        if name not in release_columns:
+            conn.execute(f"ALTER TABLE nexus_releases ADD COLUMN {name} {declaration}")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_nexus_releases_package "
+                 "ON nexus_releases(project_id,package_id,package_revision)")
     for table in ("nexus_branch_snapshots", "nexus_releases", "nexus_item_events"):
         for action in ("UPDATE", "DELETE"):
             conn.execute(f"""

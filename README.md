@@ -10,6 +10,8 @@ Nexus **4.8.0** adds an item timeline with independent CAD/project and document 
 
 Nexus **5.0.0** uses the project root as Master; see [Master work and deliverables](docs/master_work_and_deliverables.md) before upgrading shared projects.
 
+Nexus **5.1.0** supports multi-item release packages and append-only package revisions. See [Item Timeline, Nexus Branches, and Frozen Release Packages](docs/nexus_branches_and_release_packages.md).
+
 To archive Creo iterations to another disk and clean eligible project copies, see [Snapshot backup and cleanup](docs/snapshot_backup_cleanup.md).
 
 Nexus **4.9.0** adds an opt-in recorder for real company-workspace performance.
