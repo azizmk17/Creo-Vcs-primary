@@ -2927,6 +2927,13 @@ class CommitPage(QWidget):
         item = table.item(row, table.columnCount() - 1)
         path = item.data(Qt.UserRole) if item else ""
         if not path or not safe_exists(path):
+            if path:
+                from core.services.snapshot_service import SnapshotService
+                archived = SnapshotService().find_archived_creo_file(self.session.project_id, path)
+                if archived:
+                    QMessageBox.information(self, "Creo File in Snapshot", f"This Creo version is in snapshot #{archived['snapshot_id']} "
+                                            f"({archived['snapshot_name']}).\n\nBackup file:\n{archived['path']}")
+                    return
             QMessageBox.warning(self, "Open Document", f"File not found:\n{path}")
             return
         try:
@@ -3454,6 +3461,17 @@ class CommitPage(QWidget):
 
     def browse_commit_directory(self, group):
         path = self._commit_directory_for_group(group)
+        from core.services.snapshot_service import SnapshotService
+        try:
+            archived = SnapshotService().find_archived_creo_folder(
+                group.get("project_id") or self.session.project_id, path)
+        except Exception:
+            archived = None
+        if archived:
+            QMessageBox.information(self, "Creo Files in Snapshot",
+                f"Creo files from this commit were backed up in snapshot #{archived['snapshot_id']} "
+                f"({archived['snapshot_name']}).\n\nBackup folder:\n{archived['path']}\n\n"
+                "The original folder may still contain documents and other files.")
         if safe_exists(path):
             try:
                 safe_startfile(path)
@@ -3462,7 +3480,7 @@ class CommitPage(QWidget):
                     self, "Open Commit Folder",
                     f"Failed to open the exact commit directory:\n{path}\n\n{exc}",
                 )
-        else:
+        elif not archived:
             QMessageBox.warning(self, "Not Found", f"Commit directory not found:\n{path}")
 
     # ═══════════════════════════════════════════════════════════════════

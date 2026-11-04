@@ -13,7 +13,6 @@ from core.performance_recorder import timed
 from pathlib import Path
 import re
 import shutil
-import tempfile
 import uuid
 import zipfile
 
@@ -23,7 +22,7 @@ from core.repositories.permission_repository import PermissionRepository
 from core.services.master_work_service import MasterWorkService
 from utils import (
     ensure_dir_exists, long_path, safe_exists, safe_isdir, safe_isfile,
-    safe_listdir, safe_open, safe_remove,
+    safe_listdir, safe_open, safe_remove, shared_temp_file,
 )
 
 
@@ -179,8 +178,8 @@ class NexusHistoryService:
         destination = self._safe_path(root, relative)
         ensure_dir_exists(str(destination.parent))
         if not safe_exists(str(destination)):
-            fd, temporary = tempfile.mkstemp(
-                prefix=".freeze-", dir=long_path(str(destination.parent))
+            fd, temporary = shared_temp_file(
+                directory=str(destination.parent), prefix=".freeze-"
             )
             os.close(fd)
             try:
@@ -230,9 +229,13 @@ class NexusHistoryService:
         if source.parent != branches or source == branches:
             raise ValueError("Invalid branch workspace path.")
         destination = cls._merged_archive_path(root, branch_id, branch_name)
+        display_destination = str(destination)
+        source = Path(long_path(str(source)))
+        destination = Path(long_path(str(destination)))
+        branches = Path(long_path(str(branches)))
         if not source.exists():
-            return str(destination) if destination.is_dir() else ""
-        lock_root = cls._safe_path(root, ".nexus/branch-cleanup")
+            return display_destination if destination.is_dir() else ""
+        lock_root = Path(long_path(str(cls._safe_path(root, ".nexus/branch-cleanup"))))
         lock_root.mkdir(parents=True, exist_ok=True)
         lock = cls._safe_path(lock_root, str(branch_id) + ".lock")
         try:
@@ -274,7 +277,7 @@ class NexusHistoryService:
 
         try:
             move_tree(source, destination)
-            return str(destination)
+            return display_destination
         finally:
             lock.unlink(missing_ok=True)
 
@@ -482,7 +485,7 @@ class NexusHistoryService:
                 )
                 record = master.get(logical_name(name)) if native else None
                 if record:
-                    source = self._safe_path(root, "master/" + logical_name(name))
+                    source = MasterWorkService.native_path(root, record)
                     expected = str(record.get("sha256") or "")
                     name = Path(record.get("source_filename") or name).name
                     if logical_name(name) != key:
@@ -540,7 +543,7 @@ class NexusHistoryService:
                     record = master.get(key)
                     filename = document.get("latest_creo_file_name") or document["file_name"]
                     if record:
-                        source = self._safe_path(root, "master/" + key)
+                        source = MasterWorkService.native_path(root, record)
                     else:
                         source = self._safe_path(root, filename)
                         if not safe_isfile(str(source)):
@@ -669,9 +672,9 @@ class NexusHistoryService:
         digest, filename = picked["sha256"], Path(picked["filename"]).name
         vault_rel = (Path(".nexus/vault/blobs") / digest[:2] / digest / filename).as_posix()
         vault_path = self._safe_path(root, vault_rel)
-        if not vault_path.is_file():
-            vault_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(self._blob(root, picked), vault_path)
+        if not safe_isfile(str(vault_path)):
+            ensure_dir_exists(str(vault_path.parent))
+            shutil.copyfile(long_path(str(self._blob(root, picked))), long_path(str(vault_path)))
         if file_hash(vault_path) != digest:
             raise ValueError("A branch deliverable failed its vault integrity check: " + filename)
         kind = str(picked.get("file_type") or "").upper()
@@ -742,8 +745,8 @@ class NexusHistoryService:
             branch_id, stamp = uuid.uuid4().hex, now()
             # Recheck the exact base under the DB and master-publication locks.
             root = self._root(conn)
-            root.joinpath("master").mkdir(exist_ok=True)
-            lock = root / "master/.publish.lock"
+            lock = MasterWorkService.lock_path(root)
+            lock.parent.mkdir(parents=True, exist_ok=True)
             try:
                 fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             except FileExistsError:
@@ -910,20 +913,19 @@ class NexusHistoryService:
         with self.repo.connection() as conn:
             root = self._root(conn)
         destination = Path(destination).resolve()
-        for protected in (".nexus", "master", "commits", "vault"):
-            if destination.is_relative_to((root / protected).resolve()):
-                raise ValueError("Save the copy outside managed project storage.")
+        if destination.is_relative_to(root.resolve()):
+            raise ValueError("Save the copy outside managed project storage.")
         source = self._blob(root, entry) if entry.get("blob_path") else Path(entry["path"])
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(prefix=".branch-file-", dir=destination.parent)
+        ensure_dir_exists(str(destination.parent))
+        fd, temporary = shared_temp_file(destination.parent, prefix=".branch-file-")
         os.close(fd)
         try:
-            shutil.copyfile(source, temporary)
+            shutil.copyfile(long_path(str(source)), long_path(temporary))
             if file_hash(temporary) != entry["sha256"]:
                 raise ValueError("The selected branch file failed its integrity check.")
-            os.replace(temporary, destination)
+            os.replace(long_path(temporary), long_path(str(destination)))
         finally:
-            Path(temporary).unlink(missing_ok=True)
+            Path(long_path(temporary)).unlink(missing_ok=True)
         return str(destination)
 
     def active_branch_map(self, item_ids=None):
@@ -1091,8 +1093,8 @@ class NexusHistoryService:
             folder = self._safe_path(
                 root, Path(".nexus/branches") / branch_id / "workspaces" / str(checkout_owner)
             )
-                if safe_isdir(str(folder)):
-                    shutil.rmtree(long_path(str(folder)))
+            if safe_isdir(str(folder)):
+                shutil.rmtree(long_path(str(folder)))
             with self.repo.connection() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 item_ids = [int(row[0]) for row in conn.execute(
@@ -1260,7 +1262,7 @@ class NexusHistoryService:
         installed = []
         for source, filename, target, expected_hash in plans:
             ensure_dir_exists(str(target.parent))
-            temporary = target.with_name(target.name + "." + uuid.uuid4().hex + ".tmp")
+            temporary = target.parent / (".push-" + uuid.uuid4().hex + ".tmp")
             try:
                 shutil.copyfile(long_path(str(source)), long_path(str(temporary)))
                 if file_hash(temporary) != expected_hash:
@@ -1615,11 +1617,10 @@ class NexusHistoryService:
             destination = Path(destination).resolve()
             if destination.suffix.casefold() != ".zip":
                 raise ValueError("Export a release package to a .zip file.")
-            for protected in (".nexus", "master", "commits", "vault"):
-                if destination.is_relative_to((root / protected).resolve()):
-                    raise ValueError("Choose an export location outside managed project storage.")
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            fd, temporary = tempfile.mkstemp(prefix=".release-", suffix=".zip", dir=destination.parent)
+            if destination.is_relative_to(root.resolve()):
+                raise ValueError("Choose an export location outside managed project storage.")
+            ensure_dir_exists(str(destination.parent))
+            fd, temporary = shared_temp_file(destination.parent, prefix=".release-", suffix=".zip")
             os.close(fd)
             try:
                 export_manifest = json.loads(json.dumps(manifest))
@@ -1649,7 +1650,7 @@ class NexusHistoryService:
                     entry["package_path"] = relative
                     entry.pop("blob_path", None)
                     entry.pop("path", None)
-                with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as package:
+                with zipfile.ZipFile(long_path(temporary), "w", compression=zipfile.ZIP_DEFLATED) as package:
                     package.writestr("release.json", json.dumps({**dict(row), "manifest": export_manifest,
                         "manifest_json": None}, indent=2))
                     written = set()
@@ -1668,9 +1669,9 @@ class NexusHistoryService:
                         if digest.hexdigest() != entry["sha256"]:
                             raise ValueError("A frozen file changed during package export.")
                         written.add(relative)
-                os.replace(temporary, destination)
+                os.replace(long_path(temporary), long_path(str(destination)))
             finally:
-                Path(temporary).unlink(missing_ok=True)
+                Path(long_path(temporary)).unlink(missing_ok=True)
             return str(destination)
 
     def preview_merge(self, branch_id):
@@ -1831,13 +1832,20 @@ class NexusHistoryService:
                 if not affected:
                     raise ValueError("The merge has no selected CAD, deliverable, or item changes.")
                 latest_master = self._capture(conn, head["items"])
+                root_iterations = MasterWorkService.latest_native_files(root)
+                iteration_high_water = MasterWorkService.read_manifest(root).get("iteration_high_water", {})
+                def next_root_filename(entry):
+                    key = logical_name(entry["filename"])
+                    number = max(root_iterations.get(key, (0, ""))[0], int(iteration_high_water.get(key, 0))) + 1
+                    root_iterations[key] = (number, f"{key}.{number}")
+                    return f"{key}.{number}"
                 publication_entries = {}
                 for change in native_changes:
                     branch_entry = head["files"][change["key"]]
                     current_entry = latest_master["files"].get(change["key"]) or branch_entry
                     publication_entries[change["key"]] = {
                         **branch_entry,
-                        "filename": self._next_native_iteration(current_entry),
+                        "filename": next_root_filename(current_entry),
                     }
                 # Metadata-only changes still use a sealed submission containing
                 # the current native bytes, so the established validation UI works.
@@ -1848,7 +1856,7 @@ class NexusHistoryService:
                     if source is None:
                         raise ValueError("Associate native CAD before merging this branch's item changes.")
                     entry = self._freeze(root, source)
-                    entry["filename"] = self._next_native_iteration(source)
+                    entry["filename"] = next_root_filename(source)
                     publication_entries[entry["key"]] = entry
                 for entry in publication_entries.values():
                     affected.update(entry["item_ids"])
@@ -1890,7 +1898,7 @@ class NexusHistoryService:
                         kind = str(entry.get("file_type") or "Documents").upper()
                         kind = "STEP" if kind == "STP" else kind
                         relative = Path("deliverables") / re.sub(r'[^A-Za-z0-9_-]', '_', kind) / f"{label}__{item_id}" / filename
-                        document_paths[(key, item_id)] = root / "master" / relative
+                        document_paths[(key, item_id)] = root / relative
                         deliverables.append({"key": f"{item_id}:{key}", "relative_path": relative.as_posix(),
                             "filename": filename, "dest_path": str(self._blob(root, entry)), "sha256": entry["sha256"],
                             "file_type": kind, "file_revision": entry.get("file_revision") or "", "part_ids": [item_id],
@@ -1903,22 +1911,23 @@ class NexusHistoryService:
                         entry["sha256"] + Path(filename).suffix.lower()
                     )
                     target = root / "commits" / relative
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    if not target.exists():
-                        temporary = target.with_name(target.name + "." + uuid.uuid4().hex + ".tmp")
+                    ensure_dir_exists(str(target.parent))
+                    if not safe_exists(str(target)):
+                        temporary = target.parent / (".sealed-" + uuid.uuid4().hex + ".tmp")
                         try:
-                            shutil.copyfile(source, temporary)
+                            shutil.copyfile(long_path(str(source)), long_path(str(temporary)))
                             if file_hash(temporary) != entry["sha256"]:
                                 raise ValueError("The sealed merge file failed its integrity check.")
-                            os.replace(temporary, target)
+                            os.replace(long_path(str(temporary)), long_path(str(target)))
                         finally:
                             try:
-                                temporary.unlink(missing_ok=True)
+                                Path(long_path(str(temporary))).unlink(missing_ok=True)
                             except OSError:
                                 pass
                     if file_hash(target) != entry["sha256"]:
                         raise ValueError("The sealed merge file failed its integrity check.")
-                    items.append({"filename": filename, "dest_path": str(source),
+                    items.append({"filename": filename, "root_filename": filename, "dest_path": str(source),
+                        "validated": all(validation.get(item_id) == "Validated" for item_id in entry["item_ids"]),
                         "snapshot_sha256": entry["sha256"], "part_ids": entry["item_ids"],
                         "cad_document_id": entry.get("cad_document_id"), "source_order": 0})
                     baseline = {}
@@ -1976,6 +1985,19 @@ class NexusHistoryService:
                         publish_item["source_order"] = order
 
                 def publish_records():
+                    # Keep the working-directory scanners and CAD/Item readers
+                    # aligned with the exact native iteration just published.
+                    for entry in publication_entries.values():
+                        filename = entry["filename"]
+                        field = "drawing" if logical_name(filename).endswith(".drw") else "filename"
+                        for item_id in entry["item_ids"]:
+                            conn.execute(f"UPDATE bom SET {field}=? WHERE id=? AND project_id=?",
+                                         (filename, item_id, self.project_id))
+                        if entry.get("cad_document_id") and "cad_documents" in self.repo.tables(conn):
+                            conn.execute("UPDATE cad_documents SET latest_creo_file_name=?,latest_creo_file_version=? "
+                                         "WHERE id=? AND project_id=?",
+                                         (filename, int(NATIVE.fullmatch(filename)[2] or 0),
+                                          entry["cad_document_id"], self.project_id))
                     for change in chosen:
                         if change["kind"] == "attribute":
                             conn.execute(f"UPDATE bom SET {change['key']}=? WHERE id=? AND project_id=?",
@@ -2173,7 +2195,8 @@ class NexusHistoryService:
                     "timestamp_timezone": event.get("timestamp_timezone") or "local",
                     "title": kind.replace("_", " ").title(), "note": str(event.get("details") or ""),
                     "payload": {"cad_revision": event.get("version") or "",
-                                "object_version": event.get("object_version") or ""},
+                                "object_version": event.get("object_version") or "",
+                                "validation_status": event.get("commit_status") or ""},
                     "branch_id": None, "legacy": True})
             def event_order(row):
                 parsed = local_timestamp(

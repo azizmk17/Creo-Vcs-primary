@@ -119,7 +119,7 @@ not validated becomes **Integrated / Under development**. Validation is evaluate
 separately for each affected Item. Merging does not set Item Status to Released.
 
 Selected PDF, STEP, and other documents are published under
-`master/deliverables/<type>/<item>/` and registered as active document versions in
+`deliverables/<type>/<item>/` and registered as active document versions in
 **Managed Files**, including when the Item previously had no PDF or STEP record.
 The app updates the development state and PDF/STEP badges immediately after
 merge. Exports from the same validated native state are current; an older

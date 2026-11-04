@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from core.repositories.permission_repository import PermissionRepository
 from core.services.commit_service import CommitService
@@ -69,8 +69,8 @@ class UnvalidatedMasterPushTests(unittest.TestCase):
                 result = self.service.push_unvalidated_to_master("draft")
                 self.assertEqual(result["native_state"], "Under development")
                 self.assertEqual(result["status"], "Integrated")
-                self.service.commit_repository.mark_integrated_under_development.assert_called_with("draft", 7, user_id, [10])
-                self.assertEqual((self.root / "master" / "part.prt").read_bytes(), self.frozen.read_bytes())
+                self.service.commit_repository.mark_integrated_under_development.assert_called_with("draft", 7, user_id, [10], published_files=ANY)
+                self.assertEqual(MasterWorkService.native_path(self.root, MasterWorkService.read_manifest(self.root)["files"]["part.prt"]).read_bytes(), self.frozen.read_bytes())
                 manifest = MasterWorkService.read_manifest(self.root)
                 self.assertEqual(manifest["files"]["part.prt"]["published_by"], user_id)
                 self.service.commit_repository.validate.assert_not_called()
@@ -78,6 +78,20 @@ class UnvalidatedMasterPushTests(unittest.TestCase):
         self.assertEqual(approved_pdf.read_bytes(), b"old validated PDF")
         self.assertEqual(approved_step.read_bytes(), b"old validated STEP")
         self.assertEqual(self.service.emit_project_event.call_args.args[0], "commit.pushed_under_development")
+
+    def test_push_creates_root_iteration_and_retains_last_validated(self):
+        approved = self.root / "part.prt.1"
+        approved.write_bytes(b"new native work")
+        MasterWorkService.publish(self.root, "approved", [{
+            "filename": approved.name, "dest_path": str(approved),
+            "part_ids": [11], "validated": True,
+        }])
+        self.service.push_unvalidated_to_master("draft")
+        manifest = MasterWorkService.read_manifest(self.root)
+        self.assertEqual(manifest["files"]["part.prt"]["path"], "part.prt.2")
+        self.assertEqual((self.root / "part.prt.2").read_bytes(), self.frozen.read_bytes())
+        self.assertEqual(manifest["validated_files"]["part.prt"]["path"], "part.prt.1")
+        self.assertEqual(manifest["validated_files"]["part.prt"]["source_commit_id"], "approved")
 
     def test_commit_can_be_pushed_to_selected_nexus_branch(self):
         self.service.commit_repository.db_name = self.db_path
@@ -120,7 +134,7 @@ class UnvalidatedMasterPushTests(unittest.TestCase):
         self.frozen.write_bytes(b"changed after sealing")
         with self.assertRaisesRegex(ValueError, "Frozen native file changed"):
             self.service.push_unvalidated_to_master("draft")
-        self.assertFalse((self.root / "master" / "manifest.json").exists())
+        self.assertFalse(MasterWorkService.manifest_path(self.root).exists())
         self.service.emit_project_event.assert_not_called()
 
     def test_whole_submission_and_shared_item_associations_are_published(self):
@@ -136,7 +150,7 @@ class UnvalidatedMasterPushTests(unittest.TestCase):
         result = self.service.push_unvalidated_to_master("draft")
         self.assertEqual(result["affected_part_ids"], [11, 12])
         self.assertEqual(result["affected_cad_document_ids"], [21, 22])
-        self.assertEqual((self.root / "master" / "part.drw").read_bytes(), b"new drawing")
+        self.assertEqual(MasterWorkService.native_path(self.root, MasterWorkService.read_manifest(self.root)["files"]["part.drw"]).read_bytes(), b"new drawing")
         manifest = MasterWorkService.read_manifest(self.root)
         self.assertEqual(manifest["files"]["part.prt"]["part_ids"], [11, 12])
         self.assertEqual(len(self.service.snapshot_service.verify_pending_snapshot.call_args.args[3]), 3)
@@ -170,7 +184,7 @@ class UnvalidatedMasterPushTests(unittest.TestCase):
         MasterWorkService.publish(self.root, "old", [{
             "filename": "part.prt.1", "dest_path": str(older), "source_order": 1, "part_ids": [11],
         }], preserve_newer=True)
-        self.assertEqual((self.root / "master" / "part.prt").read_bytes(), self.frozen.read_bytes())
+        self.assertEqual(MasterWorkService.native_path(self.root, MasterWorkService.read_manifest(self.root)["files"]["part.prt"]).read_bytes(), self.frozen.read_bytes())
         self.assertEqual(MasterWorkService.read_manifest(self.root)["files"]["part.prt"]["source_commit_id"], "draft")
 
     def test_approved_publication_uses_exact_snapshot_and_preserves_source(self):
@@ -182,7 +196,7 @@ class UnvalidatedMasterPushTests(unittest.TestCase):
         commit = SimpleNamespace(id=10, filename="part.prt.5", commit_id="draft", part_id=11, cad_document_id=21)
         snapshot = self.service.snapshot_service.verify_pending_snapshot.return_value["part.prt.5"]
         merge._publish_approved_master([commit], {10: snapshot})
-        self.assertEqual((self.root / "master" / "part.prt").read_bytes(), self.frozen.read_bytes())
+        self.assertEqual(MasterWorkService.native_path(self.root, MasterWorkService.read_manifest(self.root)["files"]["part.prt"]).read_bytes(), self.frozen.read_bytes())
         self.assertTrue(self.frozen.exists())
 
     def test_pending_admin_ui_push_calls_development_action_without_approval_prompt(self):

@@ -29,7 +29,7 @@ class MasterWorkTests(unittest.TestCase):
             manifest = MasterWorkService.read_manifest(root)
             self.assertEqual(manifest["files"]["case.prt"]["source_commit_id"], "next-draft")
             self.assertEqual(manifest["deliverables"]["4:pdf"]["source_commit_id"], "validated")
-            self.assertEqual((root / "master" / document["relative_path"]).read_bytes(), b"validated PDF")
+            self.assertEqual((root / document["relative_path"]).read_bytes(), b"validated PDF")
 
     def test_failed_database_callback_restores_deliverable_bytes_and_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -42,17 +42,19 @@ class MasterWorkTests(unittest.TestCase):
                         "dest_path": str(pdf), "sha256": hashlib.sha256(pdf.read_bytes()).hexdigest(),
                         "file_type": "PDF", "part_ids": [4]}
             MasterWorkService.publish(root, "old", [native], deliverables=[document])
-            old_manifest = (root / "master/manifest.json").read_bytes()
+            old_manifest = MasterWorkService.manifest_path(root).read_bytes()
+            cad = root / "incoming.prt.1"
             cad.write_bytes(b"new CAD")
+            native["dest_path"] = str(cad)
             pdf.write_bytes(b"new PDF")
             document["sha256"] = hashlib.sha256(pdf.read_bytes()).hexdigest()
             def fail():
                 raise RuntimeError("Database write failed")
             with self.assertRaisesRegex(RuntimeError, "Database write failed"):
                 MasterWorkService.publish(root, "new", [native], deliverables=[document], on_published=fail)
-            self.assertEqual((root / "master/case.prt").read_bytes(), b"old CAD")
-            self.assertEqual((root / "master" / document["relative_path"]).read_bytes(), b"old PDF")
-            self.assertEqual((root / "master/manifest.json").read_bytes(), old_manifest)
+            self.assertEqual(MasterWorkService.native_path(root, MasterWorkService.read_manifest(root)["files"]["case.prt"]).read_bytes(), b"old CAD")
+            self.assertEqual((root / document["relative_path"]).read_bytes(), b"old PDF")
+            self.assertEqual(MasterWorkService.manifest_path(root).read_bytes(), old_manifest)
 
     def test_master_deliverable_cannot_escape_its_storage_directory(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -74,14 +76,14 @@ class MasterWorkTests(unittest.TestCase):
             source = root / "part.prt.1"
             source.write_bytes(b"part")
             MasterWorkService.publish(root, "first", [{"filename": source.name, "dest_path": str(source)}])
-            self.assertEqual((root / "master" / "assembly.asm").read_bytes(), b"latest")
+            self.assertEqual((root / "assembly.asm.2").read_bytes(), b"latest")
             self.assertFalse((root / "master" / "drawing.pdf").exists())
 
     def test_another_publication_cannot_overwrite_an_active_writer(self):
         with tempfile.TemporaryDirectory() as directory:
-            master = Path(directory) / "master"
+            master = Path(directory) / ".nexus"
             master.mkdir()
-            lock = master / ".publish.lock"
+            lock = MasterWorkService.lock_path(directory)
             lock.write_text("active")
             with self.assertRaisesRegex(ValueError, "publication is active"):
                 MasterWorkService.publish(directory, "second", [])
@@ -96,13 +98,13 @@ class MasterWorkTests(unittest.TestCase):
             source.write_bytes(b"draft")
             item = {"filename": "part.prt.5", "dest_path": str(source), "part_id": 4}
             MasterWorkService.publish(root, "draft-1", [item])
-            self.assertEqual((root / "master" / "part.prt").read_bytes(), b"draft")
+            self.assertEqual(MasterWorkService.native_path(root, MasterWorkService.read_manifest(root)["files"]["part.prt"]).read_bytes(), b"draft")
             self.assertEqual(approved.read_bytes(), b"approved")
             source.write_bytes(b"newer draft")
             MasterWorkService.publish(root, "draft-2", [item])
-            manifest = json.loads((root / "master" / "manifest.json").read_text())
+            manifest = json.loads(MasterWorkService.manifest_path(root).read_text())
             self.assertEqual(manifest["files"]["part.prt"]["source_commit_id"], "draft-2")
-            self.assertEqual((root / "master" / "part.prt").read_bytes(), b"newer draft")
+            self.assertEqual(MasterWorkService.native_path(root, MasterWorkService.read_manifest(root)["files"]["part.prt"]).read_bytes(), b"newer draft")
             self.assertFalse(list((root / "master").glob("*.pdf")))
 
     def test_failed_group_publication_restores_previous_master_and_manifest(self):
@@ -112,7 +114,7 @@ class MasterWorkTests(unittest.TestCase):
             source.write_bytes(b"first")
             item = {"filename": "part.prt.1", "dest_path": str(source)}
             MasterWorkService.publish(root, "first", [item])
-            manifest = (root / "master" / "manifest.json").read_bytes()
+            manifest = MasterWorkService.manifest_path(root).read_bytes()
             source.write_bytes(b"second")
             original = os.replace
 
@@ -124,9 +126,9 @@ class MasterWorkTests(unittest.TestCase):
             with patch("core.services.master_work_service.os.replace", side_effect=fail_manifest):
                 with self.assertRaisesRegex(OSError, "disk failure"):
                     MasterWorkService.publish(root, "second", [item])
-            self.assertEqual((root / "master" / "part.prt").read_bytes(), b"first")
-            self.assertEqual((root / "master" / "manifest.json").read_bytes(), manifest)
-            self.assertFalse((root / "master" / ".publish.lock").exists())
+            self.assertEqual(MasterWorkService.native_path(root, MasterWorkService.read_manifest(root)["files"]["part.prt"]).read_bytes(), b"first")
+            self.assertEqual(MasterWorkService.manifest_path(root).read_bytes(), manifest)
+            self.assertFalse(MasterWorkService.lock_path(root).exists())
 
     def test_newer_native_keeps_old_validated_deliverables_identified(self):
         current = SimpleNamespace(commit_id="v5", status="Pending")

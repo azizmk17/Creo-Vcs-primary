@@ -1946,6 +1946,7 @@ class BomService(BaseService):
                             ),
                             "details": f"{(d.get('status') or '').strip()} | {(d.get('title') or '').strip()} | {(d.get('message') or '').strip()}{step_suffix}".strip(" |"),
                             "commit_id": d.get("commit_id"),
+                            "commit_status": d.get("status"),
                             "commit_unique_id": d.get("id"),
                             "part_id": d.get("part_id"),
                             "project_id": d.get("project_id"),

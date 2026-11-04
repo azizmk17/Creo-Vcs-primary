@@ -725,6 +725,7 @@ class BomRepository:
                 SELECT b.id
                 FROM bom b
                 WHERE b.project_id=?
+                  AND b.represented_part_id IS NULL
                   AND b.deleted_at IS NULL
                   AND lower(COALESCE(b.status,''))<>'deleted'
                   AND lower(COALESCE(b.lifecycle_state,''))<>'deleted'
@@ -735,7 +736,10 @@ class BomRepository:
                       WHERE u.child_item_id=b.id
                         AND u.project_id=b.project_id
                         AND p.project_id=b.project_id
+                        AND p.represented_part_id IS NULL
                         AND p.deleted_at IS NULL
+                        AND lower(COALESCE(p.status,''))<>'deleted'
+                        AND lower(COALESCE(p.lifecycle_state,''))<>'deleted'
                   )
                 ORDER BY COALESCE(b.sort_order,b.id),b.id
                 """,

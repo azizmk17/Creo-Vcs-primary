@@ -5,8 +5,8 @@ import json
 import os
 import shutil
 import sqlite3
-import tempfile
 from contextlib import contextmanager
+from utils import long_path, shared_temp_file
 
 
 def _canonical(value):
@@ -15,7 +15,7 @@ def _canonical(value):
 
 def _digest(path):
     result = hashlib.sha256()
-    with open(path, "rb") as source:
+    with open(long_path(str(path)), "rb") as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             result.update(chunk)
     return result.hexdigest()
@@ -81,7 +81,7 @@ class CommitSnapshotService:
     def seal_pending_commit(self, commits_root, project_id, commit_id, created_by,
                             baseline_by_cad_id=None):
         """Copy every currently pending file into content-addressed immutable storage."""
-        root = os.path.realpath(commits_root)
+        root = os.path.realpath(long_path(str(commits_root)))
         with self._connection() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute("""
@@ -145,7 +145,7 @@ class CommitSnapshotService:
                     if _digest(target) != digest:
                         raise ValueError("A content-addressed snapshot file failed its hash check.")
                 else:
-                    fd, temporary = tempfile.mkstemp(prefix=".snapshot-", dir=os.path.dirname(target))
+                    fd, temporary = shared_temp_file(os.path.dirname(target), prefix=".snapshot-")
                     os.close(fd)
                     try:
                         shutil.copyfile(source, temporary)
@@ -235,7 +235,7 @@ class CommitSnapshotService:
 
     def verify_pending_snapshot(self, commits_root, project_id, commit_id, commit_rows):
         """Return immutable file paths after verifying manifest, rows, blobs, and baselines."""
-        root = os.path.realpath(commits_root)
+        root = os.path.realpath(long_path(str(commits_root)))
         with self._connection() as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute("""

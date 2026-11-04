@@ -1,58 +1,37 @@
-# Master work and deliverables — Nexus 4.0.8
+# Master work and deliverables — Nexus 5.0.0
 
-Each project's working directory contains a `master` folder. Checking in a
-native CAD submission leaves it Pending; it does not automatically publish it.
-A **master or admin** can open the Pending submission and choose **Push to Master**
-to publish its entire frozen native snapshot as **Under development**, before
-validation or integration. Use **Open Master** in the BOM Files actions to inspect
-it. Designers and checkers cannot perform this publication.
+The configured project working directory is the Master. Native Creo files are
+numbered iterations in this root, such as `part.prt.1` and `part.prt.2`.
+**Open Master** opens that root. The app stores publication metadata and the
+publication lock under `.nexus`; it does not create another native Master copy.
 
-A development push records Integrated status, removes the group from the Pending
-queue, and retains its CAD checkouts and frozen submission files. It records the publishing user and source commit in the master
-manifest and emits a project event. It does not approve the submission, close
-issues, apply the pending assembly structure, or publish PDF/STEP attachments.
-The existing validation and approval actions remain available afterward.
+When a project is opened, Nexus converts a recognized old `master` folder. It
+reuses matching validated root files and preserves validated branch files that
+were only in the old folder as new numbered root iterations. Unvalidated native
+copies in the old folder are discarded. Referenced PDF/STEP deliverables are
+preserved in `deliverables/` and their live database paths are updated. Existing
+snapshots and frozen releases retain their own storage and history. Unknown
+folders, missing files, unsafe links, and conflicting files stop conversion.
+The old folder is removed only after the conversion is recorded.
 
-A published Integrated snapshot cannot be extended or replaced in place. To
-submit more changes, create a new commit. Its master files
-and source history remain available until the next authorized push.
+Upgrade all clients before opening the shared project in this version. Older
+clients use a different publication lock and folder layout and must not access
+it concurrently. Back up the database and project before the company rollout.
+A stopped conversion can be retried after resolving its reported error.
 
-Master contains native `.prt`, `.asm`, and `.drw` files with stable filenames.
-Its `manifest.json` records the originating submission, original filename, and
-SHA-256 digest. On first publication, existing native files in the project
-working directory seed the dependencies; their provenance remains unknown.
-Existing submissions are not retroactively republished during app startup.
+Shared access depends on both the Windows share and filesystem permissions.
+The project team needs the appropriate read, create, modify and delete rights
+on the project root and its `.nexus`, `commits`, and `deliverables` folders.
+New shared publication files, snapshots and approval files inherit their
+destination folder's permissions. The app does not grant access to accounts or
+change an existing folder's ACL. If an older `.nexus` folder or file is private,
+an administrator must repair its inheritance for the approved project group.
+Verify with two different company accounts on the actual network share.
 
-Approval continues to preserve its existing native snapshots and deliverable
-history. Approving an older submission does not overwrite the newer development
-files in `master`. Releases, version-family storage, and frozen baselines retain
-their existing behavior; this change does not migrate existing release paths.
-
-The BOM Status shows **Under development** or **Validated** for the native
-work actually pushed to master. Newer unpushed submissions do not change it.
-Validation and export availability are independent. Rejected or withdrawn
-pushed work remains visible in master as under development until superseded.
-
-PDF and STEP badges use source-submission provenance:
-
-| State | Meaning |
-| --- | --- |
-| Current / green | Export belongs to the current validated or approved submission |
-| Previous validated / amber | Export belongs to an older validated or approved submission |
-| Unverified / blue | File exists, but its source is unknown or not validated |
-| Missing / not attached | No available export |
-
-Hover over each badge for its source and current native submission identifiers.
-BOM exports include the readable status and provenance details. A newer draft
-export does not hide an available validated export. Filenames and timestamps
-alone do not establish validated provenance. Manual acknowledgements retain
-their explicit user-confirmed status without creating validated provenance.
-
-Master publication serializes writers with `.publish.lock`, stages files, and
-restores overwritten files if publication raises an error. Readers should wait
-for publication to finish before opening an assembly. After a process crash,
-an administrator may need to inspect and remove a stale lock before retrying.
-
+New work can still be pushed without validation by a Master/Admin. It creates a
+root iteration and remains Under development; validated exports retain their
+provenance. Approval and branch merges use root iterations as well. PDF and STEP
+acknowledgements and version history are not reset by this conversion.
 
 ## Check-in conflicts
 
@@ -73,20 +52,6 @@ other Items, and local workspaces remain active, regardless of their owners.
 No iteration is created. The selected Item's existing ownership and Master/Admin
 permissions still apply. Legacy shared-file undo and Item check-in keep their
 existing rules.
-
-
-## Push without validation
-
-Push to Master for a Pending commit displays a warning with Cancel selected by
-default. Confirming publishes the frozen native files and records the whole
-commit as Integrated, with no checker or validation granted. The commit leaves
-the pending queue and remains in history; the BOM stays Under development.
-Validated PDF/STEP files retain their previous provenance. A failed status update
-restores the master files and manifest and leaves the commit Pending.
-
-Use **Review for Validation** in the integrated commit's history details to
-validate it later. Validation is a separate action; it returns the group to the
-Validated approval queue.
 
 
 ## Existing database compatibility

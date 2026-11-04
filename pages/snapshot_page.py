@@ -56,9 +56,9 @@ class SnapshotPage(QWidget):
         header_text.addWidget(self.lbl_summary)
         header_layout.addLayout(header_text, 1)
 
-        self.btn_new = QPushButton("Create Snapshot")
+        self.btn_new = QPushButton("Snapshot and Clean…")
         self.btn_new.setObjectName("primary")
-        self.btn_new.setToolTip("Capture the current controlled project state")
+        self.btn_new.setToolTip("Back up Creo files, verify them, then clean eligible older copies")
         header_layout.addWidget(self.btn_new)
         layout.addWidget(header)
 
@@ -250,7 +250,7 @@ class SnapshotPage(QWidget):
 
     def on_snapshot_finished(self, snapshot_id):
         self.progress_dialog.setValue(100)
-        QMessageBox.information(self, "Snapshot Created", f"Snapshot #{snapshot_id} successfully saved.")
+        QMessageBox.information(self, "Snapshot Created", f"Snapshot #{snapshot_id} saved and eligible Creo copies cleaned. Pending commits and branches were kept. See snapshot details for the backup and cleanup results.")
         self.progress_dialog.close()
         self.load_snapshots()
 
@@ -269,6 +269,9 @@ class SnapshotPage(QWidget):
         project_id = self.session.project_id
         username = self.session.username
         snapshot_name = f"Snapshot_{username}_{project_id}_{self._timestamp()}"
+        backup_directory = QFileDialog.getExistingDirectory(self, "Choose a backup folder on another disk")
+        if not backup_directory:
+            return
 
         # Create and show progress dialog
         self.progress_dialog = QProgressDialog("Creating snapshot...", "Cancel", 0, 100, self)
@@ -281,8 +284,9 @@ class SnapshotPage(QWidget):
         self.progress_dialog.show()
 
         # Run worker thread
-        self.worker = SnapshotWorker(self.service, project_id, snapshot_name, self.working_dir, username)
+        self.worker = SnapshotWorker(self.service, project_id, snapshot_name, self.working_dir, username, backup_directory)
         self.worker.progress.connect(self.progress_dialog.setValue)
+        self.worker.phase.connect(self.progress_dialog.setLabelText)
         self.worker.error.connect(self.on_snapshot_error)
         self.worker.finished.connect(self.on_snapshot_finished)
 
@@ -298,6 +302,11 @@ class SnapshotPage(QWidget):
             QMessageBox.warning(self, "Select Snapshot", "Please select a snapshot to delete.")
             return
         snapshot_id = self.table.item(row, 0).text()
+        snapshot = self.service.repo.get_by_id(snapshot_id)
+        if snapshot and (json.loads(snapshot["snapshot_data"] or "{}").get("backup") or {}).get("status") == "Verified":
+            QMessageBox.warning(self, "Backup Record", "This snapshot records a verified file backup. "
+                                "Keep its record so archived versions remain traceable.")
+            return
         reply = QMessageBox.question(self, "Confirm Delete",
                                      f"Are you sure you want to delete snapshot #{snapshot_id}?",
                                      QMessageBox.Yes | QMessageBox.No)

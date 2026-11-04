@@ -1,6 +1,7 @@
 """A request-scoped filename index, separate from saved engineering status."""
 import os
 import re
+from utils import long_path
 from core.performance_recorder import measured, timed
 
 
@@ -12,7 +13,7 @@ class WorkingDirectoryInventory:
         self._lookup = set()
         self.latest_versions = {}
         self._external_exists = {}
-        with os.scandir(self.directory) as entries:
+        with os.scandir(long_path(self.directory)) as entries:
             for entry in entries:
                 if cancel_cb and cancel_cb():
                     raise InterruptedError("Directory check cancelled")

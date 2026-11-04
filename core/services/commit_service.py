@@ -1180,8 +1180,11 @@ class CommitService(BaseService):
                 item["part_ids"].append(int(row["part_id"]))
         master_path = MasterWorkService.publish(
             working, logical_id, list(items.values()), actor_user_id=int(self.session.user_id),
+            always_new=True,
+            is_validated_commit=lambda source: self.commit_repository.is_validated_master_commit(source, project_id),
             on_published=lambda: self.commit_repository.mark_integrated_under_development(
-                logical_id, project_id, int(self.session.user_id), [int(row["id"]) for row in rows]
+                logical_id, project_id, int(self.session.user_id), [int(row["id"]) for row in rows],
+                published_files=list(items.values()),
             ),
         )
         result = {

@@ -52,6 +52,8 @@ _TRANSIENT_WORKING_DIRS = {
     "pull_requests",
     "snapshots",
     "vault",
+    "master",
+    "deliverables",
 }
 
 

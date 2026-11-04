@@ -358,6 +358,19 @@ class CommitRepository:
             """, (status,project_id,))
             rows = cur.fetchall()
             return [self._row_to_commit(r) for r in rows]
+
+    def get_working_directory_commit_records(self, project_id: int):
+        """Read exact Creo submission identities without joining on the user."""
+        from contextlib import closing
+        with closing(self.get_conn()) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(commits)")}
+            branch = "nexus_branch_id" if "nexus_branch_id" in columns else "NULL AS nexus_branch_id"
+            rows = conn.execute(f"""
+                SELECT filename, base_file_name, approved_version, status, commit_id, {branch}
+                FROM commits WHERE project_id=?
+                  AND lower(COALESCE(status,'')) NOT IN ('rejected','withdrawn','branched')
+            """, (int(project_id),)).fetchall()
+            return [dict(row) for row in rows]
     
     def get_pending_and_validated(self, project_id: int):
         with self.get_conn() as conn:
@@ -835,7 +848,15 @@ class CommitRepository:
                 last_snapshot_id, filename, project_id,
             ))
 
-    def mark_integrated_under_development(self, commit_id, project_id, actor_user_id, expected_row_ids):
+    def is_validated_master_commit(self, commit_id, project_id):
+        from contextlib import closing
+        with closing(self.get_conn()) as conn:
+            rows = conn.execute("SELECT status FROM commits WHERE commit_id=? AND project_id=?",
+                                (str(commit_id), int(project_id))).fetchall()
+            return bool(rows) and all(str(row["status"] or "").casefold() in {"approved", "validated"}
+                                      for row in rows)
+
+    def mark_integrated_under_development(self, commit_id, project_id, actor_user_id, expected_row_ids, published_files=None):
         """Remove a whole published group from review without granting validation."""
         with self.get_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -850,6 +871,18 @@ class CommitRepository:
                 "UPDATE commits SET status='Integrated' WHERE commit_id=? AND project_id=?",
                 (str(commit_id), int(project_id)),
             )
+            for item in published_files or []:
+                filename = item["published_filename"]
+                field = "drawing" if ".drw." in filename.lower() else "filename"
+                for part_id in item.get("part_ids") or []:
+                    if part_id is not None:
+                        conn.execute(f"UPDATE bom SET {field}=? WHERE id=? AND project_id=?",
+                                     (filename, int(part_id), int(project_id)))
+                if item.get("cad_document_id"):
+                    conn.execute("UPDATE cad_documents SET latest_creo_file_name=?,latest_creo_file_version=? "
+                                 "WHERE id=? AND project_id=?",
+                                 (filename, int(filename.rsplit('.', 1)[-1]) if filename.rsplit('.', 1)[-1].isdigit() else 0,
+                                  item["cad_document_id"], int(project_id)))
             conn.execute("""
                 INSERT INTO cad_submission_lifecycle_events(
                     project_id,commit_id,actor_user_id,from_status,to_status,reason

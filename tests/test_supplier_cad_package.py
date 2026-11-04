@@ -19,8 +19,14 @@ class _CommitRepo:
     def get_forced_integrated_filenames(self, _project_id):
         return []
 
+    def get_working_directory_commit_records(self, _project_id):
+        return []
+
 
 class _SnapshotRepo:
+    def get_all(self, _project_id):
+        return [self.get_last_snapshot(_project_id)]
+
     def get_last_snapshot_id(self, _project_id):
         return 1
 
@@ -93,7 +99,7 @@ class SupplierCadPackageTests(unittest.TestCase):
         service.snap_repo = _SnapshotRepo()
         return service
 
-    def test_owned_dependency_is_neither_orphan_nor_unexpected(self):
+    def test_owned_dependency_is_not_orphan_but_requires_snapshot_or_commit(self):
         assigned = self.repo.assign_cad_dependencies(
             10,
             self.owner_id,
@@ -110,7 +116,7 @@ class SupplierCadPackageTests(unittest.TestCase):
 
         self.assertEqual(assigned, 1)
         self.assertNotIn("resistor_0402.prt.1", orphan_names)
-        self.assertNotIn("resistor_0402.prt.1", unexpected_names)
+        self.assertIn("resistor_0402.prt.1", unexpected_names)
         self.assertIn("stray.prt.1", orphan_names)
         self.assertIn("stray.prt.1", unexpected_names)
 

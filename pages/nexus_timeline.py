@@ -91,6 +91,19 @@ class _GraphDelegate(QStyledItemDelegate):
                 QPointF(x, cy-6), QPointF(x+6, cy),
                 QPointF(x, cy+6), QPointF(x-6, cy),
             ]))
+        elif data.get("commit_state") == "validated":
+            painter.setPen(QPen(QColor("#16733a"), 1.8))
+            painter.setBrush(QColor("#198849"))
+            painter.drawEllipse(QPointF(x, cy), 6, 6)
+            painter.setPen(QPen(QColor("white"), 1.5))
+            painter.drawLine(QPointF(x-3, cy), QPointF(x-1, cy+2))
+            painter.drawLine(QPointF(x-1, cy+2), QPointF(x+3, cy-3))
+        elif data.get("commit_state") == "unvalidated":
+            painter.setPen(QPen(QColor("#b65a00"), 2))
+            painter.setBrush(surface)
+            painter.drawEllipse(QPointF(x, cy), 6, 6)
+            painter.drawLine(QPointF(x, cy-3), QPointF(x, cy+1))
+            painter.drawPoint(QPointF(x, cy+3))
         else:
             painter.drawEllipse(QPointF(x, cy), 5, 5)
         painter.restore()
@@ -143,6 +156,17 @@ class VerticalHistoryView(QTreeWidget):
             branch = bounds.get(event.get("branch_id"))
             graph = {"release": event["event_type"] == "RELEASE_FROZEN",
                      "branch": bool(branch), "node_x": 17, "lanes": []}
+            if str(event["event_type"]).upper() in {"COMMIT", "BRANCH_COMMIT"}:
+                status = str(payload.get("validation_status") or "").strip().casefold()
+                if status in {"validated", "approved", "released"}:
+                    graph["commit_state"] = "validated"
+                    row.setToolTip(0, "Validated commit")
+                elif status in {"pending", "integrated", "under development", "rejected", "withdrawn"}:
+                    graph["commit_state"] = "unvalidated"
+                    row.setToolTip(0, "Not validated · " + status.capitalize())
+                else:
+                    graph["commit_state"] = "unknown"
+                    row.setToolTip(0, "Commit validation status unknown")
             for lane in bounds.values():
                 if lane["top"] <= row_index <= lane["bottom"]:
                     graph["lanes"].append({
@@ -515,6 +539,9 @@ class NexusTimelinePanel(QWidget):
         layout.addWidget(self.status)
         splitter = QSplitter(Qt.Vertical)
         self.graph = VerticalHistoryView()
+        legend = QLabel("●✓ Validated commit     ○! Not validated     ○ Other event / unknown     ◆ Release")
+        legend.setToolTip("Green with a check: validated. Orange with an exclamation mark: not validated.")
+        layout.addWidget(legend)
         self.details = QPlainTextEdit()
         self.details.setReadOnly(True)
         self.details.setMaximumHeight(180)

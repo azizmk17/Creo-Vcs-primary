@@ -3,7 +3,6 @@ import json
 import os
 import shutil
 import socket
-import tempfile
 from datetime import datetime
 import uuid
 from core.services.permission_decorators import require_permission
@@ -26,6 +25,7 @@ from core.services.managed_file_service import ManagedFileService
 from core.services.approval_journal_service import ApprovalJournalService
 from core.services.export_naming import exported_document_filename
 from utils import (
+    long_path, shared_temp_file,
     is_creo_file,
     ensure_dir_exists,
     get_version_number,
@@ -455,7 +455,7 @@ class MergeService(BaseService):
             key = (int(project_id), logical_id)
             selected_by_submission.setdefault(key, []).append(commit)
 
-        commits_root = os.path.realpath(self.commits_dir)
+        commits_root = os.path.realpath(long_path(str(self.commits_dir)))
         snapshot_records = {}
         snapshot_hashes = {}
         for (project_id, logical_id), selected in selected_by_submission.items():
@@ -501,7 +501,7 @@ class MergeService(BaseService):
 
             for commit in selected:
                 source = os.path.realpath(os.path.join(
-                    self.commits_dir, snapshot_records[int(commit.id)]["path"]
+                    commits_root, snapshot_records[int(commit.id)]["path"]
                 ))
                 try:
                     inside_root = os.path.commonpath((commits_root, source)) == commits_root
@@ -579,15 +579,17 @@ class MergeService(BaseService):
     def _copy_approval_file(source, target, expected_sha256):
         from core.services.commit_snapshot_service import _digest
 
+        source, target = long_path(str(source)), long_path(str(target))
+
         os.makedirs(os.path.dirname(target), exist_ok=True)
         if os.path.isfile(target):
             if _digest(target) != expected_sha256:
                 raise ValueError("An approval destination exists with different file content: " + target)
             return
-        fd, temporary = tempfile.mkstemp(prefix=".approval-", dir=os.path.dirname(target))
+        fd, temporary = shared_temp_file(os.path.dirname(target), prefix=".approval-")
         os.close(fd)
         try:
-            shutil.copy2(source, temporary)
+            shutil.copyfile(source, temporary)
             if _digest(temporary) != expected_sha256:
                 raise ValueError("A frozen CAD file changed while approval files were being prepared.")
             try:
@@ -607,7 +609,7 @@ class MergeService(BaseService):
     def _stage_approval_files(self, plan):
         from core.services.commit_snapshot_service import _digest
 
-        commits_root = os.path.realpath(self.commits_dir)
+        commits_root = os.path.realpath(long_path(str(self.commits_dir)))
         for path_key, result in plan["results_by_path"].items():
             source = os.path.realpath(os.path.join(commits_root, result["source_path"]))
             try:
@@ -638,7 +640,7 @@ class MergeService(BaseService):
         if current_ids != sorted(str(value) for value in plan.get("row_ids") or []):
             raise ValueError("The retry submission rows differ from the saved approval plan.")
         snapshots = {"_snapshot_sha256": str(journal["snapshot_sha256"])}
-        commits_root = os.path.realpath(self.commits_dir)
+        commits_root = os.path.realpath(long_path(str(self.commits_dir)))
         for commit in commits:
             item = plan.get("sources_by_row", {}).get(str(int(commit.id)))
             if not item or os.path.basename(str(commit.filename)).casefold() != str(item.get("filename") or "").casefold():
@@ -852,7 +854,7 @@ class MergeService(BaseService):
                 attachment_part_ids = self._process_commit_attachments(
                     self._commit_group_dir(commit_data[0]), logical_id, project_id
                 )
-            self._publish_approved_master(commit_data, snapshot_records)
+            self._publish_approved_master(commit_data, snapshot_records, plan)
             journal_service.advance(journal["approval_id"], "COMPLETED")
             return self._merge_refresh_payload(
                 merged_entries, extra_part_ids=attachment_part_ids
@@ -861,15 +863,20 @@ class MergeService(BaseService):
             journal_service.record_error(journal["approval_id"], exc)
             raise
 
-    def _publish_approved_master(self, commits, snapshot_records):
+    def _publish_approved_master(self, commits, snapshot_records, plan=None):
         from core.services.master_work_service import MasterWorkService
 
         items = {}
         for commit in commits:
             snapshot = snapshot_records[int(commit.id)]
             filename = os.path.basename(str(commit.filename))
+            result = (plan or {}).get("results_by_path", {}).get(
+                self._approval_source_key(snapshot["path"], filename), {})
+            root_filename = result.get("new_filename")
             item = items.setdefault(filename.casefold(), {
                 "filename": filename,
+                "root_filename": root_filename,
+                "validated": True,
                 "dest_path": os.path.join(self.commits_dir, snapshot["path"]),
                 "snapshot_sha256": snapshot["sha256"],
                 "part_ids": [], "cad_document_id": getattr(commit, "cad_document_id", None),
@@ -880,7 +887,7 @@ class MergeService(BaseService):
                 item["part_ids"].append(int(commit.part_id))
         MasterWorkService.publish(
             self.working_dir, str(commits[0].commit_id), list(items.values()),
-            actor_user_id=int(self.session.user_id), preserve_newer=True,
+            actor_user_id=int(self.session.user_id),
         )
 
     @require_permission("merge")

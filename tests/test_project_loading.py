@@ -13,8 +13,8 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "windows" if os.name == "nt" else "offscreen")
 
-from PyQt5.QtCore import QCoreApplication, QEvent, QTimer, pyqtSignal
-from PyQt5.QtWidgets import QApplication, QWidget
+from PyQt5.QtCore import QCoreApplication, QEvent, QTimer, Qt, pyqtSignal
+from PyQt5.QtWidgets import QApplication, QWidget, QTreeWidget, QTreeWidgetItem
 
 import config
 from core.session_manager import SessionManager
@@ -23,6 +23,7 @@ from pages.bom_page import (
     BomPage, _InitialDiagWorker, _LazyChildrenWorker, _ProjectStructureWorker,
     _SearchWorker, _PROJECT_LOAD_THREADS,
     _start_project_worker,
+    BOM_TREE_FOLDER_ROLE, BOM_TREE_PLACEHOLDER_ROLE,
 )
 from pages.login_page import LoginPage
 from core.repositories.user_repository import UserRepository
@@ -42,6 +43,60 @@ class ProjectLoadingTests(unittest.TestCase):
             time.sleep(0.005)
         self.assertTrue(predicate(), "Timed out waiting for background work")
 
+    def test_cad_root_batches_keep_rows_from_previous_slices(self):
+        tree = QTreeWidget()
+        for name in ("old-1", "old-2", "old-3"):
+            tree.addTopLevelItem(QTreeWidgetItem([name]))
+        roots = [{"name": f"CAD-{index}"} for index in range(9)]
+        state = {"seq": 1, "mode": "cad", "tree": tree, "roots": roots,
+                 "index": 0, "on_complete": None}
+        page = SimpleNamespace(
+            _pdm_root_build=state, _pdm_root_build_seq=1,
+            _pdm_root_build_timer=Mock(), PDM_ROOT_BATCH_SIZE=2,
+            PDM_ROOT_SLICE_SECONDS=10, _tree_loading_label=Mock(),
+            _structure_loading=False, _finish_pdm_root_render=Mock(),
+            _add_pdm_root_item=lambda mode, root: tree.addTopLevelItem(
+                QTreeWidgetItem([root["name"]])),
+        )
+        for _ in range(20):
+            if page._pdm_root_build is None:
+                break
+            BomPage._pdm_root_build_step(page)
+        self.assertIsNone(page._pdm_root_build)
+        self.assertEqual([tree.topLevelItem(i).text(0) for i in range(tree.topLevelItemCount())],
+                         [root["name"] for root in roots])
+        page._finish_pdm_root_render.assert_called_once_with(state)
+
+    def test_ebom_restores_saved_root_order_in_tree_and_folders(self):
+        tree = QTreeWidget()
+        def item(number):
+            result = QTreeWidgetItem([str(number)])
+            result.setData(0, Qt.UserRole, number)
+            return result
+        folder = QTreeWidgetItem(["folder"])
+        folder.setData(0, BOM_TREE_FOLDER_ROLE, 10)
+        folder.addChild(item(4))
+        folder.addChild(item(2))
+        more = QTreeWidgetItem(["more"])
+        more.setData(0, BOM_TREE_PLACEHOLDER_ROLE, True)
+        for root in (item(5), folder, item(3), item(1), more):
+            tree.addTopLevelItem(root)
+        page = SimpleNamespace(
+            _pdm_ebom_roots=[{"id": n} for n in (1, 2, 3, 4, 5)],
+            _container_count=BomPage._container_count,
+            _container_item=BomPage._container_item,
+            _container_take=BomPage._container_take,
+            _is_folder_tree_item=BomPage._is_folder_tree_item,
+            _is_lazy_placeholder=BomPage._is_lazy_placeholder,
+        )
+        BomPage._restore_ebom_root_order(page, tree)
+        self.assertEqual([tree.topLevelItem(i).text(0) for i in range(tree.topLevelItemCount())],
+                         ["1", "folder", "3", "5", "more"])
+        self.assertEqual([folder.child(i).text(0) for i in range(folder.childCount())], ["2", "4"])
+        BomPage._restore_ebom_root_order(page, tree)
+        self.assertEqual([tree.topLevelItem(i).text(0) for i in range(tree.topLevelItemCount())],
+                         ["1", "folder", "3", "5", "more"])
+
     def test_shell_readiness_does_not_wait_for_a_bom_result(self):
         shell = SimpleNamespace(session=SimpleNamespace(project_id=12))
         startup = SimpleNamespace(
@@ -59,6 +114,20 @@ class ProjectLoadingTests(unittest.TestCase):
             self.assertIsNone(LoginPage._choose_project(page, 7, [
                 {"id": 12, "is_current": 1, "working_directory": "fixture"},
             ]))
+
+    def test_sign_in_project_error_is_visible_and_can_be_retried(self):
+        with patch("pages.login_page.UserRepository"), patch("pages.login_page.ProjectService") as projects:
+            page = LoginPage()
+            self.addCleanup(page.deleteLater)
+            page.username_input.setText("fixture")
+            page.password_input.setText("password")
+            page.user_service.authenticate = Mock(return_value=SimpleNamespace(
+                id=7, username="fixture", role_id=None, is_admin=False))
+            projects.return_value.get_projects_for_user.side_effect = sqlite3.OperationalError("database is locked")
+            page.login()
+            self.assertIn("database is locked", page.status_label.text())
+            self.assertTrue(page.login_btn.isEnabled())
+            self.assertTrue(page.username_input.isEnabled())
 
     def test_login_resumes_only_the_explicit_saved_version(self):
         page = SimpleNamespace(user_repo=Mock())

@@ -1,7 +1,7 @@
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit,
-    QMessageBox, QInputDialog, QLineEdit, QCheckBox
+    QMessageBox, QInputDialog, QLineEdit, QCheckBox, QScrollArea, QWidget
 )
 from PyQt5.QtGui import QFont
 from PyQt5.QtCore import Qt
@@ -34,7 +34,7 @@ class DiagPage(QDialog):
             self.audit_service = None
 
         self.setWindowTitle("Commit Synchronization & Integrity")
-        self.setMinimumSize(950, 600)
+        self.setMinimumSize(0, 0)
 
         self.working_dir = None
         self.commits_dir = None
@@ -93,7 +93,17 @@ class DiagPage(QDialog):
         # (same design code you pasted — unchanged)
         # just remove demo population part and store tab references
         self.setObjectName("diagnosticWorkspace")
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.scroll_area = QScrollArea(self)
+        self.scroll_area.setObjectName("diagnosticScrollArea")
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QFrame.NoFrame)
+        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        outer.addWidget(self.scroll_area)
+        content = QWidget()
+        self.scroll_area.setWidget(content)
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(8, 7, 8, 8)
         layout.setSpacing(6)
         header_frame = QFrame()

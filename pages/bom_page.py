@@ -549,7 +549,7 @@ BOM_COL_EXTRA_START = 11
 BOM_EXTRA_COLUMN_SPECS = [
     ("part_number", "Item Number", 115, False, ("part_number", "number")),
     ("aes_number", "AES Number", 95, True, ("aes_number",)),
-    ("drawing_number", "Drawing Number", 120, False, ("drawing_number", "drawing")),
+    ("drawing_number", "Drawing Number", 120, False, ("drawing_number",)),
     ("filename", "Native File", 135, False, ("filename", "base_file_name")),
     ("base_drw_name", "Drawing File", 135, False, ("base_drw_name",)),
     ("cad_revision", "CAD Rev", 72, True, ("cad_revision",)),
@@ -2449,6 +2449,9 @@ class _ProjectStructureWorker(QObject):
             except Exception:
                 project = {}
             working_dir = str(project.get("working_directory") or "")
+            if working_dir:
+                from core.services.master_layout_migration import migrate_master_layout
+                migrate_master_layout(working_dir, getattr(service.bom_repo, "db_name", DB_NAME), self.project_id)
             active_branch_names = {}
             active_branch_checkouts = {}
             try:
@@ -9720,8 +9723,7 @@ class BomPage(QWidget):
                 else:
                     value = self._extra_bom_column_value(info or {}, spec)
                 item.setText(column, value)
-                if value:
-                    item.setToolTip(column, value)
+                item.setToolTip(column, value)
             except Exception:
                 pass
 
@@ -11271,12 +11273,13 @@ class BomPage(QWidget):
         removed = []
         tree.setUpdatesEnabled(False)
         try:
-            while (tree.topLevelItemCount() and processed < self.PDM_ROOT_BATCH_SIZE
-                   and time.perf_counter() - started < self.PDM_ROOT_SLICE_SECONDS):
-                removed.append(tree.takeTopLevelItem(tree.topLevelItemCount() - 1))
-                processed += 1
-            if tree.topLevelItemCount() == 0:
-                state["cleared"] = True
+            if not state.get("cleared"):
+                while (tree.topLevelItemCount() and processed < self.PDM_ROOT_BATCH_SIZE
+                       and time.perf_counter() - started < self.PDM_ROOT_SLICE_SECONDS):
+                    removed.append(tree.takeTopLevelItem(tree.topLevelItemCount() - 1))
+                    processed += 1
+                if tree.topLevelItemCount() == 0:
+                    state["cleared"] = True
             if state.get("cleared"):
                 roots = state["roots"]
                 while (state["index"] < len(roots)
@@ -11424,6 +11427,7 @@ class BomPage(QWidget):
                             "Refresh the BOM to retry.",
                             "error",
                         )
+                    self._restore_ebom_root_order(tree)
                 self._renumber_tree_rows(tree)
                 page = getattr(self, "_ebom_root_page", {}) or {}
                 if not getattr(self, "_pdm_ebom_scope_path", []) and page.get("has_more"):
@@ -11436,6 +11440,47 @@ class BomPage(QWidget):
         callback = state.get("on_complete")
         if callback is not None:
             callback()
+
+    def _restore_ebom_root_order(self, tree: QTreeWidget) -> None:
+        """Keep each visible root and folder's roots in persisted page order."""
+        ranks = {}
+        for position, root in enumerate(getattr(self, "_pdm_ebom_roots", []) or []):
+            value = root.get("bom_id") or root.get("id")
+            if value is not None:
+                ranks[int(value)] = position
+        if not ranks:
+            return
+
+        def reorder(container):
+            count = self._container_count(container)
+            slots, entries, folders = [], [], []
+            for index in range(count):
+                item = self._container_item(container, index)
+                if self._is_folder_tree_item(item):
+                    folders.append(item)
+                    continue
+                if self._is_lazy_placeholder(item) or item.data(0, PDM_OBJECT_KIND_ROLE) == PDM_OBJECT_CAD:
+                    continue
+                try:
+                    item_id = int(item.data(0, Qt.UserRole))
+                except (TypeError, ValueError):
+                    continue
+                if item_id in ranks:
+                    slots.append(index)
+                    entries.append((ranks[item_id], item))
+            ordered = sorted(entries, key=lambda entry: entry[0])
+            if entries != ordered:
+                for index in reversed(slots):
+                    self._container_take(container, index)
+                for index, (_rank, item) in zip(slots, ordered):
+                    if isinstance(container, QTreeWidget):
+                        container.insertTopLevelItem(index, item)
+                    else:
+                        container.insertChild(index, item)
+            for folder in folders:
+                reorder(folder)
+
+        reorder(tree)
 
     def _add_ebom_page_row(self, parent, page):
         row = QTreeWidgetItem([""] * self._ebom_tree.columnCount())
@@ -11540,6 +11585,8 @@ class BomPage(QWidget):
                     self._add_ebom_page_row(parent, page)
                 self._render_pdm_folder_context("EBOM", context.get("bom_id") if context else None,
                                                 [parent] if parent is not None else [tree])
+                if parent is None:
+                    self._restore_ebom_root_order(tree)
                 self._renumber_tree_rows(tree)
                 if parent is not None:
                     parent.setExpanded(True)
@@ -18046,6 +18093,17 @@ class BomPage(QWidget):
             QMessageBox.warning(self, "Not Found", f"No {label} file associated with this part.")
             return
         if not safe_exists(resolved):
+            if resolved:
+                try:
+                    from core.services.snapshot_service import SnapshotService
+                    archived = SnapshotService().find_archived_creo_file(self.session.project_id, resolved)
+                except Exception:
+                    archived = None
+                if archived:
+                    QMessageBox.information(self, "File in Snapshot",
+                        f"This Creo version is backed up in snapshot #{archived['snapshot_id']} "
+                        f"({archived['snapshot_name']}).\n\nBackup file:\n{archived['path']}")
+                    return
             QMessageBox.warning(self, "Missing File", f"{label} file not found:\n{resolved}")
             return
         try:
@@ -21209,7 +21267,7 @@ class BomPage(QWidget):
     def _open_master_directory(self):
         project = self.project_service.get_project_by_id(int(self.session.project_id)) or {}
         working = str(project.get("working_directory") or "")
-        path = os.path.join(working, "master") if working else ""
+        path = working if working else ""
         if not path or not safe_exists(path):
             QMessageBox.information(self, "Master", "Master is created when a master or admin pushes a native CAD submission.")
             return
@@ -22885,6 +22943,21 @@ class BomPage(QWidget):
         for row_index, values in enumerate(rows):
             for column, value in enumerate(values):
                 table.setItem(row_index, column, QTableWidgetItem(value))
+            filename = values[1]
+            if filename != "Not captured":
+                path = self._resolve_file_path(filename)
+                if not safe_exists(path):
+                    try:
+                        from core.services.snapshot_service import SnapshotService
+                        archived = SnapshotService().find_archived_creo_file(self.session.project_id, path)
+                    except Exception:
+                        archived = None
+                    if archived:
+                        table.item(row_index, 1).setText(filename + "  [Snapshot #" + str(archived["snapshot_id"]) + "]")
+                        table.item(row_index, 1).setToolTip("Backed up at: " + archived["path"])
+                table.item(row_index, 1).setData(Qt.UserRole, filename)
+        table.cellDoubleClicked.connect(lambda row, _column: self._open_file(
+            str(table.item(row, 1).data(Qt.UserRole) or ""), "Creo"))
         layout.addWidget(table)
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.rejected.connect(dialog.reject)
@@ -24363,6 +24436,13 @@ class BomPage(QWidget):
         item = table.item(row, table.columnCount() - 1)
         path = item.data(Qt.UserRole) if item else ""
         if not path or not safe_exists(path):
+            if path:
+                from core.services.snapshot_service import SnapshotService
+                archived = SnapshotService().find_archived_creo_file(self.session.project_id, path)
+                if archived:
+                    QMessageBox.information(self, "Creo File in Snapshot", f"This Creo version is in snapshot #{archived['snapshot_id']} "
+                                            f"({archived['snapshot_name']}).\n\nBackup file:\n{archived['path']}")
+                    return
             QMessageBox.warning(self, "Open Document", f"File not found:\n{path}")
             return
         try:

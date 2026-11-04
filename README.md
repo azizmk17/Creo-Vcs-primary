@@ -8,6 +8,10 @@ Nexus **4.5.0** reuses repository initialization within a BOM service graph, def
 
 Nexus **4.8.0** adds an item timeline with independent CAD/project and document revisions, per-user active **Nexus Branches**, branch-routed commits, and immutable, exportable release packages. See [Item Timeline, Nexus Branches, and Frozen Release Packages](docs/nexus_branches_and_release_packages.md).
 
+Nexus **5.0.0** uses the project root as Master; see [Master work and deliverables](docs/master_work_and_deliverables.md) before upgrading shared projects.
+
+To archive Creo iterations to another disk and clean eligible project copies, see [Snapshot backup and cleanup](docs/snapshot_backup_cleanup.md).
+
 Nexus **4.9.0** adds an opt-in recorder for real company-workspace performance.
 
 For repeatable loading measurements, see the [large benchmark project guide](tools/README_benchmark_project.md). It describes the isolated 10,000-part / 1,000-assembly dataset, disk limits, and its synthetic CAD limitations.

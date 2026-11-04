@@ -8,6 +8,8 @@ import shutil
 import hashlib
 import tempfile
 import subprocess
+import uuid
+import json
 from core.performance_recorder import timed
 
 
@@ -26,6 +28,22 @@ def long_path(path: str) -> str:
     if normalized.startswith("\\\\"):
         return "\\\\?\\UNC\\" + normalized.lstrip("\\")
     return "\\\\?\\" + os.path.abspath(normalized)
+
+
+def shared_temp_file(directory, prefix=".nexus-", suffix=".tmp"):
+    """Create an exclusive temporary file with the directory's inherited ACL.
+
+    Unlike mkstemp's private mode, files eventually renamed into shared project
+    storage must retain the access policy inherited from that storage.
+    """
+    for _ in range(10):
+        path = os.path.join(str(directory), prefix + uuid.uuid4().hex + suffix)
+        try:
+            fd = os.open(long_path(path), os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, "O_BINARY", 0), 0o666)
+            return fd, path
+        except FileExistsError:
+            continue
+    raise FileExistsError("Could not allocate a unique temporary file in " + str(directory))
 
 
 @timed("filesystem.exists", event=False)
@@ -186,12 +204,17 @@ def get_next_version_number(working_dir: str, base_name: str) -> int:
     max_version = 0
     try:
         for f in safe_listdir(working_dir):
-            if f.startswith(base_name + ".") and is_creo_file(f):
+            if f.casefold().startswith(base_name.casefold() + ".") and is_creo_file(f):
                 v = get_version_number(f)
                 if v is not None and v > max_version:
                     max_version = v
     except OSError:
-        pass
+        raise
+    manifest = os.path.join(working_dir, ".nexus", "master-manifest.json")
+    if safe_exists(manifest):
+        with safe_open(manifest, "r", encoding="utf-8") as stream:
+            metadata = json.load(stream)
+        max_version = max(max_version, int((metadata.get("iteration_high_water") or {}).get(base_name.casefold(), 0)))
     return max_version + 1
 
 

@@ -59,13 +59,15 @@ class IntegratedMasterLifecycleTests(unittest.TestCase):
         source.write_bytes(b"old master")
         item = {"filename": source.name, "dest_path": str(source)}
         MasterWorkService.publish(self.root, "old", [item])
-        manifest = (self.root / "master" / "manifest.json").read_bytes()
+        manifest = MasterWorkService.manifest_path(self.root).read_bytes()
+        source = self.root / "incoming.prt.1"
         source.write_bytes(b"new native")
+        item["dest_path"] = str(source)
         with self.assertRaisesRegex(ValueError, "changed during publication"):
             MasterWorkService.publish(self.root, "draft", [item], on_published=lambda:
                 self.repo.mark_integrated_under_development("draft", 7, 9, [1]))
-        self.assertEqual((self.root / "master" / "part.prt").read_bytes(), b"old master")
-        self.assertEqual((self.root / "master" / "manifest.json").read_bytes(), manifest)
+        self.assertEqual(MasterWorkService.native_path(self.root, MasterWorkService.read_manifest(self.root)["files"]["part.prt"]).read_bytes(), b"old master")
+        self.assertEqual(MasterWorkService.manifest_path(self.root).read_bytes(), manifest)
         self.assertEqual(self.rows()[0][1], "Pending")
 
 

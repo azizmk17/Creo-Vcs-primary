@@ -364,6 +364,7 @@ class LoginPage(QWidget):
         self.login_btn.setText("Signing in..." if busy else "Sign in")
 
     def _show_error(self, message):
+        self.status_label.setStyleSheet("color: #b91c1c; font-weight: bold;")
         self.status_label.setText(message)
         self._set_busy(False)
 
@@ -375,7 +376,7 @@ class LoginPage(QWidget):
         )
 
     @timed("login.submit")
-    def login(self):
+    def login(self, _checked=False):
         username = self.username_input.text().strip()
         password = self.password_input.text()
         if not username or not password:
@@ -397,16 +398,20 @@ class LoginPage(QWidget):
             self._show_error("Invalid username or password.")
             return
 
-        userid = user.id
-        projects = self.project_service.get_projects_for_user(userid)
-        chosen_pid = self._choose_project(userid, projects)
-        self.session.start_session(
-            user_id=userid,
-            username=user.username,
-            role_id=user.role_id,
-            project_id=chosen_pid,
-            is_admin=user.is_admin,
-        )
+        try:
+            userid = user.id
+            projects = self.project_service.get_projects_for_user(userid)
+            chosen_pid = self._choose_project(userid, projects)
+            self.session.start_session(
+                user_id=userid,
+                username=user.username,
+                role_id=user.role_id,
+                project_id=chosen_pid,
+                is_admin=user.is_admin,
+            )
+        except Exception as exc:
+            self._show_error(f"Unable to prepare your workspace: {exc}")
+            return
         self.status_label.setStyleSheet("color: #2f7656; font-weight: bold;")
         self.status_label.setText(f"Welcome, {user.username}. Preparing your workspace...")
         self.login_succeeded.emit()

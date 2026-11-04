@@ -14,7 +14,7 @@ import re
 import json
 import uuid
 from utils import (
-    is_creo_file
+    is_creo_file, safe_isdir
 )
 from core.services.permission_decorators import require_permission
 
@@ -252,68 +252,57 @@ class DiagService:
 
     @timed("diagnostics.integrity_check")
     def check_working_directory(self, working_dir, *, cancel_cb=None, inventory=None):
-        if not working_dir or not os.path.isdir(working_dir):
+        if not working_dir or not safe_isdir(working_dir):
             return []
         try:
             inventory = inventory or WorkingDirectoryInventory(working_dir, cancel_cb=cancel_cb)
         except InterruptedError:
             return []
-        working_files = [name for name in inventory.names if is_creo_file(name)]
-        approved_commits = self.repo.get_by_status("Approved",self.session.project_id)
-        
+        native = re.compile(r"[^/\\]+\.(?:prt|asm|drw)(?:\.\d+)?", re.IGNORECASE)
+        working_files = sorted((name for name in inventory.names if native.fullmatch(name)), key=str.casefold)
+        known = set()
+        records = self.repo.get_working_directory_commit_records(int(self.session.project_id))
+        master_commits = set()
+        for row in records:
+            if row.get("nexus_branch_id"):
+                continue
+            source = os.path.basename(str(row.get("filename") or ""))
+            if native.fullmatch(source):
+                known.add(source.casefold())
+            version = str(row.get("approved_version") or "").strip()
+            match = re.fullmatch(r"(.+\.(?:prt|asm|drw))(?:\.\d+)?", source, re.IGNORECASE)
+            if match and version.isdigit() and str(row.get("status") or "").casefold() in {"approved", "released"}:
+                known.add((match[1] + "." + version).casefold())
+            if row.get("commit_id"):
+                master_commits.add(str(row["commit_id"]))
 
-        last_snapshot_id = self.snap_repo.get_last_snapshot_id(self.session.project_id)
+        # A push can assign a different root iteration from the submitted name.
+        from core.services.master_work_service import MasterWorkService
+        manifest = MasterWorkService.read_manifest(working_dir)
+        for record in (manifest.get("files") or {}).values():
+            name = str(record.get("path") or record.get("source_filename") or "")
+            if str(record.get("source_commit_id") or "") in master_commits and native.fullmatch(name):
+                known.add(name.casefold())
 
-
-        last_snapshot = self.snap_repo.get_last_snapshot(self.session.project_id)
-        if not last_snapshot:
-            return "error_no_snapshot"
-        last_snapshot_data_files = json.loads(last_snapshot['snapshot_data'])['files']
-        snap_files = {item['filename'] for item in last_snapshot_data_files}
-        approved_files = {
-            str(c.base_file_name) + "." + str(c.approved_version)
-            for c in approved_commits
-            if c.last_snapshot == "None" or c.last_snapshot != last_snapshot_id
-        }
-
-        # NEW: allow files that were force-integrated (treated as "legal" in working dir)
-        try:
-            integrated_filenames = set(self.repo.get_forced_integrated_filenames(self.session.project_id) or [])
-        except Exception:
-            integrated_filenames = set()
-        dependency_bases = self.bom_repo.dependency_base_names(
-            int(self.session.project_id)
-        )
-        managed_cad_bases = self._managed_cad_bases()
+        remaining = {name.casefold() for name in working_files} - known
+        if remaining:
+            for snapshot in self.snap_repo.get_all(int(self.session.project_id)):
+                if cancel_cb and cancel_cb():
+                    return []
+                payload = json.loads(snapshot["snapshot_data"] or "{}")
+                for item in payload.get("files") or []:
+                    name = str(item.get("filename") or "")
+                    if native.fullmatch(name):
+                        remaining.discard(name.casefold())
+                if not remaining:
+                    break
 
         results = []
-
         for part in working_files:
             if cancel_cb and cancel_cb():
                 return []
-            if self.pdm_repo.normalize_base(
-                self._creo_base_name(part)
-            ) in managed_cad_bases:
-                continue
-            if self._creo_base_name(part).casefold() in dependency_bases:
-                continue
-            
-            # allowlist check first
-            if part in integrated_filenames:
-                results.append((part, "🟢 Force Integrated", "Force integrated part"))
-                continue
-
-            #check if the part is in last snappshotted list
-            if part in snap_files:
-                continue
-            else:
-                is_committed = part in approved_files
-                if is_committed:
-                    print(f'part : {part} Matches approved commit')
-                    #results.append((part, "✅ Up-to-date", "Matches approved commit"))
-                else: 
-                    results.append((part, "❌ Unexpected", "unexpected new part"))
-
+            if part.casefold() in remaining:
+                results.append((part, "❌ Unexpected", "Creo file is not in a snapshot or committed submission."))
         return results
 
     @require_permission("merge")

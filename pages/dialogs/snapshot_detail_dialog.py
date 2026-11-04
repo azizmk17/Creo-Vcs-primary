@@ -122,6 +122,60 @@ class SnapshotDetailDialog(QDialog):
         # Add working directory info
         dir_item = QTreeWidgetItem(["Working Directory:", working_dir])
         self.tree.addTopLevelItem(dir_item)
+        backup = snapshot_data.get("backup") or {}
+        if backup:
+            self.tree.addTopLevelItem(QTreeWidgetItem([
+                "Backup", str(backup.get("file_count", 0)) + " files",
+                str(backup.get("status") or ""), str(backup.get("path") or ""),
+            ]))
+            removed = backup.get("removed") or []
+            cleanup = QTreeWidgetItem(["Cleanup", str(len(removed)) + " files removed",
+                                       str(backup.get("cleanup") or ""), ""])
+            self.tree.addTopLevelItem(cleanup)
+            for name in removed:
+                cleanup.addChild(QTreeWidgetItem([str(name), "", "Archived", os.path.join(str(backup.get("path") or ""), name)]))
+            item_updates = backup.get("updated_item_files") or []
+            if item_updates:
+                updates = QTreeWidgetItem(["Current Item file references updated", str(len(item_updates)), "Recorded", ""])
+                self.tree.addTopLevelItem(updates)
+                for entry in item_updates:
+                    updates.addChild(QTreeWidgetItem(["Item " + str(entry.get("item_id")), str(entry.get("field") or ""),
+                                                      str(entry.get("from") or ""), str(entry.get("to") or "")]))
+            cad_updates = backup.get("updated_cad_files") or []
+            if cad_updates:
+                updates = QTreeWidgetItem(["Current CAD file references updated", str(len(cad_updates)), "Recorded", ""])
+                self.tree.addTopLevelItem(updates)
+                for entry in cad_updates:
+                    updates.addChild(QTreeWidgetItem(["CAD " + str(entry.get("cad_document_id")), "",
+                                                      str(entry.get("from") or ""), str(entry.get("to") or "")]))
+            kept = backup.get("skipped") or []
+            if kept:
+                kept_node = QTreeWidgetItem(["Root Creo files kept", str(len(kept)), "Current, required or unavailable for removal", ""])
+                self.tree.addTopLevelItem(kept_node)
+                for name in kept:
+                    kept_node.addChild(QTreeWidgetItem([str(name), "", "Kept in project", ""]))
+            history = backup.get("removed_history") or []
+            history_node = QTreeWidgetItem(["Commit / pull-request Creo files", str(len(history)) + " files removed", "Archived", ""])
+            self.tree.addTopLevelItem(history_node)
+            archived_details = {item.get("relative_path"): item for item in snapshot_data.get("archived_commit_files") or []}
+            for path in history:
+                commits = (archived_details.get(path) or {}).get("commits") or []
+                parts = sorted({int(part) for commit in commits for part in commit.get("part_ids") or []})
+                context = "Item IDs: " + ", ".join(str(part) for part in parts) if parts else "Archived"
+                history_node.addChild(QTreeWidgetItem([str(path), "", context, os.path.join(str(backup.get("path") or ""), "history", path)]))
+            removed_directories = backup.get("removed_directories") or []
+            if removed_directories:
+                folders = QTreeWidgetItem(["Empty directories removed", str(len(removed_directories)), "Cleanup", ""])
+                self.tree.addTopLevelItem(folders)
+                for path in removed_directories:
+                    folders.addChild(QTreeWidgetItem([str(path), "", "Removed after emptying", ""]))
+            skipped = backup.get("skipped_history") or []
+            if skipped:
+                skipped_node = QTreeWidgetItem(["Historical files kept", str(len(skipped)),
+                                                "In use, changed, or still needed", ""])
+                self.tree.addTopLevelItem(skipped_node)
+                for path in skipped:
+                    skipped_node.addChild(QTreeWidgetItem([str(path), "", "Kept in project", ""]))
         self.tree.addTopLevelItem(QTreeWidgetItem([""]))  # spacer
 
         issues_item = QTreeWidgetItem([

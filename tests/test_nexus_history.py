@@ -1,4 +1,5 @@
 import json
+import gc
 from pathlib import Path
 import shutil
 import sqlite3
@@ -28,11 +29,14 @@ class NexusHistoryTests(unittest.TestCase):
                     migration(conn)
                 else:
                     conn.executescript(migration)
+        conn.close()
         cls.addClassCleanup(cls.base_temp.cleanup)
+        cls.addClassCleanup(gc.collect)
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        self.addCleanup(gc.collect)
         self.root = Path(self.temp.name)
         self.db = self.root / "test.db"
         shutil.copyfile(self.base, self.db)
@@ -194,7 +198,7 @@ class NexusHistoryTests(unittest.TestCase):
 
     def test_branch_workspace_and_checkin_do_not_change_master(self):
         branch_id, head, folder = self.branch()
-        self.assertEqual((self.work / "master/case.prt").read_bytes(), b"native original")
+        self.assertEqual(MasterWorkService.native_path(self.work, MasterWorkService.read_manifest(self.work)["files"]["case.prt"]).read_bytes(), b"native original")
         snapshot = self.designer.branch_details(branch_id)["manifest"]
         self.assertEqual(snapshot["files"]["case.prt"]["sha256"], file_hash(folder / "case.prt.2"))
         self.assertEqual(self.designer.timeline(1)["master_state"], "Validated")
@@ -242,7 +246,17 @@ class NexusHistoryTests(unittest.TestCase):
         self.assertEqual(len([c for c in preview["changes"] if c["conflict"]]), 2)
         with self.assertRaisesRegex(ValueError, "Resolve every conflict"):
             self.master.merge(preview, {}, "Unresolved")
-        self.assertEqual((self.work / "master/case.prt").read_bytes(), b"master changed independently")
+        self.assertEqual(MasterWorkService.native_path(self.work, MasterWorkService.read_manifest(self.work)["files"]["case.prt"]).read_bytes(), b"master changed independently")
+
+    def test_branch_merge_does_not_reuse_archived_master_iteration(self):
+        self.publish("seed", b"native original")
+        path = MasterWorkService.manifest_path(self.work)
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest["iteration_high_water"]["case.prt"] = 8
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        branch_id, _, _ = self.branch()
+        self.master.merge(self.master.preview_merge(branch_id), {}, "Merge after cleanup")
+        self.assertEqual(MasterWorkService.read_manifest(self.work)["files"]["case.prt"]["path"], "case.prt.9")
 
     def test_reviewed_merge_uses_normal_integrated_submission_and_keeps_exports(self):
         release_id = self.master.freeze_release(1, "A010", "For manufacturing")
@@ -252,7 +266,7 @@ class NexusHistoryTests(unittest.TestCase):
             active = [tuple(r) for r in conn.execute("SELECT id,active_version_id FROM part_files ORDER BY id")]
         preview = self.master.preview_merge(branch_id)
         result = self.master.merge(preview, {}, "Integrate clearance fix")
-        self.assertEqual((self.work / "master/case.prt").read_bytes(), b"branch native")
+        self.assertEqual(MasterWorkService.native_path(self.work, MasterWorkService.read_manifest(self.work)["files"]["case.prt"]).read_bytes(), b"branch native")
         self.assertEqual(self.master.branch_details(branch_id)["state"], "Merged")
         self.assertEqual(self.designer.active_branch_map(), {})
         self.assertEqual(self.master.timeline(1)["master_state"], "Under development")
@@ -291,7 +305,7 @@ class NexusHistoryTests(unittest.TestCase):
         )
         updated = self.designer.branch_details(branch_id)
         self.assertEqual(updated["head_snapshot_id"], snapshot_id)
-        self.assertEqual((self.work / "master/case.prt").read_bytes(), b"native original")
+        self.assertEqual(MasterWorkService.native_path(self.work, MasterWorkService.read_manifest(self.work)["files"]["case.prt"]).read_bytes(), b"native original")
         with self.connection() as conn:
             row = conn.execute("SELECT status,nexus_branch_id FROM commits WHERE commit_id='branch-push-1'").fetchone()
         self.assertEqual(tuple(row), ("Branched", branch_id))
@@ -308,7 +322,7 @@ class NexusHistoryTests(unittest.TestCase):
         self.publish("concurrent", b"new concurrent master", 99)
         with self.assertRaisesRegex(ValueError, "changed after review"):
             self.master.merge(preview, {}, "Stale review")
-        self.assertEqual((self.work / "master/case.prt").read_bytes(), b"new concurrent master")
+        self.assertEqual(MasterWorkService.native_path(self.work, MasterWorkService.read_manifest(self.work)["files"]["case.prt"]).read_bytes(), b"new concurrent master")
 
     def _document_commit(self, *, attach_before_push=True, validated=False, unchanged_outputs=False):
         branch_id = self.designer.create_branch([1], "document-access", include_children=False)
@@ -398,7 +412,7 @@ class NexusHistoryTests(unittest.TestCase):
             self.assertEqual(deliverable_provenance(version["file_type"], SimpleNamespace(**version), master_commit, master_commit)["state"], "ok")
         self.assertEqual(Path(paths["pdf_path"]).read_bytes(), b"branch PDF A020")
         self.assertEqual(Path(paths["step_path"]).read_bytes(), b"branch STEP A020")
-        self.assertTrue(Path(paths["pdf_path"]).is_relative_to(self.work / "master"))
+        self.assertTrue(Path(paths["pdf_path"]).is_relative_to(self.work / "deliverables"))
         self.assertEqual(len(MasterWorkService.read_manifest(self.work)["deliverables"]), 2)
         from tests.test_master_work_service import BomProvenanceIntegrationTests
         page = BomProvenanceIntegrationTests.page_methods()
@@ -483,7 +497,7 @@ class NexusHistoryTests(unittest.TestCase):
         decisions = {row["id"]: "master" for row in preview["changes"] if row["kind"] == "file" and row["native"]}
         result = self.master.merge(preview, decisions, "Keep Master CAD and branch outputs")
         self.assertEqual(result["native_state"], "Under development")
-        self.assertEqual((self.work / "master/case.prt").read_bytes(), b"different Master native")
+        self.assertEqual(MasterWorkService.native_path(self.work, MasterWorkService.read_manifest(self.work)["files"]["case.prt"]).read_bytes(), b"different Master native")
 
     def test_same_native_bytes_can_carry_branch_validation_to_an_unvalidated_master(self):
         with self.connection() as conn:
@@ -566,15 +580,15 @@ class NexusHistoryTests(unittest.TestCase):
     def test_failed_validated_merge_rolls_back_master_documents_and_their_database_versions(self):
         branch_id, _, _, _ = self._document_commit(validated=True)
         preview = self.master.preview_merge(branch_id)
-        manifest = (self.work / "master/manifest.json").read_bytes()
+        manifest = MasterWorkService.manifest_path(self.work).read_bytes()
         with self.connection() as conn:
             versions = [tuple(row) for row in conn.execute("SELECT * FROM part_file_versions ORDER BY id")]
             conn.execute("""CREATE TRIGGER reject_document_merge BEFORE UPDATE OF state ON nexus_branches
                 WHEN NEW.state='Merged' BEGIN SELECT RAISE(ABORT,'Simulated document merge failure'); END""")
         with self.assertRaisesRegex(sqlite3.IntegrityError, "Simulated document merge failure"):
             self.master.merge(preview, {}, "Fail after publishing outputs")
-        self.assertEqual((self.work / "master/manifest.json").read_bytes(), manifest)
-        self.assertFalse(any(path.is_file() for path in (self.work / "master/deliverables").rglob("*")))
+        self.assertEqual(MasterWorkService.manifest_path(self.work).read_bytes(), manifest)
+        self.assertFalse(any(path.is_file() for path in (self.work / "deliverables").rglob("*")))
         self.assertEqual(self.master.branch_details(branch_id)["state"], "Active")
         with self.connection() as conn:
             self.assertEqual([tuple(row) for row in conn.execute("SELECT * FROM part_file_versions ORDER BY id")], versions)
@@ -617,7 +631,7 @@ class NexusHistoryTests(unittest.TestCase):
     def test_failed_database_merge_restores_master_and_preserves_branch(self):
         branch_id, _, _ = self.branch()
         preview = self.master.preview_merge(branch_id)
-        old_manifest = (self.work / "master/manifest.json").read_bytes()
+        old_manifest = MasterWorkService.manifest_path(self.work).read_bytes()
         with self.connection() as conn:
             conn.execute("""
                 CREATE TRIGGER fail_branch_merge BEFORE UPDATE OF state ON nexus_branches
@@ -625,8 +639,8 @@ class NexusHistoryTests(unittest.TestCase):
             """)
         with self.assertRaisesRegex(sqlite3.IntegrityError, "Simulated DB failure"):
             self.master.merge(preview, {}, "Failure injection")
-        self.assertEqual((self.work / "master/case.prt").read_bytes(), b"native original")
-        self.assertEqual((self.work / "master/manifest.json").read_bytes(), old_manifest)
+        self.assertEqual(MasterWorkService.native_path(self.work, MasterWorkService.read_manifest(self.work)["files"]["case.prt"]).read_bytes(), b"native original")
+        self.assertEqual(MasterWorkService.manifest_path(self.work).read_bytes(), old_manifest)
         self.assertEqual(self.master.branch_details(branch_id)["state"], "Active")
         with self.connection() as conn:
             self.assertEqual(conn.execute("SELECT count(*) FROM commits WHERE commit_id LIKE 'NB-%'").fetchone()[0], 0)
@@ -647,7 +661,7 @@ class NexusHistoryTests(unittest.TestCase):
             result = self.master.merge(preview, {}, "Merge before archive cleanup")
         self.assertTrue(result["merge_completed"])
         self.assertTrue(result["cleanup_pending"])
-        self.assertEqual((self.work / "master/case.prt").read_bytes(), b"branch native")
+        self.assertEqual(MasterWorkService.native_path(self.work, MasterWorkService.read_manifest(self.work)["files"]["case.prt"]).read_bytes(), b"branch native")
         self.assertEqual(self.master.branch_details(branch_id)["state"], "Merged")
         self.assertEqual(self.designer.active_branch_map(), {})
         self.assertTrue(folder.exists())
@@ -700,7 +714,7 @@ class NexusHistoryTests(unittest.TestCase):
         (source / "free.pdf").write_bytes(b"Available PDF")
         rename = Path.rename
         def deny_locked_file(path, destination):
-            if path == source or path.name == "locked.prt":
+            if path.name == source.name or path.name == "locked.prt":
                 raise PermissionError("File is in use")
             return rename(path, destination)
         with patch.object(Path, "rename", autospec=True, side_effect=deny_locked_file):
