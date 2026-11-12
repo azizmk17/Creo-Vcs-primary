@@ -899,6 +899,22 @@ class CommitService(BaseService):
                             int(self.session.project_id),
                             exclude_commit_id=str(commit_id),
                         )
+                        previous_step_path = getattr(previous_step_commit, "step_file_path", None)
+                        if not previous_step_path or not safe_exists(previous_step_path):
+                            # New project versions receive new BOM IDs and intentionally
+                            # start without copied commit rows.  If this version has no
+                            # usable STEP baseline, continue the item's history across
+                            # sibling versions using its stable Creo base filename.
+                            family_step_commit = self.commit_repository.get_latest_step_commit_for_base_name_family(
+                                item["base_f_name"],
+                                int(self.session.project_id),
+                                exclude_commit_id=str(commit_id),
+                                exclude_project_id=int(self.session.project_id),
+                            )
+                            if safe_exists(getattr(family_step_commit, "step_file_path", None)):
+                                previous_step_commit = family_step_commit
+                            else:
+                                previous_step_commit = None
                         previous_commit_hint = getattr(previous_step_commit, "commit_id", None) or "prev"
                         previous_step_path = getattr(previous_step_commit, "step_file_path", None)
                         step_meta = self._process_step_compare(

@@ -296,7 +296,14 @@ class CommitRepository:
         base_file_name: str,
         project_id: int,
         exclude_commit_id: str | None = None,
+        exclude_project_id: int | None = None,
     ):
+        """Find the newest STEP commit for this CAD identity across project versions.
+
+        Project versions have different BOM row IDs, so STEP baselines cannot be
+        found by part_id alone.  The Creo base filename is copied with the part
+        and remains the stable identity for this lookup within a project family.
+        """
         with self.get_conn() as conn:
             cur = conn.cursor()
 
@@ -321,7 +328,7 @@ class CommitRepository:
                     FROM commits c
                     JOIN projects p ON p.id = c.project_id
                     WHERE p.root_project_id = ?
-                      AND c.base_file_name = ?
+                      AND lower(trim(c.base_file_name)) = lower(trim(?))
                       AND c.step_file_path IS NOT NULL
                       AND TRIM(c.step_file_path) <> ''
                 """
@@ -331,7 +338,7 @@ class CommitRepository:
                     SELECT c.*
                     FROM commits c
                     WHERE c.project_id = ?
-                      AND c.base_file_name = ?
+                      AND lower(trim(c.base_file_name)) = lower(trim(?))
                       AND c.step_file_path IS NOT NULL
                       AND TRIM(c.step_file_path) <> ''
                 """
@@ -340,8 +347,11 @@ class CommitRepository:
             if exclude_commit_id:
                 sql += " AND c.commit_id <> ?"
                 params.append(str(exclude_commit_id))
+            if exclude_project_id is not None:
+                sql += " AND c.project_id <> ?"
+                params.append(int(exclude_project_id))
 
-            sql += " ORDER BY c.id DESC LIMIT 1"
+            sql += " ORDER BY c.committed_at DESC, c.id DESC LIMIT 1"
             cur.execute(sql, tuple(params))
             row = cur.fetchone()
             return self._row_to_commit(row) if row else None
