@@ -256,6 +256,40 @@ class CommitRepository:
             ))
             return cur.lastrowid
 
+    def find_approved_step_baseline(self, part_id, project_id, base_file_name,
+                                    nexus_branch_id, exclude_commit_id):
+        """Find the newest accessible approved STEP on the exact Nexus branch.
+
+        NULL branch IDs identify Master. Cross-version fallback uses the CAD
+        base name within the same project family, never a different branch.
+        """
+        from utils import safe_isfile
+
+        with self.get_conn() as conn:
+            columns = {r[1] for r in conn.execute("PRAGMA table_info(projects)")}
+            project = conn.execute("SELECT * FROM projects WHERE id=?", (int(project_id),)).fetchone()
+            if project is None:
+                return None
+            family = int(project["root_project_id"] or project_id) if "root_project_id" in columns else int(project_id)
+            family_condition = "COALESCE(p.root_project_id, p.id) = ?" if "root_project_id" in columns else "p.id = ?"
+            rows = conn.execute(f"""
+                SELECT c.* FROM commits c JOIN projects p ON p.id = c.project_id
+                WHERE {family_condition}
+                  AND ((c.project_id = ? AND c.part_id = ?)
+                       OR (c.project_id <> ? AND trim(COALESCE(c.base_file_name,'')) <> ''
+                           AND lower(trim(c.base_file_name)) = lower(trim(?))))
+                  AND lower(trim(COALESCE(c.status,''))) = 'approved'
+                  AND COALESCE(NULLIF(trim(c.nexus_branch_id),''),'') = COALESCE(NULLIF(trim(?),''),'')
+                  AND COALESCE(c.commit_id,'') <> ?
+                  AND trim(COALESCE(c.step_file_path,'')) <> ''
+                ORDER BY COALESCE(NULLIF(c.merged_at,''), c.committed_at) DESC, c.id DESC
+            """, (family, int(project_id), int(part_id), int(project_id),
+                  str(base_file_name or ''), nexus_branch_id, str(exclude_commit_id))).fetchall()
+            for row in rows:
+                if safe_isfile(row["step_file_path"]):
+                    return self._row_to_commit(row)
+        return None
+
     def get_latest_step_commit_for_part(self, part_id: int, project_id: int, exclude_commit_id: str | None = None):
         with self.get_conn() as conn:
             cur = conn.cursor()
