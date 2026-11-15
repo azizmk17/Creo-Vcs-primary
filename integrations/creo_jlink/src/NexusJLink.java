@@ -48,13 +48,13 @@ public class NexusJLink {
     private static final ThreadLocal<Set<String>> authorizedEditModels =
         new ThreadLocal<Set<String>>();
     private static Map<String, Object> selectedWorkspace;
+    private static boolean connected;
+    private static boolean localExportActive;
 
     public static void start() {
         try {
             session = pfcGlobal.GetProESession();
             api = new NexusApiClient();
-            installMutationGuards();
-            installCommandGuards();
             installMenu();
             System.out.println("Nexus PDM J-Link started.");
         } catch (Throwable error) {
@@ -84,6 +84,8 @@ public class NexusJLink {
         }
         authorizedEditModels.remove();
         selectedWorkspace = null;
+        connected = false;
+        localExportActive = false;
         api = null;
         session = null;
     }
@@ -226,12 +228,16 @@ public class NexusJLink {
     }
 
     static void refreshCommandProtection() {
-        if (session == null || api == null) return;
+        if (!connected || localExportActive || session == null || api == null) return;
         try {
             installCommandGuards();
         } catch (Throwable error) {
             System.out.println("Nexus PDM command protection refresh failed: " + error);
         }
+    }
+
+    static boolean isLocalExportActive() {
+        return localExportActive;
     }
 
     private static void addCommandGuard(String commandName, String action) throws jxthrowable {
@@ -301,12 +307,21 @@ public class NexusJLink {
         addCommand("NexusPDM.Release", "NexusRelease", "NexusReleaseHelp", new CommandAction() {
             public void run() throws Exception { releaseCurrent(); }
         });
+        addCommand("NexusPDM.Deliverables", "NexusDeliverables", "NexusDeliverablesHelp", new CommandAction() {
+            public void run() throws Exception {
+                localExportActive = true;
+                try { NexusDeliverableExporter.open(session); }
+                finally { localExportActive = false; }
+            }
+        });
     }
 
     private static void addCommand(
         String commandName, String labelKey, String helpKey, CommandAction action
     ) throws jxthrowable {
-        UICommand command = session.UICreateCommand(commandName, new CommandListener(action));
+        boolean connectionRequired = !"NexusPDM.Connect".equals(commandName)
+            && !"NexusPDM.Deliverables".equals(commandName);
+        UICommand command = session.UICreateCommand(commandName, new CommandListener(action, connectionRequired));
         String iconName = commandName.substring("NexusPDM.".length());
         command.SetIcon("nexus_" + iconName.toLowerCase() + ".png");
         command.Designate("nexus_jlink.txt", labelKey, helpKey, helpKey);
@@ -316,7 +331,9 @@ public class NexusJLink {
     }
 
     private static void connect() throws Exception {
-        Map<String, Object> context = requireContext();
+        Map<String, Object> context = verifyContext();
+        connected = true;
+        installMutationGuards();
         installCommandGuards();
         Map<String, Object> user = MiniJson.object(context.get("user"));
         Map<String, Object> project = MiniJson.object(context.get("project"));
@@ -332,6 +349,11 @@ public class NexusJLink {
     }
 
     private static Map<String, Object> requireContext() throws Exception {
+        if (!connected) throw new IllegalStateException("Use Connect to Active Project before using Nexus commands.");
+        return verifyContext();
+    }
+
+    private static Map<String, Object> verifyContext() throws Exception {
         Map<String, Object> context = api.getContext();
         if (!MiniJson.bool(context, "logged_in")) {
             throw new IllegalStateException("Sign in to Nexus before using the Creo integration.");
@@ -836,6 +858,7 @@ public class NexusJLink {
     }
 
     static boolean beginEditCommand() throws Exception {
+        if (localExportActive) return true;
         Model model = currentOrActiveModel();
         if (!resolveModelConflict(model, false)) return false;
         if (model != null) {
@@ -903,6 +926,7 @@ public class NexusJLink {
     }
 
     static void requireModelEdit(Model model, String operation) throws jxthrowable {
+        if (localExportActive) return;
         try {
             // The edit command checks authorization once; regeneration is not a user edit.
             if (isAuthorizedEditCommand(model) || isModelRegenerating(model)) return;
@@ -2509,13 +2533,17 @@ public class NexusJLink {
 
     private static final class CommandListener extends DefaultUICommandActionListener {
         private final CommandAction action;
+        private final boolean connectionRequired;
 
-        private CommandListener(CommandAction action) {
+        private CommandListener(CommandAction action, boolean connectionRequired) {
             this.action = action;
+            this.connectionRequired = connectionRequired;
         }
 
         public void OnCommand() {
             try {
+                if (connectionRequired && !connected)
+                    throw new IllegalStateException("Use Connect to Active Project before using Nexus commands.");
                 action.run();
             } catch (Throwable error) {
                 showError(error);

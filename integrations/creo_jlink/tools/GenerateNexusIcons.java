@@ -13,7 +13,7 @@ import javax.imageio.ImageIO;
 public final class GenerateNexusIcons {
     private static final String[] COMMANDS = new String[] {
         "connect", "workspace", "retrieve", "status", "workspacestatus",
-        "history", "checkout", "checkin", "undo", "revise", "release"
+        "history", "checkout", "checkin", "undo", "revise", "release", "deliverables"
     };
 
     private GenerateNexusIcons() { }
@@ -47,7 +47,8 @@ public final class GenerateNexusIcons {
     }
 
     private static Color accent(String command) {
-        if ("retrieve".equals(command) || "checkin".equals(command) || "release".equals(command))
+        if ("retrieve".equals(command) || "checkin".equals(command)
+            || "release".equals(command) || "deliverables".equals(command))
             return new Color(30, 145, 95);
         if ("history".equals(command) || "revise".equals(command))
             return new Color(203, 112, 34);
@@ -122,6 +123,12 @@ public final class GenerateNexusIcons {
             g.draw(badge);
             g.drawLine(11, 16, 15, 20);
             g.drawLine(15, 20, 22, 12);
+        } else if ("deliverables".equals(command)) {
+            g.draw(new RoundRectangle2D.Double(5, 8, 22, 18, 2, 2));
+            g.drawLine(5, 13, 27, 13);
+            g.drawLine(16, 17, 16, 23);
+            g.drawLine(12, 20, 16, 24);
+            g.drawLine(16, 24, 20, 20);
         }
     }
 }

@@ -43,6 +43,7 @@ if errorlevel 1 (
     "%SOURCE%\NexusApiException.java" ^
     "%SOURCE%\NexusApiClient.java" ^
     "%SOURCE%\NexusSaveGuard.java" ^
+    "%SOURCE%\NexusDeliverableExporter.java" ^
     "%SOURCE%\NexusEditGuard.java" ^
     "%SOURCE%\NexusModelMutationGuard.java" ^
     "%SOURCE%\NexusFeatureMutationGuard.java" ^

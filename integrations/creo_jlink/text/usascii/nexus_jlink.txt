@@ -90,3 +90,11 @@ NexusReleaseHelp
 Release the current checked-in CAD Document through the Nexus lifecycle
 #
 #
+NexusDeliverables
+Export Deliverables
+#
+#
+NexusDeliverablesHelp
+Create PDFs from loaded drawings and STEP files from their referenced models
+#
+#

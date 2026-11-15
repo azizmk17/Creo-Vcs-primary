@@ -23,6 +23,7 @@ the commands are registered. In **File > Options > Customize Ribbon**, choose
 - **Document**: Status, Workspace Status, CAD History
 - **Checkout**: Check Out, Check In, Undo Check Out
 - **Lifecycle**: Create CAD Revision, Release CAD Document
+- **Deliverables**: Export Deliverables
 
 Save through **Import/Export > Save Auxiliary Application User Interface**. Creo
 creates `toolkitribbonui.rbn`; place it in
@@ -86,6 +87,44 @@ remains available as a fallback during setup.
   checked in or undone.
 - **Release CAD Document** promotes a checked-in CAD Document through the Nexus
   lifecycle. Released data must be revised before it can be edited again.
+- **Export Deliverables** creates PDFs from selected loaded drawings and STEP files
+  from the unique PRT/ASM models those drawings reference. It previews filenames
+  generated from drawing and model parameters, missing parameters, duplicate names, and existing
+  files before exporting. Existing local files are never overwritten. PDFs include
+  all sheets. A PDF window is opened only when needed and closed after that export;
+  already-open model windows are kept open.
+
+  The default name patterns are `{NUMERO_ARTICLE}-{INDEX_AES}-{NOM}` for PDFs and
+  `{NUMERO_ARTICLE}-{INDEX_AES}` for STEP files; the matching extension is added
+  automatically. Use `{MODEL.PARAMETER_NAME}` for a model parameter or
+  `{DRAWING.PARAMETER_NAME}` for a drawing parameter. `{PARAMETER_NAME}` uses the
+  model value first and falls back to the drawing. **Available parameters** lists
+  values and template names for the selected drawings and their models. Place the
+  cursor in the PDF or STEP naming field, open the list, and double-click a parameter
+  to insert it at the cursor. Enable **Uppercase filenames** to export the entire
+  filename, including its extension, in uppercase; this choice is saved with the
+  other settings. The preview groups each drawing with its PDF and referenced STEP
+  files, marking skipped files in red and warnings in orange. When a
+  parameter is missing or empty, it and its following separator are omitted; if
+  it is last, the preceding separator is removed. The preview identifies omitted
+  values. When no parameter in the rule has a value, the referenced part or assembly
+  filename is used. If the drawing has no referenced model, its filename is used.
+  Choose the model for PDF naming in the drawing list when a drawing references more
+  than one model. For STEP files referenced by multiple selected drawings, drawing
+  parameters come from the first selected drawing in the list; the preview shows it.
+  Click **Save naming rules** to keep the settings without exporting. Settings are
+  also saved when an export starts. The last folder, patterns, and export choices
+  are saved per Windows user under
+  `%LOCALAPPDATA%\CreoVCS\jlink\deliverables.properties`.
+
+  Export Deliverables writes only to the selected folder and works before connecting
+  to Nexus. It does not add exports to Nexus managed files or contact the Nexus bridge.
+  Its window opens before listing the drawings in the Creo session. All drawings
+  start unchecked; their referenced models and parameters are read only after the
+  user selects them. The preview checks existing files in the background.
+
+Nexus commands and checkout/edit checks become active after **Connect to Active
+Project** succeeds. Before connecting, Creo operations are not checked against Nexus.
 
 Before a managed read-only model is changed, the J-Link guard runs at the Creo
 command boundary. It covers feature edit/redefine/delete/suppress/resume and

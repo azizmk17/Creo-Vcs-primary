@@ -21,6 +21,7 @@ public class NexusSaveGuard extends DefaultUICommandBracketListener {
     }
 
     public void OnBeforeCommand() throws jxthrowable {
+        if (NexusJLink.isLocalExportActive()) return;
         Model model = session.GetCurrentModel();
         if (model == null) {
             model = session.GetActiveModel();
