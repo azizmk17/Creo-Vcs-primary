@@ -11883,6 +11883,73 @@ class BomPage(QWidget):
         if cad_id is not None:
             self._add_cad_member_from_tree(int(cad_id))
 
+    def _reconcile_pdm_cad_filenames(self, cad_id: int) -> None:
+        if not self.perm.can("manage_parts"):
+            QMessageBox.warning(self, "Permission denied", "You cannot manage CAD Documents.")
+            return
+        document = self.bom_service.pdm_service.repo.get_cad_document(int(cad_id)) or {}
+        old_name = str(document.get("file_name") or "")
+        if str(document.get("category") or "").upper() not in {"ASSEMBLY", "COMPONENT"}:
+            QMessageBox.information(self, "Rename CAD", "Select the PRT or ASM that owns the drawing.")
+            return
+        new_name, ok = QInputDialog.getText(
+            self, "Reconcile CAD filename",
+            "Enter the new model filename, or leave it unchanged if only a drawing was renamed.\n"
+            "Update and save affected Creo references before continuing; Nexus cannot check them.\n"
+            "The renamed root files must match the recorded CAD hashes.\n\n"
+            f"Current filename: {old_name}", text=old_name,
+        )
+        if not ok or not str(new_name).strip():
+            return
+        names = {int(cad_id): str(new_name).strip()}
+        old_stem = os.path.splitext(old_name)[0]
+        new_stem = re.sub(r"(?i)\.(?:prt|asm)(?:\.\d+)?$", "", str(new_name).strip())
+        for drawing in document.get("related_drawings") or []:
+            drawing_id = int(drawing["id"])
+            drawing_name = str(drawing.get("file_name") or "")
+            drawing_stem = os.path.splitext(drawing_name)[0]
+            suggested = new_stem + ".drw" if drawing_stem.casefold() == old_stem.casefold() else drawing_name
+            choice, accepted = QInputDialog.getText(
+                self, "Related drawing filename",
+                f"Enter the renamed filename for {drawing_name}.\n"
+                "Leave the existing name unchanged if this drawing was not renamed.", text=suggested,
+            )
+            if not accepted:
+                return
+            choice = str(choice or "").strip()
+            if choice and choice.casefold() != drawing_name.casefold():
+                names[drawing_id] = choice
+        from core.services.cad_filename_reconciliation import reconcile_filenames
+        project_id = int(self.session.project_id)
+        actor_id = int(self.session.user_id)
+        database = self.bom_service.resources.db_name
+
+        def operation(_progress):
+            return reconcile_filenames(db_name=database, project_id=project_id, actor_id=actor_id,
+                                       cad_id=int(cad_id), names=names)
+
+        def finished(result):
+            self.bom_service._tree_dirty.add(project_id)
+            refresh_ids = sorted(set(result["cad_document_ids"]) | {int(cad_id)})
+            self.bom_service.emit_project_event(
+                "cad.structure_changed", project_id=project_id, actor_user_id=actor_id,
+                entity_type="CAD_DOCUMENT", entity_id=int(cad_id),
+                payload={"cad_document_ids": refresh_ids, "item_ids": result["item_ids"]},
+            )
+            if int(self.session.project_id or 0) == project_id:
+                self._refresh_pdm_context_rows(item_ids=result.get("item_ids"), cad_ids=refresh_ids, refresh_cad_branches=True)
+                self._reselect_cad_in_current_view(int(cad_id))
+            message = "Nexus adopted the verified filenames. Historical records retain their original names."
+            if result.get("warning"):
+                QMessageBox.warning(self, "Rename CAD", message + "\n\n" + str(result["warning"]))
+            else:
+                QMessageBox.information(self, "Rename CAD", message)
+
+        self._run_export_with_progress(
+            title="Rename CAD", initial_message="Checking renamed files and updating Nexus...",
+            operation=operation, on_success=finished, error_title="Rename CAD",
+        )
+
     def _delete_selected_pdm_cad_document(
         self,
         cad_id: int | None = None,
@@ -15069,6 +15136,11 @@ class BomPage(QWidget):
 
             view_action = menu.addAction("View CAD Document Information")
             view_action.triggered.connect(lambda: self._show_pdm_cad_selection(item))
+            if can_manage and str(payload.get("category") or "").upper() in {"ASSEMBLY", "COMPONENT"}:
+                rename_action = menu.addAction("Reconcile renamed CAD files...")
+                rename_action.triggered.connect(
+                    lambda _checked=False, value=cad_id: self._reconcile_pdm_cad_filenames(value)
+                )
             graph_action = menu.addAction("Show Relationship Graph")
             graph_action.triggered.connect(
                 lambda _checked=False, value=cad_id, data=payload:

@@ -3228,6 +3228,21 @@ class BomService(BaseService):
         )
         return cad_id
 
+    def reconcile_pdm_cad_filenames(self, cad_document_id: int, names: dict) -> Dict:
+        from core.services.cad_filename_reconciliation import reconcile_filenames
+
+        result = reconcile_filenames(
+            db_name=self.resources.db_name, project_id=int(self.session.project_id),
+            actor_id=int(self.session.user_id), cad_id=int(cad_document_id), names=names,
+        )
+        self._tree_dirty.add(int(self.session.project_id))
+        self.emit_project_event(
+            "cad.structure_changed", entity_type="CAD_DOCUMENT", entity_id=int(cad_document_id),
+            payload={"cad_document_ids": sorted(set(result["cad_document_ids"]) | {int(cad_document_id)}),
+                     "item_ids": result["item_ids"]},
+        )
+        return result
+
     def delete_pdm_cad_document(
         self, cad_document_id: int, *, delete_related_drawings: bool = False
     ) -> Dict:

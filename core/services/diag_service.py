@@ -1,4 +1,5 @@
 import os
+from contextlib import closing
 from datetime import datetime
 from core.session_manager import SessionManager
 from core.repositories.commit_repository import CommitRepository
@@ -284,6 +285,28 @@ class DiagService:
             if str(record.get("source_commit_id") or "") in master_commits and native.fullmatch(name):
                 known.add(name.casefold())
 
+        # A reconciled name is expected only when its old exact iteration was
+        # already known from a commit, Master or snapshot. Other files remain
+        # unexpected, even if their base name matches a CAD Document.
+        mappings = []
+        pdm_repo = getattr(self, "pdm_repo", None)
+        if pdm_repo is not None:
+            from core.services.cad_filename_reconciliation import root_key
+            with closing(pdm_repo.get_conn()) as conn:
+                exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cad_filename_reconciliations'").fetchone()
+                if exists:
+                    for row in conn.execute("SELECT file_mapping_json FROM cad_filename_reconciliations WHERE project_id=? AND root_key=? ORDER BY id", (int(self.session.project_id), root_key(working_dir))):
+                        mappings.append({str(k).casefold(): str(v).casefold() for k, v in json.loads(row[0]).items()})
+
+        def known_names(name):
+            values = {str(name).casefold()}
+            for mapping in mappings:
+                values.update(mapping[value] for value in list(values) if value in mapping)
+            return values
+
+        for name in list(known):
+            known.update(known_names(name))
+
         remaining = {name.casefold() for name in working_files} - known
         if remaining:
             for snapshot in self.snap_repo.get_all(int(self.session.project_id)):
@@ -293,7 +316,7 @@ class DiagService:
                 for item in payload.get("files") or []:
                     name = str(item.get("filename") or "")
                     if native.fullmatch(name):
-                        remaining.discard(name.casefold())
+                        remaining.difference_update(known_names(name))
                 if not remaining:
                     break
 

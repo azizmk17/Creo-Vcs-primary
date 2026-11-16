@@ -227,6 +227,7 @@ class _ProjectTimelineNode(QGraphicsObject):
         if category == "master_checkin":
             return "MASTER CHECK-IN"
         labels = {
+            "CAD_RENAMED": "CAD RENAMED",
             "BRANCH_CREATED": "BRANCH CREATED",
             "BRANCH_CHECKIN": "BRANCH CHECK-IN",
             "BRANCH_PAUSED": "BRANCH PAUSED",

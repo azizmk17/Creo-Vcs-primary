@@ -85,7 +85,7 @@ class MasterWorkService:
                 before_publish()
             with MasterWorkService.staging_directory(lock.parent) as staging:
                 index = MasterWorkService.manifest_path(root)
-                manifest = json.loads(index.read_text(encoding="utf-8")) if index.exists() else {}
+                manifest = MasterWorkService.read_manifest(working_directory)
                 files = dict(manifest.get("files", {}))
                 validated_files = dict(manifest.get("validated_files", {}))
                 high_water = dict(manifest.get("iteration_high_water", {}))
@@ -218,11 +218,50 @@ class MasterWorkService:
         return str(working_directory)
 
     @staticmethod
-    def read_manifest(working_directory):
+    def read_manifest(working_directory, *, db_name=None, conn=None):
         if not working_directory:
             return {}
         path = MasterWorkService.manifest_path(long_path(str(working_directory)))
-        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        manifest = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        if not manifest:
+            return manifest
+        from core.services.cad_filename_reconciliation import root_key
+        from config import DB_NAME
+        import sqlite3
+        own_connection = conn is None
+        if own_connection:
+            if not os.path.isfile(long_path(os.fspath(db_name or DB_NAME))):
+                return manifest
+            conn = sqlite3.connect(db_name or DB_NAME, timeout=30)
+        try:
+            exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cad_filename_reconciliations'").fetchone()
+            if not exists:
+                return manifest
+            events = conn.execute(
+                "SELECT old_name,new_name,file_mapping_json FROM cad_filename_reconciliations WHERE root_key=? ORDER BY id",
+                (root_key(working_directory),),
+            ).fetchall()
+            for old_name, new_name, mapping_json in events:
+                mapping = {str(k).casefold(): str(v) for k, v in json.loads(mapping_json).items()}
+                old_key, new_key = str(old_name).casefold(), str(new_name).casefold()
+                for section in ("files", "validated_files"):
+                    records = manifest.get(section) or {}
+                    if old_key not in records:
+                        continue
+                    if new_key in records:
+                        raise ValueError("Master manifest contains conflicting CAD rename identities: " + str(new_name))
+                    record = dict(records.pop(old_key))
+                    for field in ("path", "source_filename"):
+                        if str(record.get(field) or "").casefold() in mapping:
+                            record[field] = mapping[str(record[field]).casefold()]
+                    records[new_key] = record
+                high_water = manifest.get("iteration_high_water") or {}
+                if old_key in high_water:
+                    high_water[new_key] = max(int(high_water.get(new_key) or 0), int(high_water.pop(old_key) or 0))
+            return manifest
+        finally:
+            if own_connection:
+                conn.close()
 
 
 def master_commit_for_part(commits, manifest, part_id):

@@ -3865,6 +3865,28 @@ def _migration_53(conn):
 MIGRATIONS[53] = _migration_53
 
 
+def _migration_54(conn):
+    """Record manually completed Creo filename changes without altering history."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cad_filename_reconciliations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            cad_document_id INTEGER NOT NULL,
+            root_key TEXT NOT NULL,
+            old_name TEXT NOT NULL,
+            new_name TEXT NOT NULL,
+            file_mapping_json TEXT NOT NULL,
+            actor_user_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_cad_rename_root ON cad_filename_reconciliations(root_key,id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_cad_rename_project ON cad_filename_reconciliations(project_id,id)")
+
+
+MIGRATIONS[54] = _migration_54
+
+
 # --- Migration ---
 def migrate():
     init_db()  
