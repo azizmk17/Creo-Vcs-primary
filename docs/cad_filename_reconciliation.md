@@ -22,10 +22,15 @@ hash or iteration is missing, or if a validated Master file is unavailable,
 Nexus refuses the reconciliation instead of carrying old validation onto new
 bytes. Changed CAD content must be handled through the controlled CAD workflow.
 
-For safety, the operation also blocks while the project has CAD or Item
-checkouts, pending or validated commits, active or paused Nexus branches, or
-another project sharing the directory and the same CAD filename. A read-only
-project version cannot be reconciled. Complete or resolve those conflicts first.
+For safety, the operation blocks while an affected CAD document or a CAD
+document associated with its Items is checked out, a related Item is checked
+out, or an active Nexus branch contains the affected CAD or a related Item.
+Unrelated checkouts and branches do not block it. A paused branch does not
+block reconciliation; its frozen snapshot retains the old filename, so review
+and reconcile the branch contents before resuming or merging it. The operation
+also blocks on project-wide pending or validated commits, or another project
+sharing the directory and the same CAD filename. A read-only project version
+cannot be reconciled. Complete or resolve those conflicts first.
 The operation does not delete old files from users' local CAD workspaces; users
 should retrieve the newly named CAD Document into their workspace after the
 reconciliation and review any old local copies.

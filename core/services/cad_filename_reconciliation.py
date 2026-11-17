@@ -1,5 +1,6 @@
 """Adopt Creo filenames renamed by a user, without modifying CAD bytes or history."""
 import json
+import hashlib
 import logging
 import os
 import re
@@ -40,6 +41,39 @@ def _new_name(value, extension):
     if re.fullmatch(r"(?i)(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?", name):
         raise ValueError("The filename is reserved by Windows.")
     return name
+
+
+def _active_branch_contains_documents(conn, project_id, document_ids, item_ids, names):
+    """Check active branch items and frozen CAD dependencies, including CAD-only files."""
+    branches = conn.execute("""
+        SELECT b.id, b.head_snapshot_id, s.manifest_json, s.manifest_sha256
+        FROM nexus_branches b LEFT JOIN nexus_branch_snapshots s
+          ON s.id=b.head_snapshot_id AND s.branch_id=b.id
+        WHERE b.project_id=? AND lower(b.state)='active'
+    """, (project_id,)).fetchall()
+    for branch in branches:
+        if item_ids:
+            marks = ",".join("?" for _ in item_ids)
+            if conn.execute(f"SELECT 1 FROM nexus_branch_items WHERE branch_id=? AND bom_id IN ({marks}) LIMIT 1",
+                            (branch["id"], *item_ids)).fetchone():
+                return True
+        encoded = branch["manifest_json"]
+        if not encoded or hashlib.sha256(encoded.encode("utf-8")).hexdigest() != branch["manifest_sha256"]:
+            raise ValueError("Cannot verify an active branch snapshot. Resolve the branch before reconciling filenames.")
+        try:
+            files = json.loads(encoded)["files"]
+            if not isinstance(files, dict):
+                raise ValueError("Invalid branch files")
+            for entry in files.values():
+                cad_id = entry.get("cad_document_id")
+                if cad_id is not None and int(cad_id) in document_ids:
+                    return True
+                # Legacy snapshots may not have CAD IDs.
+                if cad_id is None and _logical(entry.get("filename")) in names:
+                    return True
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise ValueError("Cannot verify an active branch snapshot. Resolve the branch before reconciling filenames.") from exc
+    return False
 
 
 def reconcile_filenames(*, db_name, project_id, actor_id, cad_id, names):
@@ -106,15 +140,23 @@ def reconcile_filenames(*, db_name, project_id, actor_id, cad_id, names):
         affected = [documents[k] for k in requested]
         ids = [int(row["id"]) for row in affected]
         marks = ",".join("?" for _ in ids)
-        if conn.execute("SELECT 1 FROM cad_documents WHERE project_id=? AND checked_out_by IS NOT NULL LIMIT 1", (int(project_id),)).fetchone():
-            raise ValueError("Finish CAD checkouts in this project before reconciling filenames.")
         item_ids = sorted({int(row[0]) for row in conn.execute(
             f"SELECT DISTINCT item_id FROM cad_item_associations WHERE active=1 AND cad_document_id IN ({marks})", ids
         )})
-        if conn.execute("SELECT 1 FROM locks l JOIN bom b ON b.id=l.part_id WHERE b.project_id=? LIMIT 1", (int(project_id),)).fetchone():
-            raise ValueError("Finish Item checkouts in this project before reconciling filenames.")
-        if conn.execute("SELECT 1 FROM nexus_branches WHERE project_id=? AND state IN ('Active','Paused') LIMIT 1", (int(project_id),)).fetchone():
-            raise ValueError("This project has an active or paused Nexus branch. Merge or abandon it before reconciling filenames.")
+        related_ids = set(ids)
+        if item_ids:
+            item_marks = ",".join("?" for _ in item_ids)
+            related_ids.update(int(row[0]) for row in conn.execute(
+                f"SELECT cad_document_id FROM cad_item_associations WHERE active=1 AND item_id IN ({item_marks})", item_ids))
+        related_marks = ",".join("?" for _ in related_ids)
+        if conn.execute(f"SELECT 1 FROM cad_documents WHERE project_id=? AND id IN ({related_marks}) AND checked_out_by IS NOT NULL LIMIT 1",
+                        (int(project_id), *sorted(related_ids))).fetchone():
+            raise ValueError("Finish related CAD checkouts before reconciling filenames.")
+        if item_ids and conn.execute(f"SELECT 1 FROM locks WHERE part_id IN ({item_marks}) LIMIT 1", item_ids).fetchone():
+            raise ValueError("Finish related Item checkouts before reconciling filenames.")
+        names = {_logical(document["file_name"]) for document in affected}
+        if _active_branch_contains_documents(conn, int(project_id), set(ids), item_ids, names):
+            raise ValueError("A related CAD document or Item is in an active Nexus branch. Merge, pause or abandon that branch before reconciling filenames.")
         if conn.execute("SELECT 1 FROM commits WHERE project_id=? AND lower(status) IN ('pending','validated') LIMIT 1", (int(project_id),)).fetchone():
             raise ValueError("Finish pending and validated commits in this project before reconciling filenames.")
 

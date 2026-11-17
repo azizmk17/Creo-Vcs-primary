@@ -59,7 +59,9 @@ class FilenameReconciliationTests(unittest.TestCase):
                 CREATE TABLE cad_document_iterations(id INTEGER PRIMARY KEY,cad_document_id INTEGER,revision TEXT,iteration INTEGER,primary_path TEXT,sha256 TEXT);
                 CREATE TABLE cad_item_associations(cad_document_id INTEGER,item_id INTEGER,active INTEGER);
                 CREATE TABLE locks(part_id INTEGER);
-                CREATE TABLE nexus_branches(id TEXT,project_id INTEGER,state TEXT);
+                CREATE TABLE nexus_branches(id TEXT,project_id INTEGER,state TEXT,head_snapshot_id TEXT);
+                CREATE TABLE nexus_branch_items(branch_id TEXT,bom_id INTEGER);
+                CREATE TABLE nexus_branch_snapshots(id TEXT,branch_id TEXT,manifest_json TEXT,manifest_sha256 TEXT);
                 CREATE TABLE commits(project_id INTEGER,cad_document_id INTEGER,part_id INTEGER,status TEXT,filename TEXT);
                 CREATE TABLE bom(id INTEGER PRIMARY KEY,project_id INTEGER,filename TEXT,base_file_name TEXT,drawing TEXT,base_drw_name TEXT);
                 CREATE TABLE nexus_item_events(id INTEGER PRIMARY KEY,project_id INTEGER,bom_id INTEGER,actor_id INTEGER,created_at TEXT,event_type TEXT,title TEXT,note TEXT,branch_id TEXT,snapshot_id TEXT,release_id TEXT,payload_json TEXT);
@@ -153,14 +155,61 @@ class FilenameReconciliationTests(unittest.TestCase):
                 reconcile_filenames(db_name=self.db, project_id=1, actor_id=7, cad_id=1,
                                     names={1: "old.prt", 2: "old.drw"})
 
-    def test_active_branch_blocks_operation(self):
-        conn = sqlite3.connect(self.db)
-        try:
-            conn.execute("INSERT INTO nexus_branches VALUES('branch',1,'Active')")
-            conn.commit()
-        finally:
-            conn.close()
-        with self.assertRaisesRegex(ValueError, "active or paused Nexus branch"):
+    def add_branch(self, state, *, item_id=None, files=None):
+        encoded = json.dumps({"files": files or {}})
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("INSERT INTO nexus_branches VALUES('branch',1,?,'head')", (state,))
+            conn.execute("INSERT INTO nexus_branch_snapshots VALUES('head','branch',?,?)",
+                         (encoded, hashlib.sha256(encoded.encode()).hexdigest()))
+            if item_id is not None:
+                conn.execute("INSERT INTO nexus_branch_items VALUES('branch',?)", (item_id,))
+
+    def test_active_related_branch_blocks_operation(self):
+        self.add_branch("Active", item_id=9)
+        with self.assertRaisesRegex(ValueError, "active Nexus branch"):
+            self.reconcile()
+
+    def test_active_branch_with_cad_dependency_blocks_operation(self):
+        self.add_branch("Active", files={"old.prt": {"cad_document_id": 1, "filename": "old.prt.5"}})
+        with self.assertRaisesRegex(ValueError, "active Nexus branch"):
+            self.reconcile()
+
+    def test_active_legacy_branch_with_cad_filename_blocks_operation(self):
+        self.add_branch("Active", files={"old.prt": {"filename": "old.prt.5"}})
+        with self.assertRaisesRegex(ValueError, "active Nexus branch"):
+            self.reconcile()
+
+    def test_damaged_active_snapshot_is_not_silently_ignored(self):
+        self.add_branch("Active")
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE nexus_branch_snapshots SET manifest_sha256='invalid'")
+        with self.assertRaisesRegex(ValueError, "Cannot verify an active branch snapshot"):
+            self.reconcile()
+
+    def test_active_unrelated_branch_does_not_block(self):
+        self.add_branch("Active", item_id=99, files={"other.prt": {"cad_document_id": 99}})
+        self.reconcile()
+
+    def test_paused_related_branch_does_not_block(self):
+        self.add_branch("Paused", item_id=9, files={"old.prt": {"cad_document_id": 1}})
+        self.reconcile()
+
+    def test_unrelated_checkouts_do_not_block(self):
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("INSERT INTO cad_documents(id,project_id,checked_out_by) VALUES(99,1,5)")
+            conn.execute("INSERT INTO locks VALUES(99)")
+        self.reconcile()
+
+    def test_related_item_checkout_blocks(self):
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("INSERT INTO locks VALUES(9)")
+        with self.assertRaisesRegex(ValueError, "related Item checkouts"):
+            self.reconcile()
+
+    def test_related_cad_checkout_blocks(self):
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE cad_documents SET checked_out_by=5 WHERE id=2")
+        with self.assertRaisesRegex(ValueError, "related CAD checkouts"):
             self.reconcile()
 
     def test_unverified_latest_iteration_cannot_inherit_master_validation(self):
