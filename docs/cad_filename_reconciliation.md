@@ -39,3 +39,21 @@ This feature adds database migration 54. Update all Nexus clients that use the
 shared database before using it. Nexus stores rename mappings in SQLite and
 applies them when reading the Master manifest; it does not rewrite the original
 manifest as part of reconciliation.
+
+## Force adoption when verification fails
+
+Users with Master/merge permission can choose **Force rename — require new
+check-in and approval** in the rename verification dialog and enter a reason.
+The renamed file must exist in the project root; the highest existing Creo
+iteration is adopted even when the recorded iteration or hash differs.
+The ordinary naming, checkout, branch, pending-commit, and publication-lock
+checks still apply.
+
+Force adoption requires migration 55. Update all shared-workspace clients and
+have the administrator run the migration before using it. The audit record
+stores the user, reason, adopted path and hash. Historical CAD iteration records,
+commits and frozen releases retain their original evidence. Current CAD returns
+to IN_WORK, and Master shows Unverified — check-in required. New branch captures
+and release packages using that CAD are blocked. Check in the renamed CAD and
+approve it through the normal workflow to restore verified Master status;
+a development push alone does not clear the unverified marker.

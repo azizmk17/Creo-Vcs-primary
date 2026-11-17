@@ -108,6 +108,19 @@ class NexusHistoryTests(unittest.TestCase):
                                       attributes=attributes)
         return branch_id, head, folder
 
+    def test_unverified_rename_blocks_new_release_but_keeps_frozen_history(self):
+        release_id = self.master.freeze_release(1, "A010", "Before rename")
+        path = MasterWorkService.manifest_path(self.work)
+        manifest = json.loads(path.read_text())
+        manifest["files"]["case.prt"]["unverified"] = True
+        manifest["files"]["case.prt"]["source_commit_id"] = None
+        path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "unverified"):
+            self.master.freeze_release(1, "A011", "After force rename")
+        with self.assertRaisesRegex(ValueError, "unverified"):
+            self.designer.create_branch([1], "unverified-branch")
+        self.assertTrue(self.master.project_release_details(release_id))
+
     def test_fresh_schema_adds_history_without_rewriting_existing_deliverables(self):
         with self.connection() as conn:
             before = [tuple(r) for r in conn.execute("SELECT * FROM part_file_versions ORDER BY id")]

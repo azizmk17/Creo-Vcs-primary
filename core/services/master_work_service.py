@@ -149,6 +149,8 @@ class MasterWorkService:
                         "part_ids": item.get("part_ids") or [item.get("part_id")],
                         "cad_document_id": item.get("cad_document_id"),
                     }
+                    if existing.get("unverified") and not item.get("validated"):
+                        files[name]["unverified"] = True
                     if item.get("validated"):
                         validated_files[name] = dict(files[name])
                     if not destination.exists():
@@ -237,13 +239,34 @@ class MasterWorkService:
             exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cad_filename_reconciliations'").fetchone()
             if not exists:
                 return manifest
+            columns = {r[1] for r in conn.execute("PRAGMA table_info(cad_filename_reconciliations)")}
+            force_column = "force_metadata_json" if "force_metadata_json" in columns else "NULL"
+            applied = set(manifest.get("applied_rename_ids") or [])
             events = conn.execute(
-                "SELECT old_name,new_name,file_mapping_json FROM cad_filename_reconciliations WHERE root_key=? ORDER BY id",
+                f"SELECT id,old_name,new_name,file_mapping_json,{force_column} FROM cad_filename_reconciliations WHERE root_key=? ORDER BY id",
                 (root_key(working_directory),),
             ).fetchall()
-            for old_name, new_name, mapping_json in events:
+            for rename_id, old_name, new_name, mapping_json, force_json in events:
+                if rename_id in applied:
+                    continue
+                applied.add(rename_id)
                 mapping = {str(k).casefold(): str(v) for k, v in json.loads(mapping_json).items()}
                 old_key, new_key = str(old_name).casefold(), str(new_name).casefold()
+                if force_json:
+                    record = json.loads(force_json)
+                    record["source_filename"] = record["path"]
+                    record["source_commit_id"] = None
+                    record["unverified"] = True
+                    manifest.setdefault("files", {}).pop(old_key, None)
+                    manifest["files"][new_key] = record
+                    manifest.setdefault("validated_files", {}).pop(old_key, None)
+                    manifest["validated_files"].pop(new_key, None)
+                    high_water = manifest.setdefault("iteration_high_water", {})
+                    match = re.search(r"\.(\d+)$", record["path"])
+                    high_water[new_key] = max(int(high_water.get(new_key) or 0),
+                                              int(high_water.pop(old_key, 0) or 0),
+                                              int(match[1]) if match else 0)
+                    continue
                 for section in ("files", "validated_files"):
                     records = manifest.get(section) or {}
                     if old_key not in records:
@@ -258,6 +281,7 @@ class MasterWorkService:
                 high_water = manifest.get("iteration_high_water") or {}
                 if old_key in high_water:
                     high_water[new_key] = max(int(high_water.get(new_key) or 0), int(high_water.pop(old_key) or 0))
+            manifest["applied_rename_ids"] = sorted(applied)
             return manifest
         finally:
             if own_connection:
@@ -266,6 +290,11 @@ class MasterWorkService:
 
 def master_commit_for_part(commits, manifest, part_id):
     """Unpushed submissions cannot change the state or exports shown for master."""
+    if any(record.get("unverified") and part_id in record.get("part_ids", [])
+           for record in (manifest.get("files") or {}).values()):
+        from types import SimpleNamespace
+        return SimpleNamespace(commit_id="unverified-rename", status="Unverified", id=0,
+                               committed_at=None, merged_at=None)
     records = [record for record in (manifest.get("files") or {}).values()
                if int(part_id) in [int(value) for value in record.get("part_ids", []) if value is not None]
                and record.get("source_commit_id")]
@@ -283,6 +312,8 @@ def native_work_state(commit):
     if commit is None:
         return ""
     status = str(getattr(commit, "status", "") or "").lower()
+    if status == "unverified":
+        return "Unverified — check-in required"
     return "Validated" if status in {"validated", "approved"} else "Under development"
 
 

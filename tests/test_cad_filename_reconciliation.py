@@ -10,7 +10,7 @@ from unittest.mock import patch
 from core.services.cad_filename_reconciliation import reconcile_filenames
 from core.services.diag_service import DiagService
 from core.services.master_work_service import MasterWorkService
-from setup.migrations import _migration_54
+from setup.migrations import _migration_54, _migration_55
 
 
 class _Repository:
@@ -67,9 +67,11 @@ class FilenameReconciliationTests(unittest.TestCase):
                 CREATE TABLE nexus_item_events(id INTEGER PRIMARY KEY,project_id INTEGER,bom_id INTEGER,actor_id INTEGER,created_at TEXT,event_type TEXT,title TEXT,note TEXT,branch_id TEXT,snapshot_id TEXT,release_id TEXT,payload_json TEXT);
             """)
             _migration_54(conn)
+            _migration_55(conn)
+            conn.execute("ALTER TABLE cad_documents ADD COLUMN lifecycle_state TEXT")
             conn.execute("INSERT INTO projects VALUES(1,?)", (str(self.root),))
-            conn.execute("INSERT INTO cad_documents VALUES(1,1,'old.prt','Model','old.prt','old','COMPONENT',NULL,NULL,'A',1,'old.prt.5',NULL)")
-            conn.execute("INSERT INTO cad_documents VALUES(2,1,'old.drw','Drawing','old.drw','old','DRAWING',1,NULL,'A',1,'old.drw.2',NULL)")
+            conn.execute("INSERT INTO cad_documents VALUES(1,1,'old.prt','Model','old.prt','old','COMPONENT',NULL,NULL,'A',1,'old.prt.5',NULL,'RELEASED')")
+            conn.execute("INSERT INTO cad_documents VALUES(2,1,'old.drw','Drawing','old.drw','old','DRAWING',1,NULL,'A',1,'old.drw.2',NULL,'RELEASED')")
             conn.execute("INSERT INTO cad_document_iterations VALUES(1,1,'A',1,'old.prt.5',?)", (self.part_hash,))
             conn.execute("INSERT INTO cad_document_iterations VALUES(2,2,'A',1,'old.drw.2',?)", (self.drawing_hash,))
             conn.executemany("INSERT INTO cad_item_associations VALUES(?,?,1)", [(1, 9), (2, 9)])
@@ -86,6 +88,63 @@ class FilenameReconciliationTests(unittest.TestCase):
         with patch("core.repositories.permission_repository.PermissionRepository.user_has_permission", return_value=True):
             return reconcile_filenames(db_name=self.db, project_id=1, actor_id=7, cad_id=1,
                                        names={1: "new.prt", 2: "new.drw"})
+
+    def force_rename(self):
+        with patch("core.repositories.permission_repository.PermissionRepository.user_has_permission", return_value=True):
+            return reconcile_filenames(db_name=self.db, project_id=1, actor_id=7, cad_id=1,
+                                       names={1: "new.prt"}, force=True, reason="Creo rename changed iteration")
+
+    def test_force_adopts_changed_iteration_and_requires_approval(self):
+        from core.services.master_work_service import master_commit_for_part, native_work_state
+        (self.root / "new.prt.5").unlink()
+        digest = self.write_file("new.prt.8", b"changed geometry")
+        result = self.force_rename()
+        self.assertIn("unverified", result["warning"])
+        manifest = MasterWorkService.read_manifest(self.root, db_name=self.db)
+        record = manifest["files"]["new.prt"]
+        self.assertEqual(record["sha256"], digest)
+        self.assertEqual(record["path"], "new.prt.8")
+        self.assertIsNone(record["source_commit_id"])
+        self.assertNotIn("new.prt", manifest["validated_files"])
+        self.assertIn("Unverified", native_work_state(master_commit_for_part([], manifest, 9)))
+        with sqlite3.connect(self.db) as conn:
+            self.assertEqual(conn.execute("SELECT lifecycle_state FROM cad_documents WHERE id=1").fetchone()[0], "IN_WORK")
+            self.assertEqual(conn.execute("SELECT primary_path FROM cad_document_iterations WHERE id=1").fetchone()[0], "old.prt.5")
+            self.assertEqual(conn.execute("SELECT filename FROM bom WHERE id=9").fetchone()[0], "new.prt.8")
+        item = {"filename": "new.prt.8", "dest_path": str(self.root / "new.prt.8"), "part_ids": [9]}
+        with patch("config.DB_NAME", self.db):
+            MasterWorkService.publish(self.root, "draft", [item])
+            self.assertTrue(MasterWorkService.read_manifest(self.root)["files"]["new.prt"]["unverified"])
+            item["validated"] = True
+            MasterWorkService.publish(self.root, "approved", [item])
+            approved = MasterWorkService.read_manifest(self.root)
+        self.assertFalse(approved["files"]["new.prt"].get("unverified"))
+        self.assertEqual(approved["validated_files"]["new.prt"]["source_commit_id"], "approved")
+        self.assertEqual(MasterWorkService.read_manifest(self.root, db_name=self.db), approved)
+
+    def test_force_permission_enforced_by_service(self):
+        with patch("core.repositories.permission_repository.PermissionRepository.user_has_permission",
+                   side_effect=lambda user, permission, project: permission == "manage_parts"):
+            with self.assertRaisesRegex(PermissionError, "Master/merge"):
+                reconcile_filenames(db_name=self.db, project_id=1, actor_id=7, cad_id=1,
+                                    names={1: "new.prt"}, force=True, reason="test")
+
+    def test_force_requires_a_reason(self):
+        with patch("core.repositories.permission_repository.PermissionRepository.user_has_permission", return_value=True):
+            with self.assertRaisesRegex(ValueError, "reason"):
+                reconcile_filenames(db_name=self.db, project_id=1, actor_id=7, cad_id=1,
+                                    names={1: "new.prt"}, force=True)
+
+    def test_force_does_not_bypass_related_checkout(self):
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("INSERT INTO locks VALUES(9)")
+        with self.assertRaisesRegex(ValueError, "related Item checkouts"):
+            self.force_rename()
+
+    def test_force_still_requires_existing_new_file(self):
+        (self.root / "new.prt.5").unlink()
+        with self.assertRaisesRegex(ValueError, "No renamed"):
+            self.force_rename()
 
     def test_reconciles_model_and_drawing_and_keeps_unexpected_files_visible(self):
         result = self.reconcile()

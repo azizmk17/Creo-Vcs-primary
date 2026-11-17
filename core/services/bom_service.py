@@ -3228,12 +3228,12 @@ class BomService(BaseService):
         )
         return cad_id
 
-    def reconcile_pdm_cad_filenames(self, cad_document_id: int, names: dict) -> Dict:
+    def reconcile_pdm_cad_filenames(self, cad_document_id: int, names: dict, *, force=False, reason="") -> Dict:
         from core.services.cad_filename_reconciliation import reconcile_filenames
 
         result = reconcile_filenames(
             db_name=self.resources.db_name, project_id=int(self.session.project_id),
-            actor_id=int(self.session.user_id), cad_id=int(cad_document_id), names=names,
+            actor_id=int(self.session.user_id), cad_id=int(cad_document_id), names=names, force=force, reason=reason,
         )
         self._tree_dirty.add(int(self.session.project_id))
         self.emit_project_event(

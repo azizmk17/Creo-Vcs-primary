@@ -2283,7 +2283,7 @@ class _BomIndicatorLookupContext:
         self._published_parts = {
             int(part_id)
             for record in (self._manifest.get("files") or {}).values()
-            if record.get("source_commit_id")
+            if record.get("source_commit_id") or record.get("unverified")
             for part_id in (record.get("part_ids") or [])
             if str(part_id).isdigit()
         }
@@ -11919,6 +11919,20 @@ class BomPage(QWidget):
             choice = str(choice or "").strip()
             if choice and choice.casefold() != drawing_name.casefold():
                 names[drawing_id] = choice
+        force = False
+        reason = ""
+        if self.perm.can("merge"):
+            mode, accepted = QInputDialog.getItem(
+                self, "Rename verification", "Choose how to adopt the renamed files:",
+                ["Verify against recorded CAD", "Force rename — require new check-in and approval"], 0, False)
+            if not accepted:
+                return
+            force = mode.startswith("Force")
+            if force:
+                reason, accepted = QInputDialog.getText(self, "Force rename reason",
+                    "The files will be unverified until checked in and approved again.\nReason:")
+                if not accepted or not str(reason).strip():
+                    return
         from core.services.cad_filename_reconciliation import reconcile_filenames
         project_id = int(self.session.project_id)
         actor_id = int(self.session.user_id)
@@ -11926,7 +11940,7 @@ class BomPage(QWidget):
 
         def operation(_progress):
             return reconcile_filenames(db_name=database, project_id=project_id, actor_id=actor_id,
-                                       cad_id=int(cad_id), names=names)
+                                       cad_id=int(cad_id), names=names, force=force, reason=reason)
 
         def finished(result):
             self.bom_service._tree_dirty.add(project_id)
@@ -11939,7 +11953,7 @@ class BomPage(QWidget):
             if int(self.session.project_id or 0) == project_id:
                 self._refresh_pdm_context_rows(item_ids=result.get("item_ids"), cad_ids=refresh_ids, refresh_cad_branches=True)
                 self._reselect_cad_in_current_view(int(cad_id))
-            message = "Nexus adopted the verified filenames. Historical records retain their original names."
+            message = "Nexus adopted the filenames. Historical records retain their original names."
             if result.get("warning"):
                 QMessageBox.warning(self, "Rename CAD", message + "\n\n" + str(result["warning"]))
             else:
@@ -21439,7 +21453,7 @@ class BomPage(QWidget):
     def _has_published_master_for_part(self, part_id):
         project = self.project_service.get_project_by_id(int(self.session.project_id)) or {}
         manifest = MasterWorkService.read_manifest(project.get("working_directory"))
-        return any(record.get("source_commit_id") and int(part_id) in record.get("part_ids", [])
+        return any((record.get("source_commit_id") or record.get("unverified")) and int(part_id) in record.get("part_ids", [])
                    for record in (manifest.get("files") or {}).values())
 
     def _legacy_latest_change_commit_for_part(self, part_id):

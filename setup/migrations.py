@@ -3887,6 +3887,15 @@ def _migration_54(conn):
 MIGRATIONS[54] = _migration_54
 
 
+def _migration_55(conn):
+    """Persist forced rename evidence separately from immutable CAD history."""
+    _ensure_column(conn, "cad_filename_reconciliations", "force_metadata_json",
+                   "force_metadata_json TEXT")
+
+
+MIGRATIONS[55] = _migration_55
+
+
 # --- Migration ---
 def migrate():
     init_db()  

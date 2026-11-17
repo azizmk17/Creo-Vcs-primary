@@ -485,6 +485,8 @@ class NexusHistoryService:
                 )
                 record = master.get(logical_name(name)) if native else None
                 if record:
+                    if record.get("unverified"):
+                        raise ValueError("Forced rename is unverified. Check in and approve the CAD before freezing a branch or release: " + name)
                     source = MasterWorkService.native_path(root, record)
                     expected = str(record.get("sha256") or "")
                     name = Path(record.get("source_filename") or name).name
@@ -541,6 +543,8 @@ class NexusHistoryService:
                     if key in result["files"]:
                         continue
                     record = master.get(key)
+                    if record and record.get("unverified"):
+                        raise ValueError("Forced rename dependency is unverified. Check in and approve it first: " + key)
                     filename = document.get("latest_creo_file_name") or document["file_name"]
                     if record:
                         source = MasterWorkService.native_path(root, record)
@@ -2748,6 +2752,8 @@ class NexusHistoryService:
                             "SELECT status FROM commits WHERE project_id=? AND commit_id=? AND (part_id=? OR part_id IS NULL)",
                             (self.project_id, source_id, int(item_id)))}
                         state = "Validated" if statuses and statuses <= {"validated", "approved"} else "Under development"
+                if any(r.get("unverified") for r in records):
+                    state, source_id = "Unverified — check-in required", ""
             return {"item": item, "cad_revision": str(project.get("version_label") or ""),
                     "master_state": state or "Not published", "master_source": source_id,
                     "branches": branches, "events": rows[:limit], "releases": releases,

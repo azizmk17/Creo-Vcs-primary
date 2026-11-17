@@ -76,7 +76,7 @@ def _active_branch_contains_documents(conn, project_id, document_ids, item_ids, 
     return False
 
 
-def reconcile_filenames(*, db_name, project_id, actor_id, cad_id, names):
+def reconcile_filenames(*, db_name, project_id, actor_id, cad_id, names, force=False, reason=""):
     """Commit name changes only for matching, already renamed root files.
 
     Frozen records keep their original names. Each reconciliation and its exact
@@ -87,6 +87,11 @@ def reconcile_filenames(*, db_name, project_id, actor_id, cad_id, names):
 
     if not PermissionRepository(db_name).user_has_permission(actor_id, "manage_parts", project_id):
         raise PermissionError("You do not have permission to manage CAD Documents.")
+    if force:
+        if not PermissionRepository(db_name).user_has_permission(actor_id, "merge", project_id):
+            raise PermissionError("Force rename requires Master/merge permission.")
+        if not str(reason).strip():
+            raise ValueError("Enter a reason for the forced rename.")
     conn = sqlite3.connect(db_name, timeout=30)
     conn.row_factory = sqlite3.Row
     lock_path = None
@@ -166,6 +171,7 @@ def reconcile_filenames(*, db_name, project_id, actor_id, cad_id, names):
             inventory = {entry.name.casefold(): entry.name for entry in scan if entry.is_file(follow_symlinks=False)}
         changed = []
         verified_files = {}
+        force_records = {}
 
         def verify_file(name, expected):
             path = os.path.join(root, name)
@@ -203,6 +209,29 @@ def reconcile_filenames(*, db_name, project_id, actor_id, cad_id, names):
             for name in new_files:
                 suffix = name[len(new):]
                 mapping[old + suffix] = name
+            if force:
+                # Adopt the highest existing Creo iteration, even if numbering changed.
+                latest_new = max(new_files, key=lambda n: int(new_pattern.fullmatch(n)[1] or 0))
+                digest = _file_digest(os.path.join(root, latest_new))
+                if not verify_file(latest_new, digest):
+                    raise ValueError("The renamed file changed during verification. Retry when it is stable.")
+                related_items = [int(r[0]) for r in conn.execute(
+                    "SELECT item_id FROM cad_item_associations WHERE active=1 AND cad_document_id=?",
+                    (int(document["id"]),))]
+                for record in [(manifest.get(section) or {}).get(old.casefold()) or {}
+                               for section in ("files", "validated_files")]:
+                    for field in ("path", "source_filename"):
+                        if record.get(field):
+                            mapping[str(record[field])] = latest_new
+                if document.get("latest_creo_file_name"):
+                    mapping[str(document["latest_creo_file_name"])] = latest_new
+                force_records[int(document["id"])] = {
+                    "reason": str(reason).strip(), "path": latest_new, "sha256": digest,
+                    "part_ids": related_items, "cad_document_id": int(document["id"]),
+                    "unverified": True, "source_commit_id": None,
+                }
+                changed.append((document, old, new, mapping, None, latest_new))
+                continue
             evidence = False
             current_manifest_file = ""
             for section in ("files", "validated_files"):
@@ -239,6 +268,11 @@ def reconcile_filenames(*, db_name, project_id, actor_id, cad_id, names):
             doc_id = int(document["id"])
             conn.execute("INSERT INTO cad_filename_reconciliations(project_id,cad_document_id,root_key,old_name,new_name,file_mapping_json,actor_user_id,created_at) VALUES(?,?,?,?,?,?,?,?)",
                          (int(project_id), doc_id, key, old, new, json.dumps(mapping, sort_keys=True), int(actor_id), stamp))
+            if force:
+                rename_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                conn.execute("UPDATE cad_filename_reconciliations SET force_metadata_json=? WHERE id=?",
+                             (json.dumps(force_records[doc_id]), rename_id))
+                conn.execute("UPDATE cad_documents SET lifecycle_state='IN_WORK' WHERE id=?", (doc_id,))
             label = str(document.get("name") or "")
             if label.casefold() in {old.casefold(), os.path.splitext(old)[0].casefold()}:
                 label = new if label.casefold() == old.casefold() else os.path.splitext(new)[0]
@@ -267,13 +301,16 @@ def reconcile_filenames(*, db_name, project_id, actor_id, cad_id, names):
             if item_ids:
                 NexusHistoryRepository.event(conn, project_id, item_ids, actor_id, stamp,
                     "CAD_RENAMED", "CAD filename reconciled", old + " -> " + new,
-                    payload={"cad_document_id": doc_id, "old_name": old, "new_name": new, "files": mapping})
+                    payload={"cad_document_id": doc_id, "old_name": old, "new_name": new, "files": mapping,
+                             "forced": bool(force), "evidence": force_records.get(doc_id)})
         for path, signature in verified_files.items():
             stat = os.stat(long_path(path))
             if (stat.st_size, stat.st_mtime_ns, stat.st_ino) != signature:
                 raise ValueError(f"{os.path.basename(path)} changed during reconciliation. Retry when the file is stable.")
         conn.commit()
         result = {"cad_document_ids": ids, "item_ids": item_ids, "renamed": [{"old": old, "new": new} for _, old, new, _, _, _ in changed]}
+        if force:
+            result["warning"] = "Forced rename: CAD is unverified. Check in and approve it again before release."
         return result
     except Exception:
         conn.rollback()
